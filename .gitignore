@@ -1,0 +1,98 @@
+# ============================================================
+# X-Term .gitignore  (Tauri 2 + Vue 3 + pnpm + Rust, Windows)
+# ============================================================
+
+# ---- 依赖目录 ----
+node_modules/
+.pnpm-store/
+
+# ---- 前端构建产物 ----
+dist/
+dist-ssr/
+*.local
+
+# ---- Vite / TypeScript 缓存 ----
+.vite/
+*.tsbuildinfo
+
+# ---- 日志 ----
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---- 编辑器 / IDE ----
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.suo
+*.user
+*.sln.docstates
+
+# ---- 操作系统文件 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# ============================================================
+# Rust / Tauri 后端
+# ============================================================
+
+# ---- 编译产物（体积巨大，绝对不入库）----
+src-tauri/target/
+target/
+
+# ---- Tauri 生成的 schema（构建时重新生成）----
+src-tauri/gen/
+
+# ---- Cargo 缓存 ----
+**/*.rs.bk
+
+# ============================================================
+# 敏感 / 本地运行时数据（绝不能传到 GitHub）
+# ============================================================
+
+# ---- 加密的凭据保险库（含密码/私钥，最高敏感）----
+*.enc
+master.key
+credentials.*
+*.key
+
+# ---- 本地 SQLite 数据库 ----
+*.db
+*.db-journal
+*.sqlite
+*.sqlite-journal
+
+# ---- 本地设置（可能含 AI API Key / token）----
+settings.local.json
+.env
+.env.*
+!.env.example
+
+# ============================================================
+# 打包 / 发布产物
+# ============================================================
+release/
+*.msi
+*.exe
+*.app
+*.dmg
+*.deb
+*.AppImage
+
+# ============================================================
+# 工具 / 临时文件
+# ============================================================
+
+# ---- ZCode 本地工作区（plans 等本地状态）----
+.zcode/
+
+# ---- 临时文件 ----
+*.tmp
+*.bak
+*.swp
+*~

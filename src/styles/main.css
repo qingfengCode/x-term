@@ -1,0 +1,79 @@
+:root {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue",
+    Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+}
+
+/* 滚动条统一样式 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(128, 128, 128, 0.4);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(128, 128, 128, 0.6);
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* xterm 容器，撑满父元素 */
+.xterm-pane {
+  width: 100%;
+  height: 100%;
+  background: #000;
+}
+.xterm-pane .xterm {
+  padding: 4px;
+}
+
+/* 工作区无标签时占位 */
+.workspace-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--el-text-color-secondary);
+  font-size: 13px;
+  user-select: none;
+}
+
+/* 通用 flex 工具 */
+.row {
+  display: flex;
+  flex-direction: row;
+}
+.col {
+  display: flex;
+  flex-direction: column;
+}
+.flex-1 {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+}

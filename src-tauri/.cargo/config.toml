@@ -1,0 +1,10 @@
+# 项目级 cargo 配置。
+#
+# 说明：在 Windows 上 cc crate 默认会自动探测 MSVC 工具链。如果用户环境变量
+# 中设置了 CC=gcc（如 TDM-GCC/MinGW），会干扰这一探测，导致 libsqlite3-sys
+# bundled 的 C 代码被编译为 GNU ABI 对象，链接到 MSVC 目标时报
+# `unresolved external symbol __chkstk_ms`。
+#
+# 解决方案：构建时不要设置 CC/CXX 环境变量（或在 shell 中 `unset CC CXX`），
+# 让 cc crate 选用 cl.exe。这里没有显式设置 target.cc，因为 cc crate 推荐的
+# 覆盖方式是设置 `CC_x86_64-pc-windows-msvc`。

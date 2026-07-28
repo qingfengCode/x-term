@@ -1,0 +1,77 @@
+[package]
+name = "x-term"
+version = "0.1.0"
+description = "X-Term 现代化运维终端客户端"
+authors = ["x-term"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "x_term_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-os = "2"
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 异步运行时
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+futures = "0.3"
+
+# SSH
+russh = "0.45"
+russh-keys = "0.45"
+russh-sftp = "2"
+
+# 数据库
+rusqlite = { version = "0.32", features = ["bundled"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.25"
+# MySQL（SQL 控制台 + AI 工具）
+sqlx = { version = "0.8", default-features = false, features = ["mysql", "runtime-tokio-rustls", "chrono", "json"] }
+
+# 加密
+aes-gcm = "0.10"
+argon2 = "0.5"
+rand = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+# TOTP（MFA 验证码生成）
+# 注：totp-rs 实际发布到 5.x（5.7.2 为当前最新）。原 `^1.5` 在 registry 中无可匹配版本，
+# 故改为 `^5.7`。使用 default-features = false 以避免引入 url/qr 等额外依赖；
+# URI 解析在本项目内手写实现。
+totp-rs = { version = "^5.7", default-features = false }
+
+# HTTP（AI）
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+
+# 工具
+uuid = { version = "1", features = ["v4", "serde"] }
+anyhow = "1"
+thiserror = "1"
+chrono = { version = "0.4", features = ["serde"] }
+log = "0.4"
+env_logger = "0.11"
+dirs = "5"
+once_cell = "1"
+parking_lot = "0.12"
+async-trait = "0.1"
+base64 = "0.22"
+regex = "1"
+zmodem2 = "0.7.1"
+
+[profile.release]
+panic = "abort"
+codegen-units = 16
+opt-level = 2
+strip = true
