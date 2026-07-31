@@ -14,7 +14,6 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { ElMessage, ElMessageBox } from "element-plus";
 import {
   Refresh,
-  VideoPlay,
   VideoPause,
   Plus,
   Edit,
@@ -26,6 +25,10 @@ import {
   Connection,
   Coin,
   Document,
+  Folder,
+  FolderAdd,
+  MoreFilled,
+  EditPen,
 } from "@element-plus/icons-vue";
 import {
   dbDeleteProfile,
@@ -33,9 +36,12 @@ import {
   dbListDatabases,
   dbListProfiles,
   dbListTables,
+  dbListGroups,
+  dbSaveGroup,
+  dbDeleteGroup,
   type DraggedTable,
 } from "@/api/db";
-import type { DbProfile, QueryResult, AiSqlResultEvent } from "@/api/types";
+import type { DbGroup, DbProfile, QueryResult, AiSqlResultEvent } from "@/api/types";
 import { listen } from "@tauri-apps/api/event";
 import DbProfileDialog from "@/components/DbProfileDialog.vue";
 import AiPanel from "@/components/AiPanel.vue";
@@ -68,6 +74,7 @@ const SYSTEM_EXPLAIN =
 
 // --- profile 列表 -----------------------------------------------------------
 const profiles = ref<DbProfile[]>([]);
+const dbGroups = ref<DbGroup[]>([]);
 const selectedProfileId = ref<string | null>(null);
 const loadingProfiles = ref(false);
 
@@ -75,15 +82,14 @@ const selectedProfile = computed(
   () => profiles.value.find((p) => p.id === selectedProfileId.value) ?? null
 );
 
-function profileLabel(p: DbProfile): string {
-  return `${p.name} (${p.host}:${p.port})`;
-}
-
 async function loadProfiles() {
   loadingProfiles.value = true;
   try {
-    profiles.value = await dbListProfiles();
-    // 同步树根：实例层。
+    [profiles.value, dbGroups.value] = await Promise.all([
+      dbListProfiles(),
+      dbListGroups(),
+    ]);
+    // 同步树根：分组 + 实例层。
     treeData.value = rebuildInstanceNodes();
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -96,42 +102,9 @@ async function loadProfiles() {
 // --- 连接状态 ---------------------------------------------------------------
 // connId 由全局 db store 维护，便于 AI 智能体面板读取活动连接（启用 SQL 工具集）。
 const connId = computed(() => db.activeConnId);
-const connecting = ref(false);
 const isConnected = computed(() => !!connId.value);
 
 const readOnly = ref(true); // 默认只读
-
-async function connect() {
-  if (!selectedProfileId.value) {
-    ElMessage.warning("请先选择数据库连接");
-    return;
-  }
-  connecting.value = true;
-  try {
-    const profile = profiles.value.find((p) => p.id === selectedProfileId.value);
-    const name = profile?.name ?? selectedProfileId.value;
-    await db.connect(selectedProfileId.value, name);
-    ElMessage.success("已连接");
-    // 重建树并展开当前实例节点（触发懒加载库列表）。
-    treeData.value = rebuildInstanceNodes();
-    await nextTick();
-    const instKey = `inst-${selectedProfileId.value}`;
-    treeRef.value?.store?.getNode(instKey)?.expand();
-    // 连接后聚焦输入：命令行模式聚焦原生输入框，代码模式挂载/重挂 CodeMirror。
-    await nextTick();
-    if (editorMode.value === "console") {
-      cliInputRef.value?.focus();
-    } else {
-      remountSqlEditor();
-    }
-  } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : String(e);
-    ElMessage.error("连接失败：" + msg);
-    db.clear();
-  } finally {
-    connecting.value = false;
-  }
-}
 
 async function disconnect() {
   if (!connId.value) return;
@@ -145,15 +118,137 @@ async function disconnect() {
   db.setActiveDatabase(null);
 }
 
+// --- DB 分组管理 ---------------------------------------------------------------
+async function createDbGroup() {
+  let name: string;
+  try {
+    const res = await ElMessageBox.prompt("请输入分组名称", "新建分组", {
+      confirmButtonText: "创建",
+      cancelButtonText: "取消",
+      inputValidator: (v) => !!v?.trim() || "名称不能为空",
+    });
+    name = res.value;
+  } catch {
+    return;
+  }
+  try {
+    await dbSaveGroup({
+      id: crypto.randomUUID(),
+      name: name.trim(),
+      parentId: null,
+      sortOrder: 0,
+      createdAt: new Date().toISOString(),
+    });
+    await loadProfiles();
+    ElMessage.success("已创建分组");
+  } catch (e) {
+    ElMessage.error("创建分组失败: " + String(e));
+  }
+}
+
+async function renameDbGroup(g: DbGroup) {
+  let name: string;
+  try {
+    const res = await ElMessageBox.prompt("请输入新的分组名称", "重命名分组", {
+      inputValue: g.name,
+      confirmButtonText: "保存",
+      cancelButtonText: "取消",
+      inputValidator: (v) => !!v?.trim() || "名称不能为空",
+    });
+    name = res.value;
+  } catch {
+    return;
+  }
+  try {
+    await dbSaveGroup({ ...g, name: name.trim() });
+    await loadProfiles();
+    ElMessage.success("已重命名");
+  } catch (e) {
+    ElMessage.error("重命名失败: " + String(e));
+  }
+}
+
+async function deleteDbGroup(g: DbGroup) {
+  const hasChild = profiles.value.some((p) => p.groupId === g.id);
+  try {
+    await ElMessageBox.confirm(
+      hasChild
+        ? `分组 "${g.name}" 下仍有连接，删除分组后连接将变为无分组。继续？`
+        : `确定删除分组 "${g.name}" 吗？`,
+      "删除分组",
+      { type: "warning", confirmButtonText: "删除", cancelButtonText: "取消" }
+    );
+  } catch {
+    return;
+  }
+  try {
+    await dbDeleteGroup(g.id);
+    await loadProfiles();
+    ElMessage.success("已删除");
+  } catch (e) {
+    ElMessage.error("删除失败: " + String(e));
+  }
+}
+
+/** 树节点右键/下拉菜单命令。 */
+function onTreeCommand(cmd: string, data: TreeNode) {
+  if (data.type === "instance") {
+    const profile = profiles.value.find((p) => p.id === data.value);
+    if (!profile) return;
+    switch (cmd) {
+      case "edit":
+        selectedProfileId.value = profile.id;
+        openEditProfile();
+        break;
+      case "delete":
+        deleteProfileById(profile);
+        break;
+    }
+  } else if (data.type === "group") {
+    const g = dbGroups.value.find((x) => x.id === data.value);
+    if (!g) return;
+    switch (cmd) {
+      case "newChild":
+        openCreateProfile(g.id);
+        break;
+      case "rename":
+        renameDbGroup(g);
+        break;
+      case "delete":
+        deleteDbGroup(g);
+        break;
+    }
+  }
+}
+
+async function deleteProfileById(p: DbProfile) {
+  try {
+    await ElMessageBox.confirm(`确定删除连接 "${p.name}" 吗？`, "删除连接", {
+      type: "warning",
+      confirmButtonText: "删除",
+      cancelButtonText: "取消",
+    });
+  } catch {
+    return;
+  }
+  try {
+    await dbDeleteProfile(p.id);
+    await loadProfiles();
+    ElMessage.success("已删除");
+  } catch (e) {
+    ElMessage.error("删除失败: " + String(e));
+  }
+}
+
 // --- 表列表 -----------------------------------------------------------------
-// --- 左侧导航树（实例 > 库 > 表）-------------------------------------------
+// --- 左侧导航树（分组 > 实例 > 库 > 表）-------------------------------------------
 interface TreeNode {
-  type: "instance" | "database" | "table";
+  type: "group" | "instance" | "database" | "table";
   /** 唯一 key。 */
   key: string;
   /** 显示文本。 */
   label: string;
-  /** 实例：profile id；库：库名；表：表名。 */
+  /** 分组：group id；实例：profile id；库：库名；表：表名。 */
   value: string;
   /** 表所属的库名（仅 table 节点用）。 */
   database?: string;
@@ -167,33 +262,94 @@ interface TreeNode {
   columns?: string[];
 }
 
-/** 树根：所有 profile 作为实例节点。 */
+/** 树根：分组 + 实例节点。 */
 const treeData = ref<TreeNode[]>([]);
 const treeRef = ref<any>(null);
 
-/** 重建实例层：从 profiles 生成根节点。 */
+/** 重建树根：分组节点 + 未分组实例节点。 */
 function rebuildInstanceNodes(): TreeNode[] {
-  return profiles.value.map((p) => ({
-    type: "instance",
-    key: `inst-${p.id}`,
-    label: p.name,
-    value: p.id,
-    isLeaf: false,
-    children: [],
-  }));
+  const roots: TreeNode[] = [];
+  const groupMap = new Map<string, TreeNode>();
+
+  // 构建分组节点。
+  for (const g of dbGroups.value) {
+    const node: TreeNode = {
+      type: "group",
+      key: `grp-${g.id}`,
+      label: g.name,
+      value: g.id,
+      isLeaf: false,
+      children: [],
+    };
+    groupMap.set(g.id, node);
+  }
+  // 挂载子分组。
+  for (const g of dbGroups.value) {
+    const node = groupMap.get(g.id)!;
+    if (g.parentId && groupMap.has(g.parentId)) {
+      groupMap.get(g.parentId)!.children!.push(node);
+    } else {
+      roots.push(node);
+    }
+  }
+
+  // 把实例挂到对应分组或根。
+  for (const p of profiles.value) {
+    const inst: TreeNode = {
+      type: "instance",
+      key: `inst-${p.id}`,
+      label: p.name,
+      value: p.id,
+      isLeaf: false,
+      children: [],
+    };
+    if (p.groupId && groupMap.has(p.groupId)) {
+      groupMap.get(p.groupId)!.children!.push(inst);
+    } else {
+      roots.push(inst);
+    }
+  }
+
+  // 排序：分组在前，实例在后；同类按名称。
+  roots.sort((a, b) => {
+    if (a.type !== b.type) return a.type === "group" ? -1 : 1;
+    return a.label.localeCompare(b.label);
+  });
+  return roots;
 }
 
 /** 懒加载子节点（el-tree 的 load 回调）。 */
 async function loadTreeNode(node: any, resolve: (children: TreeNode[]) => void) {
   const data: TreeNode = node.data ?? node;
+  if (data.type === "group") {
+    // 分组节点的子节点（实例）已在 rebuildInstanceNodes 中静态构建。
+    resolve(data.children ?? []);
+    return;
+  }
   if (data.type === "instance") {
-    // 展开实例 → 列出库。要求已连接（connId 存在）。
-    if (!db.activeConnId) {
-      resolve([]);
-      return;
-    }
+    // 展开实例 → 自动连接（若尚未连接该 profile）。
+    const profileId = data.value;
     try {
-      const dbs = await dbListDatabases(db.activeConnId);
+      // 如果当前连接的不是这个 profile，先断开旧连接再连新的。
+      const currentConn = db.conns[0];
+      if (!currentConn || currentConn.profileId !== profileId) {
+        if (currentConn) {
+          await db.disconnect();
+        }
+        selectedProfileId.value = profileId;
+        const profile = profiles.value.find((p) => p.id === profileId);
+        const name = profile?.name ?? profileId;
+        await db.connect(profileId, name);
+        ElMessage.success(`已连接 ${name}`);
+        // 连接后聚焦编辑器。
+        await nextTick();
+        if (editorMode.value === "console") {
+          cliInputRef.value?.focus();
+        } else {
+          remountSqlEditor();
+        }
+      }
+      const dbs = await dbListDatabases(db.activeConnId!);
       resolve(
         dbs
           .filter((d) => !["information_schema", "performance_schema", "mysql", "sys"].includes(d))
@@ -206,7 +362,10 @@ async function loadTreeNode(node: any, resolve: (children: TreeNode[]) => void) 
             children: [],
           })),
       );
-    } catch {
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      ElMessage.error("连接失败：" + msg);
+      db.clear();
       resolve([]);
     }
     return;
@@ -257,12 +416,8 @@ function onTableDragStart(e: DragEvent, data: TreeNode) {
 
 /** 点击树节点。 */
 async function onTreeNodeClick(data: TreeNode) {
-  if (data.type === "instance") {
-    // 点击实例：切换连接（若未连接该 profile）。
-    if (selectedProfileId.value !== data.value) {
-      selectedProfileId.value = data.value;
-      await connect();
-    }
+  if (data.type === "group" || data.type === "instance") {
+    // 分组/实例：展开由 el-tree 的 expand-on-click-node 处理，此处不干预。
     return;
   }
   if (data.type === "database") {
@@ -542,9 +697,11 @@ function aiExplain() {
 // --- profile 弹窗 -----------------------------------------------------------
 const dialogVisible = ref(false);
 const editingProfile = ref<DbProfile | null>(null);
+const defaultGroupId = ref<string | null>(null);
 
-function openCreateProfile() {
+function openCreateProfile(groupId: string | null = null) {
   editingProfile.value = null;
+  defaultGroupId.value = groupId;
   dialogVisible.value = true;
 }
 
@@ -627,49 +784,19 @@ onBeforeUnmount(() => {
     <!-- 顶部工具栏 -->
     <div class="toolbar">
       <div class="toolbar-left">
-        <el-select
-          v-model="selectedProfileId"
-          placeholder="选择数据库连接"
-          :loading="loadingProfiles"
-          :disabled="isConnected"
-          filterable
-          style="width: 280px"
-        >
-          <el-option
-            v-for="p in profiles"
-            :key="p.id"
-            :label="profileLabel(p)"
-            :value="p.id"
-          />
-        </el-select>
-
-        <el-button :icon="Plus" :disabled="isConnected" @click="openCreateProfile" />
-        <el-button :icon="Edit" :disabled="isConnected || !selectedProfileId" @click="openEditProfile" />
-        <el-button
-          :icon="Delete"
-          type="danger"
-          plain
-          :disabled="isConnected || !selectedProfileId"
-          @click="deleteProfile"
-        />
+        <el-button :icon="Plus" size="small" @click="openCreateProfile()" />
 
         <el-divider direction="vertical" />
 
-        <template v-if="!isConnected">
-          <el-button
-            type="primary"
-            :icon="VideoPlay"
-            :loading="connecting"
-            :disabled="!selectedProfileId"
-            @click="connect"
-          >
-            连接
+        <template v-if="isConnected">
+          <el-tag type="success" effect="dark" size="small" round>
+            {{ selectedProfileName }}
+          </el-tag>
+          <el-button :icon="VideoPause" size="small" type="warning" plain @click="disconnect">
+            断开
           </el-button>
         </template>
-        <template v-else>
-          <el-tag type="success" effect="dark" size="default" round>已连接</el-tag>
-          <el-button :icon="VideoPause" type="warning" plain @click="disconnect">断开</el-button>
-        </template>
+        <span v-else class="conn-hint">展开左侧实例以连接</span>
       </div>
 
       <div class="toolbar-right">
@@ -681,26 +808,20 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
-    <!-- 主体 -->
-    <div v-if="!isConnected && !connecting" class="placeholder">
-      <el-empty description="请选择 DB profile 并连接" />
-    </div>
-    <div v-else-if="connecting && !isConnected" class="placeholder">
-      <el-icon class="is-loading" :size="32"><Refresh /></el-icon>
-      <p>正在连接...</p>
-    </div>
-
-    <div v-else class="console-body">
+    <!-- 主体：始终显示 -->
+    <div class="console-body">
       <!-- 左侧：数据库树（宽度可拖拽） -->
       <aside class="table-list" :style="{ width: sidebarWidth + 'px' }">
         <div class="list-header">
           <span>数据库</span>
-          <el-button
-            :icon="Refresh"
-            size="small"
-            circle
-            @click="treeData = rebuildInstanceNodes()"
-          />
+          <div class="list-header-actions">
+            <el-tooltip content="新建分组" placement="bottom">
+              <el-button :icon="FolderAdd" size="small" circle @click="createDbGroup" />
+            </el-tooltip>
+            <el-tooltip content="刷新" placement="bottom">
+              <el-button :icon="Refresh" size="small" circle @click="loadProfiles" />
+            </el-tooltip>
+          </div>
         </div>
         <div class="list-body tree-body">
           <el-tree
@@ -711,7 +832,7 @@ onBeforeUnmount(() => {
             :load="loadTreeNode"
             :indent="10"
             lazy
-            :expand-on-click-node="false"
+            :expand-on-click-node="true"
             highlight-current
             @node-click="onTreeNodeClick"
           >
@@ -722,10 +843,34 @@ onBeforeUnmount(() => {
                 :draggable="data.type === 'table'"
                 @dragstart="onTableDragStart($event, data)"
               >
-                <el-icon v-if="data.type === 'instance'" class="node-icon"><Connection /></el-icon>
+                <el-icon v-if="data.type === 'group'" class="node-icon grp"><Folder /></el-icon>
+                <el-icon v-else-if="data.type === 'instance'" class="node-icon"><Connection /></el-icon>
                 <el-icon v-else-if="data.type === 'database'" class="node-icon"><Coin /></el-icon>
                 <el-icon v-else class="node-icon"><Document /></el-icon>
                 <span class="node-label">{{ data.label }}</span>
+
+                <!-- 实例/分组悬浮操作菜单 -->
+                <el-dropdown
+                  v-if="data.type === 'instance' || data.type === 'group'"
+                  class="node-menu"
+                  trigger="click"
+                  placement="bottom-end"
+                  @command="(cmd: string) => onTreeCommand(cmd, data)"
+                  @click.stop
+                >
+                  <el-icon class="node-menu-icon"><MoreFilled /></el-icon>
+                  <template #dropdown>
+                    <el-dropdown-menu v-if="data.type === 'instance'">
+                      <el-dropdown-item command="edit" :icon="EditPen">编辑</el-dropdown-item>
+                      <el-dropdown-item command="delete" :icon="Delete" divided>删除</el-dropdown-item>
+                    </el-dropdown-menu>
+                    <el-dropdown-menu v-else>
+                      <el-dropdown-item command="newChild" :icon="Plus">新建连接</el-dropdown-item>
+                      <el-dropdown-item command="rename" :icon="EditPen">重命名</el-dropdown-item>
+                      <el-dropdown-item command="delete" :icon="Delete" divided>删除</el-dropdown-item>
+                    </el-dropdown-menu>
+                  </template>
+                </el-dropdown>
               </span>
             </template>
           </el-tree>
@@ -740,6 +885,11 @@ onBeforeUnmount(() => {
 
       <!-- 右侧：编辑器 + 结果 -->
       <section class="editor-area sql-console-area">
+        <!-- 未连接提示 -->
+        <div v-if="!isConnected" class="editor-placeholder">
+          <el-empty description="展开左侧数据库实例以连接" :image-size="80" />
+        </div>
+        <template v-else>
         <!-- 顶部小工具栏 -->
         <div class="console-toolbar">
           <span class="console-prompt">
@@ -878,6 +1028,7 @@ onBeforeUnmount(() => {
             </div>
           </div>
         </template>
+        </template>
       </section>
       <!-- DB 助手面板：仅在 SQL 页显示，与 SSH 助手完全隔离 -->
       <AiPanel domain="db" />
@@ -887,6 +1038,7 @@ onBeforeUnmount(() => {
     <DbProfileDialog
       v-model:visible="dialogVisible"
       :profile="editingProfile"
+      :default-group-id="defaultGroupId"
       @saved="onProfileSaved"
     />
 
@@ -982,6 +1134,20 @@ onBeforeUnmount(() => {
   color: var(--el-text-color-secondary);
 }
 
+/* 编辑器区未连接占位 */
+.editor-placeholder {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* 工具栏连接提示 */
+.conn-hint {
+  font-size: 12px;
+  color: var(--el-text-color-placeholder);
+}
+
 /* 主体布局 */
 .console-body {
   flex: 1;
@@ -1071,6 +1237,37 @@ onBeforeUnmount(() => {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  flex: 1;
+  min-width: 0;
+}
+/* 分组图标颜色 */
+.node-icon.grp {
+  color: var(--el-color-primary);
+}
+/* 悬浮操作菜单（参考终端侧栏） */
+.list-header-actions {
+  display: flex;
+  gap: 2px;
+}
+.node-menu {
+  display: none;
+  align-items: center;
+  cursor: pointer;
+  padding: 2px;
+  flex-shrink: 0;
+}
+.tree-node:hover .node-menu,
+.node-menu:focus-within {
+  display: flex;
+}
+.node-menu-icon {
+  font-size: 13px;
+  color: var(--el-text-color-secondary);
+  border-radius: 4px;
+}
+.node-menu-icon:hover {
+  color: var(--el-color-primary);
+  background: var(--el-fill-color);
 }
 .empty-tip {
   padding: 16px 12px;

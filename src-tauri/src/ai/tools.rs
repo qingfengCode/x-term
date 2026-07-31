@@ -43,6 +43,7 @@ use tauri::AppHandle;
 use tokio::time::timeout;
 
 use crate::error::{AppError, AppResult};
+use crate::utils::{format_query_result, strip_ansi};
 use crate::state::AppState;
 
 // ===========================================================================
@@ -973,46 +974,3 @@ pub fn describe_call(name: &str, arguments: &Value) -> String {
     }
 }
 
-// ===========================================================================
-// 辅助
-// ===========================================================================
-
-/// 剥离常见的 ANSI 转义序列（CSI、OSC 等）。
-///
-/// 用于把 exec 输出中残留的颜色/光标控制序列去掉，得到干净文本。
-fn strip_ansi(s: &str) -> String {
-    // CSI: ESC [ ... letter
-    let csi = Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").unwrap();
-    // OSC: ESC ] ... BEL  或  ESC ] ... ESC \
-    let osc = Regex::new(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)").unwrap();
-    // 其它单字符转义（ESC + 一个字符）。
-    let single = Regex::new(r"\x1b[@-_]").unwrap();
-    let s = csi.replace_all(s, "");
-    let s = osc.replace_all(&s, "");
-    let s = single.replace_all(&s, "");
-    s.into_owned()
-}
-
-/// 把 [`crate::database::mysql::QueryResult`] 格式化成可读文本。
-///
-/// 采用对齐的 ASCII 表格：首行列名，其后每行一个数据行。
-fn format_query_result(qr: &crate::database::mysql::QueryResult) -> String {
-    if qr.columns.is_empty() {
-        // 非查询语句。
-        return format!("OK，影响 {} 行", qr.affected);
-    }
-    let mut out = String::new();
-    out.push_str(&qr.columns.join(" | "));
-    out.push('\n');
-    out.push_str(&"-".repeat(qr.columns.iter().map(|c| c.len() + 3).sum::<usize>()));
-    out.push('\n');
-    for row in &qr.rows {
-        out.push_str(&row.join(" | "));
-        out.push('\n');
-    }
-    if qr.rows.is_empty() {
-        out.push_str("(无数据)\n");
-    }
-    out.push_str(&format!("共 {} 行", qr.rows.len()));
-    out
-}

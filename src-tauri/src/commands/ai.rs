@@ -83,28 +83,8 @@ pub async fn ai_chat(
     let ssh_cfg = settings.ai.ssh_agent.clone();
     let sql_cfg = settings.ai.sql_agent.clone();
 
-    // state 的共享字段都是 Arc，clone 出来 move 进 spawned task。
-    let data_dir = state.data_dir.clone();
-    let db = state.db.clone();
-    let vault = state.vault.clone();
-    let terminals = state.terminals.clone();
-    let mysql_conns = state.mysql_conns.clone();
-    let pending_tool_calls = state.pending_tool_calls.clone();
-
-    // 构造一个独立的 AppState 句柄（共享同一份内部数据）。
-    let task_state = AppState {
-        data_dir,
-        db,
-        vault,
-        terminals,
-        sftp_sessions: state.sftp_sessions.clone(),
-        tunnels: state.tunnels.clone(),
-        mysql_conns,
-        pending_tool_calls,
-        // 任务自身不操作 pending_ai_tasks，但 AppState 字段必须完整；与外部共享同一 Arc。
-        pending_ai_tasks: state.pending_ai_tasks.clone(),
-        settings_path: state.settings_path.clone(),
-    };
+    // AppState 所有字段均为 Arc，clone 廉价且共享同一份内部数据。
+    let task_state = state.inner().clone();
 
     let request_id = req.request_id.clone();
     let app_clone = app.clone();

@@ -141,7 +141,16 @@ impl SftpSession {
             .await
             .map_err(|e| AppError::Ssh(format!("打开远程文件 `{}` 失败: {}", remote, e)))?;
 
-        let mut local_file = tokio::fs::File::create(local_path).await?;
+        let mut local_file = tokio::fs::File::create(local_path).await.map_err(|e| {
+            AppError::Io(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "无法创建本地文件 `{}`: {}（请检查目标目录是否有写入权限）",
+                    local_path.display(),
+                    e
+                ),
+            ))
+        })?;
 
         let mut transferred: u64 = 0;
         let mut buf = vec![0u8; CHUNK_SIZE];
@@ -160,7 +169,12 @@ impl SftpSession {
             transferred += n as u64;
             progress(transferred, total);
         }
-        local_file.flush().await?;
+        local_file.flush().await.map_err(|e| {
+            AppError::Io(std::io::Error::new(
+                e.kind(),
+                format!("刷新本地文件 `{}` 失败: {}", local_path.display(), e),
+            ))
+        })?;
         Ok(())
     }
 
@@ -176,10 +190,28 @@ impl SftpSession {
     where
         F: Fn(u64, u64),
     {
-        let local_meta = tokio::fs::metadata(local_path).await?;
+        let local_meta = tokio::fs::metadata(local_path).await.map_err(|e| {
+            AppError::Io(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "无法读取文件信息 `{}`: {}（请检查文件是否存在、是否被其他程序占用）",
+                    local_path.display(),
+                    e
+                ),
+            ))
+        })?;
         let total = local_meta.len();
 
-        let mut local_file = tokio::fs::File::open(local_path).await?;
+        let mut local_file = tokio::fs::File::open(local_path).await.map_err(|e| {
+            AppError::Io(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "无法打开本地文件 `{}`: {}（请检查文件是否被其他程序占用或权限不足）",
+                    local_path.display(),
+                    e
+                ),
+            ))
+        })?;
         let mut remote_file = self
             .channel
             .create(remote)

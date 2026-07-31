@@ -13,7 +13,7 @@ use std::time::Instant;
 use tauri::{AppHandle, State};
 
 use crate::database::mysql::{connect_direct, connect_via_ssh, MySqlConn};
-use crate::database::profiles::{list_db_profiles, upsert_db_profile, DbProfile};
+use crate::database::profiles::{list_db_profiles, upsert_db_profile, DbProfile, DbGroup};
 use crate::error::{AppError, AppResult};
 use crate::events::{emit, DbQueryResultEvent, DB_QUERY_RESULT};
 use crate::state::AppState;
@@ -39,6 +39,28 @@ pub fn db_save_profile(profile: DbProfile, state: State<'_, AppState>) -> AppRes
 pub fn db_delete_profile(id: String, state: State<'_, AppState>) -> AppResult<()> {
     let conn = state.conn()?;
     crate::database::profiles::delete_db_profile(&conn, &id)
+}
+
+// ===========================================================================
+// DB 分组 CRUD
+// ===========================================================================
+
+#[tauri::command]
+pub fn db_list_groups(state: State<'_, AppState>) -> AppResult<Vec<DbGroup>> {
+    let conn = state.conn()?;
+    crate::database::profiles::list_db_groups(&conn)
+}
+
+#[tauri::command]
+pub fn db_save_group(group: DbGroup, state: State<'_, AppState>) -> AppResult<()> {
+    let conn = state.conn()?;
+    crate::database::profiles::upsert_db_group(&conn, &group)
+}
+
+#[tauri::command]
+pub fn db_delete_group(id: String, state: State<'_, AppState>) -> AppResult<()> {
+    let conn = state.conn()?;
+    crate::database::profiles::delete_db_group(&conn, &id)
 }
 
 // ===========================================================================

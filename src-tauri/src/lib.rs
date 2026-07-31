@@ -12,11 +12,13 @@ pub mod config;
 pub mod database;
 pub mod error;
 pub mod events;
+pub mod mcp;
 pub mod ssh;
 pub mod state;
 pub mod storage;
 pub mod telnet;
 pub mod totp;
+pub mod utils;
 
 use state::AppState;
 use storage::db;

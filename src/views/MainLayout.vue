@@ -8,8 +8,11 @@ import { useAiSshStore, useAiDbStore } from "@/stores/ai";
 import { useTransferStore } from "@/stores/transfer";
 import { useTerminalsStore } from "@/stores/terminals";
 import { useUiStore } from "@/stores/ui";
+import { useMcpStore } from "@/stores/mcp";
 import { useAppShortcuts } from "@/composables/useAppShortcuts";
 import SessionSidebar from "@/components/SessionSidebar.vue";
+import McpApprovalToast from "@/components/McpApprovalToast.vue";
+import type { McpApprovalRequest } from "@/api/mcp";
 
 const route = useRoute();
 const router = useRouter();
@@ -21,6 +24,8 @@ const aiDb = useAiDbStore();
 const transfer = useTransferStore();
 const terminalsStore = useTerminalsStore();
 const ui = useUiStore();
+// MCP 服务端：外部客户端发来的 exec_ssh/exec_sql 确认请求全局可见，故在 layout 层订阅。
+const mcp = useMcpStore();
 
 /** 会话侧栏组件引用（用于 focusSessions 快捷键聚焦搜索框）。 */
 const sidebarRef = ref<InstanceType<typeof SessionSidebar> | null>(null);
@@ -33,6 +38,7 @@ const navItems = [
   { key: "remote", label: "桌面", icon: "Monitor" },
   { key: "keys", label: "密钥", icon: "Key" },
   { key: "mfa", label: "MFA", icon: "Iphone" },
+  { key: "mcp", label: "MCP", icon: "Link" },
   { key: "settings", label: "设置", icon: "Setting" },
 ];
 
@@ -45,6 +51,7 @@ const activeNav = computed(() => {
     route.name === "remote" ||
     route.name === "keys" ||
     route.name === "mfa" ||
+    route.name === "mcp" ||
     route.name === "settings"
   ) {
     return route.name as string;
@@ -124,6 +131,17 @@ onMounted(async () => {
     transfer.update(e.payload.taskId, { status: "error", message: e.payload.message });
   });
 
+  // 订阅 MCP 工具调用确认请求（外部 MCP 客户端发起 exec_ssh/exec_sql 时，
+  // 后端 emit mcp:approval_request；推入 store，由全局浮层 McpApprovalToast 展示）。
+  listen<McpApprovalRequest>("mcp:approval_request", (e) => {
+    mcp.onApprovalRequest(e.payload);
+  });
+
+  // 订阅 MCP 确认请求过期事件（后端超时自动拒绝后 emit），移除对应浮层卡片。
+  listen<{ requestId: string }>("mcp:approval_expired", (e) => {
+    mcp.onApprovalExpired(e.payload.requestId);
+  });
+
   // 全局快捷键（应用级）由 useAppShortcuts 在下面注册。
 });
 
@@ -198,6 +216,9 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onNumberKeydown));
         </KeepAlive>
       </router-view>
     </main>
+
+    <!-- MCP 工具调用确认浮层（外部客户端发起 exec_ssh/exec_sql 时弹出，全局可见） -->
+    <McpApprovalToast />
   </div>
 </template>
 

@@ -99,6 +99,9 @@ pub struct ShortcutCommand {
     /// 为空表示仅作为按钮、不绑定按键。
     #[serde(default)]
     pub shortcut: Option<String>,
+    /// 所属分组名称。为空表示未分组。
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
 /// 快捷键设置。
@@ -108,6 +111,9 @@ pub struct ShortcutSettings {
     /// 快捷命令列表。
     #[serde(default)]
     pub commands: Vec<ShortcutCommand>,
+    /// 有序分组名列表（用于前端标签页排序）。
+    #[serde(default)]
+    pub groups: Vec<String>,
     /// 应用级快捷键绑定（action -> 组合键）。键为动作名（如 "newTab"），
     /// 值为组合键字符串（如 "Ctrl+T"）。前端读取并在全局 keydown 中分发。
     /// 老配置文件没有此字段时使用 `default_app_shortcuts`。
@@ -392,26 +398,31 @@ fn default_shortcuts() -> ShortcutSettings {
                 label: "ls -la".into(),
                 command: "ls -la".into(),
                 shortcut: Some("Ctrl+1".into()),
+                group: None,
             },
             ShortcutCommand {
                 id: "sc-default-tail".into(),
                 label: "tail 日志".into(),
                 command: "tail -f /var/log/syslog".into(),
                 shortcut: Some("Ctrl+2".into()),
+                group: None,
             },
             ShortcutCommand {
                 id: "sc-default-disk".into(),
                 label: "磁盘".into(),
                 command: "df -h".into(),
                 shortcut: Some("Ctrl+3".into()),
+                group: None,
             },
             ShortcutCommand {
                 id: "sc-default-process".into(),
                 label: "进程".into(),
                 command: "ps aux --sort=-%cpu | head -20".into(),
                 shortcut: None,
+                group: None,
             },
         ],
+        groups: vec![],
         app: default_app_shortcuts(),
     }
 }

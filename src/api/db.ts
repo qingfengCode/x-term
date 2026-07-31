@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { DbProfile, QueryResult } from "./types";
+import type { DbGroup, DbProfile, QueryResult } from "./types";
 
 export function dbListProfiles(): Promise<DbProfile[]> {
   return invoke<DbProfile[]>("db_list_profiles");
@@ -11,6 +11,19 @@ export function dbSaveProfile(profile: DbProfile): Promise<void> {
 
 export function dbDeleteProfile(id: string): Promise<void> {
   return invoke<void>("db_delete_profile", { id });
+}
+
+// --- DB 分组 ---
+export function dbListGroups(): Promise<DbGroup[]> {
+  return invoke<DbGroup[]>("db_list_groups");
+}
+
+export function dbSaveGroup(group: DbGroup): Promise<void> {
+  return invoke<void>("db_save_group", { group });
+}
+
+export function dbDeleteGroup(id: string): Promise<void> {
+  return invoke<void>("db_delete_group", { id });
 }
 
 /** 连接一个 DB profile，返回 connId。 */

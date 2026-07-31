@@ -133,6 +133,25 @@ pub fn get_session(conn: &DbConn, id: &str) -> AppResult<Option<Session>> {
     }
 }
 
+/// 根据 name 取单个会话；不存在则返回 `None`。
+///
+/// 若有同名会话（name 非唯一约束），返回排序后的第一条。
+pub fn get_session_by_name(conn: &DbConn, name: &str) -> AppResult<Option<Session>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, group_id, host, port, username, auth_type, credential_id, \
+         key_path, jump_session_id, startup_script, tags, color, sort_order, \
+         created_at, updated_at, protocol, space_id \
+         FROM sessions WHERE name = ?1 LIMIT 1",
+    )?;
+
+    let mut rows = stmt.query_map([name], row_to_session)?;
+    if let Some(row) = rows.next() {
+        Ok(Some(row?))
+    } else {
+        Ok(None)
+    }
+}
+
 /// 插入或更新（基于 `id` 主键）一个会话。
 pub fn upsert_session(conn: &DbConn, s: &Session) -> AppResult<()> {
     conn.execute(

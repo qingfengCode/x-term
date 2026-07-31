@@ -121,6 +121,13 @@ pub struct AppState {
     /// 任务自然结束时由其自身清理（run_agent_loop 返回后 remove）。
     pub pending_ai_tasks: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
 
+    /// MCP 人工确认注册表（exec_ssh / exec_sql 必须经前端确认）。
+    ///
+    /// 外部 MCP 客户端发起工具调用时，MCP 服务端在此登记一个 oneshot，
+    /// 阻塞等待前端通过 `mcp_respond_approval` 回结果。详见
+    /// [`crate::mcp::approval`]。
+    pub approval_registry: Arc<crate::mcp::approval::ApprovalRegistry>,
+
     /// settings.json 的路径（缓存的快捷访问）。
     pub settings_path: Arc<PathBuf>,
 }
@@ -138,6 +145,7 @@ impl AppState {
             mysql_conns: Arc::new(Mutex::new(HashMap::new())),
             pending_tool_calls: Arc::new(Mutex::new(HashMap::new())),
             pending_ai_tasks: Arc::new(Mutex::new(HashMap::new())),
+            approval_registry: Arc::new(crate::mcp::approval::ApprovalRegistry::new()),
             settings_path: Arc::new(settings_path),
         }
     }

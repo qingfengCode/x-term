@@ -340,6 +340,13 @@ function removeShortcut(id: string) {
   settings.removeShortcut(id);
 }
 
+/** 分组选择变更时，若为新分组则自动加入分组列表。 */
+function onGroupChange(sc: ShortcutCommand, val: string) {
+  if (val && !settings.shortcutGroups.includes(val)) {
+    settings.addShortcutGroup(val);
+  }
+}
+
 async function saveShortcuts() {
   // 校验：label 和 command 不能同时为空。
   const invalid = settings.shortcuts.find((s) => !s.label.trim() && !s.command.trim());
@@ -529,7 +536,7 @@ async function saveSqlSwitches() {
                 v-model="sc.label"
                 placeholder="显示名称"
                 size="small"
-                style="width: 140px"
+                style="width: 120px"
               />
               <el-input
                 v-model="sc.command"
@@ -542,9 +549,27 @@ async function saveSqlSwitches() {
                 v-model="sc.shortcut"
                 placeholder="如 Ctrl+1（可选）"
                 size="small"
-                style="width: 140px"
+                style="width: 130px"
                 @keydown="onShortcutKeyCapture(sc, $event)"
               />
+              <el-select
+                v-model="sc.group"
+                placeholder="分组"
+                size="small"
+                style="width: 110px"
+                clearable
+                filterable
+                allow-create
+                default-first-option
+                @change="(val: string) => onGroupChange(sc, val)"
+              >
+                <el-option
+                  v-for="g in settings.shortcutGroups"
+                  :key="g"
+                  :label="g"
+                  :value="g"
+                />
+              </el-select>
               <el-button
                 type="danger"
                 size="small"

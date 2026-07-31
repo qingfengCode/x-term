@@ -35,6 +35,19 @@ pub struct DbProfile {
     pub credential_id: Option<String>,
     /// 可选：通过哪个 SSH 会话配置建立隧道再连 MySQL。
     pub ssh_session_config_id: Option<String>,
+    /// 所属分组 id（`db_groups` 表）。
+    pub group_id: Option<String>,
+    pub created_at: String,
+}
+
+/// 数据库连接分组。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DbGroup {
+    pub id: String,
+    pub name: String,
+    pub parent_id: Option<String>,
+    pub sort_order: i64,
     pub created_at: String,
 }
 
@@ -46,7 +59,7 @@ pub struct DbProfile {
 pub fn list_db_profiles(conn: &DbConn) -> AppResult<Vec<DbProfile>> {
     let mut stmt = conn.prepare(
         "SELECT id, name, kind, host, port, username, default_database, \
-         credential_id, ssh_session_config_id, created_at \
+         credential_id, ssh_session_config_id, group_id, created_at \
          FROM db_profiles ORDER BY name ASC",
     )?;
     let rows = stmt.query_map([], row_to_profile)?;
@@ -62,9 +75,27 @@ pub fn get_db_profile(conn: &DbConn, id: &str) -> AppResult<Option<DbProfile>> {
     // 用 query_row + 捕获 NoRows 转 None。
     let res = conn.query_row(
         "SELECT id, name, kind, host, port, username, default_database, \
-         credential_id, ssh_session_config_id, created_at \
+         credential_id, ssh_session_config_id, group_id, created_at \
          FROM db_profiles WHERE id = ?1",
         params![id],
+        row_to_profile,
+    );
+    match res {
+        Ok(p) => Ok(Some(p)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// 按 name 取单个 profile，不存在返回 `None`。
+///
+/// 若有同名 profile（name 非唯一约束），返回第一条。
+pub fn get_db_profile_by_name(conn: &DbConn, name: &str) -> AppResult<Option<DbProfile>> {
+    let res = conn.query_row(
+        "SELECT id, name, kind, host, port, username, default_database, \
+         credential_id, ssh_session_config_id, group_id, created_at \
+         FROM db_profiles WHERE name = ?1 LIMIT 1",
+        params![name],
         row_to_profile,
     );
     match res {
@@ -79,8 +110,8 @@ pub fn upsert_db_profile(conn: &DbConn, p: &DbProfile) -> AppResult<()> {
     conn.execute(
         "INSERT OR REPLACE INTO db_profiles \
          (id, name, kind, host, port, username, default_database, \
-          credential_id, ssh_session_config_id, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+          credential_id, ssh_session_config_id, group_id, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             p.id,
             p.name,
@@ -91,6 +122,7 @@ pub fn upsert_db_profile(conn: &DbConn, p: &DbProfile) -> AppResult<()> {
             p.default_database,
             p.credential_id,
             p.ssh_session_config_id,
+            p.group_id,
             p.created_at,
         ],
     )?;
@@ -119,9 +151,49 @@ fn row_to_profile(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbProfile> {
         default_database: row.get(6)?,
         credential_id: row.get(7)?,
         ssh_session_config_id: row.get(8)?,
-        created_at: row.get(9)?,
+        group_id: row.get(9)?,
+        created_at: row.get(10)?,
     })
 }
 
-// `row_to_profile` 的签名 `FnMut(&Row) -> Result<T, Error>` 与
-// `Statement::query_map` 期望一致，故可直接作为函数指针传入。
+// ===========================================================================
+// DB 分组 CRUD
+// ===========================================================================
+
+/// 列出全部数据库分组。
+pub fn list_db_groups(conn: &DbConn) -> AppResult<Vec<DbGroup>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, parent_id, sort_order, created_at \
+         FROM db_groups ORDER BY sort_order ASC, name ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(DbGroup {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            parent_id: row.get(2)?,
+            sort_order: row.get(3)?,
+            created_at: row.get(4)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// 插入或更新一个数据库分组。
+pub fn upsert_db_group(conn: &DbConn, g: &DbGroup) -> AppResult<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO db_groups (id, name, parent_id, sort_order, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![g.id, g.name, g.parent_id, g.sort_order, g.created_at],
+    )?;
+    Ok(())
+}
+
+/// 删除数据库分组（不删除其下的 profile，profile 变为无分组）。
+pub fn delete_db_group(conn: &DbConn, id: &str) -> AppResult<()> {
+    conn.execute("DELETE FROM db_groups WHERE id = ?1", params![id])?;
+    Ok(())
+}

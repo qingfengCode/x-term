@@ -43,6 +43,8 @@ export const useSettingsStore = defineStore("settings", () => {
   const sqlAgent = ref<SqlAgentSettings>({ ...defaultSqlAgent });
   /** 快捷命令列表（终端底部按钮栏 + 快捷键绑定）。 */
   const shortcuts = ref<ShortcutCommand[]>([]);
+  /** 快捷命令有序分组名列表。 */
+  const shortcutGroups = ref<string[]>([]);
   /** 应用级快捷键绑定（action -> 组合键）。 */
   const appShortcuts = ref<AppShortcuts>(defaultAppShortcuts());
   const loaded = ref(false);
@@ -64,6 +66,7 @@ export const useSettingsStore = defineStore("settings", () => {
     }
     sqlAgent.value = { ...defaultSqlAgent, ...(s.ai.sqlAgent ?? {}) };
     shortcuts.value = s.shortcuts?.commands ?? [];
+    shortcutGroups.value = s.shortcuts?.groups ?? [];
     appShortcuts.value = { ...defaultAppShortcuts(), ...(s.shortcuts?.app ?? {}) };
     loaded.value = true;
   }
@@ -77,7 +80,7 @@ export const useSettingsStore = defineStore("settings", () => {
         sshAgent: sshAgent.value,
         sqlAgent: sqlAgent.value,
       },
-      shortcuts: { commands: shortcuts.value, app: appShortcuts.value },
+      shortcuts: { commands: shortcuts.value, groups: shortcutGroups.value, app: appShortcuts.value },
       firstRun: false,
     };
     await configApi.settingsSave(s);
@@ -103,9 +106,9 @@ export const useSettingsStore = defineStore("settings", () => {
   }
 
   /** 新增一条快捷命令（返回新 id）。 */
-  function addShortcut(): string {
+  function addShortcut(group?: string): string {
     const id = `sc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    shortcuts.value.push({ id, label: "新命令", command: "", shortcut: null });
+    shortcuts.value.push({ id, label: "新命令", command: "", shortcut: null, group: group ?? null });
     return id;
   }
 
@@ -120,6 +123,33 @@ export const useSettingsStore = defineStore("settings", () => {
     shortcuts.value = shortcuts.value.filter((x) => x.id !== id);
   }
 
+  // --- 快捷命令分组管理 ---------------------------------------------------
+
+  /** 添加分组（若已存在则忽略）。 */
+  function addShortcutGroup(name: string) {
+    const trimmed = name.trim();
+    if (trimmed && !shortcutGroups.value.includes(trimmed)) {
+      shortcutGroups.value.push(trimmed);
+    }
+  }
+
+  /** 删除分组（同时清除该组下命令的 group 字段）。 */
+  function removeShortcutGroup(name: string) {
+    shortcutGroups.value = shortcutGroups.value.filter((g) => g !== name);
+    shortcuts.value.forEach((sc) => {
+      if (sc.group === name) sc.group = null;
+    });
+  }
+
+  /** 重命名分组。 */
+  function renameShortcutGroup(oldName: string, newName: string) {
+    const idx = shortcutGroups.value.indexOf(oldName);
+    if (idx !== -1) shortcutGroups.value[idx] = newName;
+    shortcuts.value.forEach((sc) => {
+      if (sc.group === oldName) sc.group = newName;
+    });
+  }
+
   return {
     terminal,
     aiProviders,
@@ -127,6 +157,7 @@ export const useSettingsStore = defineStore("settings", () => {
     sshAgent,
     sqlAgent,
     shortcuts,
+    shortcutGroups,
     appShortcuts,
     loaded,
     load,
@@ -135,6 +166,9 @@ export const useSettingsStore = defineStore("settings", () => {
     addShortcut,
     updateShortcut,
     removeShortcut,
+    addShortcutGroup,
+    removeShortcutGroup,
+    renameShortcutGroup,
     getAppShortcut,
     setAppShortcut,
     resetAppShortcuts,

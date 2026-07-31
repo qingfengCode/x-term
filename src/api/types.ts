@@ -161,10 +161,14 @@ export interface ShortcutCommand {
   command: string;
   /** 可选快捷键，如 "Ctrl+1" / "F1"。 */
   shortcut?: string | null;
+  /** 所属分组名称，为空表示未分组。 */
+  group?: string | null;
 }
 
 export interface ShortcutSettings {
   commands: ShortcutCommand[];
+  /** 有序分组名列表（用于标签页排序）。 */
+  groups?: string[];
   /** 应用级快捷键绑定（action -> 组合键字符串）。 */
   app?: AppShortcuts;
 }
@@ -303,6 +307,16 @@ export interface DbProfile {
   defaultDatabase: string | null;
   credentialId: string | null;
   sshSessionConfigId: string | null;
+  groupId: string | null;
+  createdAt: string;
+}
+
+/** 数据库连接分组。 */
+export interface DbGroup {
+  id: string;
+  name: string;
+  parentId: string | null;
+  sortOrder: number;
   createdAt: string;
 }
 

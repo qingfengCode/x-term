@@ -11,16 +11,18 @@ import { ElMessage } from "element-plus";
 import type { FormInstance, FormRules } from "element-plus";
 import { useSessionsStore } from "@/stores/sessions";
 import { credentialSave } from "@/api/vault";
-import { dbSaveProfile } from "@/api/db";
-import type { DbProfile, Session } from "@/api/types";
+import { dbSaveProfile, dbListGroups } from "@/api/db";
+import type { DbGroup, DbProfile, Session } from "@/api/types";
 
 const props = withDefaults(
   defineProps<{
     visible: boolean;
     /** 传入则编辑，否则新建。 */
     profile?: DbProfile | null;
+    /** 新建时默认所属分组。 */
+    defaultGroupId?: string | null;
   }>(),
-  { profile: null }
+  { profile: null, defaultGroupId: null }
 );
 
 const emit = defineEmits<{
@@ -42,10 +44,12 @@ interface FormState {
   defaultDatabase: string;
   useSshTunnel: boolean;
   sshSessionId: string | null;
+  groupId: string | null;
 }
 
 const formRef = ref<FormInstance>();
 const saving = ref(false);
+const groups = ref<DbGroup[]>([]);
 
 function emptyForm(): FormState {
   return {
@@ -57,6 +61,7 @@ function emptyForm(): FormState {
     defaultDatabase: "",
     useSshTunnel: false,
     sshSessionId: null,
+    groupId: null,
   };
 }
 
@@ -96,8 +101,14 @@ function sessionLabel(s: Session): string {
 /** 弹窗显示时根据 profile 初始化表单。 */
 watch(
   () => props.visible,
-  (v) => {
+  async (v) => {
     if (!v) return;
+    // 加载分组列表。
+    try {
+      groups.value = await dbListGroups();
+    } catch {
+      groups.value = [];
+    }
     if (props.profile) {
       // 编辑模式：密码留空（保持不变）。
       Object.assign(form, {
@@ -109,9 +120,11 @@ watch(
         defaultDatabase: props.profile.defaultDatabase ?? "",
         useSshTunnel: !!props.profile.sshSessionConfigId,
         sshSessionId: props.profile.sshSessionConfigId ?? null,
+        groupId: props.profile.groupId ?? null,
       });
     } else {
       Object.assign(form, emptyForm());
+      form.groupId = props.defaultGroupId ?? null;
     }
     // 清理上一次校验状态。
     formRef.value?.clearValidate();
@@ -161,6 +174,7 @@ async function submit() {
       defaultDatabase: form.defaultDatabase.trim() || null,
       credentialId,
       sshSessionConfigId: form.useSshTunnel ? form.sshSessionId : null,
+      groupId: form.groupId || null,
       createdAt: base?.createdAt ?? new Date().toISOString(),
     };
 
@@ -194,6 +208,17 @@ async function submit() {
     >
       <el-form-item label="名称" prop="name">
         <el-input v-model="form.name" placeholder="例如：生产库-主" />
+      </el-form-item>
+
+      <el-form-item label="分组">
+        <el-select v-model="form.groupId" placeholder="无分组" clearable style="width: 100%">
+          <el-option
+            v-for="g in groups"
+            :key="g.id"
+            :label="g.name"
+            :value="g.id"
+          />
+        </el-select>
       </el-form-item>
 
       <el-form-item label="主机" prop="host">

@@ -219,6 +219,60 @@ async function renameGroup(g: Group) {
 
 // 默认展开所有分组。
 const defaultExpandedKeys = computed(() => sessionsStore.groups.map((g) => g.id));
+
+// --- 拖拽分组 ---------------------------------------------------------------
+// 只允许会话节点被拖拽，分组不可拖。
+function allowDrag(node: { data: TreeNode }) {
+  return node.data.type === "session";
+}
+
+// 放置规则：inner 只能放到分组上；prev/next 允许（用于调整归属）。
+function allowDrop(
+  _draggingNode: { data: TreeNode },
+  dropNode: { data: TreeNode },
+  type: "prev" | "inner" | "next"
+) {
+  if (type === "inner") {
+    return dropNode.data.type === "group";
+  }
+  // prev / next：不允许放在分组正旁边（避免歧义），只允许放在会话节点旁。
+  return dropNode.data.type === "session";
+}
+
+// 拖拽完成后持久化 groupId 变更。
+async function onNodeDrop(
+  draggingNode: { data: TreeNode },
+  dropNode: { data: TreeNode },
+  dropType: "prev" | "inner" | "next"
+) {
+  const session = draggingNode.data.raw as Session;
+  let newGroupId: string | null = null;
+
+  if (dropType === "inner") {
+    // 放入分组内部。
+    newGroupId = dropNode.data.id;
+  } else {
+    // prev / next：取目标会话的 groupId（可能为 null = 根级）。
+    const targetSession = dropNode.data.raw as Session;
+    newGroupId = targetSession.groupId ?? null;
+  }
+
+  if (newGroupId === session.groupId) return; // 无变化
+
+  try {
+    await sessionsStore.saveSession({ ...session, groupId: newGroupId });
+    const groupName = newGroupId
+      ? sessionsStore.groups.find((g) => g.id === newGroupId)?.name
+      : null;
+    ElMessage.success(
+      groupName ? `已移动到分组 "${groupName}"` : "已移至未分组"
+    );
+  } catch (e) {
+    ElMessage.error("移动失败: " + String(e));
+    // 恢复树状态。
+    await sessionsStore.load();
+  }
+}
 </script>
 
 <template>
@@ -270,7 +324,11 @@ const defaultExpandedKeys = computed(() => sessionsStore.groups.map((g) => g.id)
         :filter-node-method="filterNode"
         :expand-on-click-node="false"
         :highlight-current="true"
+        draggable
+        :allow-drag="allowDrag"
+        :allow-drop="allowDrop"
         @node-click="onNodeClick"
+        @node-drop="onNodeDrop"
       >
         <template #default="{ data }">
           <div class="tree-node" :class="{ 'is-group': data.type === 'group' }">

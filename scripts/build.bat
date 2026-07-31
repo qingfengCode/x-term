@@ -22,18 +22,31 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM 2. 强制 cc/cmake 用 MSVC cl.exe（避免 MinGW 产物与 MSVC 链接器冲突）。
-set CC_x86_64_pc_windows_msvc=cl.exe
-set CXX_x86_64_pc_windows_msvc=cl.exe
+REM 2. 从 PATH 中移除 MinGW/TDM-GCC，防止 cc crate 误用 gcc。
+set "PATH=%PATH:C:\mypc\TDM-GCC-64\bin;=%"
+set "PATH=%PATH:C:\mypc\TDM-GCC-64\bin=%"
+set "PATH=%PATH:C:\MinGW\bin;=%"
+set "PATH=%PATH:C:\MinGW\bin=%"
+set "PATH=%PATH:C:\msys64\mingw64\bin;=%"
+set "PATH=%PATH:C:\msys64\mingw64\bin=%"
+
+REM 3. 强制 cc/cmake 用 MSVC cl.exe（覆盖系统级 CC 环境变量）。
 set CC=cl.exe
 set CXX=cl.exe
+set CC_x86_64_pc_windows_msvc=cl.exe
+set CXX_x86_64_pc_windows_msvc=cl.exe
 
 echo [build] cl.exe:
 where cl
 echo.
 
-REM 3. 安装前端依赖（如果 node_modules 不存在）。
+REM 4. 清除可能被 gcc 污染的构建缓存。
+echo [build] 清除 libsqlite3-sys 旧缓存（避免 GNU ABI 残留）...
+cd /d D:\code\tanghan-yunwei\x-term\src-tauri
+cargo clean -p libsqlite3-sys 2>nul
 cd /d D:\code\tanghan-yunwei\x-term
+
+REM 5. 安装前端依赖（如果 node_modules 不存在）。
 if not exist node_modules (
     echo [build] 安装前端依赖...
     call pnpm install
@@ -44,7 +57,7 @@ if not exist node_modules (
     )
 )
 
-REM 4. 执行 Tauri 构建（release + 打包 nsis 安装包）。
+REM 6. 执行 Tauri 构建（release + 打包 nsis 安装包）。
 echo [build] 开始构建（可能需要几分钟，首次更长）...
 echo.
 call npx tauri build --bundles nsis
@@ -55,7 +68,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM 5. 完成。
+REM 7. 完成。
 echo.
 echo [build] === 构建成功！ ===
 echo [build] 安装包位置：

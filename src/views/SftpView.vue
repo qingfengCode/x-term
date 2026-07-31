@@ -55,6 +55,12 @@ interface UnifiedEntry {
   modified: string | null;
 }
 
+/** 面板间拖拽的载荷。 */
+interface DragPayload {
+  source: "local" | "remote";
+  entry: UnifiedEntry;
+}
+
 // ---------------------------------------------------------------------------
 // 会话 / SFTP 连接
 // ---------------------------------------------------------------------------
@@ -500,6 +506,10 @@ const dragOver = ref(false);
 let dragDropUnlisten: UnlistenFn | null = null;
 let transferDoneUnlisten: UnlistenFn | null = null;
 
+// --- 面板间拖拽传输（HTML5 DnD） ---
+const paneDragOver = ref<"local" | "remote" | null>(null);
+let dragPayload: DragPayload | null = null;
+
 async function handleDragDrop(event: { payload: { type: string; paths?: string[]; position?: { x: number; y: number } } }) {
   const p = event.payload;
   if (p.type === "over" || p.type === "enter") {
@@ -581,6 +591,71 @@ async function downloadSelected() {
   } catch (e) {
     transfer.update(taskId, { status: "error", message: String(e) });
     ElMessage.error("下载失败: " + String(e));
+  }
+}
+
+// 下载单个远程文件到本地当前目录（拖拽用，无需弹框）。
+async function downloadOne(remoteAbs: string, name: string) {
+  const localAbs = await joinLocal(name);
+  const taskId = crypto.randomUUID();
+  transfer.add({
+    id: taskId,
+    name,
+    direction: "download",
+    transferred: 0,
+    total: 0,
+    status: "pending",
+  });
+  try {
+    await sftpDownload({
+      sftpId: sftpId.value,
+      remotePath: remoteAbs,
+      localPath: localAbs,
+      taskId,
+    });
+    transfer.update(taskId, { status: "running" });
+    ElMessage.success(`已开始下载 ${name}`);
+  } catch (e) {
+    transfer.update(taskId, { status: "error", message: String(e) });
+    ElMessage.error("下载失败: " + String(e));
+  }
+}
+
+// --- 面板间拖拽传输（HTML5 DnD） ---
+function onRowDragStart(source: "local" | "remote", entry: UnifiedEntry) {
+  if (entry.isDir) return;
+  dragPayload = { source, entry };
+}
+
+function onPaneDragOver(target: "local" | "remote", e: DragEvent) {
+  e.preventDefault();
+  if (dragPayload && dragPayload.source !== target) {
+    paneDragOver.value = target;
+  }
+}
+
+function onPaneDragLeave() {
+  paneDragOver.value = null;
+}
+
+async function onPaneDrop(target: "local" | "remote", e: DragEvent) {
+  e.preventDefault();
+  paneDragOver.value = null;
+  if (!dragPayload || dragPayload.source === target) return;
+  if (!sftpId.value) {
+    ElMessage.warning("请先打开 SFTP 连接");
+    return;
+  }
+  const { entry } = dragPayload;
+  dragPayload = null;
+  if (target === "remote") {
+    // 本地 → 远程 = 上传
+    const full = await joinLocal(entry.name);
+    void uploadOne(full, entry.name);
+  } else {
+    // 远程 → 本地 = 下载
+    const remoteAbs = joinRemote(entry.name);
+    void downloadOne(remoteAbs, entry.name);
   }
 }
 
@@ -716,7 +791,13 @@ onBeforeUnmount(() => {
     <div class="sftp-body">
       <template v-if="isConnected">
         <!-- 本地栏 -->
-        <section class="pane local-pane">
+        <section
+          class="pane local-pane"
+          :class="{ 'drag-over': paneDragOver === 'local' }"
+          @dragover="onPaneDragOver('local', $event)"
+          @dragleave="onPaneDragLeave"
+          @drop="onPaneDrop('local', $event)"
+        >
           <div class="pane-header">
             <span class="pane-title">
               <el-icon><FolderOpened /></el-icon>
@@ -764,8 +845,10 @@ onBeforeUnmount(() => {
               :key="'l-' + idx"
               class="file-row"
               :class="{ selected: selectedLocal?.name === e.name }"
+              :draggable="!e.isDir"
               @click="selectedLocal = e"
               @dblclick="localEnter(e)"
+              @dragstart="onRowDragStart('local', e)"
             >
               <el-icon class="file-icon" :class="{ 'is-dir': e.isDir }">
                 <Folder v-if="e.isDir" />
@@ -804,7 +887,10 @@ onBeforeUnmount(() => {
         <section
           ref="remotePaneRef"
           class="pane remote-pane"
-          :class="{ 'drag-over': dragOver }"
+          :class="{ 'drag-over': dragOver || paneDragOver === 'remote' }"
+          @dragover="onPaneDragOver('remote', $event)"
+          @dragleave="onPaneDragLeave"
+          @drop="onPaneDrop('remote', $event)"
         >
           <div class="pane-header">
             <span class="pane-title">
@@ -859,8 +945,10 @@ onBeforeUnmount(() => {
               :key="'r-' + idx"
               class="file-row"
               :class="{ selected: selectedRemote?.name === e.name }"
+              :draggable="!e.isDir"
               @click="selectedRemote = e"
               @dblclick="remoteEnter(e)"
+              @dragstart="onRowDragStart('remote', e)"
             >
               <el-icon class="file-icon" :class="{ 'is-dir': e.isDir }">
                 <Folder v-if="e.isDir" />
@@ -971,11 +1059,18 @@ onBeforeUnmount(() => {
   background: var(--el-bg-color-overlay);
   overflow: hidden;
 }
-/* 拖拽上传高亮 */
-.remote-pane.drag-over {
+/* 拖拽传输高亮（面板间 + OS 拖入） */
+.pane.drag-over {
   outline: 2px dashed var(--el-color-primary);
   outline-offset: -4px;
   background: var(--el-color-primary-light-9);
+}
+/* 可拖拽行光标 */
+.file-row[draggable="true"] {
+  cursor: grab;
+}
+.file-row[draggable="true"]:active {
+  cursor: grabbing;
 }
 .pane-header {
   display: flex;

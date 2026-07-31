@@ -9,6 +9,7 @@ pub mod ai;
 pub mod config;
 pub mod db;
 pub mod forward;
+pub mod mcp;
 pub mod remote_desktop;
 pub mod session;
 pub mod sftp;
@@ -85,6 +86,9 @@ pub fn register(
         crate::commands::db::db_list_profiles,
         crate::commands::db::db_save_profile,
         crate::commands::db::db_delete_profile,
+        crate::commands::db::db_list_groups,
+        crate::commands::db::db_save_group,
+        crate::commands::db::db_delete_group,
         crate::commands::db::db_connect,
         crate::commands::db::db_disconnect,
         crate::commands::db::db_exec_sql,
@@ -92,5 +96,14 @@ pub fn register(
         crate::commands::db::db_list_databases,
         crate::commands::db::db_describe_table,
         crate::commands::db::db_show_create_table,
+        // mcp
+        crate::commands::mcp::mcp_start,
+        crate::commands::mcp::mcp_stop,
+        crate::commands::mcp::mcp_status,
+        crate::commands::mcp::mcp_save_config,
+        crate::commands::mcp::mcp_load_config,
+        crate::commands::mcp::mcp_generate_token,
+        crate::commands::mcp::mcp_respond_approval,
+        crate::commands::mcp::mcp_log,
     ])
 }

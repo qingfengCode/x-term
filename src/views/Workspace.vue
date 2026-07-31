@@ -50,6 +50,19 @@ function zoom(delta: number) {
 }
 
 // --- 快捷命令栏 ---------------------------------------------------------
+
+/** 当前激活的分组标签（"__all__" 表示全部）。 */
+const activeGroup = ref("__all__");
+
+/** 是否存在多个分组（决定是否显示标签行）。 */
+const hasGroups = computed(() => settings.shortcutGroups.length > 0);
+
+/** 当前标签下可见的快捷命令。 */
+const visibleShortcuts = computed(() => {
+  if (activeGroup.value === "__all__") return settings.shortcuts;
+  return settings.shortcuts.filter((sc) => sc.group === activeGroup.value);
+});
+
 /** 把命令文本中的占位符 {host}/{user}/{port} 按当前活动会话替换。 */
 function resolveCommand(cmd: string): string {
   const s = active.value?.session;
@@ -170,18 +183,41 @@ onBeforeUnmount(() => {
     </div>
     <!-- 终端底部快捷命令栏 -->
     <div v-if="active && settings.shortcuts.length > 0" class="shortcut-bar">
-      <el-tooltip
-        v-for="sc in settings.shortcuts"
-        :key="sc.id"
-        :content="sc.shortcut ? `${sc.command}  (${sc.shortcut})` : sc.command"
-        placement="top"
-        :show-after="400"
-      >
-        <button class="sc-btn" @click="runShortcut(sc)">
-          <span class="sc-label">{{ sc.label }}</span>
-          <span v-if="sc.shortcut" class="sc-key">{{ sc.shortcut }}</span>
+      <!-- 分组标签页（仅存在分组时显示） -->
+      <div v-if="hasGroups" class="sc-tabs">
+        <button
+          class="sc-tab"
+          :class="{ active: activeGroup === '__all__' }"
+          @click="activeGroup = '__all__'"
+        >
+          全部
         </button>
-      </el-tooltip>
+        <button
+          v-for="g in settings.shortcutGroups"
+          :key="g"
+          class="sc-tab"
+          :class="{ active: activeGroup === g }"
+          @click="activeGroup = g"
+        >
+          {{ g }}
+        </button>
+      </div>
+      <!-- 命令按钮区 -->
+      <div class="sc-buttons">
+        <el-tooltip
+          v-for="sc in visibleShortcuts"
+          :key="sc.id"
+          :content="sc.shortcut ? `${sc.command}  (${sc.shortcut})` : sc.command"
+          placement="top"
+          :show-after="400"
+        >
+          <button class="sc-btn" @click="runShortcut(sc)">
+            <span class="sc-label">{{ sc.label }}</span>
+            <span v-if="sc.shortcut" class="sc-key">{{ sc.shortcut }}</span>
+          </button>
+        </el-tooltip>
+        <span v-if="visibleShortcuts.length === 0" class="sc-empty">该分组暂无命令</span>
+      </div>
     </div>
   </div>
 </template>
@@ -339,13 +375,47 @@ onBeforeUnmount(() => {
 /* --- 终端底部快捷命令栏 --- */
 .shortcut-bar {
   display: flex;
+  flex-direction: column;
+  background: var(--el-bg-color-overlay);
+  border-top: 1px solid var(--el-border-color-lighter);
+  flex-shrink: 0;
+}
+.sc-tabs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px 10px 0;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+}
+.sc-tab {
+  padding: 3px 10px;
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s;
+}
+.sc-tab:hover {
+  color: var(--el-color-primary);
+}
+.sc-tab.active {
+  color: var(--el-color-primary);
+  border-bottom-color: var(--el-color-primary);
+  font-weight: 500;
+}
+.sc-buttons {
+  display: flex;
   align-items: center;
   gap: 6px;
   padding: 6px 10px;
-  background: var(--el-bg-color-overlay);
-  border-top: 1px solid var(--el-border-color-lighter);
   overflow-x: auto;
-  flex-shrink: 0;
+}
+.sc-empty {
+  font-size: 12px;
+  color: var(--el-text-color-placeholder);
 }
 .sc-btn {
   display: inline-flex;

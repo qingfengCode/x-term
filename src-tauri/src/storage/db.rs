@@ -144,7 +144,16 @@ pub fn run_migrations(conn: &Connection) -> AppResult<()> {
             default_database        TEXT,
             credential_id           TEXT,
             ssh_session_config_id   TEXT,
+            group_id                TEXT,
             created_at              TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS db_groups (
+            id          TEXT PRIMARY KEY,
+            name        TEXT NOT NULL,
+            parent_id   TEXT,
+            sort_order  INTEGER NOT NULL DEFAULT 0,
+            created_at  TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS desktops (
@@ -183,6 +192,8 @@ pub fn run_migrations(conn: &Connection) -> AppResult<()> {
     add_column_if_missing(conn, "credentials", "kind", "TEXT NOT NULL DEFAULT 'password'")?;
     // 给 sessions 加 space_id 列：会话所属空间（"local" 或 JumpServer 空间 id）。
     add_column_if_missing(conn, "sessions", "space_id", "TEXT NOT NULL DEFAULT 'local'")?;
+    // 给 db_profiles 加 group_id 列：数据库连接所属分组。
+    add_column_if_missing(conn, "db_profiles", "group_id", "TEXT")?;
 
     Ok(())
 }

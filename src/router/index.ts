@@ -14,6 +14,7 @@ const routes: RouteRecordRaw[] = [
       { path: "remote", name: "remote", component: () => import("@/views/RemoteDesktopView.vue") },
       { path: "keys", name: "keys", component: () => import("@/views/KeyManagerView.vue") },
       { path: "mfa", name: "mfa", component: () => import("@/views/MfaView.vue") },
+      { path: "mcp", name: "mcp", component: () => import("@/views/McpView.vue") },
       { path: "settings", name: "settings", component: () => import("@/views/Settings.vue") },
     ],
   },
