@@ -15,6 +15,7 @@ pub mod session;
 pub mod sftp;
 pub mod terminal;
 pub mod totp;
+pub mod update;
 pub mod vault;
 
 /// 把所有命令注册到给定的 [`tauri::Builder`] 上，返回 builder 自身以便链式调用。
@@ -105,5 +106,12 @@ pub fn register(
         crate::commands::mcp::mcp_generate_token,
         crate::commands::mcp::mcp_respond_approval,
         crate::commands::mcp::mcp_log,
+        // update（应用自更新）
+        crate::commands::update::update_get_info,
+        crate::commands::update::update_get_manifest_url,
+        crate::commands::update::update_set_manifest_url,
+        crate::commands::update::update_check,
+        crate::commands::update::update_download,
+        crate::commands::update::update_install_and_exit,
     ])
 }

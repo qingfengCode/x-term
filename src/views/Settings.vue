@@ -13,6 +13,7 @@ import { ElMessage, ElMessageBox } from "element-plus";
 import type { FormInstance, FormRules } from "element-plus";
 import { Delete, Plus, Refresh } from "@element-plus/icons-vue";
 import { useSettingsStore } from "@/stores/settings";
+import { useUpdateStore } from "@/stores/update";
 import { ProviderKind } from "@/api/types";
 import { APP_SHORTCUT_METAS, SQL_MODE_OPTIONS, defaultAppShortcuts } from "@/api/types";
 import { eventToCombo, isModifierOnly } from "@/utils/shortcut";
@@ -26,7 +27,62 @@ import type {
 } from "@/api/types";
 
 const settings = useSettingsStore();
-const activeTab = ref<"terminal" | "shortcuts" | "appShortcuts" | "ai">("terminal");
+const updater = useUpdateStore();
+const activeTab = ref<"terminal" | "shortcuts" | "appShortcuts" | "ai" | "about">("terminal");
+
+// --- 关于 / 更新 -----------------------------------------------------------
+/** 更新源输入框本地副本（编辑后点保存才回写）。 */
+const manifestUrlInput = ref("");
+const savingUrl = ref(false);
+
+/** 字节数格式化为人类可读单位。 */
+function formatBytes(n: number): string {
+  if (!n) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let i = 0;
+  let v = n;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+/** 保存更新源地址。 */
+async function saveUrl() {
+  savingUrl.value = true;
+  try {
+    await updater.saveManifestUrl(manifestUrlInput.value);
+    ElMessage.success("已保存更新源");
+  } catch (e) {
+    ElMessage.error("保存失败：" + (e instanceof Error ? e.message : String(e)));
+  } finally {
+    savingUrl.value = false;
+  }
+}
+
+/** 安装前二次确认（会退出应用）。 */
+async function confirmInstall() {
+  try {
+    await ElMessageBox.confirm(
+      "安装将退出当前应用并启动安装程序，未保存的会话将断开。继续？",
+      "安装确认",
+      { type: "warning", confirmButtonText: "安装并重启", cancelButtonText: "取消" },
+    );
+  } catch {
+    return;
+  }
+  void updater.install();
+}
+
+// 切到关于页时按需加载应用信息与更新源。
+watch(activeTab, (tab) => {
+  if (tab === "about") loadAbout();
+});
+async function loadAbout() {
+  await updater.loadInfo();
+  manifestUrlInput.value = updater.info?.manifestUrl ?? "";
+}
 
 // --- 应用快捷键（独立 tab） ----------------------------------------------
 // 本地副本：编辑期间不立即写 store，点"保存"才回写。
@@ -887,6 +943,110 @@ async function saveSqlSwitches() {
           </template>
         </el-dialog>
       </el-tab-pane>
+
+      <!-- ============ 关于 ============ -->
+      <el-tab-pane label="关于" name="about">
+        <div class="about-page">
+          <!-- 品牌区 -->
+          <div class="about-brand">
+            <div class="about-logo">X</div>
+            <div class="about-name">X-Term</div>
+            <div class="about-slogan">一站式运维工作站</div>
+            <div class="about-version">当前版本 v{{ updater.info?.currentVersion ?? "—" }}</div>
+          </div>
+
+          <!-- 检查更新卡片 -->
+          <div class="form-card about-update">
+            <div class="about-card-title">检查更新</div>
+
+            <!-- 空闲 / 错误后重试 -->
+            <div v-if="updater.status === 'idle'" class="about-update-body">
+              <el-button type="primary" :icon="Refresh" @click="updater.check()">检查更新</el-button>
+              <span v-if="updater.skippedVersion" class="about-hint">
+                已跳过 v{{ updater.skippedVersion }}，点击检查将重新提示
+              </span>
+            </div>
+
+            <!-- 检查中 -->
+            <div v-else-if="updater.status === 'checking'" class="about-update-body">
+              <el-icon class="is-loading"><Refresh /></el-icon>
+              <span>正在检查更新…</span>
+            </div>
+
+            <!-- 已是最新 -->
+            <div v-else-if="updater.status === 'up-to-date'" class="about-update-body">
+              <el-tag type="success" effect="light">✓ 当前已是最新版本</el-tag>
+              <el-button link @click="updater.reset()">返回</el-button>
+            </div>
+
+            <!-- 发现新版本 -->
+            <div v-else-if="updater.status === 'update-available'" class="about-update-body column">
+              <div class="about-new-ver">
+                <el-tag type="warning" effect="dark">发现新版本 v{{ updater.manifest?.version }}</el-tag>
+              </div>
+              <pre v-if="updater.manifest?.notes" class="about-notes">{{ updater.manifest.notes }}</pre>
+              <div class="about-actions">
+                <el-button type="primary" @click="updater.download()">立即更新</el-button>
+                <el-button @click="updater.skip()">跳过此版本</el-button>
+              </div>
+            </div>
+
+            <!-- 下载中 -->
+            <div v-else-if="updater.status === 'downloading'" class="about-update-body column">
+              <el-progress
+                :percentage="updater.progress.percent"
+                :stroke-width="14"
+                :format="(p: number) => `${p}%`"
+              />
+              <div class="about-dl-meta">
+                {{ formatBytes(updater.progress.received) }}
+                <template v-if="updater.progress.total"> / {{ formatBytes(updater.progress.total) }}</template>
+              </div>
+            </div>
+
+            <!-- 下载完成 -->
+            <div v-else-if="updater.status === 'downloaded'" class="about-update-body column">
+              <el-tag type="success" effect="light">✓ 下载完成</el-tag>
+              <div class="about-actions">
+                <el-button type="primary" @click="confirmInstall">立即安装并重启</el-button>
+              </div>
+            </div>
+
+            <!-- 出错 -->
+            <div v-else-if="updater.status === 'error'" class="about-update-body column">
+              <el-alert :title="updater.error ?? '更新失败'" type="error" :closable="false" show-icon />
+              <div class="about-actions">
+                <el-button @click="updater.reset()">返回</el-button>
+                <el-button type="primary" @click="updater.check()">重试</el-button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 更新源配置 -->
+          <div class="form-card about-source">
+            <div class="about-card-title">更新源</div>
+            <div class="about-source-row">
+              <el-input
+                v-model="manifestUrlInput"
+                placeholder="http://your-server/x-term/update.json"
+                clearable
+              />
+              <el-button type="primary" :loading="savingUrl" @click="saveUrl">保存</el-button>
+            </div>
+            <div class="about-hint">指向自建服务器上的 update.json，包含 version / notes / url / sha256。</div>
+          </div>
+
+          <!-- 技术信息 -->
+          <div class="form-card about-meta">
+            <div class="about-card-title">技术信息</div>
+            <div class="about-meta-grid">
+              <span class="k">Tauri</span><span class="v">v{{ updater.info?.tauriVersion ?? "—" }}</span>
+              <span class="k">平台</span><span class="v">Windows x64</span>
+              <span class="k">数据目录</span><span class="v">{{ updater.info?.dataDir ?? "—" }}</span>
+            </div>
+          </div>
+        </div>
+      </el-tab-pane>
     </el-tabs>
   </div>
 </template>
@@ -1118,5 +1278,110 @@ async function saveSqlSwitches() {
   font-size: 11px;
   color: var(--el-color-warning);
   margin-top: 4px;
+}
+
+/* --- 关于页 --- */
+.about-page {
+  max-width: 640px;
+}
+.about-brand {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 24px 0 28px;
+}
+.about-logo {
+  width: 64px;
+  height: 64px;
+  border-radius: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 34px;
+  font-weight: 700;
+  color: #fff;
+  background: linear-gradient(135deg, var(--el-color-primary), var(--el-color-primary-light-3));
+  margin-bottom: 8px;
+}
+.about-name {
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--el-text-color-primary);
+}
+.about-slogan {
+  font-size: 13px;
+  color: var(--el-text-color-secondary);
+}
+.about-version {
+  font-size: 12px;
+  color: var(--el-text-color-placeholder);
+  margin-top: 4px;
+}
+.about-card-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--el-text-color-primary);
+  margin-bottom: 14px;
+}
+.about-update-body {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.about-update-body.column {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 12px;
+}
+.about-new-ver {
+  display: flex;
+  align-items: center;
+}
+.about-notes {
+  margin: 0;
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-all;
+  background: var(--el-fill-color-light);
+  border-radius: 6px;
+  color: var(--el-text-color-regular);
+  max-height: 200px;
+  overflow-y: auto;
+  font-family: inherit;
+}
+.about-actions {
+  display: flex;
+  gap: 10px;
+}
+.about-dl-meta {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  text-align: center;
+}
+.about-hint {
+  font-size: 12px;
+  color: var(--el-text-color-placeholder);
+}
+.about-source-row {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.about-meta-grid {
+  display: grid;
+  grid-template-columns: 90px 1fr;
+  row-gap: 8px;
+  column-gap: 12px;
+  font-size: 13px;
+}
+.about-meta-grid .k {
+  color: var(--el-text-color-secondary);
+}
+.about-meta-grid .v {
+  color: var(--el-text-color-primary);
+  word-break: break-all;
 }
 </style>

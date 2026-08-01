@@ -438,3 +438,37 @@ pub fn settings_load_inner(state: &AppState) -> AppResult<Settings> {
     migrate_legacy_ai(&mut settings.ai);
     Ok(settings)
 }
+
+// ===========================================================================
+// 应用级配置（app.json）：更新源等非用户日常编辑的运行时配置
+// ===========================================================================
+
+/// 应用级配置文件名（位于应用数据目录下）。
+pub const APP_CONFIG_FILENAME: &str = "app.json";
+
+/// 自更新相关配置。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateConfig {
+    /// 更新清单（update.json）地址，指向自建服务器。为空则检查更新时报错提示配置。
+    #[serde(default)]
+    pub manifest_url: String,
+}
+
+/// 应用级配置（区别于用户设置 settings.json，存放更新源等运行期配置）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppConfig {
+    #[serde(default)]
+    pub update: UpdateConfig,
+}
+
+/// 读取应用级配置；文件缺失时返回全默认值。
+pub fn app_config_load_inner(path: &std::path::Path) -> AppResult<AppConfig> {
+    json_store::read_json_or_default::<AppConfig>(path)
+}
+
+/// 写入应用级配置。
+pub fn app_config_save_inner(path: &std::path::Path, config: &AppConfig) -> AppResult<()> {
+    json_store::write_json(path, config)
+}

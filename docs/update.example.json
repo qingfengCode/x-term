@@ -1,0 +1,6 @@
+{
+  "version": "0.2.0",
+  "notes": "• 新增 MCP 服务能力\n• 优化终端滚动与 SQL 执行体验\n• 新增「关于」页与应用自更新",
+  "url": "http://your-server/x-term/X-Term_0.2.0_x64-setup.exe",
+  "sha256": null
+}

@@ -336,3 +336,34 @@ export interface DbQueryResultEvent {
   elapsedMs: number;
 }
 
+// ---------------------------------------------------------------------------
+// 应用自更新
+// ---------------------------------------------------------------------------
+
+/** 更新清单（自建服务器上的 update.json）。对应后端 UpdateManifest。 */
+export interface UpdateManifest {
+  /** 远端最新版本号。 */
+  version: string;
+  /** 更新日志 / 发布说明。 */
+  notes: string;
+  /** 安装包下载地址。 */
+  url: string;
+  /** 安装包 sha256（可选）。 */
+  sha256: string | null;
+}
+
+/** 更新下载进度事件。对应后端 update:progress。 */
+export interface UpdateProgressEvent {
+  received: number;
+  total: number;
+  percent: number;
+}
+
+/** 关于页应用信息。对应后端 UpdateInfo。 */
+export interface UpdateInfo {
+  currentVersion: string;
+  manifestUrl: string;
+  dataDir: string;
+  tauriVersion: string;
+}
+

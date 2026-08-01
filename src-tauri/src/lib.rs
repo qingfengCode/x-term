@@ -18,6 +18,7 @@ pub mod state;
 pub mod storage;
 pub mod telnet;
 pub mod totp;
+pub mod updater;
 pub mod utils;
 
 use state::AppState;

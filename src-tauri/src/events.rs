@@ -55,6 +55,9 @@ pub const AI_SQL_RESULT: &str = "ai:sql_result";
 /// SQL 控制台查询结果。payload: [`DbQueryResultEvent`]。
 pub const DB_QUERY_RESULT: &str = "db:query_result";
 
+/// 应用更新下载进度。payload: [`UpdateProgressEvent`]。
+pub const UPDATE_PROGRESS: &str = "update:progress";
+
 // ===========================================================================
 // 事件 payload 结构体
 // ===========================================================================
@@ -221,6 +224,18 @@ pub struct DbQueryResultEvent {
     pub affected: u64,
     pub error: Option<String>,
     pub elapsed_ms: u64,
+}
+
+/// 应用更新下载进度。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateProgressEvent {
+    /// 已下载字节数。
+    pub received: u64,
+    /// 总字节数（服务端未返回 Content-Length 时为 0）。
+    pub total: u64,
+    /// 百分比（0~100；total 未知时为 0）。
+    pub percent: u8,
 }
 
 // ===========================================================================

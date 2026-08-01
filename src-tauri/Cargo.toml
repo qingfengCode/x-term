@@ -46,6 +46,8 @@ aes-gcm = "0.10"
 argon2 = "0.5"
 rand = "0.8"
 zeroize = { version = "1", features = ["derive"] }
+# 更新包完整性校验
+sha2 = "0.10"
 # TOTP（MFA 验证码生成）
 # 注：totp-rs 实际发布到 5.x（5.7.2 为当前最新）。原 `^1.5` 在 registry 中无可匹配版本，
 # 故改为 `^5.7`。使用 default-features = false 以避免引入 url/qr 等额外依赖；

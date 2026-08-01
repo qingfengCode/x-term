@@ -39,6 +39,9 @@ pub enum AppError {
     #[error("认证错误: {0}")]
     Auth(String),
 
+    #[error("更新错误: {0}")]
+    Update(String),
+
     #[error("Tauri 错误: {0}")]
     Tauri(#[from] tauri::Error),
 }
