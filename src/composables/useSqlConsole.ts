@@ -80,7 +80,7 @@ export function useSqlConsole(
 ) {
   // --- 输出累积 ---
   const entries = ref<ConsoleEntry[]>([]);
-  /** 滚动容器 ref（视图侧绑定，供自动滚到底部用）。 */
+  /** 滚动容器 ref（视图侧绑定，供自动滚动用）。 */
   const scrollRef = ref<HTMLElement | null>(null);
   const executing = ref(false);
   /** 最近一次完整结果（供代码模式/AI 等读取）。 */
@@ -88,35 +88,104 @@ export function useSqlConsole(
 
   /**
    * 滚动逻辑（mysql CLI 风格）：
-   * - 内容未超出容器高度 → 不滚动（scrollTop 保持 0，内容从顶部自然排列，输入框紧跟输出末尾）
-   * - 内容超出容器高度 → 滚到让输入框可见（贴近视口底部）
    *
-   * 实现用 scrollIntoView({ block: 'end' })：浏览器自动判断溢出与否——
-   * 不溢出时不产生滚动，溢出时滚到刚好让锚点元素（输入框）底部对齐视口底部。
+   * 执行时把"上一条输入"（语句回显行）滚到视口顶端，当前查询从顶端开始，
+   * 结果在其下方展开：
+   * - 结果未铺满视口 → 输入框自然跟在输出后面（无需滚动，语句保持在顶端）；
+   * - 结果铺满视口 → 结果尾部停在视口下边框处，输入框紧跟结果之后
+   *   （输入框此时在下边框之外，按 ↓ / 回车后随之下移回到底部）。
+   *
+   * 更早的历史在上方，向上滚动回看。
    */
   const bottomAnchorRef = ref<HTMLElement | null>(null);
-  function scrollToBottom() {
-    nextTick(() => {
-      const anchor = bottomAnchorRef.value;
-      if (anchor) {
-        // block:'end' 让锚点底部对齐视口底部；inline:'nearest' 避免水平滚动。
-        anchor.scrollIntoView({ block: "end", inline: "nearest", behavior: "auto" });
-      } else {
-        // 兜底：无锚点时按溢出判断。
-        const el = scrollRef.value;
-        if (el && el.scrollHeight > el.clientHeight) {
-          el.scrollTop = el.scrollHeight;
-        }
+  /** 当前"上一条输入"（最近执行的 SQL 回显行）的 DOM 锚点，视图侧 :ref 回调设置。 */
+  const activeSqlEl = ref<HTMLElement | null>(null);
+  /** 活跃 SQL entry 的 id（结果到达后不清空，作为滚动测量的起点）。 */
+  const activeSqlId = ref<string | null>(null);
+
+  // --- 合并滚动调度 -------------------------------------------------------------
+  // 快速 IPC 下结果事件可能在 Vue 渲染之前就到达（onQueryResult 先于渲染执行），
+  // 导致滚动回调成堆且互相覆盖、测量时机也不稳。统一调度到 rAF：
+  // rAF 在 DOM 更新并布局后触发，同帧内多次请求只保留最后一次意图——
+  // 保证"结果到达后的定位"总是赢过"语句入流时的定位"。
+  type ScrollIntent = "sql-top" | "after-result";
+  let pendingIntent: ScrollIntent | null = null;
+  let scheduled = false;
+
+  function scheduleScroll(intent: ScrollIntent) {
+    pendingIntent = intent; // 后到覆盖先到
+    if (scheduled) return;
+    scheduled = true;
+    const run = () => {
+      scheduled = false;
+      const it = pendingIntent;
+      pendingIntent = null;
+      if (it === "sql-top") {
+        doScrollSqlToTop();
+      } else if (it === "after-result") {
+        doScrollAfterResult();
+        // el-table 等组件异步布局（ResizeObserver/mounted 后才定高），
+        // 首帧测得的高度可能偏小；延迟再校准一次，避免大结果滚动不足。
+        setTimeout(doScrollAfterResult, 80);
       }
-    });
+    };
+    if (typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(run);
+    } else {
+      // 无 rAF 环境兜底（测试等）：nextTick + 微任务延迟，尽量等布局完成。
+      nextTick(() => setTimeout(run, 0));
+    }
   }
+
+  /** 执行时：把语句回显行滚到视口顶端。 */
+  function scrollSqlToTop() {
+    scheduleScroll("sql-top");
+  }
+
+  /** 结果到达后：输入框跟在结果后面（铺满时结果尾部贴下边框）。 */
+  function scrollToBottomIfOverflow() {
+    scheduleScroll("after-result");
+  }
+
+  function doScrollSqlToTop() {
+    const el = activeSqlEl.value;
+    if (el) {
+      el.scrollIntoView({ block: "start", inline: "nearest", behavior: "auto" });
+    } else {
+      const c = scrollRef.value;
+      if (c) c.scrollTop = 0;
+    }
+  }
+
+  /**
+   * 定位到"结果之后"：目标 scrollTop = 内容总高 - 视口高（输入框贴底），
+   * 但不超过"语句行顶端"（保证语句可见、输入框跟在结果后）。
+   * 结果未铺满时 maxScroll < sqlTop → 不滚动，内容从顶部自然排列。
+   */
+  function doScrollAfterResult() {
+    const c = scrollRef.value;
+    if (!c) return;
+    const anchor = activeSqlEl.value;
+    const maxScroll = Math.max(0, c.scrollHeight - c.clientHeight); // 输入框贴底
+    let target = maxScroll;
+    if (anchor) {
+      const cRect = c.getBoundingClientRect();
+      const aRect = anchor.getBoundingClientRect();
+      const sqlTopInContent = aRect.top - cRect.top + c.scrollTop;
+      target = Math.min(target, sqlTopInContent); // 语句保持可见
+    }
+    c.scrollTop = target;
+  }
+
   function pushEntry(e: ConsoleEntry) {
+    // 纯数据入流；滚动由调用方决定（SQL 行→置顶，结果→溢出判断）。
     entries.value.push(e);
-    scrollToBottom();
   }
   function clear() {
     entries.value = [];
     lastResult.value = null;
+    activeSqlEl.value = null;
+    activeSqlId.value = null;
   }
 
   // --- 执行调度 + 事件路由 ---
@@ -164,6 +233,9 @@ export function useSqlConsole(
     // 推入 running entry。pendingEntryId 必须在 await 之前设置——
     // 后端 emit 的事件会在 invoke resolve 之前到达 onQueryResult。
     pushEntry({ id: entryId, kind: "sql", sql, status: "running" });
+    // "上一条输入"置顶，当前查询从顶端开始（mysql CLI 风格）。
+    activeSqlId.value = entryId;
+    scrollSqlToTop();
     pendingEntryId.value = entryId;
     lastExecutedSql.value = sql;
 
@@ -183,7 +255,7 @@ export function useSqlConsole(
   function replaceEntry(id: string, e: ConsoleEntry) {
     const idx = entries.value.findIndex((x) => x.id === id);
     if (idx >= 0) entries.value[idx] = e;
-    scrollToBottom();
+    scrollToBottomIfOverflow();
   }
 
   /** 在指定 entry 之后插入新条目（mysql CLI：结果插在 SQL 行之后）。 */
@@ -194,7 +266,7 @@ export function useSqlConsole(
     } else {
       entries.value.push(e);
     }
-    scrollToBottom();
+    scrollToBottomIfOverflow();
   }
 
   /** db:query_result 事件处理：把 running entry 替换为最终结果。 */
@@ -245,7 +317,7 @@ export function useSqlConsole(
       pushHistory(lastExecutedSql.value, payload.elapsedMs);
       lastExecutedSql.value = "";
     }
-    scrollToBottom();
+    scrollToBottomIfOverflow();
   }
 
   /** 订阅 db:query_result 事件（视图在 onMounted 调用，onBeforeUnmount 调 destroy）。 */
@@ -274,6 +346,10 @@ export function useSqlConsole(
   const HISTORY_MAX = 100;
   const history = ref<HistoryItem[]>([]);
   const lastExecutedSql = ref("");
+  /** 历史浏览游标：null=未浏览（正在编辑新命令），0=最新一条，递增向更旧。 */
+  const histCursor = ref<number | null>(null);
+  /** 进入历史浏览前的草稿（以便按 ↓ 回到未写完的命令）。 */
+  const histDraft = ref("");
 
   function loadHistory() {
     try {
@@ -289,6 +365,9 @@ export function useSqlConsole(
     history.value = history.value.filter((h) => h.sql !== trimmed);
     history.value.unshift({ sql: trimmed, ts: Date.now(), elapsedMs });
     if (history.value.length > HISTORY_MAX) history.value.length = HISTORY_MAX;
+    // 新命令入历史后重置浏览状态，下次 ↑ 从最新一条开始。
+    histCursor.value = null;
+    histDraft.value = "";
     try {
       localStorage.setItem(HISTORY_KEY, JSON.stringify(history.value));
     } catch {
@@ -298,6 +377,38 @@ export function useSqlConsole(
   /** 用历史条目填充编辑器（视图侧传入 CodeMirror 操作或直接改 sqlText）。 */
   function useHistory(item: HistoryItem) {
     sqlTextRef.value = item.sql;
+  }
+
+  /**
+   * ↑ 浏览上一条历史。返回应填入输入框的文本；已到最旧一条时返回 null（保持不变）。
+   * 首次进入浏览时 current 为输入框现值，会被记为草稿。
+   */
+  function historyOlder(current: string): string | null {
+    if (history.value.length === 0) return null;
+    if (histCursor.value === null) {
+      histDraft.value = current;
+      histCursor.value = 0;
+    } else if (histCursor.value < history.value.length - 1) {
+      histCursor.value += 1;
+    } else {
+      return null; // 已是最旧
+    }
+    return history.value[histCursor.value].sql;
+  }
+
+  /**
+   * ↓ 浏览下一条历史（向最新方向）。返回应填入的文本；
+   * 越过最新一条时返回草稿（空字符串=清空输入框），未处于浏览时返回 null。
+   */
+  function historyNewer(): string | null {
+    if (histCursor.value === null) return null; // 未在浏览
+    if (histCursor.value > 0) {
+      histCursor.value -= 1;
+      return history.value[histCursor.value].sql;
+    }
+    // 回到最新之外 → 恢复草稿并退出浏览。
+    histCursor.value = null;
+    return histDraft.value;
   }
   function clearHistory() {
     history.value = [];
@@ -329,6 +440,9 @@ export function useSqlConsole(
     const sqlId = genId("e");
     // SQL 行（mysql> 前缀，done 态，不转圈）。
     pushEntry({ id: sqlId, kind: "sql", sql: res.sql, status: "done" });
+    // 与用户手动执行一致：语句回显置顶。
+    activeSqlId.value = sqlId;
+    scrollSqlToTop();
     if (res.error) {
       insertAfter(sqlId, { id: genId("e"), kind: "error", sql: res.sql, message: res.error });
     } else if (res.columns.length > 0) {
@@ -374,6 +488,8 @@ export function useSqlConsole(
     entries,
     scrollRef,
     bottomAnchorRef,
+    activeSqlEl,
+    activeSqlId,
     executing,
     lastResult,
     clear,
@@ -388,6 +504,8 @@ export function useSqlConsole(
     history,
     loadHistory,
     useHistory,
+    historyOlder,
+    historyNewer,
     clearHistory,
     // 表结构
     selectedTable,

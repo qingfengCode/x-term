@@ -29,6 +29,7 @@ import {
   FolderAdd,
   MoreFilled,
   EditPen,
+  QuestionFilled,
 } from "@element-plus/icons-vue";
 import {
   dbDeleteProfile,
@@ -552,6 +553,8 @@ const {
   entries: consoleEntries,
   scrollRef: consoleScrollRef,
   bottomAnchorRef: consoleBottomAnchor,
+  activeSqlEl,
+  activeSqlId,
   executing,
   lastResult: result,
   clear: clearConsole,
@@ -562,6 +565,8 @@ const {
   history,
   loadHistory,
   useHistory: applyHistory,
+  historyOlder,
+  historyNewer,
   clearHistory,
   selectedTable,
   describeResult,
@@ -585,12 +590,39 @@ async function execute() {
   await runSql(readOnly.value);
 }
 
+/**
+ * SQL 回显行的 :ref 回调——仅捕获"上一条输入"（activeSqlId）对应的 DOM，
+ * 供 composable 滚动逻辑作锚点（语句置顶 / 结果溢出判断）。卸载时以 null 调用则清空。
+ */
+function bindSqlEntry(id: string, el: unknown) {
+  if (id !== activeSqlId.value) return;
+  activeSqlEl.value = (el as HTMLElement | null) ?? null;
+}
+
 // --- 命令行模式专用输入（原生 textarea，非 CodeMirror） ---
 const cliInputRef = ref<HTMLTextAreaElement | null>(null);
 const cliInput = ref("");
 
 /** 命令行回车：执行 cliInput 内容，成功后清空输入框（mysql CLI 风格）。 */
 async function onCliKeydown(e: KeyboardEvent) {
+  // ↑ / ↓ 浏览历史命令（mysql CLI 风格）。
+  if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+    if (e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) return; // 带修饰键交给默认行为
+    const text =
+      e.key === "ArrowUp" ? historyOlder(cliInput.value) : historyNewer();
+    if (text === null) return; // 无可切换项（已到边界 / 未在浏览），保持默认光标移动
+    e.preventDefault();
+    cliInput.value = text;
+    // 光标移到末尾，方便继续编辑。
+    nextTick(() => {
+      const el = cliInputRef.value;
+      if (el) {
+        el.selectionStart = el.selectionEnd = el.value.length;
+      }
+    });
+    return;
+  }
+
   if (e.key !== "Enter") return;
   if (e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) return; // Shift+Enter 换行
   e.preventDefault();
@@ -911,22 +943,53 @@ onBeforeUnmount(() => {
           >
             表结构{{ selectedTable ? `: ${selectedTable}` : "" }}
           </el-button>
+        </div>
+
+        <!-- ============ 命令行模式（mysql CLI 风格：输入在结果流末尾） ============ -->
+        <template v-if="editorMode === 'console'">
+        <!-- 命令行模式辅助操作行（与代码模式位置一致：工作区上方） -->
+        <div class="console-action-bar">
+          <!-- 帮助：悬浮显示使用指南 -->
+          <el-popover
+            placement="bottom-start"
+            :width="340"
+            trigger="hover"
+          >
+            <template #reference>
+              <el-button :icon="QuestionFilled" size="small" link class="help-btn">帮助</el-button>
+            </template>
+            <div class="help-content">
+              <div class="help-title">命令行模式使用指南</div>
+              <ul class="help-list">
+                <li>输入 SQL 后按 <b>Enter</b> 执行，<b>Shift+Enter</b> 换行</li>
+                <li>执行后语句置顶、结果向下展开：输入框始终跟在结果后面（结果铺满时其尾部停在底边），更早的历史在上方可滚动回看</li>
+                <li><b>↑ / ↓</b> 浏览历史命令（↑ 取上一条，↓ 回最新，可循环翻找）</li>
+                <li>点击左侧<b>表名</b>：自动填入 SELECT 模板并加载表结构</li>
+                <li>点击左侧<b>库名</b>：设为当前关联库（同步给 AI 助手上下文）</li>
+                <li><b>表结构</b>：查看当前选中表的字段定义</li>
+                <li><b>清屏</b>：清空输出流；<b>AI 优化 / AI 解释</b>：把当前 SQL 发给右侧 AI 助手</li>
+                <li><b>历史</b>：打开查询历史抽屉，点击条目回填执行</li>
+                <li><b>只读模式</b>下写操作（INSERT/UPDATE 等）会被拦截，需切换到读写模式</li>
+                <li>DROP / TRUNCATE 及无 WHERE 的 DELETE 需二次确认后才执行</li>
+              </ul>
+            </div>
+          </el-popover>
           <el-button :icon="Delete" size="small" link @click="clearConsole">清屏</el-button>
           <el-button :icon="MagicStick" size="small" link @click="aiOptimize">AI 优化</el-button>
           <el-button :icon="View" size="small" link @click="aiExplain">AI 解释</el-button>
           <el-button :icon="Plus" size="small" link @click="historyDrawer = true">历史</el-button>
         </div>
-
-        <!-- ============ 命令行模式（mysql CLI 风格：输入在结果流末尾） ============ -->
-        <template v-if="editorMode === 'console'">
-        <!-- 单一输出流：历史 SQL+结果 交织，末尾是当前输入 prompt -->
+        <!-- 单一输出流（顶部输入式终端）：
+             输入框常驻内容区顶部（始终可见）；历史输出在输入框上方（溢出内容区，
+             靠负滚动 / 向上滚轮回看）；当前内容区始终展示最新一条输出。 -->
         <div ref="consoleScrollRef" class="console-output">
-          <div v-if="consoleEntries.length === 0" class="console-empty">
-            输入 SQL 后按 Enter 执行（Shift+Enter 换行）。点击左侧表名快速查询。
-          </div>
           <template v-for="e in consoleEntries" :key="e.id">
             <!-- 执行的 SQL -->
-            <div v-if="e.kind === 'sql'" class="entry entry-sql">
+            <div
+              v-if="e.kind === 'sql'"
+              class="entry entry-sql"
+              :ref="(el) => bindSqlEntry(e.id, el)"
+            >
               <span class="entry-prompt">mysql&gt;</span>
               <span class="entry-sql-text">{{ e.sql }}</span>
               <el-icon v-if="e.status === 'running'" class="is-loading entry-spin"><Refresh /></el-icon>
@@ -957,7 +1020,7 @@ onBeforeUnmount(() => {
             <!-- 信息（表结构标题等） -->
             <div v-else-if="e.kind === 'info'" class="entry entry-info">-- {{ e.text }}</div>
           </template>
-          <!-- 当前输入（在结果流末尾，mysql CLI 风格；原生输入框，非 CodeMirror） -->
+          <!-- 输入框（mysql CLI 风格：常驻输出流末尾，新输出贴在它上方） -->
           <div ref="consoleBottomAnchor" class="console-input-wrap">
             <span class="input-prompt">mysql&gt;</span>
             <textarea
@@ -965,7 +1028,7 @@ onBeforeUnmount(() => {
               v-model="cliInput"
               class="cli-input"
               rows="1"
-              placeholder="输入 SQL，Enter 执行，Shift+Enter 换行"
+              placeholder="输入 SQL，Enter 执行，Shift+Enter 换行，↑↓ 切换历史"
               spellcheck="false"
               @keydown="onCliKeydown"
             />
@@ -980,6 +1043,13 @@ onBeforeUnmount(() => {
               执行
             </el-button>
             <el-button size="small" :icon="ClearIcon" @click="clearSql">清空</el-button>
+            <!-- 辅助操作：从顶部工具栏移到执行行右侧 -->
+            <div class="code-toolbar-right">
+              <el-button :icon="Delete" size="small" link @click="clearConsole">清屏</el-button>
+              <el-button :icon="MagicStick" size="small" link @click="aiOptimize">AI 优化</el-button>
+              <el-button :icon="View" size="small" link @click="aiExplain">AI 解释</el-button>
+              <el-button :icon="Plus" size="small" link @click="historyDrawer = true">历史</el-button>
+            </div>
           </div>
           <!-- 复用同一个 CodeMirror 实例：命令行/代码模式共享 sqlEditorRef。
                注意：v-if 切换会销毁重建 DOM，CM 需重新挂载，由 connect 后的 mount 保证。 -->
@@ -1336,10 +1406,30 @@ onBeforeUnmount(() => {
   font-family: "Consolas", "Cascadia Code", "JetBrains Mono", monospace;
   font-size: 13px;
 }
-.console-empty {
-  color: var(--el-text-color-placeholder);
-  text-align: center;
-  padding: 32px 0;
+/* 帮助浮层内容 */
+.help-content {
+  font-size: 12px;
+  line-height: 1.7;
+}
+.help-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--el-text-color-primary);
+  margin-bottom: 6px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+}
+.help-list {
+  margin: 0;
+  padding-left: 16px;
+  color: var(--el-text-color-regular);
+}
+.help-list li {
+  margin-bottom: 3px;
+}
+.help-list b {
+  color: var(--el-color-primary);
+  font-weight: 600;
 }
 .entry {
   margin-bottom: 8px;
@@ -1385,12 +1475,10 @@ onBeforeUnmount(() => {
   color: var(--el-text-color-secondary);
   font-style: italic;
 }
-/* 当前输入区（在输出流末尾，mysql CLI 风格） */
+/* 当前输入区（常驻输出流末尾，mysql CLI 风格；内联样式，无独立边框） */
 .console-input-wrap {
   display: flex;
   align-items: stretch;
-  border-top: 1px solid var(--el-border-color-lighter);
-  background: var(--el-bg-color-overlay);
   flex-shrink: 0;
   min-height: 36px;
   max-height: 160px;
@@ -1447,6 +1535,21 @@ onBeforeUnmount(() => {
   flex-direction: column;
   gap: 4px;
 }
+/* 命令行模式辅助操作行（与代码模式执行行同位：工作区上方） */
+.console-action-bar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 2px;
+  padding: 4px 12px;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+  background: var(--el-bg-color-overlay);
+  flex-shrink: 0;
+}
+/* 帮助按钮固定在最左侧，其余按钮靠右 */
+.console-action-bar .help-btn {
+  margin-right: auto;
+}
 /* 代码模式（多行编辑器 + 结果区） */
 .code-editor-toolbar {
   display: flex;
@@ -1456,6 +1559,13 @@ onBeforeUnmount(() => {
   border-bottom: 1px solid var(--el-border-color-lighter);
   background: var(--el-bg-color-overlay);
   flex-shrink: 0;
+}
+/* 执行行右侧辅助按钮组（清屏 / AI 优化 / AI 解释 / 历史） */
+.code-toolbar-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 2px;
 }
 .code-editor {
   height: 220px;
