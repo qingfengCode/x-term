@@ -19,6 +19,7 @@ use tokio::time::timeout;
 use crate::database::mysql::{connect_direct as mysql_connect_direct, connect_via_ssh};
 use crate::database::profiles::{list_db_profiles, DbProfile};
 use crate::error::{AppError, AppResult};
+use crate::ssh::client::AuthMethod;
 use crate::state::AppState;
 use crate::storage::sessions_repo::{get_session, list_sessions, Session};
 
@@ -175,6 +176,43 @@ pub async fn exec_ssh_by_id(
     exec_ssh_with_config(state, session_config, command, app).await
 }
 
+/// 在调用方指定的服务器上执行一条命令（MCP 客户端直连模式）。
+///
+/// 与 [`exec_ssh_with_config`] 的区别：host/port/username/密码直接由调用方在工具
+/// 参数中传入，不经过本地会话配置与 vault 解析。密码仅本次连接使用，不缓存、
+/// 不落日志、不写入任何配置文件。
+pub async fn exec_ssh_direct(
+    host: &str,
+    port: u16,
+    username: &str,
+    password: &str,
+    command: &str,
+    app: tauri::AppHandle,
+) -> AppResult<String> {
+    if command.trim().is_empty() {
+        return Err(AppError::InvalidInput("command 不能为空".into()));
+    }
+    if password.is_empty() {
+        return Err(AppError::Auth("password 不能为空".into()));
+    }
+    log::info!(
+        "[mcp] exec_ssh（直连）开始：{}@{}:{}, 命令：{}",
+        username,
+        host,
+        port,
+        command
+    );
+    exec_ssh_with_auth(
+        host,
+        port,
+        username,
+        AuthMethod::Password(password.to_string()),
+        command,
+        app,
+    )
+    .await
+}
+
 /// 共用的"解析凭据 → 建连 → exec → 收集输出"实现（by_name / by_id 都委托到此）。
 ///
 /// 流程参考 `ai::tools::exec_ssh` 的独立连接分支：
@@ -213,16 +251,33 @@ async fn exec_ssh_with_config(
         command
     );
 
+    exec_ssh_with_auth(
+        &session_config.host,
+        session_config.port,
+        &session_config.username,
+        resolved.auth_method,
+        command,
+        app,
+    )
+    .await
+}
+
+/// 共用的"建连 → exec → 收集输出"实现（by_config / direct 都委托到此）。
+///
+/// 流程：connect_direct → channel_open_session → `channel.exec(false, command)` →
+/// 循环 channel.wait() 收集 Data / ExtendedData（去 ANSI，截断 16KB）→ disconnect。
+/// 整个过程用 30s 超时包裹。`auth` 由调用方决定（vault 解析 / 参数直传）。
+async fn exec_ssh_with_auth(
+    host: &str,
+    port: u16,
+    username: &str,
+    auth: AuthMethod,
+    command: &str,
+    app: tauri::AppHandle,
+) -> AppResult<String> {
     // 连接 + exec（30s 超时）。
     let run = async {
-        let handle = crate::ssh::client::connect_direct(
-            &session_config.host,
-            session_config.port,
-            &session_config.username,
-            resolved.auth_method,
-            app,
-        )
-        .await?;
+        let handle = crate::ssh::client::connect_direct(host, port, username, auth, app).await?;
 
         let mut channel = handle
             .channel_open_session()
@@ -418,6 +473,47 @@ async fn exec_sql_with_profile(
     Ok(format_query_result(&qr))
 }
 
+/// 在调用方指定的 MySQL 服务器上执行 SQL（MCP 客户端直连模式）。
+///
+/// 与 [`exec_sql_with_profile`] 的区别：host/port/username/密码直接由调用方在工具
+/// 参数中传入，不经过 DB profile 与 vault 解析；密码仅本次连接使用，不缓存、不落
+/// 日志、不写入任何配置文件。
+///
+/// 不支持 SSH 隧道（如需要可后续扩展 sshHost/sshPort 等可选参数）。`database` 为
+/// 可选：传则作为默认库连接，不传则不指定默认库（SQL 里可带 `db.table` 限定名）。
+pub async fn exec_sql_direct(
+    host: &str,
+    port: u16,
+    username: &str,
+    password: &str,
+    database: Option<&str>,
+    sql: &str,
+    limit: u32,
+) -> AppResult<String> {
+    if sql.trim().is_empty() {
+        return Err(AppError::InvalidInput("sql 不能为空".into()));
+    }
+    if password.is_empty() {
+        return Err(AppError::Auth("password 不能为空".into()));
+    }
+    log::info!(
+        "[mcp] exec_sql（直连）开始：{}@{}:{}/{}, SQL: {}",
+        username,
+        host,
+        port,
+        database.unwrap_or(""),
+        sql
+    );
+
+    // 直连（不走 SSH 隧道）→ 执行 → 立即关闭。
+    let conn_obj = mysql_connect_direct(host, port, username, password, database).await?;
+    let res = conn_obj.execute(sql, limit).await;
+    conn_obj.close().await;
+
+    let qr = res?;
+    Ok(format_query_result(&qr))
+}
+
 // ===========================================================================
 // 辅助
 // ===========================================================================
@@ -462,4 +558,53 @@ pub fn arg_limit(args: &Value) -> u32 {
         .and_then(Value::as_u64)
         .map(|n| n as u32)
         .unwrap_or(100)
+}
+
+// --- 客户端直连模式参数解析（host/port/username/password/database） ---
+
+/// 解析工具参数中 `host` 字段（直连模式用，必填）。
+pub fn arg_host(args: &Value) -> AppResult<String> {
+    args.get("host")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::InvalidInput("缺少 host 参数（直连模式需指定目标服务器）".into()))
+}
+
+/// 解析工具参数中 `port` 字段（直连模式用，省略默认 22）。
+pub fn arg_port(args: &Value) -> AppResult<u16> {
+    match args.get("port") {
+        Some(v) => v
+            .as_u64()
+            .filter(|n| (1..=65535).contains(n))
+            .map(|n| n as u16)
+            .ok_or_else(|| AppError::InvalidInput("port 参数无效（需为 1-65535 的整数）".into())),
+        None => Ok(22),
+    }
+}
+
+/// 解析工具参数中 `username` 字段（直连模式用，必填）。
+pub fn arg_username(args: &Value) -> AppResult<String> {
+    args.get("username")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::InvalidInput("缺少 username 参数".into()))
+}
+
+/// 解析工具参数中 `password` 字段（直连模式用，必填；仅本次调用使用）。
+pub fn arg_password(args: &Value) -> AppResult<String> {
+    args.get("password")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::InvalidInput("缺少 password 参数".into()))
+}
+
+/// 解析工具参数中可选的 `database` 字段（DB 直连用；空/缺省返回 None）。
+pub fn arg_database(args: &Value) -> Option<String> {
+    args.get("database")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
 }

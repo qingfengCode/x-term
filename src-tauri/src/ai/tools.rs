@@ -16,6 +16,8 @@
 //! - `exec_sql`：在指定 MySQL 连接上执行 SQL。
 //! - `list_db_tables`：列出当前数据库的表。
 //! - `describe_table`：描述表结构。
+//! - `read_file` / `write_file` / `list_files`：本地文件读写（设置页开启"本地文件
+//!   读写"后才下发）。只能在各助手工作目录（沙箱）内操作，详见 [`file_tools`]。
 //!
 //! # 执行流程
 //!
@@ -33,6 +35,7 @@
 //! 这并非沙箱：执行端不做拦截，仍按用户最终决定执行。
 
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use once_cell::sync::Lazy;
@@ -112,6 +115,12 @@ const EXEC_OUTPUT_CAP: usize = 16 * 1024;
 const MAX_EXEC_OUTPUT_BYTES: usize = 16 * 1024;
 /// terminal_snapshot 默认/上限字节数（8 KiB）。
 const SNAPSHOT_DEFAULT_BYTES: usize = 8 * 1024;
+/// read_file 单文件读取上限（1 MiB）。超出拒绝，防上下文爆炸。
+const MAX_FILE_READ_BYTES: usize = 1024 * 1024;
+/// write_file 单次写入上限（10 MiB）。
+const MAX_FILE_WRITE_BYTES: usize = 10 * 1024 * 1024;
+/// list_files 单目录最多返回条目数。
+const MAX_LIST_ENTRIES: usize = 200;
 
 // ===========================================================================
 // 工具集
@@ -221,6 +230,71 @@ table 可用 `database.table` 限定名（推荐，尤其当连接未指定默�
     ]
 }
 
+/// 本地文件读写工具集（设置页开启"本地文件读写"后才由编排层下发）。
+///
+/// 两个助手域（终端助手 / 数据库助手）共用同一组工具定义；执行时按请求所属的
+/// domain（"ssh" / "db"）取该域在设置里配置的工作目录，路径参数一律视为
+/// **相对工作目录的路径**（如 `data/users.csv`），绝对路径与 `..` 逃逸被拒绝。
+///
+/// - `read_file`：读取工作目录内文本文件（≤1 MiB，二进制拒绝）。
+/// - `write_file`：写入文本到工作目录内文件（覆盖已有文件标记危险，需人工确认）。
+/// - `list_files`：列出工作目录/子目录内容（帮助 AI 了解有哪些文件可用）。
+pub fn file_tools() -> Vec<ToolDef> {
+    vec![
+        ToolDef {
+            name: "read_file".into(),
+            description: "读取本地工作目录内的文本文件内容，返回原始文本。\
+path 是相对工作目录的路径（如 data/users.csv），不允许绝对路径或 .. 逃逸。\
+单文件上限 1MB；二进制文件会被拒绝。".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "相对工作目录的文件路径，如 data/users.csv"
+                    }
+                },
+                "required": ["path"]
+            }),
+        },
+        ToolDef {
+            name: "write_file".into(),
+            description: "把文本内容写入本地工作目录内的文件。path 是相对工作目录的路径，\
+不允许绝对路径或 .. 逃逸。父目录需已存在（不会自动创建多级目录）。\
+若目标文件已存在会被覆盖（用户会收到危险确认）。适合导出数据、保存脚本等。".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "相对工作目录的文件路径，如 out/users.csv"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "要写入的完整文本内容"
+                    }
+                },
+                "required": ["path", "content"]
+            }),
+        },
+        ToolDef {
+            name: "list_files".into(),
+            description: "列出工作目录（或相对其的子目录）内的条目：文件名、类型（文件/目录）、\
+大小。path 省略时列工作目录根。用于了解有哪些文件可用、确认输出文件是否已存在。".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "相对工作目录的目录路径，省略或空串表示工作目录本身"
+                    }
+                },
+                "required": []
+            }),
+        },
+    ]
+}
+
 /// 返回全部工具定义（SSH + SQL）。保留用于测试/兼容；运行时按上下文裁剪请用
 /// [`tools_for_context`]。
 pub fn all_tools() -> Vec<ToolDef> {
@@ -267,6 +341,9 @@ pub fn allowed_tool_names(tools: &[ToolDef]) -> HashSet<String> {
 /// 若 `call.name` 不在其中，说明模型幻觉调用了未 advertised 的工具，直接拒绝——
 /// 防止"只给了 SSH 工具，模型却调 exec_sql"这类越权。
 ///
+/// `file_domain` 是请求所属助手域（"ssh"/"db"/""），文件工具据此取对应工作目录；
+/// 非文件工具忽略该参数。
+///
 /// 任何执行错误都被吞掉并返回 `ToolResult { ok: false, output: <错误信息> }`，
 /// 由调用方把错误回填给模型，让模型据此重试或解释给用户。
 pub async fn execute_tool(
@@ -275,6 +352,7 @@ pub async fn execute_tool(
     call: &ToolCall,
     allowed: &HashSet<String>,
     visualization: bool,
+    file_domain: &str,
 ) -> ToolResult {
     if !allowed.contains(&call.name) {
         return ToolResult::err(format!(
@@ -288,6 +366,9 @@ pub async fn execute_tool(
         "exec_sql" => exec_sql(app, state, &call.arguments, visualization).await,
         "list_db_tables" => list_db_tables(state, &call.arguments).await,
         "describe_table" => describe_table(state, &call.arguments).await,
+        "read_file" => read_file(state, &call.arguments, file_domain),
+        "write_file" => write_file(state, &call.arguments, file_domain),
+        "list_files" => list_files(state, &call.arguments, file_domain),
         other => ToolResult::err(format!("未知工具: {other}")),
     }
 }
@@ -730,6 +811,198 @@ async fn describe_table(state: &AppState, args: &Value) -> ToolResult {
 }
 
 // ===========================================================================
+// 本地文件读写工具（工作目录沙箱）
+// ===========================================================================
+
+/// 取指定助手域的工作目录（设置页配置）。未配置返回 None。
+fn workspace_dir_for(state: &AppState, domain: &str) -> Option<String> {
+    let settings = crate::config::settings_load_inner(state).ok()?;
+    settings.ai.file_access.workspace_dirs.get(domain).cloned()
+}
+
+/// 把"相对工作目录"的路径解析为沙箱内绝对路径。
+///
+/// 安全规则：
+/// 1. 拒绝绝对路径与含 `..` 组分的路径；
+/// 2. 工作目录 canonicalize（解析 symlink，统一实际大小写）；
+/// 3. 目标已存在 → canonicalize 全路径后必须位于工作目录内（防 symlink 逃逸）；
+/// 4. 目标不存在（写新文件）→ 父目录 canonicalize 校验，文件名直接拼接。
+fn resolve_workspace_path(workspace: &Path, rel: &str) -> Result<PathBuf, String> {
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute() {
+        return Err("path 必须是相对工作目录的路径，不允许绝对路径".into());
+    }
+    if rel_path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err("path 不允许包含 `..`（不能逃逸工作目录）".into());
+    }
+    let ws = workspace
+        .canonicalize()
+        .map_err(|e| format!("工作目录不可访问: {e}"))?;
+    let joined = ws.join(rel_path);
+    // 目标已存在：canonicalize 后校验前缀（可解析 symlink，防逃逸）。
+    if joined.exists() {
+        let real = joined
+            .canonicalize()
+            .map_err(|e| format!("解析路径失败: {e}"))?;
+        if !real.starts_with(&ws) {
+            return Err("路径超出工作目录范围，已拒绝".into());
+        }
+        return Ok(real);
+    }
+    // 目标不存在（写新文件）：父目录必须存在且在工作目录内。
+    let parent = joined.parent().unwrap_or(&ws);
+    if !parent.exists() {
+        return Err(format!("父目录不存在: {}", parent.display()));
+    }
+    let real_parent = parent
+        .canonicalize()
+        .map_err(|e| format!("解析父目录失败: {e}"))?;
+    if !real_parent.starts_with(&ws) {
+        return Err("路径超出工作目录范围，已拒绝".into());
+    }
+    let name = joined
+        .file_name()
+        .ok_or_else(|| "无效的文件名".to_string())?;
+    Ok(real_parent.join(name))
+}
+
+/// read_file：读取工作目录内文本文件（≤1 MiB）。
+fn read_file(state: &AppState, args: &Value, domain: &str) -> ToolResult {
+    let rel = match args.get("path").and_then(Value::as_str) {
+        Some(p) => p,
+        None => return ToolResult::err("read_file 缺少 path 参数"),
+    };
+    let ws = match workspace_dir_for(state, domain) {
+        Some(w) => w,
+        None => {
+            return ToolResult::err(
+                "当前助手未配置工作目录：请在设置页开启「本地文件读写」并选择工作目录",
+            );
+        }
+    };
+    let path = match resolve_workspace_path(Path::new(&ws), rel) {
+        Ok(p) => p,
+        Err(e) => return ToolResult::err(e),
+    };
+    if !path.is_file() {
+        return ToolResult::err(format!("{} 不是文件", path.display()));
+    }
+    let meta = match std::fs::metadata(&path) {
+        Ok(m) => m,
+        Err(e) => return ToolResult::err(format!("读取文件信息失败: {e}")),
+    };
+    if meta.len() > MAX_FILE_READ_BYTES as u64 {
+        return ToolResult::err(format!(
+            "文件过大（{} 字节，上限 {} 字节）。请先手动拆分/截取后再让 AI 读取",
+            meta.len(),
+            MAX_FILE_READ_BYTES
+        ));
+    }
+    let data = match std::fs::read(&path) {
+        Ok(d) => d,
+        Err(e) => return ToolResult::err(format!("读取文件失败: {e}")),
+    };
+    // 二进制检测：含 NUL 字节即视为二进制，拒绝（防止把乱码/图片内容塞给模型）。
+    if data.contains(&0) {
+        return ToolResult::err("二进制文件不支持读取，仅支持文本文件");
+    }
+    let text = String::from_utf8_lossy(&data);
+    ToolResult::ok(format!(
+        "文件 {}（{} 字节）内容：\n{}",
+        path.display(),
+        data.len(),
+        text
+    ))
+}
+
+/// write_file：把文本写入工作目录内文件（覆盖已有文件在上层被标记危险）。
+fn write_file(state: &AppState, args: &Value, domain: &str) -> ToolResult {
+    let (rel, content) = match (
+        args.get("path").and_then(Value::as_str),
+        args.get("content").and_then(Value::as_str),
+    ) {
+        (Some(p), Some(c)) => (p, c),
+        _ => return ToolResult::err("write_file 缺少 path 或 content 参数"),
+    };
+    let ws = match workspace_dir_for(state, domain) {
+        Some(w) => w,
+        None => {
+            return ToolResult::err(
+                "当前助手未配置工作目录：请在设置页开启「本地文件读写」并选择工作目录",
+            );
+        }
+    };
+    if content.len() > MAX_FILE_WRITE_BYTES {
+        return ToolResult::err(format!(
+            "内容过大（{} 字节，上限 {} 字节）",
+            content.len(),
+            MAX_FILE_WRITE_BYTES
+        ));
+    }
+    let path = match resolve_workspace_path(Path::new(&ws), rel) {
+        Ok(p) => p,
+        Err(e) => return ToolResult::err(e),
+    };
+    match std::fs::write(&path, content) {
+        Ok(()) => ToolResult::ok(format!(
+            "已写入 {}（{} 字节）",
+            path.display(),
+            content.len()
+        )),
+        Err(e) => ToolResult::err(format!("写入失败: {e}")),
+    }
+}
+
+/// list_files：列出工作目录（或相对其的子目录）内的条目。
+fn list_files(state: &AppState, args: &Value, domain: &str) -> ToolResult {
+    let rel = args.get("path").and_then(Value::as_str).unwrap_or("");
+    let ws = match workspace_dir_for(state, domain) {
+        Some(w) => w,
+        None => {
+            return ToolResult::err(
+                "当前助手未配置工作目录：请在设置页开启「本地文件读写」并选择工作目录",
+            );
+        }
+    };
+    let dir = match resolve_workspace_path(Path::new(&ws), rel) {
+        Ok(p) => p,
+        Err(e) => return ToolResult::err(e),
+    };
+    if !dir.is_dir() {
+        return ToolResult::err(format!("{} 不是目录", dir.display()));
+    }
+    let rd = match std::fs::read_dir(&dir) {
+        Ok(r) => r,
+        Err(e) => return ToolResult::err(format!("列出目录失败: {e}")),
+    };
+    let mut lines: Vec<String> = Vec::new();
+    let mut count = 0usize;
+    for entry in rd {
+        if count >= MAX_LIST_ENTRIES {
+            lines.push(format!("…（条目过多，仅显示前 {MAX_LIST_ENTRIES} 项）"));
+            break;
+        }
+        let Ok(e) = entry else { continue };
+        count += 1;
+        let name = e.file_name().to_string_lossy().to_string();
+        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_dir {
+            lines.push(format!("[目录] {name}/"));
+        } else {
+            let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+            lines.push(format!("{name}（{} 字节）", size));
+        }
+    }
+    if lines.is_empty() {
+        lines.push("（空目录）".into());
+    }
+    ToolResult::ok(format!("目录 {}：\n{}", dir.display(), lines.join("\n")))
+}
+
+// ===========================================================================
 // 安全护栏
 // ===========================================================================
 
@@ -769,8 +1042,12 @@ static DELETE_NO_WHERE_RE: Lazy<Regex> = Lazy::new(|| {
 /// - exec_ssh：command 命中危险命令模式（rm -rf /、mkfs、dd 写块设备、
 ///   shutdown/reboot、fork bomb、chmod -R 777 / 等）。
 /// - exec_sql：DROP/TRUNCATE 开头，或 DELETE 无 WHERE 子句。
+/// - write_file：目标文件已存在（覆盖已有数据）→ 危险。
 /// - 其它工具默认安全。
-pub fn is_dangerous(name: &str, arguments: &Value) -> bool {
+///
+/// `workspace` 为文件工具所属助手的工作目录（`write_file` 判断覆盖用）；
+/// 非文件工具传 None 即可。
+pub fn is_dangerous(name: &str, arguments: &Value, workspace: Option<&Path>) -> bool {
     match name {
         "exec_ssh" => arguments
             .get("command")
@@ -786,6 +1063,19 @@ pub fn is_dangerous(name: &str, arguments: &Value) -> bool {
             .and_then(Value::as_str)
             .map(|sql| DROP_TRUNCATE_RE.is_match(sql) || DELETE_NO_WHERE_RE.is_match(sql))
             .unwrap_or(false),
+        "write_file" => {
+            // 覆盖已有文件：解析出沙箱路径后检查存在性（解析失败视为不危险，
+            // 执行阶段会返回错误，不需要提前标记）。
+            match (
+                arguments.get("path").and_then(Value::as_str),
+                workspace,
+            ) {
+                (Some(p), Some(ws)) => resolve_workspace_path(ws, p)
+                    .map(|p| p.exists())
+                    .unwrap_or(false),
+                _ => false,
+            }
+        }
         _ => false,
     }
 }
@@ -969,6 +1259,28 @@ pub fn describe_call(name: &str, arguments: &Value) -> String {
                 .and_then(Value::as_str)
                 .unwrap_or("?");
             format!("查看表 {t} 结构")
+        }
+        "read_file" => {
+            let p = arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            format!("读取文件: {p}")
+        }
+        "write_file" => {
+            let p = arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            format!("写入文件: {p}")
+        }
+        "list_files" => {
+            let p = arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("工作目录");
+            format!("列出目录: {p}")
         }
         other => format!("执行工具: {other}"),
     }

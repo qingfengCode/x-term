@@ -44,9 +44,18 @@ pub struct McpInstanceConfig {
     /// Bearer token（未生成则为 None；启动时必须存在）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
-    /// 绑定的资源 id：SSH 会话 id（ssh）或 DB profile id（db）。
+    /// 绑定的资源 id：SSH 会话 id（ssh）或 DB profile id（db）。仅 `resource_mode == "bound"`
+    /// 时必填；`"client"` 模式下忽略。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_id: Option<String>,
+    /// 资源模式："bound"（绑定本地资源，默认）| "client"（客户端直连，免绑定实例）。
+    ///
+    /// - bound：启动要求绑定资源（resourceId），工具参数只传 command/sql，目标从绑定解析，
+    ///   凭据从本地 vault 解析。
+    /// - client：无需绑定资源，工具参数需携带 host/port/username/password 等目标信息，
+    ///   凭据即用即弃、不存储不落日志。适合调用方自带账密表的巡检场景。
+    #[serde(default = "default_resource_mode")]
+    pub resource_mode: String,
     /// 绑定的具体数据库名（仅 db kind 有效）。设置后 exec_sql 只针对该库操作。
     /// 为空则使用 profile 的 default_database。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -67,6 +76,21 @@ fn default_enable_log() -> bool {
     true
 }
 
+/// 默认资源模式：绑定本地资源（向后兼容；老 mcp.json 无此字段即视为 bound）。
+fn default_resource_mode() -> String {
+    "bound".into()
+}
+
+/// 规范化资源模式：仅 `"client"` 视为直连模式，其余一律按 `"bound"` 处理
+/// （防配置文件被手动改坏导致意外直连）。
+pub(crate) fn normalize_resource_mode(m: &str) -> String {
+    if m == "client" {
+        "client".into()
+    } else {
+        "bound".into()
+    }
+}
+
 /// kind 的默认端口。
 fn default_port_for(kind: McpKind) -> u16 {
     match kind {
@@ -84,6 +108,7 @@ impl McpInstanceConfig {
             port: default_port_for(kind),
             token: None,
             resource_id: None,
+            resource_mode: default_resource_mode(),
             bound_database: None,
             auto_approve: false,
             enable_log: true,
@@ -166,7 +191,9 @@ fn set_instance_config(state: &AppState, kind: McpKind, c: McpInstanceConfig) ->
 ///
 /// - `host` / `port` 可选，省略时用配置文件中的值（默认 0.0.0.0 / 8765|8766）。
 /// - token 必须已生成（配置文件中存在），否则返回 Config 错误。
-/// - 必须已绑定资源（resourceId 非空），否则返回错误。
+/// - 资源校验按 `resource_mode` 分支：
+///   - bound（默认）：必须已绑定资源（resourceId 非空），否则返回错误；
+///   - client：无需绑定资源，目标与凭据由调用方在工具参数中传入。
 #[tauri::command]
 pub async fn mcp_start(
     kind: String,
@@ -177,6 +204,7 @@ pub async fn mcp_start(
 ) -> AppResult<McpServerStatus> {
     let kind = McpKind::parse(&kind);
     let cfg = instance_config(state.inner(), kind);
+    let resource_mode = normalize_resource_mode(&cfg.resource_mode);
 
     let host = host.unwrap_or(cfg.host);
     let port = port.unwrap_or(cfg.port);
@@ -186,16 +214,21 @@ pub async fn mcp_start(
             kind.label()
         ))
     })?;
-    let bound_resource_id = cfg.resource_id.ok_or_else(|| {
-        AppError::Config(format!(
-            "{} 未绑定资源：请先在 MCP 页面选择一个{}",
-            kind.label(),
-            match kind {
-                McpKind::Ssh => "SSH 会话",
-                McpKind::Db => "数据库连接",
-            }
-        ))
-    })?;
+    // bound 模式要求绑定资源；client 模式（客户端直连）不要求。
+    let bound_resource_id = if resource_mode == "client" {
+        None
+    } else {
+        Some(cfg.resource_id.ok_or_else(|| {
+            AppError::Config(format!(
+                "{} 未绑定资源：请先在 MCP 页面选择一个{}，或开启「客户端直连模式」",
+                kind.label(),
+                match kind {
+                    McpKind::Ssh => "SSH 会话",
+                    McpKind::Db => "数据库连接",
+                }
+            ))
+        })?)
+    };
 
     start_mcp_server(
         kind,
@@ -206,6 +239,7 @@ pub async fn mcp_start(
         token,
         bound_resource_id,
         cfg.bound_database,
+        resource_mode,
         cfg.auto_approve,
         cfg.enable_log,
     )

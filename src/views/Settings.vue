@@ -11,7 +11,9 @@
 import { computed, onMounted, reactive, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import type { FormInstance, FormRules } from "element-plus";
-import { Delete, Plus, Refresh } from "@element-plus/icons-vue";
+import { Delete, Plus, Refresh, Folder } from "@element-plus/icons-vue";
+import { open } from "@tauri-apps/plugin-dialog";
+import { setWorkspaceDir } from "@/api/ai";
 import { useSettingsStore } from "@/stores/settings";
 import { useUpdateStore } from "@/stores/update";
 import { ProviderKind } from "@/api/types";
@@ -511,6 +513,55 @@ async function saveSqlSwitches() {
     ElMessage.error("保存失败：" + String(e));
   }
 }
+
+// --- 本地文件读写：开关 + 工作目录 ----------------------------------------
+/** 文件读写开关切换后立即保存。 */
+async function saveFileAccessSwitch() {
+  try {
+    await settings.save();
+    ElMessage.success(
+      settings.fileAccess.enabled ? "已启用本地文件读写" : "已关闭本地文件读写"
+    );
+  } catch (e: unknown) {
+    ElMessage.error("保存失败：" + String(e));
+  }
+}
+
+/** 为某个助手域选择工作目录（弹系统目录选择器）。 */
+async function pickWorkspaceDir(domain: "ssh" | "db") {
+  const picked = await open({
+    title: `选择${domain === "ssh" ? "终端助手" : "数据库助手"}工作目录`,
+    directory: true,
+    multiple: false,
+  });
+  if (typeof picked !== "string" || !picked) return; // 用户取消
+  try {
+    await setWorkspaceDir(domain, picked);
+    // 回写本地 store 并持久化（settings.json 由后端写入，这里同步前端状态）。
+    settings.fileAccess.workspaceDirs = {
+      ...settings.fileAccess.workspaceDirs,
+      [domain]: picked,
+    };
+    await settings.save();
+    ElMessage.success("工作目录已设置");
+  } catch (e: unknown) {
+    ElMessage.error("设置失败：" + String(e));
+  }
+}
+
+/** 清除某个助手域的工作目录。 */
+async function clearWorkspaceDir(domain: "ssh" | "db") {
+  try {
+    await setWorkspaceDir(domain, "");
+    const dirs = { ...settings.fileAccess.workspaceDirs };
+    delete dirs[domain];
+    settings.fileAccess.workspaceDirs = dirs;
+    await settings.save();
+    ElMessage.success("已清除工作目录");
+  } catch (e: unknown) {
+    ElMessage.error("清除失败：" + String(e));
+  }
+}
 </script>
 
 <template>
@@ -888,11 +939,57 @@ async function saveSqlSwitches() {
               <div>终端可视化执行</div>
               <div class="switch-desc">
                 开启后，AI 执行的 SQL 及其结果<strong>回显到 SQL 控制台</strong>（命令行模式），
-                就像你手动执行一样。关闭则结果只在 AI 面板。与 SSH 助手的可视化独立设置。
+                就像你手动执行一样。关闭则结果只在 AI 面板。与终端助手的可视化独立设置。
               </div>
             </div>
             <el-switch v-model="settings.sqlAgent.terminalVisualization" @change="saveSqlSwitches" />
           </div>
+        </div>
+
+        <!-- 本地文件读写 -->
+        <div class="form-card">
+          <div class="card-title">本地文件读写</div>
+          <div class="card-desc">
+            开启后，AI 可在各助手的工作目录内<strong>自动读写文件</strong>（读取数据文件、
+            导出查询结果为 CSV/SQL 等）。AI 只能访问工作目录及子目录（沙箱），
+            写文件覆盖已有文件仍需人工确认。关闭时 AI 无法访问本地文件。
+          </div>
+          <div class="switch-row" style="margin-top: 12px">
+            <div class="switch-label">
+              <div>启用本地文件读写</div>
+              <div class="switch-desc">关闭时 AI 行为与之前完全一致。</div>
+            </div>
+            <el-switch v-model="settings.fileAccess.enabled" @change="saveFileAccessSwitch" />
+          </div>
+          <template v-if="settings.fileAccess.enabled">
+            <div
+              v-for="d in (['ssh', 'db'] as const)"
+              :key="d"
+              class="workspace-row"
+            >
+              <div class="switch-label">
+                <div>{{ d === "ssh" ? "终端助手" : "数据库助手" }}工作目录</div>
+                <div class="switch-desc">
+                  AI 读写文件的根目录（可读写其子目录）。未设置时 AI 无法使用文件工具。
+                </div>
+              </div>
+              <div class="workspace-picker">
+                <el-tag
+                  class="workspace-path"
+                  :type="settings.fileAccess.workspaceDirs[d] ? 'info' : 'warning'"
+                  effect="plain"
+                  :closable="!!settings.fileAccess.workspaceDirs[d]"
+                  :close-icon="Delete"
+                  @close="clearWorkspaceDir(d)"
+                >
+                  {{ settings.fileAccess.workspaceDirs[d] ?? "未设置" }}
+                </el-tag>
+                <el-button size="small" :icon="Folder" @click="pickWorkspaceDir(d)">
+                  {{ settings.fileAccess.workspaceDirs[d] ? "更改" : "选择目录" }}
+                </el-button>
+              </div>
+            </div>
+          </template>
         </div>
 
         <!-- 添加 Provider 弹窗 -->
@@ -1166,6 +1263,30 @@ async function saveSqlSwitches() {
   line-height: 1.5;
   color: var(--el-text-color-secondary);
   margin-top: 2px;
+}
+
+/* 本地文件读写：工作目录选择行 */
+.workspace-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 0;
+  border-top: 1px solid var(--el-border-color-lighter);
+}
+.workspace-picker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  max-width: 55%;
+}
+.workspace-path {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: "Consolas", "Cascadia Code", monospace;
+  font-size: 12px;
 }
 
 /* --- 快捷命令 tab --- */

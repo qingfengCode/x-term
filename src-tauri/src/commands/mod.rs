@@ -73,6 +73,7 @@ pub fn register(
         crate::commands::ai::ai_cancel_tool,
         crate::commands::ai::ai_stop,
         crate::commands::ai::ai_add_to_whitelist,
+        crate::commands::ai::set_workspace_dir,
         // config
         crate::commands::config::settings_load,
         crate::commands::config::settings_save,

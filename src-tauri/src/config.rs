@@ -153,6 +153,9 @@ pub struct AiSettings {
     /// SQL 智能体配置（exec_sql 工具）。
     #[serde(default)]
     pub sql_agent: SqlAgentSettings,
+    /// 本地文件读写配置（read_file / write_file / list_files 工具）。
+    #[serde(default)]
+    pub file_access: FileAccessSettings,
 
     // === 向后兼容：旧字段（已迁移到 ssh_agent）。保留字段以便读取旧 settings.json，
     //     迁移逻辑见 [`migrate_legacy_ai`]。序列化时跳过写出，避免数据重复丢失。 ===
@@ -171,6 +174,7 @@ impl Default for AiSettings {
             active: None,
             ssh_agent: SshAgentSettings::default(),
             sql_agent: SqlAgentSettings::default(),
+            file_access: FileAccessSettings::default(),
             command_whitelist: Vec::new(),
             auto_approve_whitelist: false,
             terminal_visualization: false,
@@ -239,6 +243,33 @@ impl Default for SqlAgentSettings {
             sql_mode: default_sql_mode(),
             auto_approve_safe: default_sql_auto_approve_safe(),
             terminal_visualization: false,
+        }
+    }
+}
+
+/// AI 本地文件读写配置（read_file / write_file / list_files 工具）。
+///
+/// - 开关关闭时（默认）：文件工具不下发，AI 行为与之前完全一致。
+/// - 开启后：AI 只能在两个助手各自的工作目录（沙箱）内读写文件，路径逃逸
+///   （`..`、绝对路径、symlink）一律拒绝；读写自动执行，但**覆盖已有文件**
+///   仍走危险确认（防数据被意外覆盖）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileAccessSettings {
+    /// 是否启用本地文件读写工具。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 各助手域的工作目录：key = "ssh" | "db"，值为绝对路径。
+    /// AI 只能访问该目录及其子目录内的文件。
+    #[serde(default)]
+    pub workspace_dirs: std::collections::HashMap<String, String>,
+}
+
+impl Default for FileAccessSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            workspace_dirs: std::collections::HashMap::new(),
         }
     }
 }

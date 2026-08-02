@@ -54,7 +54,7 @@ import { useCodeMirror } from "@/composables/useCodeMirror";
 // KeepAlive 按 name 匹配缓存本组件（保留 DB 助手面板状态）。
 defineOptions({ name: "SqlConsoleView" });
 
-// 用 DB 域 store：aiOptimize/aiExplain 的结果会进右侧 DB 助手面板，与 SSH 助手隔离。
+// 用 DB 域 store：aiOptimize/aiExplain 的结果会进右侧 DB 助手面板，与终端助手隔离。
 const ai = useAiDbStore();
 const db = useDbStore();
 const settings = useSettingsStore();
@@ -1100,7 +1100,7 @@ onBeforeUnmount(() => {
         </template>
         </template>
       </section>
-      <!-- DB 助手面板：仅在 SQL 页显示，与 SSH 助手完全隔离 -->
+      <!-- DB 助手面板：仅在 SQL 页显示，与终端助手完全隔离 -->
       <AiPanel domain="db" />
     </div>
 

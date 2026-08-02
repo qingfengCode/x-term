@@ -67,7 +67,7 @@ export interface AiMessage {
  * AI 助手 store 工厂。
  *
  * 拆分为两个完全隔离的助手（各自独立的对话列表 / 多会话 / requestToCid 路由表）：
- * - `useAiSshStore`（id "ai:ssh"）：终端页 SSH 助手
+ * - `useAiSshStore`（id "ai:ssh"）：终端助手（终端页）
  * - `useAiDbStore`（id "ai:db"）：SQL 页数据库助手
  *
  * 事件路由：MainLayout 把 `ai:*` 事件同时分发给两个 store，每个 store 的
@@ -173,11 +173,17 @@ const makeAiStore = (id: string) =>
    * @param opts.agent 是否启用工具调用（智能体模式）
    * @param opts.activeTerminalId 当前活动终端（agent 模式上下文）
    * @param opts.activeDbConnId 当前活动 MySQL 连接
+   * @param opts.domain 请求所属助手域（"ssh" | "db"），文件工具据此取工作目录
    */
   async function send(
     userText: string,
     systemPrompt?: string,
-    opts?: { agent?: boolean; activeTerminalId?: string; activeDbConnId?: string }
+    opts?: {
+      agent?: boolean;
+      activeTerminalId?: string;
+      activeDbConnId?: string;
+      domain?: string;
+    }
   ) {
     ensureConversation();
     const conv = activeConversation.value!;
@@ -245,6 +251,7 @@ const makeAiStore = (id: string) =>
         agentMode: opts?.agent ?? false,
         activeTerminalId: opts?.activeTerminalId,
         activeDbConnId: opts?.activeDbConnId,
+        domain: opts?.domain,
       });
     } catch (e) {
       assistantMsg.streaming = false;
@@ -490,7 +497,12 @@ const makeAiStore = (id: string) =>
   async function regenerate(
     messageId: string,
     systemPrompt?: string,
-    opts?: { agent?: boolean; activeTerminalId?: string; activeDbConnId?: string },
+    opts?: {
+      agent?: boolean;
+      activeTerminalId?: string;
+      activeDbConnId?: string;
+      domain?: string;
+    },
   ) {
     const conv = activeConversation.value;
     if (!conv || conv.sending) return;

@@ -2,10 +2,16 @@
   McpInstancePanel.vue — 单个 MCP 实例（SSH / DB）的配置与管理面板。
 
   作为 McpView 的两个 Tab 共用组件，按 kind 区分：
-  - kind="ssh"：绑定资源为 SSH 会话（来自 sessions store），对外暴露 exec_ssh。
-  - kind="db"：绑定资源为 DB profile（db_list_profiles），对外暴露 exec_sql。
+  - kind="ssh"：对外暴露 exec_ssh。
+  - kind="db"：对外暴露 exec_sql。
+
+  资源模式（resourceMode）：
+  - "bound"（默认）：绑定资源为 SSH 会话 / DB profile，工具只传 command/sql。
+  - "client"（客户端直连）：免绑定实例，调用方在工具参数中传
+    host/port/username/password，凭据即用即弃、不存储不落日志。
 
   功能：
+  - 资源模式开关（直连模式隐藏绑定 UI 并展示安全提示）。
   - 绑定资源下拉（启动前/后均可改；运行中改后提示"需重启生效"）。
   - 监听地址（默认 0.0.0.0）与端口可编辑。
   - token 生成 / 复制。
@@ -39,14 +45,24 @@ const loadingDbs = ref(false);
 const isSsh = computed(() => props.kind === "ssh");
 /** kind 中文标题。 */
 const title = computed(() => (isSsh.value ? "SSH MCP" : "DB MCP"));
-/** 该 kind 对外暴露的工具说明。 */
-const toolHint = computed(() =>
-  isSsh.value ? "对外暴露 exec_ssh(command)，目标服务器即下方绑定的 SSH 会话。" : "对外暴露 exec_sql(sql)，目标数据库即下方绑定的连接。",
-);
+/** 该 kind 对外暴露的工具说明（按资源模式分支）。 */
+const toolHint = computed(() => {
+  if (clientMode.value) {
+    return isSsh.value
+      ? "对外暴露 exec_ssh(host/port/username/password/command)：目标服务器由调用方在参数中指定，免绑定本地实例。"
+      : "对外暴露 exec_sql(host/port/username/password/database/sql)：目标数据库由调用方在参数中指定，免绑定本地实例。";
+  }
+  return isSsh.value
+    ? "对外暴露 exec_ssh(command)，目标服务器即下方绑定的 SSH 会话。"
+    : "对外暴露 exec_sql(sql)，目标数据库即下方绑定的连接。";
+});
 
 const config = computed(() => (isSsh.value ? mcp.sshConfig : mcp.dbConfig));
 const status = computed(() => (isSsh.value ? mcp.sshStatus : mcp.dbStatus));
 const loading = computed(() => mcp.loading[props.kind]);
+
+/** 客户端直连模式（免绑定实例）：目标与账密由调用方在工具参数中传入。 */
+const clientMode = computed(() => config.value.resourceMode === "client");
 
 /** 该 kind 是否有可用资源可选。 */
 const hasResources = computed(() =>
@@ -164,15 +180,15 @@ async function saveAutoApprove() {
 }
 
 async function start() {
-  if (!config.value.resourceId) {
-    ElMessage.warning(`请先选择一个${isSsh.value ? "SSH 会话" : "数据库连接"}再启动`);
+  if (!clientMode.value && !config.value.resourceId) {
+    ElMessage.warning(`请先选择一个${isSsh.value ? "SSH 会话" : "数据库连接"}，或开启「客户端直连模式」`);
     return;
   }
   if (!config.value.token) {
     ElMessage.warning("请先生成 token 再启动");
     return;
   }
-  // 先把当前 host/port/resourceId 落盘，再用配置启动。
+  // 先把当前 host/port/resourceId/resourceMode 落盘，再用配置启动。
   await saveConfigAndMaybeWarn();
   try {
     const s = await mcp.start(props.kind);
@@ -225,8 +241,41 @@ onMounted(async () => {
       <div class="card-title">{{ title }}</div>
       <div class="card-desc">{{ toolHint }}</div>
 
-      <!-- 绑定资源 -->
-      <div class="field-row">
+      <!-- 资源模式开关：绑定模式 / 客户端直连模式 -->
+      <div class="mode-row">
+        <div class="switch-label">
+          <div>客户端直连模式（免绑定实例）</div>
+          <div class="switch-desc">
+            开启后无需绑定本地资源，调用方在工具参数中传入目标服务器与账密
+            （host/port/username/password）。适用于调用方自带服务器账密表的巡检场景。
+          </div>
+        </div>
+        <el-switch
+          v-model="config.resourceMode"
+          active-value="client"
+          inactive-value="bound"
+          @change="saveConfigAndMaybeWarn"
+        />
+      </div>
+
+      <!-- 直连模式安全提示 -->
+      <el-alert
+        v-if="clientMode"
+        type="warning"
+        :closable="false"
+        show-icon
+        class="mt8"
+      >
+        <div class="client-mode-alert">
+          <div>调用方需在工具参数中传 <code>host</code> / <code>port</code> /
+            <code>username</code> / <code>password</code>（DB 另可传 <code>database</code>）。</div>
+          <div>密码<strong>仅本次调用有效</strong>：不存储、不落日志、不显示在确认弹窗中。</div>
+          <div>切换本模式后需<strong>重启 MCP 服务</strong>才能生效。</div>
+        </div>
+      </el-alert>
+
+      <!-- 绑定资源（仅绑定模式） -->
+      <div v-if="!clientMode" class="field-row">
         <label class="field-label">
           绑定{{ isSsh ? "SSH 会话" : "数据库连接" }}
           <span class="required">*</span>
@@ -258,8 +307,8 @@ onMounted(async () => {
         </el-select>
       </div>
 
-      <!-- DB MCP：绑定具体数据库 -->
-      <div v-if="!isSsh" class="field-row">
+      <!-- DB MCP：绑定具体数据库（仅绑定模式） -->
+      <div v-if="!isSsh && !clientMode" class="field-row">
         <label class="field-label">绑定数据库（可选）</label>
         <el-select
           v-model="config.boundDatabase"
@@ -280,12 +329,12 @@ onMounted(async () => {
         </div>
       </div>
       <el-alert
-        v-if="!hasResources"
+        v-if="!clientMode && !hasResources"
         type="warning"
         :closable="false"
         show-icon
         class="mt8"
-        :title="`暂无可用${isSsh ? 'SSH 会话' : '数据库连接'}，请先在对应页面创建`"
+        :title="`暂无可用${isSsh ? 'SSH 会话' : '数据库连接'}，请先在对应页面创建，或开启「客户端直连模式」`"
       />
 
       <!-- 监听地址 + 端口 -->
@@ -348,7 +397,11 @@ onMounted(async () => {
         <el-tag :type="status.running ? 'success' : 'info'" effect="dark" size="small">
           {{ status.running ? "运行中" : "已停止" }}
         </el-tag>
-        <template v-if="status.running && boundResourceName">
+        <template v-if="status.running && clientMode">
+          <span class="status-label">模式</span>
+          <span class="bound-name">客户端直连（未绑定）</span>
+        </template>
+        <template v-else-if="status.running && boundResourceName">
           <span class="status-label">绑定</span>
           <span class="bound-name">{{ boundResourceName }}</span>
         </template>
@@ -394,6 +447,7 @@ onMounted(async () => {
       <div class="card-desc">
         外部客户端请求时需在 Header 携带
         <code>Authorization: Bearer &lt;token&gt;</code>，或在 URL 加 <code>?token=&lt;token&gt;</code>。
+        <strong>请妥善保管 token</strong>：任何持有 token 的客户端均可调用本服务执行操作。
       </div>
       <div class="token-row">
         <el-input :model-value="config.token ?? ''" placeholder="点击生成 token" readonly class="token-input">
@@ -415,7 +469,7 @@ onMounted(async () => {
       </div>
       <div v-if="!status.running || !config.token" class="config-empty">
         <el-alert type="info" :closable="false" show-icon>
-          请先绑定资源、生成 token 并启动服务，配置将自动生成。
+          请先完成配置（{{ clientMode ? "直连模式无需绑定实例" : "绑定资源" }}）、生成 token 并启动服务，配置将自动生成。
         </el-alert>
       </div>
       <template v-else>
@@ -496,6 +550,22 @@ onMounted(async () => {
 }
 .port-field {
   max-width: 160px;
+}
+.mode-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+.client-mode-alert {
+  font-size: 12px;
+  line-height: 1.8;
+}
+.client-mode-alert code {
+  background: var(--el-fill-color-light);
+  padding: 1px 4px;
+  border-radius: 3px;
 }
 .hint-text {
   font-size: 12px;

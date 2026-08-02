@@ -20,8 +20,14 @@ export interface McpInstanceConfig {
   port: number;
   /** Bearer token（未生成则 undefined）。 */
   token?: string;
-  /** 绑定的资源 id：SSH 会话 id（ssh）或 DB profile id（db）。 */
+  /** 绑定的资源 id：SSH 会话 id（ssh）或 DB profile id（db）。仅 bound 模式必填。 */
   resourceId?: string;
+  /**
+   * 资源模式："bound"（绑定本地资源，默认）| "client"（客户端直连，免绑定实例）。
+   * client 模式下调用方需在工具参数中传 host/port/username/password，
+   * 凭据仅本次调用有效、不存储不落日志。
+   */
+  resourceMode: "bound" | "client";
   /** 绑定的具体数据库名（仅 db kind）。设置后 exec_sql 只针对该库。 */
   boundDatabase?: string;
   /** 自动放行：开启后 exec_ssh/exec_sql 跳过人工确认直接执行。默认 false。 */

@@ -37,6 +37,7 @@ export const useMcpStore = defineStore("mcp", () => {
       port: kind === "ssh" ? 8765 : 8766,
       token: undefined,
       resourceId: undefined,
+      resourceMode: "bound",
       boundDatabase: undefined,
       autoApprove: false,
       enableLog: true,

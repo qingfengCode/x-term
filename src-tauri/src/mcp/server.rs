@@ -103,8 +103,11 @@ pub fn mcp_server_status(kind: McpKind) -> McpServerStatus {
 /// 启动 MCP 服务端。
 ///
 /// 绑定 `host:port`，用 `token` 做 Bearer 校验。成功后后台 spawn 一个 axum 任务运行，
-/// 句柄存入全局 [`SERVERS`]。`bound_resource_id` 是该 MCP 绑定的资源 id（SSH 会话 id
-/// 或 DB profile id），执行工具时按此 id 解析目标。若该 kind 已有实例运行则返回错误。
+/// 句柄存入全局 [`SERVERS`]。
+///
+/// `bound_resource_id` 是该 MCP 绑定的资源 id（SSH 会话 id 或 DB profile id），执行
+/// 工具时按此 id 解析目标；`resource_mode == "client"`（客户端直连）时传 `None`，
+/// 目标与凭据由调用方在工具参数中传入。若该 kind 已有实例运行则返回错误。
 pub async fn start_mcp_server(
     kind: McpKind,
     app: AppHandle,
@@ -112,8 +115,9 @@ pub async fn start_mcp_server(
     host: String,
     port: u16,
     token: String,
-    bound_resource_id: String,
+    bound_resource_id: Option<String>,
     bound_database: Option<String>,
+    resource_mode: String,
     auto_approve: bool,
     enable_log: bool,
 ) -> AppResult<()> {
@@ -129,6 +133,14 @@ pub async fn start_mcp_server(
 
     // 启动时设置自动放行开关。
     set_auto_approve(kind, auto_approve);
+
+    // 资源模式规范化：仅 "client" 视为直连模式，其余一律按 bound 处理。
+    let resource_mode = if resource_mode == "client" {
+        "client"
+    } else {
+        "bound"
+    };
+    let bound_resource_id = bound_resource_id.unwrap_or_default();
 
     // 绑定监听端口。
     let addr: SocketAddr = format!("{}:{}", host, port)
@@ -155,13 +167,19 @@ pub async fn start_mcp_server(
             McpKind::Db => "db",
         };
         let path = log_dir.join(format!("mcp-{}-{}.log", kind_str, ts));
+        let bound_desc = if resource_mode == "client" {
+            "(客户端直连，未绑定)".to_string()
+        } else {
+            bound_resource_id.clone()
+        };
         let header = format!(
-            "=== X-Term {} 执行日志 ===\n启动时间: {}\n监听: {}:{}\n绑定资源: {}\n绑定数据库: {}\n自动放行: {}\n---\n",
+            "=== X-Term {} 执行日志 ===\n启动时间: {}\n监听: {}:{}\n资源模式: {}\n绑定资源: {}\n绑定数据库: {}\n自动放行: {}\n---\n",
             kind.label(),
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
             host,
             port,
-            bound_resource_id,
+            resource_mode,
+            bound_desc,
             bound_database.as_deref().unwrap_or("(默认)"),
             if auto_approve { "是" } else { "否" },
         );
@@ -177,6 +195,7 @@ pub async fn start_mcp_server(
         app: app.clone(),
         state: state.clone(),
         kind,
+        resource_mode: resource_mode.to_string(),
         bound_resource_id,
         bound_database,
         token,
@@ -278,8 +297,11 @@ struct SharedState {
     state: AppState,
     /// 该实例是 SSH MCP 还是 DB MCP（决定对外暴露哪个工具）。
     kind: McpKind,
+    /// 资源模式："bound"（绑定本地资源）| "client"（客户端直连，目标/凭据来自参数）。
+    /// 决定工具定义、目标解析与确认请求的脱敏行为。
+    resource_mode: String,
     /// 绑定的资源 id：SSH 会话 id（kind=Ssh）或 DB profile id（kind=Db）。
-    /// 工具执行时按此 id 解析目标，外部客户端无需传连接名。
+    /// 工具执行时按此 id 解析目标，外部客户端无需传连接名。client 模式下为空串。
     bound_resource_id: String,
     /// 绑定的具体数据库名（仅 kind=Db 有效）。设置后 exec_sql 只针对该库。
     bound_database: Option<String>,
@@ -598,7 +620,7 @@ async fn dispatch(shared: &Arc<SharedState>, req: &JsonRpcRequest) -> JsonRpcRes
             JsonRpcResponse::success(req.id.clone(), result)
         }
         "tools/list" => {
-            let tools = tool_defs(shared.kind, shared.bound_database.as_deref());
+            let tools = tool_defs(shared.kind, &shared.resource_mode, shared.bound_database.as_deref());
             JsonRpcResponse::success(req.id.clone(), json!({ "tools": tools }))
         }
         "tools/call" => {
@@ -643,8 +665,13 @@ fn parse_call_params(params: &Option<Value>) -> Result<(String, Value), String> 
 /// `result` 形如 `{content: [{type:"text", text:"..."}], isError: bool}`。
 ///
 /// 按 `shared.kind` 分派到该实例唯一的工具：SSH MCP 只认 `exec_ssh`，DB MCP 只认
-/// `exec_sql`。目标资源由 `shared.bound_resource_id` 决定（用户在页面手动绑定），
-/// 不从 arguments 读连接名——外部客户端只需传 command / sql。写操作仍经人工确认。
+/// `exec_sql`。目标资源由模式决定：
+/// - bound 模式：`shared.bound_resource_id`（用户在页面手动绑定），不从 arguments 读
+///   连接名——外部客户端只需传 command / sql。
+/// - client 模式：目标与凭据从 arguments 解析（host/port/username/password），
+///   确认请求中的参数副本会剔除 password（防明文出现在前端浮层/事件）。
+///
+/// 写操作仍经人工确认。
 async fn handle_tool_call(
     shared: &Arc<SharedState>,
     name: &str,
@@ -663,21 +690,14 @@ async fn handle_tool_call(
         ))));
     }
 
-    // 绑定资源为空则拒绝（启动时已校验，这里是双保险）。
-    if shared.bound_resource_id.is_empty() {
-        return tool_text_result(Err(AppError::InvalidInput(format!(
-            "{} 未绑定资源",
-            shared.kind.label()
-        ))));
-    }
-
-    // 解析绑定的资源展示名（前端确认浮层标注来源）。
-    let resource_name = match shared.kind {
-        McpKind::Ssh => exec::session_name_by_id(&shared.state, &shared.bound_resource_id),
-        McpKind::Db => exec::profile_name_by_id(&shared.state, &shared.bound_resource_id),
+    // 解析本次调用的执行目标（bound：绑定资源；client：参数直连）。
+    let target = match resolve_target(shared, arguments) {
+        Ok(t) => t,
+        Err(e) => return tool_text_result(Err(e)),
     };
+    let resource_name = target.display_name();
 
-    // 执行内容原文（记录到日志：SSH 命令 / SQL）。
+    // 执行内容原文（记录到日志：SSH 命令 / SQL，不含密码）。
     let exec_detail = match shared.kind {
         McpKind::Ssh => format!("command: {}", exec::arg_command(arguments).unwrap_or_default()),
         McpKind::Db => format!("sql: {}", exec::arg_sql(arguments).unwrap_or_default()),
@@ -686,42 +706,12 @@ async fn handle_tool_call(
     // 自动放行：跳过人工确认直接执行。
     if is_auto_approved(shared.kind) {
         log::info!(
-            "[mcp] {} 自动放行，直接执行（绑定资源: {}）",
+            "[mcp] {} 自动放行，直接执行（目标: {}）",
             shared.kind.label(),
             resource_name
         );
         let started = std::time::Instant::now();
-        let res = match shared.kind {
-            McpKind::Ssh => {
-                let command = match exec::arg_command(arguments) {
-                    Ok(c) => c,
-                    Err(e) => return tool_text_result(Err(e)),
-                };
-                exec::exec_ssh_by_id(
-                    &shared.state,
-                    &shared.bound_resource_id,
-                    &command,
-                    shared.app.clone(),
-                )
-                .await
-            }
-            McpKind::Db => {
-                let sql = match exec::arg_sql(arguments) {
-                    Ok(s) => s,
-                    Err(e) => return tool_text_result(Err(e)),
-                };
-                let limit = exec::arg_limit(arguments);
-                exec::exec_sql_by_id(
-                    &shared.state,
-                    &shared.bound_resource_id,
-                    &sql,
-                    limit,
-                    shared.bound_database.as_deref(),
-                    shared.app.clone(),
-                )
-                .await
-            }
-        };
+        let res = run_target(shared, &target, arguments).await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
         log_execution(shared, name, &format!("[自动放行] {} | {}", resource_name, exec_detail), &res, elapsed_ms);
         return tool_text_result(res);
@@ -733,11 +723,13 @@ async fn handle_tool_call(
         McpKind::Ssh => describe_exec_ssh(arguments, &resource_name),
         McpKind::Db => describe_exec_sql(arguments, &resource_name),
     };
+    // client 模式：确认请求的参数副本剔除 password，避免明文密码出现在前端浮层/事件。
+    let approval_args = redact_arguments(shared, arguments);
     let approval = ApprovalRequest {
         request_id: uuid::Uuid::new_v4().to_string(),
         kind: shared.kind,
         tool_name: name.into(),
-        arguments: arguments.clone(),
+        arguments: approval_args,
         description,
         client_name,
         resource_name: resource_name.clone(),
@@ -750,37 +742,7 @@ async fn handle_tool_call(
     {
         Ok(true) => {
             let started = std::time::Instant::now();
-            let res = match shared.kind {
-                McpKind::Ssh => {
-                    let command = match exec::arg_command(arguments) {
-                        Ok(c) => c,
-                        Err(e) => return tool_text_result(Err(e)),
-                    };
-                    exec::exec_ssh_by_id(
-                        &shared.state,
-                        &shared.bound_resource_id,
-                        &command,
-                        shared.app.clone(),
-                    )
-                    .await
-                }
-                McpKind::Db => {
-                    let sql = match exec::arg_sql(arguments) {
-                        Ok(s) => s,
-                        Err(e) => return tool_text_result(Err(e)),
-                    };
-                    let limit = exec::arg_limit(arguments);
-                    exec::exec_sql_by_id(
-                        &shared.state,
-                        &shared.bound_resource_id,
-                        &sql,
-                        limit,
-                        shared.bound_database.as_deref(),
-                        shared.app.clone(),
-                    )
-                    .await
-                }
-            };
+            let res = run_target(shared, &target, arguments).await;
             let elapsed_ms = started.elapsed().as_millis() as u64;
             log_execution(shared, name, &format!("[已确认] {} | {}", resource_name, exec_detail), &res, elapsed_ms);
             tool_text_result(res)
@@ -800,6 +762,190 @@ async fn handle_tool_call(
         }
         Err(e) => tool_text_result(Err(e)),
     }
+}
+
+// ===========================================================================
+// 执行目标解析（bound / client 双模式）
+// ===========================================================================
+
+/// 本次工具调用的执行目标。
+#[derive(Debug)]
+enum ResolvedTarget {
+    /// 绑定模式：本地资源 id（SSH 会话 / DB profile）。
+    Bound { resource_id: String, display: String },
+    /// 客户端直连模式：目标与凭据全部来自工具参数。
+    Direct {
+        host: String,
+        port: u16,
+        username: String,
+        password: String,
+        display: String,
+    },
+}
+
+impl ResolvedTarget {
+    /// 展示名：bound 为资源名，client 为 `user@host:port`（供确认浮层/日志标注来源）。
+    fn display_name(&self) -> String {
+        match self {
+            ResolvedTarget::Bound { display, .. } | ResolvedTarget::Direct { display, .. } => {
+                display.clone()
+            }
+        }
+    }
+}
+
+/// 解析本次调用的执行目标。
+///
+/// - bound 模式：校验绑定资源非空，展示名为资源名（找不到时回退占位）。
+/// - client 模式：从工具参数解析 host/port/username/password（password 必填，
+///   仅本次调用使用），展示名为 `user@host:port`。
+fn resolve_target(shared: &SharedState, arguments: &Value) -> Result<ResolvedTarget, AppError> {
+    let client_mode = shared.resource_mode == "client";
+    match shared.kind {
+        McpKind::Ssh if client_mode => {
+            let host = exec::arg_host(arguments)?;
+            let port = exec::arg_port(arguments)?;
+            let username = exec::arg_username(arguments)?;
+            let password = exec::arg_password(arguments)?;
+            Ok(ResolvedTarget::Direct {
+                display: format!("{}@{}:{}", username, host, port),
+                host,
+                port,
+                username,
+                password,
+            })
+        }
+        McpKind::Ssh => {
+            if shared.bound_resource_id.is_empty() {
+                return Err(AppError::InvalidInput(format!(
+                    "{} 未绑定资源",
+                    shared.kind.label()
+                )));
+            }
+            let display = exec::session_name_by_id(&shared.state, &shared.bound_resource_id);
+            Ok(ResolvedTarget::Bound {
+                resource_id: shared.bound_resource_id.clone(),
+                display,
+            })
+        }
+        McpKind::Db if client_mode => {
+            let host = exec::arg_host(arguments)?;
+            let port = exec::arg_port(arguments)?;
+            let username = exec::arg_username(arguments)?;
+            let password = exec::arg_password(arguments)?;
+            Ok(ResolvedTarget::Direct {
+                display: format!("{}@{}:{}", username, host, port),
+                host,
+                port,
+                username,
+                password,
+            })
+        }
+        McpKind::Db => {
+            if shared.bound_resource_id.is_empty() {
+                return Err(AppError::InvalidInput(format!(
+                    "{} 未绑定资源",
+                    shared.kind.label()
+                )));
+            }
+            let display = exec::profile_name_by_id(&shared.state, &shared.bound_resource_id);
+            Ok(ResolvedTarget::Bound {
+                resource_id: shared.bound_resource_id.clone(),
+                display,
+            })
+        }
+    }
+}
+
+/// 按已解析的目标执行工具（bound → 本地绑定资源；client → 参数直连）。
+async fn run_target(
+    shared: &Arc<SharedState>,
+    target: &ResolvedTarget,
+    arguments: &Value,
+) -> AppResult<String> {
+    match shared.kind {
+        McpKind::Ssh => {
+            let command = exec::arg_command(arguments)?;
+            match target {
+                ResolvedTarget::Bound { resource_id, .. } => {
+                    exec::exec_ssh_by_id(
+                        &shared.state,
+                        resource_id,
+                        &command,
+                        shared.app.clone(),
+                    )
+                    .await
+                }
+                ResolvedTarget::Direct {
+                    host,
+                    port,
+                    username,
+                    password,
+                    ..
+                } => {
+                    exec::exec_ssh_direct(
+                        host,
+                        *port,
+                        username,
+                        password,
+                        &command,
+                        shared.app.clone(),
+                    )
+                    .await
+                }
+            }
+        }
+        McpKind::Db => {
+            let sql = exec::arg_sql(arguments)?;
+            let limit = exec::arg_limit(arguments);
+            match target {
+                ResolvedTarget::Bound { resource_id, .. } => {
+                    exec::exec_sql_by_id(
+                        &shared.state,
+                        resource_id,
+                        &sql,
+                        limit,
+                        shared.bound_database.as_deref(),
+                        shared.app.clone(),
+                    )
+                    .await
+                }
+                ResolvedTarget::Direct {
+                    host,
+                    port,
+                    username,
+                    password,
+                    ..
+                } => {
+                    // 客户端直连：database 取参数（可选），未传则不指定默认库。
+                    let database = exec::arg_database(arguments);
+                    exec::exec_sql_direct(
+                        host,
+                        *port,
+                        username,
+                        password,
+                        database.as_deref(),
+                        &sql,
+                        limit,
+                    )
+                    .await
+                }
+            }
+        }
+    }
+}
+
+/// 构造发给前端的确认请求参数副本。
+///
+/// client 模式下工具参数含 password，原样透传会把明文密码送进前端浮层/事件，
+/// 这里剔除后返回（执行仍用原始 arguments）。
+fn redact_arguments(shared: &SharedState, arguments: &Value) -> Value {
+    if shared.resource_mode != "client" {
+        return arguments.clone();
+    }
+    let mut map = arguments.as_object().cloned().unwrap_or_default();
+    map.remove("password");
+    Value::Object(map)
 }
 
 /// 把一个 `AppResult<String>`（工具输出）封装成 MCP `tools/call` 的 result JSON。
@@ -883,49 +1029,139 @@ fn describe_exec_sql(arguments: &Value, resource: &str) -> String {
 ///
 /// SSH MCP 只暴露 `exec_ssh`（目标由绑定决定，免传连接名）；
 /// DB MCP 只暴露 `exec_sql`（若绑定了具体库，描述中注明）。
-fn tool_defs(kind: McpKind, bound_database: Option<&str>) -> Vec<Value> {
+///
+/// 按 `resource_mode` 分支：
+/// - `"bound"`（默认）：目标由绑定资源决定，工具参数只传 command/sql。
+/// - `"client"`（客户端直连）：目标与凭据由调用方在参数中传入
+///   （host/port/username/password），工具描述中注明密码不存储不落日志。
+fn tool_defs(kind: McpKind, resource_mode: &str, bound_database: Option<&str>) -> Vec<Value> {
+    let client_mode = resource_mode == "client";
     match kind {
-        McpKind::Ssh => vec![json!({
-            "name": "exec_ssh",
-            "description": "在当前 SSH MCP 绑定的服务器上执行一条 shell 命令（非交互），\
+        McpKind::Ssh => {
+            if client_mode {
+                vec![json!({
+                    "name": "exec_ssh",
+                    "description": "在调用方指定的服务器上执行一条 shell 命令（非交互），\
+返回标准输出和标准错误的合并文本。目标服务器由参数 host/port/username 指定，\
+password 为登录密码（敏感字段，仅本次调用有效，X-Term 不存储、不落日志）。\
+单命令超时 30 秒，输出截断 16KB。执行前需要 X-Term 用户人工确认。",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "host": {
+                                "type": "string",
+                                "description": "目标服务器 IP 或域名"
+                            },
+                            "port": {
+                                "type": "integer",
+                                "description": "SSH 端口，默认 22",
+                                "minimum": 1,
+                                "maximum": 65535
+                            },
+                            "username": {
+                                "type": "string",
+                                "description": "登录用户名"
+                            },
+                            "password": {
+                                "type": "string",
+                                "description": "登录密码（敏感字段，仅本次调用有效）"
+                            },
+                            "command": {
+                                "type": "string",
+                                "description": "要执行的 shell 命令（单条，非交互）"
+                            }
+                        },
+                        "required": ["host", "username", "password", "command"]
+                    }
+                })]
+            } else {
+                vec![json!({
+                    "name": "exec_ssh",
+                    "description": "在当前 SSH MCP 绑定的服务器上执行一条 shell 命令（非交互），\
 返回标准输出和标准错误的合并文本。单命令超时 30 秒，输出截断 16KB。\
 目标服务器由 X-Term 用户在页面绑定（无需传连接名）。执行前需要 X-Term 用户人工确认。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "要执行的 shell 命令（单条，非交互）"
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "command": {
+                                "type": "string",
+                                "description": "要执行的 shell 命令（单条，非交互）"
+                            }
+                        },
+                        "required": ["command"]
                     }
-                },
-                "required": ["command"]
+                })]
             }
-        })],
+        }
         McpKind::Db => {
-            let db_hint = match bound_database {
-                Some(db) => format!("当前绑定的数据库为「{}」，SQL 将在此库上执行。", db),
-                None => "目标数据库由 X-Term 用户在页面绑定（无需传连接名）。".to_string(),
-            };
-            vec![json!({
-                "name": "exec_sql",
-                "description": format!(
-                    "在当前 DB MCP 绑定的 MySQL 上执行 SQL，返回结果表格文本。{}\
+            if client_mode {
+                vec![json!({
+                    "name": "exec_sql",
+                    "description": "在调用方指定的 MySQL 服务器上执行 SQL，返回结果表格文本。\
+目标数据库由参数 host/port/username 指定，password 为连接密码（敏感字段，仅本次调用有效，\
+X-Term 不存储、不落日志）。database 可选，传则作为默认库。\
 执行前需要 X-Term 用户人工确认。",
-                    db_hint
-                ),
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "sql": { "type": "string", "description": "要执行的 SQL 语句" },
-                        "limit": {
-                            "type": "integer",
-                            "description": "返回行数上限，默认 100",
-                            "minimum": 1
-                        }
-                    },
-                    "required": ["sql"]
-                }
-            })]
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "host": {
+                                "type": "string",
+                                "description": "目标 MySQL 服务器 IP 或域名"
+                            },
+                            "port": {
+                                "type": "integer",
+                                "description": "MySQL 端口，默认 3306",
+                                "minimum": 1,
+                                "maximum": 65535
+                            },
+                            "username": {
+                                "type": "string",
+                                "description": "连接用户名"
+                            },
+                            "password": {
+                                "type": "string",
+                                "description": "连接密码（敏感字段，仅本次调用有效）"
+                            },
+                            "database": {
+                                "type": "string",
+                                "description": "默认数据库（可选，省略则 SQL 需带库名限定）"
+                            },
+                            "sql": { "type": "string", "description": "要执行的 SQL 语句" },
+                            "limit": {
+                                "type": "integer",
+                                "description": "返回行数上限，默认 100",
+                                "minimum": 1
+                            }
+                        },
+                        "required": ["host", "username", "password", "sql"]
+                    }
+                })]
+            } else {
+                let db_hint = match bound_database {
+                    Some(db) => format!("当前绑定的数据库为「{}」，SQL 将在此库上执行。", db),
+                    None => "目标数据库由 X-Term 用户在页面绑定（无需传连接名）。".to_string(),
+                };
+                vec![json!({
+                    "name": "exec_sql",
+                    "description": format!(
+                        "在当前 DB MCP 绑定的 MySQL 上执行 SQL，返回结果表格文本。{}\
+执行前需要 X-Term 用户人工确认。",
+                        db_hint
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "sql": { "type": "string", "description": "要执行的 SQL 语句" },
+                            "limit": {
+                                "type": "integer",
+                                "description": "返回行数上限，默认 100",
+                                "minimum": 1
+                            }
+                        },
+                        "required": ["sql"]
+                    }
+                })]
+            }
         }
     }
 }

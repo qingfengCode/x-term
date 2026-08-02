@@ -120,6 +120,14 @@ export interface SqlAgentSettings {
   terminalVisualization: boolean;
 }
 
+/** AI 本地文件读写配置（read_file / write_file / list_files 工具）。 */
+export interface FileAccessSettings {
+  /** 是否启用本地文件读写。关闭时 AI 行为与之前完全一致。 */
+  enabled: boolean;
+  /** 各助手域的工作目录：key = "ssh" | "db"，值为绝对路径。 */
+  workspaceDirs: Record<string, string>;
+}
+
 export interface AiSettings {
   providers: ProviderConfig[];
   active: string | null;
@@ -127,6 +135,8 @@ export interface AiSettings {
   sshAgent: SshAgentSettings;
   /** SQL 智能体配置。 */
   sqlAgent: SqlAgentSettings;
+  /** 本地文件读写配置。 */
+  fileAccess: FileAccessSettings;
   /** 旧字段（向后兼容读取，不再写出；store 加载时迁移到 sshAgent）。 */
   commandWhitelist?: string[];
   autoApproveWhitelist?: boolean;

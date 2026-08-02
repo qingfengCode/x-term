@@ -28,7 +28,7 @@ use tauri::{AppHandle, State};
 
 use crate::ai::provider::{build_provider, ChatMessage};
 use crate::ai::tools::{self, ToolApproval, ToolResult};
-use crate::config::{settings_load_inner, SshAgentSettings, SqlAgentSettings};
+use crate::config::{settings_load_inner, FileAccessSettings, SshAgentSettings, SqlAgentSettings};
 use crate::error::{AppError, AppResult};
 use crate::events::{
     self, AiDoneEvent, AiErrorEvent, AiToolCallEvent, AiToolResultEvent, AI_DONE, AI_ERROR,
@@ -58,6 +58,10 @@ pub struct AiChatRequest {
     /// 当前活动 MySQL 连接 id（保留字段）。
     #[serde(default)]
     pub active_db_conn_id: Option<String>,
+    /// 请求所属助手域："ssh"（终端助手）| "db"（数据库助手）。
+    /// 文件工具（read_file / write_file / list_files）据此取对应工作目录。
+    #[serde(default)]
+    pub domain: Option<String>,
 }
 
 /// 发起一次 AI 对话（流式；agent 模式下走多轮工具调用循环）。
@@ -80,8 +84,10 @@ pub async fn ai_chat(
     // SSH / SQL 智能体配置：分别克隆一份 move 进 spawned task。
     // SSH 域读 ssh_agent（command_whitelist / auto_approve_safe / terminal_visualization），
     // SQL 域读 sql_agent（sql_mode / auto_approve_safe）。
+    // 文件读写配置：启用时下发文件工具，按请求 domain 取工作目录。
     let ssh_cfg = settings.ai.ssh_agent.clone();
     let sql_cfg = settings.ai.sql_agent.clone();
+    let file_cfg = settings.ai.file_access.clone();
 
     // AppState 所有字段均为 Arc，clone 廉价且共享同一份内部数据。
     let task_state = state.inner().clone();
@@ -99,6 +105,7 @@ pub async fn ai_chat(
             provider,
             ssh_cfg,
             sql_cfg,
+            file_cfg,
         )
         .await;
         // 任务结束（正常完成或被 abort）后，从 pending_ai_tasks 移除自己。
@@ -223,6 +230,45 @@ pub fn ai_add_to_whitelist(command: String, state: State<'_, AppState>) -> AppRe
     Ok(())
 }
 
+/// 设置某个助手域的工作目录并持久化（设置页「本地文件读写」卡片触发）。
+///
+/// `domain` 为 "ssh"（终端助手）| "db"（数据库助手）；`path` 为绝对路径。
+/// AI 只能在该目录及子目录内读写文件（沙箱）。传空串清除配置。
+#[tauri::command]
+pub fn set_workspace_dir(
+    domain: String,
+    path: String,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    if domain != "ssh" && domain != "db" {
+        return Err(AppError::InvalidInput(format!("无效的助手域: {domain}")));
+    }
+    let mut settings = settings_load_inner(&state)?;
+    if path.trim().is_empty() {
+        settings.ai.file_access.workspace_dirs.remove(&domain);
+    } else {
+        // 校验目录存在（不校验是否为目录内可达，AI 执行期会 canonicalize 复查）。
+        let p = std::path::Path::new(path.trim());
+        if !p.is_absolute() {
+            return Err(AppError::InvalidInput("工作目录必须是绝对路径".into()));
+        }
+        if !p.exists() {
+            return Err(AppError::NotFound(format!("目录不存在: {}", p.display())));
+        }
+        settings
+            .ai
+            .file_access
+            .workspace_dirs
+            .insert(domain, path.trim().to_string());
+    }
+    let path = state
+        .settings_path
+        .as_path()
+        .join(crate::config::SETTINGS_FILENAME);
+    crate::storage::json_store::write_json(&path, &settings)?;
+    Ok(())
+}
+
 // ===========================================================================
 // 智能体编排循环
 // ===========================================================================
@@ -239,16 +285,30 @@ async fn run_agent_loop(
     provider: Box<dyn crate::ai::provider::LlmProvider>,
     ssh_cfg: SshAgentSettings,
     sql_cfg: SqlAgentSettings,
+    file_cfg: FileAccessSettings,
 ) -> AppResult<()> {
     // agent_mode 决定是否传入工具集。false 时 tools 为空，等同普通对话。
-    // 工具集按活动上下文裁剪（块A）：有活动终端→SSH 工具；有活动 DB 连接→SQL 工具。
-    let tools = if req.agent_mode {
-        tools::tools_for_context(
+    // 工具集按活动上下文裁剪（块A）：有活动终端→SSH 工具；有活动 DB 连接→SQL 工具；
+    // 设置页开启「本地文件读写」→ 追加文件工具（read_file/write_file/list_files）。
+    let mut tools = Vec::new();
+    if req.agent_mode {
+        tools.extend(tools::tools_for_context(
             req.active_terminal_id.as_deref(),
             req.active_db_conn_id.as_deref(),
-        )
+        ));
+        if file_cfg.enabled {
+            tools.extend(tools::file_tools());
+        }
+    }
+    // 文件工具按请求所属域取工作目录（未配置时执行器返回明确错误引导用户）。
+    let file_domain = req.domain.as_deref().unwrap_or("");
+    let file_workspace = if file_cfg.enabled {
+        file_cfg
+            .workspace_dirs
+            .get(file_domain)
+            .map(|p| std::path::PathBuf::from(p))
     } else {
-        Vec::new()
+        None
     };
     let allowed = tools::allowed_tool_names(&tools);
     let mut messages = req.messages.clone();
@@ -328,7 +388,11 @@ async fn run_agent_loop(
                 });
                 continue;
             }
-            let dangerous = tools::is_dangerous(&call.name, &call.arguments);
+            let dangerous = tools::is_dangerous(
+                &call.name,
+                &call.arguments,
+                file_workspace.as_deref(),
+            );
             let description = tools::describe_call(&call.name, &call.arguments);
 
             // === 域分发：按工具名取对应配置 + 计算 whitelisted / auto_run ===
@@ -336,12 +400,19 @@ async fn run_agent_loop(
             // exec_sql：先按 sql_mode 校验是否允许（不允许直接拒绝，不执行）；
             //           只读查询（is_readonly_sql）视作"安全"（前端绿色卡片），
             //           配合 sql_cfg.auto_approve_safe 自动放行。
+            // 文件工具（read_file/write_file/list_files）：启用后自动处理——
+            //           读/列自动执行，写文件仅覆盖已有文件（危险）时走确认。
             // 其它工具（terminal_snapshot / list_db_tables / describe_table）：默认安全，
             // 不走确认（auto_run = true，无副作用读操作）。
             let domain = if call.name == "exec_ssh" {
                 "ssh"
             } else if call.name == "exec_sql" {
                 "sql"
+            } else if matches!(
+                call.name.as_str(),
+                "read_file" | "write_file" | "list_files"
+            ) {
+                "file"
             } else {
                 "other"
             };
@@ -389,6 +460,7 @@ async fn run_agent_loop(
             //   - ssh：命令命中 ssh 白名单即 whitelisted=true（前端绿色卡片）；
             //          auto_run = auto_approve_safe && whitelisted && !dangerous。
             //   - sql：只读查询 whitelisted=true；auto_run = auto_approve_safe && 只读 && !dangerous。
+            //   - file：启用即自动处理（读/列直接执行；写仅覆盖已有文件时确认）。
             //   - 其它：无副作用读操作，whitelisted=false 但 auto_run=true（直接执行）。
             let (whitelisted, auto_run) = match domain {
                 "ssh" => {
@@ -410,6 +482,10 @@ async fn run_agent_loop(
                         .unwrap_or(false);
                     // 危险 SQL（DROP/TRUNCATE/无 WHERE DELETE）永远走人工确认。
                     (readonly, sql_cfg.auto_approve_safe && readonly && !dangerous)
+                }
+                "file" => {
+                    // 写文件若覆盖已有文件（dangerous）仍走确认，其余自动执行。
+                    (false, call.name != "write_file" || !dangerous)
                 }
                 _ => (false, true),
             };
@@ -440,7 +516,15 @@ async fn run_agent_loop(
 
             let result = if auto_run {
                 // 自动放行：不等待人工确认，直接执行。
-                let r = tools::execute_tool(app, &state, call, &allowed, visualization).await;
+                let r = tools::execute_tool(
+                    app,
+                    &state,
+                    call,
+                    &allowed,
+                    visualization,
+                    file_domain,
+                )
+                .await;
                 events::emit(
                     app,
                     AI_TOOL_RESULT,
@@ -462,8 +546,15 @@ async fn run_agent_loop(
 
                 match approval {
                     Ok(Ok(ToolApproval { approved: true })) => {
-                        let r = tools::execute_tool(app, &state, call, &allowed, visualization)
-                            .await;
+                        let r = tools::execute_tool(
+                            app,
+                            &state,
+                            call,
+                            &allowed,
+                            visualization,
+                            file_domain,
+                        )
+                        .await;
                         events::emit(
                             app,
                             AI_TOOL_RESULT,

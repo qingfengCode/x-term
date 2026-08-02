@@ -1,9 +1,12 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
-import { Promotion, Delete, ChatDotRound, DArrowRight, Connection, Tools, ArrowDown, Plus, Close, CopyDocument, RefreshRight, VideoPause, Document, Loading } from "@element-plus/icons-vue";
+import { Promotion, Delete, ChatDotRound, DArrowRight, Connection, Tools, ArrowDown, Plus, Close, CopyDocument, RefreshRight, VideoPause, Document, Loading, Download } from "@element-plus/icons-vue";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
+import { save } from "@tauri-apps/plugin-dialog";
+import { writeTextFile } from "@tauri-apps/plugin-fs";
+import { homeDir, join } from "@tauri-apps/api/path";
 import { useAiSshStore, useAiDbStore, type AiMessage } from "@/stores/ai";
 import { useSettingsStore } from "@/stores/settings";
 import { useTerminalsStore } from "@/stores/terminals";
@@ -12,7 +15,7 @@ import { useUiStore } from "@/stores/ui";
 import { dbShowCreateTable, type DraggedTable } from "@/api/db";
 import type { ToolCallItem } from "@/stores/ai";
 
-/** 助手域：ssh=终端页 SSH 助手；db=SQL 页数据库助手。决定用哪个 store、暴露哪些工具。 */
+/** 助手域：ssh=终端助手（终端页）；db=数据库助手（SQL 页）。决定用哪个 store、暴露哪些工具。 */
 const props = defineProps<{ domain: "ssh" | "db" }>();
 
 // 按 domain 选 store：两个 store 是同一 factory 产出的独立实例，状态完全隔离。
@@ -113,7 +116,7 @@ const MODE_OPTIONS = props.domain === "ssh" ? SSH_MODES : DB_MODES;
 const mode = ref<Mode>("agent");
 
 /** 面板标题：按域显示。 */
-const panelTitle = computed(() => (props.domain === "ssh" ? "SSH 助手" : "数据库助手"));
+const panelTitle = computed(() => (props.domain === "ssh" ? "终端助手" : "数据库助手"));
 
 // --- 对话标签重命名（双击进入编辑） ---
 const editingCid = ref<string | null>(null);
@@ -149,9 +152,6 @@ const contextTip = computed(() => {
       const tab = terminals.tabs.find((t) => t.instanceId === activeTerminalId.value);
       if (tab) parts.push(`终端: ${tab.session.name}`);
     }
-    return parts.length
-      ? `已附加: ${parts.join("、")}`
-      : "未选择活动终端，请先连接后 AI 才能操作";
   } else {
     // db 域
     if (db.activeConnId) {
@@ -160,10 +160,20 @@ const contextTip = computed(() => {
       // 追加当前关联库（点库/表或拖表时设置）。
       if (db.activeDatabase) parts.push(`库: ${db.activeDatabase}`);
     }
-    return parts.length
-      ? `已附加: ${parts.join(" · ")}`
-      : "未连接数据库，请先在 SQL 控制台连接后 AI 才能操作";
   }
+  // 本地文件读写：启用时展示工作目录状态（未设置则提示，引导去设置页）。
+  if (settings.fileAccess.enabled) {
+    const dir = settings.fileAccess.workspaceDirs[props.domain];
+    parts.push(dir ? `文件: ${dir}` : "⚠ 文件读写已开启，未设置工作目录");
+  }
+  if (props.domain === "ssh") {
+    return parts.length
+      ? `已附加: ${parts.join("、")}`
+      : "未选择活动终端，请先连接后 AI 才能操作";
+  }
+  return parts.length
+    ? `已附加: ${parts.join(" · ")}`
+    : "未连接数据库，请先在 SQL 控制台连接后 AI 才能操作";
 });
 
 // --- 配置状态 ------------------------------------------------------------
@@ -364,6 +374,20 @@ async function handleSend() {
         );
       }
     }
+    // 本地文件读写（设置页开启后注入）：告知模型工作目录与工具用法。
+    if (settings.fileAccess.enabled) {
+      const dir = settings.fileAccess.workspaceDirs[props.domain];
+      if (dir) {
+        ctxParts.push(
+          `本地文件读写已启用，工作目录为 "${dir}"。可用 read_file / write_file / list_files ` +
+            `工具（path 为相对工作目录的路径）读取数据文件或导出结果文件。`
+        );
+      } else {
+        ctxParts.push(
+          "本地文件读写已开启，但当前助手尚未设置工作目录。请告诉用户去设置页配置，不要调用文件工具。"
+        );
+      }
+    }
     prompt += "\n\n=== 当前可用上下文 ===\n" + ctxParts.join("\n");
     // 附加表结构（拖表产生）：把 DDL 拼进 system prompt。
     prompt += buildAttachedDdlSection();
@@ -371,6 +395,7 @@ async function handleSend() {
       agent: true,
       activeTerminalId: activeTerminal,
       activeDbConnId: activeDb,
+      domain: props.domain,
     });
   } else {
     let prompt = SYSTEM_PROMPTS[mode.value];
@@ -421,6 +446,7 @@ async function regenerateMessage(m: AiMessage) {
           agent: true,
           activeTerminalId: props.domain === "ssh" ? (activeTerminalId.value ?? undefined) : undefined,
           activeDbConnId: props.domain === "db" ? (db.activeConnId ?? undefined) : undefined,
+          domain: props.domain,
         }
       : undefined;
   try {
@@ -487,6 +513,90 @@ async function handleClear() {
   ElMessage.success("已清空");
 }
 
+// --- 导出对话 ------------------------------------------------------------
+/** 工具调用状态 → 导出文案。 */
+const TOOL_STATUS_TEXT: Record<ToolCallItem["status"], string> = {
+  pending: "待确认",
+  approved: "执行中",
+  rejected: "已拒绝",
+  done: "已完成",
+};
+
+/** 导出当前会话为 Markdown 文件（含工具调用，便于归档/分享）。 */
+async function handleExport() {
+  const conv = ai.activeConversation;
+  if (!conv || conv.messages.length === 0) return;
+  const title = conv.title || "新对话";
+
+  const lines: string[] = [];
+  lines.push(`# ${title}`);
+  lines.push("");
+  lines.push(`> 助手: ${panelTitle.value}`);
+  lines.push(`> 导出时间: ${new Date().toLocaleString("zh-CN", { hour12: false })}`);
+  lines.push(`> 消息数: ${conv.messages.length}`);
+  lines.push("");
+  lines.push("---");
+
+  for (const m of conv.messages) {
+    lines.push("");
+    lines.push(m.role === "user" ? "## 用户" : "## 助手");
+    lines.push("");
+    if (m.content) lines.push(m.content);
+    // 工具调用：参数与执行结果逐条列出，保留完整执行记录。
+    if (m.role === "assistant" && m.toolCalls && m.toolCalls.length > 0) {
+      for (const t of m.toolCalls) {
+        lines.push("");
+        lines.push(`### 工具调用: \`${t.name}\``);
+        lines.push("");
+        lines.push(`**描述**: ${t.description}`);
+        lines.push("");
+        lines.push(`**状态**: ${TOOL_STATUS_TEXT[t.status] ?? t.status}`);
+        lines.push("");
+        lines.push("**参数**:");
+        lines.push("");
+        lines.push("```json");
+        lines.push(JSON.stringify(t.arguments, null, 2));
+        lines.push("```");
+        if (t.result) {
+          lines.push("");
+          lines.push(t.result.ok ? "**输出**: " : "**失败**: ");
+          lines.push("");
+          lines.push("```");
+          lines.push(t.result.output);
+          lines.push("```");
+        }
+        lines.push("");
+      }
+    }
+    if (m.error) {
+      lines.push("");
+      lines.push(`> ⚠ ${m.error}`);
+    }
+    lines.push("");
+  }
+
+  // 默认文件名：助手名-对话标题-时间戳.md（去掉 Windows 非法字符）。
+  const safeTitle = title.replace(/[\\/:*?"<>|]/g, "_");
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const now = new Date();
+  const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+  const defaultPath = await join(await homeDir(), `${panelTitle.value}-${safeTitle}-${stamp}.md`);
+
+  const filePath = await save({
+    title: `导出${panelTitle.value}对话`,
+    defaultPath,
+    filters: [{ name: "Markdown", extensions: ["md"] }],
+  });
+  if (!filePath) return; // 用户取消
+
+  try {
+    await writeTextFile(filePath, lines.join("\n"));
+    ElMessage.success("对话已导出");
+  } catch (e) {
+    ElMessage.error("导出失败: " + String(e));
+  }
+}
+
 // --- Markdown 渲染 -------------------------------------------------------
 // 用 marked 解析完整 GFM（标题/列表/粗体/表格/链接/代码块等），DOMPurify 清洗
 // 防 XSS（因为通过 v-html 渲染）。marked 配置 GFM + line break，贴近聊天 UI 习惯。
@@ -532,6 +642,11 @@ function renderMarkdown(text: string): string {
           <el-tooltip content="收起" placement="bottom">
             <el-button class="icon-btn" link @click="toggle">
               <el-icon><DArrowRight /></el-icon>
+            </el-button>
+          </el-tooltip>
+          <el-tooltip content="导出对话" placement="bottom">
+            <el-button class="icon-btn" link :disabled="ai.messages.length === 0" @click="handleExport">
+              <el-icon><Download /></el-icon>
             </el-button>
           </el-tooltip>
           <el-tooltip content="清空对话" placement="bottom">
@@ -756,44 +871,46 @@ function renderMarkdown(text: string): string {
           </el-button>
         </div>
         <div class="composer-row">
-          <el-input
-            ref="inputRef"
-            v-model="inputText"
-            type="textarea"
-            :autosize="{ minRows: 2, maxRows: 5 }"
-            :placeholder="
-              configBlocked
-                ? configTip
-                : mode === 'translate'
-                ? '描述想做什么...'
-                : mode === 'diagnose'
-                ? '粘贴报错信息...'
-                : mode === 'explain'
-                ? '粘贴命令输出...'
-                : '输入问题，Enter 发送，Shift+Enter 换行'
-            "
-            :disabled="configBlocked"
-            resize="none"
-            @keydown="onKeydown"
-          />
-          <!-- 发送 / 终止：发送中变为红色终止按钮 -->
-          <el-button
-            v-if="!ai.sending"
-            type="primary"
-            :icon="Promotion"
-            :disabled="!inputText.trim() || configBlocked"
-            class="send-btn"
-            title="发送 (Enter)"
-            @click="handleSend"
-          />
-          <el-button
-            v-else
-            type="danger"
-            :icon="VideoPause"
-            class="send-btn stop-btn"
-            title="终止生成"
-            @click="handleStop"
-          />
+          <div class="input-wrap">
+            <el-input
+              ref="inputRef"
+              v-model="inputText"
+              type="textarea"
+              :autosize="{ minRows: 2, maxRows: 5 }"
+              :placeholder="
+                configBlocked
+                  ? configTip
+                  : mode === 'translate'
+                  ? '描述想做什么...'
+                  : mode === 'diagnose'
+                  ? '粘贴报错信息...'
+                  : mode === 'explain'
+                  ? '粘贴命令输出...'
+                  : '输入问题，Enter 发送，Shift+Enter 换行'
+              "
+              :disabled="configBlocked"
+              resize="none"
+              @keydown="onKeydown"
+            />
+            <!-- 发送 / 终止：输入框内右下角悬浮图标，发送中变为红色终止图标 -->
+            <el-button
+              v-if="!ai.sending"
+              link
+              :icon="Promotion"
+              :disabled="!inputText.trim() || configBlocked"
+              class="send-inner-btn"
+              title="发送 (Enter)"
+              @click="handleSend"
+            />
+            <el-button
+              v-else
+              link
+              :icon="VideoPause"
+              class="send-inner-btn stop-btn"
+              title="终止生成"
+              @click="handleStop"
+            />
+          </div>
         </div>
       </div>
     </div>
@@ -1236,24 +1353,38 @@ function renderMarkdown(text: string): string {
 }
 .composer-row {
   display: flex;
-  gap: 8px;
   align-items: flex-end;
+}
+/* 输入框容器：发送图标悬浮在右下角（不占布局空间） */
+.input-wrap {
+  position: relative;
+  flex: 1;
 }
 .composer-row :deep(.el-textarea__inner) {
   resize: none;
+  /* 右下角给悬浮图标留出空间，避免文字被遮挡 */
+  padding-right: 36px;
 }
-/* 纯图标发送按钮：正方形、与两行 textarea 等高对齐，节省横向空间。
-   Element Plus 的 default size 按钮高 32px；textarea minRows=2 约 56px。
-   这里让按钮高度跟随 textarea（align-items: flex-end + self-stretch 不可用，
-   故用固定高度匹配两行输入框）。 */
-.send-btn {
-  flex-shrink: 0;
-  width: 40px;
-  height: 40px;
-  padding: 0;
+/* 输入框内右下角的纯图标发送/终止按钮（link 无边框背景） */
+.send-inner-btn {
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  font-size: 16px;
+  color: var(--el-color-primary);
+  padding: 3px;
+  border-radius: 4px;
 }
-.send-btn :deep(.el-icon) {
-  font-size: 18px;
+.send-inner-btn:disabled {
+  color: var(--el-text-color-placeholder);
+  background: transparent;
+  cursor: not-allowed;
+}
+.send-inner-btn:hover:not(:disabled) {
+  background: var(--el-fill-color-light);
+}
+.send-inner-btn.stop-btn {
+  color: var(--el-color-danger);
 }
 
 /* --- 智能体上下文提示（已合并进 composer-toolbar，见 .ctx-tip-inline） --- */

@@ -10,6 +10,8 @@ export interface AiChatRequest {
   activeTerminalId?: string;
   /** 当前活动 MySQL 连接 id（可选）。 */
   activeDbConnId?: string;
+  /** 请求所属助手域："ssh"（终端助手）| "db"（数据库助手）。文件工具据此取工作目录。 */
+  domain?: string;
 }
 
 export function aiChat(req: AiChatRequest): Promise<void> {
@@ -19,4 +21,9 @@ export function aiChat(req: AiChatRequest): Promise<void> {
 /** 终止正在进行的 AI 请求。 */
 export function aiStop(requestId: string): Promise<void> {
   return invoke<void>("ai_stop", { requestId });
+}
+
+/** 设置某个助手域的工作目录（传空串清除）。 */
+export function setWorkspaceDir(domain: string, path: string): Promise<void> {
+  return invoke<void>("set_workspace_dir", { domain, path });
 }

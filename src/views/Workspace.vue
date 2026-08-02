@@ -8,7 +8,7 @@ import { Close, Delete, Top, Bottom, ZoomIn, ZoomOut, Refresh } from "@element-p
 import { eventToCombo, isModifierOnly } from "@/utils/shortcut";
 import type { ShortcutCommand } from "@/api/types";
 
-// KeepAlive 按 name 匹配缓存本组件（保留 SSH 助手面板状态）。
+// KeepAlive 按 name 匹配缓存本组件（保留终端助手面板状态）。
 defineOptions({ name: "Workspace" });
 
 const terminals = useTerminalsStore();
@@ -178,7 +178,7 @@ onBeforeUnmount(() => {
           还没有打开任何终端。请从左侧会话树连接一台服务器。
         </div>
       </div>
-      <!-- SSH 助手面板：仅在终端页显示，与 DB 助手完全隔离 -->
+      <!-- 终端助手面板：仅在终端页显示，与 DB 助手完全隔离 -->
       <AiPanel domain="ssh" />
     </div>
     <!-- 终端底部快捷命令栏 -->

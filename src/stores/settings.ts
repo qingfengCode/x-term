@@ -5,6 +5,7 @@ import {
   defaultAppShortcuts,
   type AppShortcutAction,
   type AppShortcuts,
+  type FileAccessSettings,
   type Settings,
   type ShortcutCommand,
   type SshAgentSettings,
@@ -21,6 +22,10 @@ const defaultSqlAgent: SqlAgentSettings = {
   sqlMode: "readonly",
   autoApproveSafe: false,
   terminalVisualization: false,
+};
+const defaultFileAccess: FileAccessSettings = {
+  enabled: false,
+  workspaceDirs: {},
 };
 
 const defaultTerminal: TerminalSettings = {
@@ -41,6 +46,8 @@ export const useSettingsStore = defineStore("settings", () => {
   const sshAgent = ref<SshAgentSettings>({ ...defaultSshAgent });
   /** SQL 智能体配置（exec_sql）。 */
   const sqlAgent = ref<SqlAgentSettings>({ ...defaultSqlAgent });
+  /** 本地文件读写配置（read_file / write_file / list_files）。 */
+  const fileAccess = ref<FileAccessSettings>({ ...defaultFileAccess, workspaceDirs: {} });
   /** 快捷命令列表（终端底部按钮栏 + 快捷键绑定）。 */
   const shortcuts = ref<ShortcutCommand[]>([]);
   /** 快捷命令有序分组名列表。 */
@@ -65,6 +72,10 @@ export const useSettingsStore = defineStore("settings", () => {
       };
     }
     sqlAgent.value = { ...defaultSqlAgent, ...(s.ai.sqlAgent ?? {}) };
+    fileAccess.value = {
+      enabled: s.ai.fileAccess?.enabled ?? false,
+      workspaceDirs: { ...(s.ai.fileAccess?.workspaceDirs ?? {}) },
+    };
     shortcuts.value = s.shortcuts?.commands ?? [];
     shortcutGroups.value = s.shortcuts?.groups ?? [];
     appShortcuts.value = { ...defaultAppShortcuts(), ...(s.shortcuts?.app ?? {}) };
@@ -79,6 +90,7 @@ export const useSettingsStore = defineStore("settings", () => {
         active: aiActive.value,
         sshAgent: sshAgent.value,
         sqlAgent: sqlAgent.value,
+        fileAccess: fileAccess.value,
       },
       shortcuts: { commands: shortcuts.value, groups: shortcutGroups.value, app: appShortcuts.value },
       firstRun: false,
@@ -156,6 +168,7 @@ export const useSettingsStore = defineStore("settings", () => {
     aiActive,
     sshAgent,
     sqlAgent,
+    fileAccess,
     shortcuts,
     shortcutGroups,
     appShortcuts,
