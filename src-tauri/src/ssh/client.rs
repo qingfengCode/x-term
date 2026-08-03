@@ -20,6 +20,7 @@
 //! [`SignatureHash`](russh::keys::key::SignatureHash)），无需像 main 分支
 //! 那样显式传 `PrivateKeyWithHashAlg`。
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -94,10 +95,23 @@ pub enum AuthMethod {
 
 /// 构造默认的 SSH 客户端配置。
 ///
-/// 主要设置空闲超时为 300 秒，其余保持 russh 默认（算法偏好、窗口大小等）。
+/// 主要设置空闲超时为 300 秒；并在主机密钥算法列表末尾追加 `ssh-rsa`，
+/// 以兼容只提供 `ssh-rsa`（RSA/SHA-1）主机密钥的服务器（如部分 JumpServer
+/// 堡垒机）。现代算法（ed25519/ecdsa/rsa-sha2）仍排在前面，优先级不受影响。
 pub fn default_config() -> client::Config {
     client::Config {
         inactivity_timeout: Some(Duration::from_secs(300)),
+        preferred: russh::Preferred {
+            key: Cow::Borrowed(&[
+                russh::keys::key::ED25519,
+                russh::keys::key::ECDSA_SHA2_NISTP256,
+                russh::keys::key::ECDSA_SHA2_NISTP521,
+                russh::keys::key::RSA_SHA2_256,
+                russh::keys::key::RSA_SHA2_512,
+                russh::keys::key::SSH_RSA,
+            ]),
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
