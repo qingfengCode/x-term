@@ -349,12 +349,13 @@ async function onNodeDrop(
         >
         <el-dropdown
           class="recent-menu"
+          size="small"
           trigger="click"
           placement="bottom-end"
           @command="(cmd: string) => onCommand(cmd, { type: 'session', id: s.id, label: s.name, raw: s })"
-          @click.stop
         >
-          <el-icon class="node-menu-icon"><MoreFilled /></el-icon>
+          <!-- stop 必须放在触发元素上：放在 el-dropdown 上不会阻止事件冒泡到树节点 -->
+          <el-icon class="node-menu-icon" @click.stop><MoreFilled /></el-icon>
           <template #dropdown>
             <el-dropdown-menu>
               <el-dropdown-item command="connect" :icon="'Link'">连接</el-dropdown-item>
@@ -413,12 +414,13 @@ async function onNodeDrop(
             <!-- 悬浮操作按钮（右键菜单等价物） -->
             <el-dropdown
               class="node-menu"
+              size="small"
               trigger="click"
               placement="bottom-end"
               @command="(cmd: string) => onCommand(cmd, data)"
-              @click.stop
             >
-              <el-icon class="node-menu-icon"><MoreFilled /></el-icon>
+              <!-- stop 必须放在触发元素上：放在 el-dropdown 上不会阻止事件冒泡到树节点 -->
+              <el-icon class="node-menu-icon" @click.stop><MoreFilled /></el-icon>
               <template #dropdown>
                 <el-dropdown-menu v-if="data.type === 'session'">
                   <el-dropdown-item command="connect" :icon="'Link'">连接</el-dropdown-item>

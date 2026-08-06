@@ -885,12 +885,13 @@ onBeforeUnmount(() => {
                 <el-dropdown
                   v-if="data.type === 'instance' || data.type === 'group'"
                   class="node-menu"
+                  size="small"
                   trigger="click"
                   placement="bottom-end"
                   @command="(cmd: string) => onTreeCommand(cmd, data)"
-                  @click.stop
                 >
-                  <el-icon class="node-menu-icon"><MoreFilled /></el-icon>
+                  <!-- stop 必须放在触发元素上：放在 el-dropdown 上不会阻止事件冒泡到树节点 -->
+                  <el-icon class="node-menu-icon" @click.stop><MoreFilled /></el-icon>
                   <template #dropdown>
                     <el-dropdown-menu v-if="data.type === 'instance'">
                       <el-dropdown-item command="edit" :icon="EditPen">编辑</el-dropdown-item>
