@@ -15,7 +15,10 @@
 //! 为避免 SSH 上开太多 channel，pool 大小限制为 2。
 
 use serde::{Deserialize, Serialize};
+use sqlx::mysql::types::MySqlTime;
 use sqlx::mysql::{MySqlPoolOptions, MySqlRow};
+use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use sqlx::types::{Decimal, JsonValue};
 use sqlx::{Column, MySqlPool, Row};
 use std::sync::Arc;
 use tokio::io::copy_bidirectional;
@@ -26,6 +29,7 @@ use russh::client::Handle;
 use crate::error::{AppError, AppResult};
 use crate::ssh::client::ClientHandler;
 use crate::ssh::session::ResolvedCredential;
+use crate::state::AppState;
 use crate::storage::db::DbConn;
 use crate::storage::secure::CredentialVault;
 use crate::storage::sessions_repo::Session;
@@ -85,36 +89,42 @@ impl MySqlConn {
     /// 仅保留前 `limit` 行；其余语句走 `execute` 取影响行数。
     pub async fn execute(&self, sql: &str, limit: u32) -> AppResult<QueryResult> {
         if is_query_stmt(sql) {
-            let rows: Vec<MySqlRow> = sqlx::query(sql).fetch_all(&self.pool).await?;
-            // 列名：从第一行取；若无行则无法拿到列（MySQL 在 0 行时 columns 为空）。
-            // 实际上 fetch_all 返回的 Vec<MySqlRow> 每行都有 columns()，但为空时只能
-            // 尝试从第一行；取不到列就给空数组。
-            let columns: Vec<String> = rows
-                .first()
-                .map(|r| {
-                    r.columns()
+            // 流式逐行读取，而不是 fetch_all：fetch_all 会把整个结果集一次性
+            // 读进内存，超大表（百万行+）直接 OOM。这里只保留前 limit 行后
+            // 提前 break——sqlx 在连接复用时（wait_until_ready）会把未读完的
+            // 剩余结果集排空，无协议残留风险。
+            use futures::TryStreamExt;
+            let mut stream = sqlx::query(sql).fetch(&self.pool);
+            let mut columns: Vec<String> = Vec::new();
+            let mut out_rows: Vec<Vec<String>> = Vec::with_capacity(limit as usize);
+            let mut seen: u64 = 0;
+            while let Some(row) = stream.try_next().await? {
+                seen += 1;
+                // 列名：从第一行取；若 0 行则无法拿到列（MySQL 在 0 行时
+                // columns 为空），保持空数组。
+                if columns.is_empty() {
+                    columns = row
+                        .columns()
                         .iter()
                         .map(|c| c.name().to_string())
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            let n = rows.len();
-            let mut out_rows: Vec<Vec<String>> = Vec::with_capacity(n.min(limit as usize));
-            for (i, row) in rows.iter().enumerate() {
-                if i as u32 >= limit {
+                        .collect();
+                }
+                if seen > limit as u64 {
+                    // 超过 limit 上限：停止读取（不占内存，连接由 sqlx 自动排空）。
                     break;
                 }
                 let mut vals: Vec<String> = Vec::with_capacity(row.columns().len());
                 for idx in 0..row.columns().len() {
-                    vals.push(cell_to_string(row, idx));
+                    vals.push(cell_to_string(&row, idx));
                 }
                 out_rows.push(vals);
             }
             Ok(QueryResult {
                 columns,
                 rows: out_rows,
-                affected: n as u64,
+                // 只统计已读取的行（limit 截断后）。无法得知全量行数——
+                // 截断语义下如实汇报读取量。
+                affected: seen,
             })
         } else {
             let res = sqlx::query(sql).execute(&self.pool).await?;
@@ -177,7 +187,7 @@ pub async fn connect_direct(
 ///    `channel_open_direct_tcpip(mysql_host, mysql_port)`，spawn 双向桥接。
 /// 3. sqlx 连本地 listener 的随机端口。
 ///
-/// `app` 用于 SSH 事件 handler 与日志。
+/// `state` 用于 SSH 事件 handler、日志与二次认证挑战注册。
 #[allow(clippy::too_many_arguments)]
 pub async fn connect_via_ssh(
     ssh_session_config: &Session,
@@ -187,15 +197,16 @@ pub async fn connect_via_ssh(
     mysql_user: &str,
     mysql_pass: &str,
     mysql_db: Option<&str>,
-    app: tauri::AppHandle,
+    state: AppState,
 ) -> AppResult<MySqlConn> {
     // 1. 建立 SSH 连接。
     let handle = crate::ssh::client::connect_direct(
         &ssh_session_config.host,
         ssh_session_config.port,
         &ssh_session_config.username,
+        &ssh_session_config.id,
         resolved_credential.auth_method,
-        app,
+        state,
     )
     .await?;
 
@@ -255,18 +266,21 @@ pub async fn connect_via_ssh(
     });
 
     // 3. sqlx 连本地端口。
-    let url = build_mysql_url(
-        "127.0.0.1",
-        local_port,
-        mysql_user,
-        mysql_pass,
-        mysql_db,
-    );
+    let url = build_mysql_url("127.0.0.1", local_port, mysql_user, mysql_pass, mysql_db);
     // SSH 隧道下限制 pool 大小，避免开过多 channel。
-    let pool = MySqlPoolOptions::new()
+    let pool = match MySqlPoolOptions::new()
         .max_connections(2)
         .connect(&url)
-        .await?;
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            // 连接失败：必须 abort 隧道 accept 循环并断开 SSH，否则 accept 任务
+            // 带着监听端口与 SSH handle 一直泄漏到进程退出。
+            tunnel_handle.abort();
+            return Err(e.into());
+        }
+    };
 
     Ok(MySqlConn {
         pool,
@@ -340,36 +354,63 @@ fn is_query_stmt(sql: &str) -> bool {
 
 /// 把一个 cell 转为字符串。
 ///
-/// 优先尝试 `Option<String>` decode（覆盖大多数 MySQL 类型：INT/VARCHAR/
-/// TEXT/DATETIME/DECIMAL 等）；失败则回退 `"<binary>"`（如 BLOB）。
+/// sqlx 的 `String` 解码只兼容少量文本类型（VARCHAR/TEXT/CHAR/ENUM/BLOB 等），
+/// TIME/DATE/DATETIME/TIMESTAMP/JSON/DECIMAL 等列直接 `try_get<String>` 会因
+/// 类型不兼容而报错。这里按列类型逐级尝试解码，全部失败才回退 `"<binary>"`。
 fn cell_to_string(row: &MySqlRow, idx: usize) -> String {
+    // 文本类：VARCHAR/TEXT/CHAR/ENUM/BLOB 等。
     match row.try_get::<Option<String>, _>(idx) {
-        Ok(Some(s)) => s,
-        Ok(None) => String::new(),
-        Err(_) => {
-            // 尝试常见非 String 类型：i64/u64/f64/bool/Vec<u8>。
-            if let Ok(v) = row.try_get::<Option<i64>, _>(idx) {
-                return v.map(|x| x.to_string()).unwrap_or_default();
-            }
-            if let Ok(v) = row.try_get::<Option<u64>, _>(idx) {
-                return v.map(|x| x.to_string()).unwrap_or_default();
-            }
-            if let Ok(v) = row.try_get::<Option<f64>, _>(idx) {
-                return v.map(|x| x.to_string()).unwrap_or_default();
-            }
-            if let Ok(v) = row.try_get::<Option<bool>, _>(idx) {
-                return v.map(|x| x.to_string()).unwrap_or_default();
-            }
-            if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(idx) {
-                return v
-                    .map(|bytes| {
-                        String::from_utf8_lossy(&bytes).into_owned()
-                    })
-                    .unwrap_or_default();
-            }
-            "<binary>".to_string()
-        }
+        Ok(Some(s)) => return s,
+        // NULL 值：任何列都能以 Option 形式解出 None，直接返回空串。
+        Ok(None) => return String::new(),
+        Err(_) => {}
     }
+    // 数值类：INT/BIGINT/FLOAT/DOUBLE；u64 额外覆盖 YEAR、BIT。
+    if let Ok(v) = row.try_get::<Option<i64>, _>(idx) {
+        return v.map(|x| x.to_string()).unwrap_or_default();
+    }
+    if let Ok(v) = row.try_get::<Option<u64>, _>(idx) {
+        return v.map(|x| x.to_string()).unwrap_or_default();
+    }
+    if let Ok(v) = row.try_get::<Option<f64>, _>(idx) {
+        return v.map(|x| x.to_string()).unwrap_or_default();
+    }
+    if let Ok(v) = row.try_get::<Option<bool>, _>(idx) {
+        return v.map(|x| x.to_string()).unwrap_or_default();
+    }
+    // 日期时间类：DATETIME/DATE/TIME/TIMESTAMP。
+    if let Ok(v) = row.try_get::<Option<NaiveDateTime>, _>(idx) {
+        return v.map(|x| x.to_string()).unwrap_or_default();
+    }
+    if let Ok(v) = row.try_get::<Option<DateTime<Utc>>, _>(idx) {
+        // TIMESTAMP 仅 NaiveDateTime 不兼容，落到这里；naive 即服务器返回的原始值。
+        return v.map(|x| x.naive_utc().to_string()).unwrap_or_default();
+    }
+    if let Ok(v) = row.try_get::<Option<NaiveDate>, _>(idx) {
+        return v.map(|x| x.to_string()).unwrap_or_default();
+    }
+    // TIME：先试标准 00:00:00 形式；负数/超 24h 的间隔值回退 MySqlTime。
+    if let Ok(v) = row.try_get::<Option<NaiveTime>, _>(idx) {
+        return v.map(|x| x.to_string()).unwrap_or_default();
+    }
+    if let Ok(v) = row.try_get::<Option<MySqlTime>, _>(idx) {
+        return v.map(|x| x.to_string()).unwrap_or_default();
+    }
+    // JSON：以紧凑 JSON 文本展示。
+    if let Ok(v) = row.try_get::<Option<JsonValue>, _>(idx) {
+        return v.map(|x| x.to_string()).unwrap_or_default();
+    }
+    // DECIMAL：二进制协议下以十进制数字字符串传输。
+    if let Ok(v) = row.try_get::<Option<Decimal>, _>(idx) {
+        return v.map(|x| x.to_string()).unwrap_or_default();
+    }
+    // 二进制兜底：BLOB 等按 UTF-8 lossy 解码。
+    if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(idx) {
+        return v
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
+    }
+    "<binary>".to_string()
 }
 
 /// 构造 `mysql://user:pass@host:port/db` URL，密码做百分号编码。

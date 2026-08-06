@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
-import { Promotion, Delete, ChatDotRound, DArrowRight, Connection, Tools, ArrowDown, Plus, Close, CopyDocument, RefreshRight, VideoPause, Document, Loading, Download } from "@element-plus/icons-vue";
+import { Promotion, Delete, ChatDotRound, DArrowRight, Connection, Tools, ArrowDown, Plus, Close, CopyDocument, RefreshRight, VideoPause, Document, Loading, Download, MagicStick, Collection } from "@element-plus/icons-vue";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 import { save } from "@tauri-apps/plugin-dialog";
@@ -14,6 +14,9 @@ import { useDbStore } from "@/stores/db";
 import { useUiStore } from "@/stores/ui";
 import { dbShowCreateTable, type DraggedTable } from "@/api/db";
 import type { ToolCallItem } from "@/stores/ai";
+import SkillDialog from "@/components/SkillDialog.vue";
+import SkillManagerDialog from "@/components/SkillManagerDialog.vue";
+import type { SkillConfig } from "@/api/types";
 
 /** 助手域：ssh=终端助手（终端页）；db=数据库助手（SQL 页）。决定用哪个 store、暴露哪些工具。 */
 const props = defineProps<{ domain: "ssh" | "db" }>();
@@ -33,12 +36,62 @@ const collapsed = computed({
   get: () => ui.aiCollapsed,
   set: (v) => ui.setAiCollapsed(v),
 });
-const EXPANDED_WIDTH = 340;
 const COLLAPSED_WIDTH = 40;
+
+/** 展开态宽度：按 domain 从 uiStore 取（拖拽调整后记忆）。 */
+const panelWidth = computed(() =>
+  collapsed.value ? COLLAPSED_WIDTH : ui.aiWidths[props.domain]
+);
 
 function toggle() {
   ui.toggleAi();
 }
+
+// --- 拖拽调整宽度 ---------------------------------------------------------
+// 拖动面板左缘竖条改变宽度（写法沿用 SQL 控制台左侧树 sidebar-resizer 惯例：
+// mousedown 后挂 document 级 mousemove/mouseup，期间锁定 body 光标与选区）。
+const DEFAULT_WIDTH = 340;
+const MIN_WIDTH = 240;
+
+const dragging = ref(false);
+let dragStartX = 0;
+let dragStartWidth = 0;
+
+function startResize(e: MouseEvent) {
+  e.preventDefault();
+  dragging.value = true;
+  dragStartX = e.clientX;
+  dragStartWidth = ui.aiWidths[props.domain];
+  document.body.style.cursor = "col-resize";
+  document.body.style.userSelect = "none";
+  document.addEventListener("mousemove", onResizeMove);
+  document.addEventListener("mouseup", onResizeEnd);
+}
+
+function onResizeMove(e: MouseEvent) {
+  // 面板在右缘：向左拖（clientX 减小）→ 宽度增大。
+  const delta = dragStartX - e.clientX;
+  const max = Math.max(MIN_WIDTH, Math.round(window.innerWidth * 0.6));
+  const w = Math.min(max, Math.max(MIN_WIDTH, dragStartWidth + delta));
+  ui.setAiWidth(props.domain, w);
+}
+
+function onResizeEnd() {
+  dragging.value = false;
+  document.body.style.cursor = "";
+  document.body.style.userSelect = "";
+  document.removeEventListener("mousemove", onResizeMove);
+  document.removeEventListener("mouseup", onResizeEnd);
+}
+
+/** 双击竖条：恢复默认宽度。 */
+function resetWidth() {
+  ui.setAiWidth(props.domain, DEFAULT_WIDTH);
+}
+
+onBeforeUnmount(() => {
+  if (dragging.value) onResizeEnd();
+});
 
 // --- 模式 ----------------------------------------------------------------
 // 按域定制：SSH 域聚焦服务器运维，DB 域聚焦数据库。两套模式与提示词独立。
@@ -321,17 +374,68 @@ async function scrollToBottom() {
   if (wrap) wrap.scrollTop = wrap.scrollHeight;
 }
 
-watch(() => ai.messages.length, scrollToBottom);
-// 流式期间内容增长也要跟随。
+/** 滚动跟随阈值（px）：距底部小于该距离视为"在底部"，流式内容才自动跟随。 */
+const FOLLOW_THRESHOLD = 48;
+
+/** 用户是否位于底部附近（上翻浏览历史输出后返回 false，流式不再强制拉回）。 */
+function isNearBottom(): boolean {
+  const wrap = scrollbarRef.value?.wrapRef as HTMLElement | undefined;
+  if (!wrap) return true;
+  return wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < FOLLOW_THRESHOLD;
+}
+
+// 消息数量/内容变化（流式增长）时：仅当用户本就位于底部附近才跟随滚动，
+// 上翻浏览历史输出时允许内容继续增长而不打断阅读位置；用户主动发送则强制滚动。
+watch(() => ai.messages.length, () => {
+  if (isNearBottom()) void scrollToBottom();
+});
 watch(
   () => ai.messages.map((m) => m.content).join(""),
-  scrollToBottom
+  () => {
+    if (isNearBottom()) void scrollToBottom();
+  }
 );
+
+// --- 输入历史（上下方向键填充） ------------------------------------------
+/** 已发送过的输入（旧→新），上限 50 条；按面板域独立记忆（会话内共享）。 */
+const sendHistory = ref<string[]>([]);
+/** 历史浏览游标：-1 = 正常编辑态；>=0 指向 sendHistory 索引。 */
+const historyIndex = ref(-1);
+/** 进入历史浏览时保存的当前草稿（按向下可恢复）。 */
+const historyDraft = ref("");
+
+/** 发送成功后记录输入（相邻去重，置顶由记录顺序保证）。 */
+function recordHistory(text: string) {
+  const t = text.trim();
+  if (!t) return;
+  if (sendHistory.value[sendHistory.value.length - 1] !== t) {
+    sendHistory.value.push(t);
+    if (sendHistory.value.length > 50) sendHistory.value.shift();
+  }
+  historyIndex.value = -1;
+  historyDraft.value = "";
+}
+
+/** 把光标移到输入框末尾（Vue 更新 DOM 后执行）。 */
+function moveCursorToEnd(el: HTMLTextAreaElement | null) {
+  nextTick(() => {
+    if (!el) return;
+    el.focus();
+    el.setSelectionRange(el.value.length, el.value.length);
+  });
+}
+
+/** 切换对话：切到目标会话并滚到底部（避免残留上一个会话的滚动位置）。 */
+function onSwitchConversation(cid: string) {
+  ai.switchConversation(cid);
+  void scrollToBottom();
+}
 
 async function handleSend() {
   const text = inputText.value.trim();
   if (!text || ai.sending || configBlocked.value) return;
   inputText.value = "";
+  recordHistory(text);
   if (mode.value === "agent") {
     // 动态构建系统提示：把当前活动上下文的真实 id 注入，让模型直接填对参数。
     // 按域裁剪：SSH 面板只传 terminalId（后端就只暴露 SSH 工具），
@@ -391,6 +495,8 @@ async function handleSend() {
     prompt += "\n\n=== 当前可用上下文 ===\n" + ctxParts.join("\n");
     // 附加表结构（拖表产生）：把 DDL 拼进 system prompt。
     prompt += buildAttachedDdlSection();
+    // 已启用的可复用 skill（历史总结沉淀）。
+    prompt += buildSkillsSection();
     await ai.send(text, prompt, {
       agent: true,
       activeTerminalId: activeTerminal,
@@ -401,8 +507,12 @@ async function handleSend() {
     let prompt = SYSTEM_PROMPTS[mode.value];
     const ddlSection = buildAttachedDdlSection();
     if (ddlSection) prompt += ddlSection;
+    prompt += buildSkillsSection();
     await ai.send(text, prompt);
   }
+  // 发送后强制跟随滚动到底部（用户主动发送，应看到自己的消息与回复开始；
+  // 若此刻正在上翻浏览，也以发送为准回到最新位置）。
+  void scrollToBottom();
   // 发送后清空附加表（下次提问重新拖）。
   clearAttachedTables();
 }
@@ -416,6 +526,108 @@ function buildAttachedDdlSection(): string {
     "\n\n=== 用户附加的表结构（用户拖入的相关表，分析时请参考）===\n" +
     blocks.join("\n\n")
   );
+}
+
+/** 拼接已启用的 skill 段落（注入 system prompt）。无启用 skill 返回空串。 */
+function buildSkillsSection(): string {
+  const skills = settings.skills.filter((s) => s.domain === props.domain && s.enabled);
+  if (skills.length === 0) return "";
+  const blocks = skills.map((s) => `【${s.title}】\n${s.content}`);
+  return "\n\n=== 可复用技能（来自历史总结，处理同类任务时请遵循）===\n" + blocks.join("\n\n");
+}
+
+// --- skill 总结与管理 -----------------------------------------------------
+const summarizing = ref(false);
+const skillDialogVisible = ref(false);
+const editingSkill = ref<SkillConfig | null>(null);
+const skillManagerVisible = ref(false);
+
+/** 把当前会话总结成 skill：把对话文本喂给 AI，让它生成结构化标题+内容，用户编辑后保存。 */
+async function handleSummarizeSkill() {
+  const conv = ai.activeConversation;
+  if (!conv || conv.messages.length === 0 || summarizing.value) return;
+
+  // 复用 handleExport 的渲染逻辑，把会话拼成纯文本。
+  const transcript = conv.messages
+    .map((m) => {
+      const role = m.role === "user" ? "用户" : "助手";
+      let block = `【${role}】\n${m.content}`;
+      if (m.role === "assistant" && m.toolCalls) {
+        for (const t of m.toolCalls) {
+          block += `\n  （工具 ${t.name}: ${JSON.stringify(t.arguments)} → ${t.result?.ok ? "成功" : "失败"}）`;
+        }
+      }
+      return block;
+    })
+    .join("\n\n");
+
+  summarizing.value = true;
+  // 用非 agent 模式发一条总结请求（不调工具，纯文本输出）。
+  const prompt =
+    "你是运维经验沉淀助手。请把以下运维对话总结成一条可复用的 skill，供未来处理同类任务时参考。\n" +
+    "要求：\n" +
+    "1. 提炼这类任务的标准处理步骤、关键命令/SQL、常见坑和注意事项。\n" +
+    "2. 内容简洁实用，可直接作为系统提示词片段使用，控制在 500 字以内。\n" +
+    "3. 第一行输出标题（不超过 20 字，不要加书名号或引号），第二行起输出 skill 内容。\n\n" +
+    `=== 待总结的对话 ===\n${transcript}`;
+
+  try {
+    // 临时切到 chat 模式发请求（不进 agent 循环）。
+    await ai.send("请总结这段对话为可复用 skill", prompt);
+    // 等待本次请求的流式完成。必须用捕获的 conv（send 时活跃的会话）判断
+    // sending，而不能用 ai.activeConversation——等待期间用户切走对话会让
+    // activeConversation 变成别的会话，读取它的 sending/lastMsg 都会错。
+    const rid = ai.activeRequestId;
+    if (rid) {
+      const waitDone = async () => {
+        for (let i = 0; i < 600; i++) {
+          // 600 * 500ms = 5min 上限
+          await new Promise((r) => setTimeout(r, 500));
+          if (!conv.sending) break;
+        }
+      };
+      await waitDone();
+    }
+    const msgs = conv.messages;
+    const lastMsg = msgs[msgs.length - 1];
+    if (lastMsg && lastMsg.role === "assistant" && lastMsg.content.trim()) {
+      const text = lastMsg.content.trim();
+      // 解析：第一行为标题，其余为内容。
+      const nlIdx = text.indexOf("\n");
+      const title = nlIdx > 0 ? text.slice(0, nlIdx).trim() : "新技能";
+      const content = nlIdx > 0 ? text.slice(nlIdx + 1).trim() : text;
+      // 弹出编辑弹窗，用户确认后保存。
+      editingSkill.value = {
+        id: "",
+        title,
+        content,
+        domain: props.domain,
+        enabled: true,
+      };
+      skillDialogVisible.value = true;
+    } else {
+      ElMessage.warning("未能生成技能内容，请重试");
+    }
+  } catch (e) {
+    ElMessage.error("总结失败: " + String(e));
+  } finally {
+    summarizing.value = false;
+  }
+}
+
+/** SkillDialog 保存回调：新建或更新 skill。 */
+async function onSkillSaved(s: SkillConfig) {
+  if (s.id) {
+    settings.updateSkill(s.id, { title: s.title, content: s.content, enabled: s.enabled });
+  } else {
+    settings.addSkill({
+      title: s.title,
+      content: s.content,
+      enabled: s.enabled,
+      domain: props.domain,
+    });
+  }
+  await settings.save().catch(() => {});
 }
 
 /** 终止当前 AI 请求（发送按钮在 sending 时点击触发）。 */
@@ -464,8 +676,13 @@ async function approveTool(tool: ToolCallItem) {
 /** 加入白名单并执行：把命令前缀持久化到白名单，然后正常 approve。 */
 async function addToWhitelistAndRun(tool: ToolCallItem) {
   if (tool.status !== "pending") return;
-  await ai.addToWhitelistAndApprove(tool.toolCallId);
-  ElMessage.success("已加入白名单并执行");
+  const whitelisted = await ai.addToWhitelistAndApprove(tool.toolCallId);
+  if (whitelisted) {
+    ElMessage.success("已加入白名单并执行");
+  } else {
+    // 白名单写入失败但执行已批准：如实告知，避免"已加入白名单"的误导。
+    ElMessage.warning("已执行，但加入白名单失败（可到设置页手动添加）");
+  }
 }
 
 async function rejectTool(tool: ToolCallItem) {
@@ -480,6 +697,49 @@ function toggleExpand(id: string) {
 }
 
 function onKeydown(e: KeyboardEvent) {
+  const el = e.target instanceof HTMLTextAreaElement ? e.target : null;
+
+  // 上方向键浏览输入历史：已在历史浏览态时始终上翻；
+  // 正常编辑态需光标在行首（或输入为空）才进入历史。
+  if (e.key === "ArrowUp" && !e.shiftKey && !e.isComposing) {
+    const inHistory = historyIndex.value !== -1;
+    const atStart = el ? el.selectionStart === 0 : true;
+    if ((inHistory || atStart) && sendHistory.value.length > 0) {
+      if (!inHistory) {
+        historyDraft.value = inputText.value;
+        historyIndex.value = sendHistory.value.length - 1;
+      } else if (historyIndex.value > 0) {
+        historyIndex.value -= 1;
+      } else {
+        return; // 已是最旧一条
+      }
+      e.preventDefault();
+      inputText.value = sendHistory.value[historyIndex.value];
+      moveCursorToEnd(el);
+    }
+    return;
+  }
+
+  // 下方向键：历史浏览态下前进；到最后一条后再按恢复进入前的草稿。
+  if (e.key === "ArrowDown" && !e.shiftKey && !e.isComposing) {
+    if (historyIndex.value !== -1) {
+      const atEnd = el ? el.selectionStart === el.value.length : true;
+      if (atEnd) {
+        e.preventDefault();
+        if (historyIndex.value < sendHistory.value.length - 1) {
+          historyIndex.value += 1;
+          inputText.value = sendHistory.value[historyIndex.value];
+        } else {
+          // 回到草稿，退出历史浏览。
+          historyIndex.value = -1;
+          inputText.value = historyDraft.value;
+        }
+        moveCursorToEnd(el);
+      }
+    }
+    return;
+  }
+
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
     e.preventDefault();
     // 发送中：Enter 触发终止（与按钮行为一致）；否则发送。
@@ -626,7 +886,19 @@ function renderMarkdown(text: string): string {
 </script>
 
 <template>
-  <div class="ai-panel" :class="{ collapsed }" :style="{ width: collapsed ? COLLAPSED_WIDTH + 'px' : EXPANDED_WIDTH + 'px' }">
+  <div
+    class="ai-panel"
+    :class="{ collapsed, dragging }"
+    :style="{ width: panelWidth + 'px' }"
+  >
+    <!-- 拖拽竖条：展开态下拖动调整面板宽度，双击恢复默认 -->
+    <div
+      v-if="!collapsed"
+      class="resize-handle"
+      title="拖动调整宽度，双击恢复默认"
+      @mousedown="startResize"
+      @dblclick="resetWidth"
+    />
     <!-- 折叠态：窄竖条 -->
     <div v-if="collapsed" class="rail" @click="toggle" :title="`展开 ${panelTitle}`">
       <el-icon class="rail-icon"><ChatDotRound /></el-icon>
@@ -649,6 +921,16 @@ function renderMarkdown(text: string): string {
               <el-icon><Download /></el-icon>
             </el-button>
           </el-tooltip>
+          <el-tooltip content="总结成技能" placement="bottom">
+            <el-button class="icon-btn" link :disabled="ai.messages.length === 0 || ai.sending || summarizing" :loading="summarizing" @click="handleSummarizeSkill">
+              <el-icon v-if="!summarizing"><MagicStick /></el-icon>
+            </el-button>
+          </el-tooltip>
+          <el-tooltip content="技能管理" placement="bottom">
+            <el-button class="icon-btn" link @click="skillManagerVisible = true">
+              <el-icon><Collection /></el-icon>
+            </el-button>
+          </el-tooltip>
           <el-tooltip content="清空对话" placement="bottom">
             <el-button class="icon-btn" link :disabled="ai.messages.length === 0" @click="handleClear">
               <el-icon><Delete /></el-icon>
@@ -665,7 +947,7 @@ function renderMarkdown(text: string): string {
           class="conv-tab"
           :class="{ active: c.id === ai.activeCid }"
           :title="c.title"
-          @click="ai.switchConversation(c.id)"
+          @click="onSwitchConversation(c.id)"
         >
           <input
             v-if="editingCid === c.id"
@@ -914,11 +1196,24 @@ function renderMarkdown(text: string): string {
         </div>
       </div>
     </div>
+    <!-- 技能编辑弹窗（总结生成后或从管理器新建时弹出） -->
+    <SkillDialog
+      v-model:visible="skillDialogVisible"
+      :skill="editingSkill"
+      :domain="domain"
+      @saved="onSkillSaved"
+    />
+    <!-- 技能管理弹窗（列表 / 启停 / 删除 / 新建） -->
+    <SkillManagerDialog
+      v-model:visible="skillManagerVisible"
+      :domain="domain"
+    />
   </div>
 </template>
 
 <style scoped>
 .ai-panel {
+  position: relative;
   height: 100%;
   background: var(--el-bg-color);
   border-left: 1px solid var(--el-border-color-light);
@@ -927,6 +1222,37 @@ function renderMarkdown(text: string): string {
   overflow: hidden;
   transition: width 0.2s ease;
   flex-shrink: 0;
+}
+
+/* 拖拽中禁用宽度过渡，保证跟手 */
+.ai-panel.dragging {
+  transition: none;
+}
+
+/* --- 拖拽竖条（面板左缘，悬浮于终端区之上） --- */
+.resize-handle {
+  position: absolute;
+  left: -4px;
+  top: 0;
+  bottom: 0;
+  width: 8px;
+  cursor: col-resize;
+  z-index: 10;
+}
+/* 悬停/拖拽时显示一条主色竖线提示可拖 */
+.resize-handle::after {
+  content: "";
+  position: absolute;
+  left: 3px;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: transparent;
+  transition: background 0.15s;
+}
+.resize-handle:hover::after,
+.ai-panel.dragging .resize-handle::after {
+  background: var(--el-color-primary);
 }
 
 /* --- 折叠竖条 --- */

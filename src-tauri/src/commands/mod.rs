@@ -8,6 +8,7 @@
 pub mod ai;
 pub mod config;
 pub mod db;
+pub mod file_backend;
 pub mod forward;
 pub mod mcp;
 pub mod remote_desktop;
@@ -19,9 +20,7 @@ pub mod update;
 pub mod vault;
 
 /// 把所有命令注册到给定的 [`tauri::Builder`] 上，返回 builder 自身以便链式调用。
-pub fn register(
-    builder: tauri::Builder<tauri::Wry>,
-) -> tauri::Builder<tauri::Wry> {
+pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
     builder.invoke_handler(tauri::generate_handler![
         // vault
         crate::commands::vault::vault_exists,
@@ -44,6 +43,8 @@ pub fn register(
         crate::commands::session::connect_session,
         crate::commands::session::disconnect_session,
         crate::commands::session::open_sftp_for_session,
+        crate::commands::session::ssh_auth_respond,
+        crate::commands::session::ssh_host_key_respond,
         // terminal
         crate::commands::terminal::terminal_write,
         crate::commands::terminal::terminal_resize,
@@ -56,6 +57,19 @@ pub fn register(
         crate::commands::sftp::sftp_download,
         crate::commands::sftp::sftp_upload,
         crate::commands::sftp::sftp_close,
+        // file backend (S3 / 兼容存储)
+        crate::commands::file_backend::file_account_list,
+        crate::commands::file_backend::file_account_save,
+        crate::commands::file_backend::file_account_delete,
+        crate::commands::file_backend::file_connect,
+        crate::commands::file_backend::file_disconnect,
+        crate::commands::file_backend::file_list,
+        crate::commands::file_backend::file_stat,
+        crate::commands::file_backend::file_mkdir,
+        crate::commands::file_backend::file_rename,
+        crate::commands::file_backend::file_remove,
+        crate::commands::file_backend::file_download,
+        crate::commands::file_backend::file_upload,
         // forward
         crate::commands::forward::forward_start,
         crate::commands::forward::forward_stop,
@@ -74,6 +88,8 @@ pub fn register(
         crate::commands::ai::ai_stop,
         crate::commands::ai::ai_add_to_whitelist,
         crate::commands::ai::set_workspace_dir,
+        crate::commands::ai::ai_list_conversations,
+        crate::commands::ai::ai_save_conversations,
         // config
         crate::commands::config::settings_load,
         crate::commands::config::settings_save,

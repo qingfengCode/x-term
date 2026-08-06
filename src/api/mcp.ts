@@ -1,14 +1,16 @@
 // MCP（Model Context Protocol）服务端 API。
 //
-// X-Term 作为 MCP 服务端，对外暴露两类独立 MCP 实例：
-// - SSH MCP（kind="ssh"）：对外暴露 exec_ssh，绑定到一个 SSH 会话。
+// X-Term 作为 MCP 服务端，对外暴露三类独立 MCP 实例：
+// - SSH MCP（kind="ssh"）：对外暴露 exec_ssh + 文件工具，绑定到一个 SSH 会话。
 // - DB MCP（kind="db"）：对外暴露 exec_sql，绑定到一个 DB profile。
-// 两者各自独立启停、监听地址/端口/token/绑定资源。配置持久化在 mcp.json。
+// - File MCP（kind="file"）：对外暴露 list_files/upload_file/download_file，
+//   绑定到一个 S3 文件账号（仅 bound 模式）。
+// 三者各自独立启停、监听地址/端口/token/绑定资源。配置持久化在 mcp.json。
 
 import { invoke } from "@tauri-apps/api/core";
 
 /** MCP 实例种类。 */
-export type McpKind = "ssh" | "db";
+export type McpKind = "ssh" | "db" | "file";
 
 /** 单个 MCP 实例的配置（持久化在 mcp.json，每个 kind 一份）。 */
 export interface McpInstanceConfig {

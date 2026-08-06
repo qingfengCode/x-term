@@ -11,8 +11,7 @@ use crate::database::mysql::QueryResult;
 // ANSI 转义剥离
 // ===========================================================================
 
-static CSI_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").unwrap());
+static CSI_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").unwrap());
 static OSC_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)").unwrap());
 static SINGLE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\x1b[@-_]").unwrap());
@@ -42,9 +41,7 @@ pub fn format_query_result(qr: &QueryResult) -> String {
     let mut out = String::new();
     out.push_str(&qr.columns.join(" | "));
     out.push('\n');
-    out.push_str(&"-".repeat(
-        qr.columns.iter().map(|c| c.len() + 3).sum::<usize>(),
-    ));
+    out.push_str(&"-".repeat(qr.columns.iter().map(|c| c.len() + 3).sum::<usize>()));
     out.push('\n');
     for row in &qr.rows {
         out.push_str(&row.join(" | "));

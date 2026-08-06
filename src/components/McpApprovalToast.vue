@@ -66,12 +66,17 @@ async function reject(requestId: string) {
 function toolLabel(toolName: string): string {
   if (toolName === "exec_ssh") return "执行 SSH 命令";
   if (toolName === "exec_sql") return "执行 SQL";
+  if (toolName === "list_files") return "列目录";
+  if (toolName === "upload_file") return "上传文件";
+  if (toolName === "download_file") return "下载文件";
   return toolName;
 }
 
 /** kind 中文标签。 */
 function kindLabel(kind: string): string {
-  return kind === "db" ? "DB MCP" : "SSH MCP";
+  if (kind === "db") return "DB MCP";
+  if (kind === "file") return "File MCP";
+  return "SSH MCP";
 }
 </script>
 

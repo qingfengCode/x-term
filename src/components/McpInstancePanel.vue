@@ -1,17 +1,19 @@
 <!--
-  McpInstancePanel.vue — 单个 MCP 实例（SSH / DB）的配置与管理面板。
+  McpInstancePanel.vue — 单个 MCP 实例（SSH / DB / File）的配置与管理面板。
 
-  作为 McpView 的两个 Tab 共用组件，按 kind 区分：
-  - kind="ssh"：对外暴露 exec_ssh。
-  - kind="db"：对外暴露 exec_sql。
+  作为 McpView 的三个 Tab 共用组件，按 kind 区分：
+  - kind="ssh"：对外暴露 exec_ssh + 文件工具，绑定一个 SSH 会话。
+  - kind="db"：对外暴露 exec_sql，绑定一个 DB profile。
+  - kind="file"：对外暴露 list_files/upload_file/download_file，绑定一个 S3 文件账号（仅 bound 模式）。
 
   资源模式（resourceMode）：
-  - "bound"（默认）：绑定资源为 SSH 会话 / DB profile，工具只传 command/sql。
+  - "bound"（默认）：绑定资源为 SSH 会话 / DB profile / S3 文件账号，工具只传 command/sql/path 等。
   - "client"（客户端直连）：免绑定实例，调用方在工具参数中传
     host/port/username/password，凭据即用即弃、不存储不落日志。
+    （File MCP 不支持 client 模式）
 
   功能：
-  - 资源模式开关（直连模式隐藏绑定 UI 并展示安全提示）。
+  - 资源模式开关（直连模式隐藏绑定 UI 并展示安全提示；File kind 隐藏此开关）。
   - 绑定资源下拉（启动前/后均可改；运行中改后提示"需重启生效"）。
   - 监听地址（默认 0.0.0.0）与端口可编辑。
   - token 生成 / 复制。
@@ -26,6 +28,8 @@ import { VideoPlay, VideoPause, Refresh, CopyDocument, Key } from "@element-plus
 import { useMcpStore } from "@/stores/mcp";
 import { useSessionsStore } from "@/stores/sessions";
 import { dbListProfiles, dbConnect, dbListDatabases, dbDisconnect } from "@/api/db";
+import { fileAccountList } from "@/api/fileBackend";
+import type { FileAccount } from "@/api/fileBackend";
 import type { McpKind } from "@/api/mcp";
 import type { DbProfile, Session } from "@/api/types";
 
@@ -34,19 +38,25 @@ const props = defineProps<{ kind: McpKind }>();
 const mcp = useMcpStore();
 const sessions = useSessionsStore();
 
-/** 该 kind 的可用资源列表（ssh→SSH 会话；db→DB profile）。 */
+/** 该 kind 的可用资源列表（ssh→SSH 会话；db→DB profile；file→S3 文件账号）。 */
 const sshSessions = ref<Session[]>([]);
 const dbProfiles = ref<DbProfile[]>([]);
+const fileAccounts = ref<FileAccount[]>([]);
 
 /** DB MCP 专用：绑定 profile 后可选的数据库列表。 */
 const databases = ref<string[]>([]);
 const loadingDbs = ref(false);
 
 const isSsh = computed(() => props.kind === "ssh");
+const isFile = computed(() => props.kind === "file");
 /** kind 中文标题。 */
-const title = computed(() => (isSsh.value ? "SSH MCP" : "DB MCP"));
+const title = computed(() => (isSsh.value ? "SSH MCP" : isFile.value ? "File MCP" : "DB MCP"));
 /** 该 kind 对外暴露的工具说明（按资源模式分支）。 */
 const toolHint = computed(() => {
+  if (isFile.value) {
+    return "对外暴露 list_files(path) / upload_file(localPath, remotePath) / download_file(remotePath, localPath)，\
+目标即下方绑定的 S3 文件账号。File MCP 仅支持绑定模式。";
+  }
   if (clientMode.value) {
     return isSsh.value
       ? "对外暴露 exec_ssh(host/port/username/password/command)：目标服务器由调用方在参数中指定，免绑定本地实例。"
@@ -57,17 +67,27 @@ const toolHint = computed(() => {
     : "对外暴露 exec_sql(sql)，目标数据库即下方绑定的连接。";
 });
 
-const config = computed(() => (isSsh.value ? mcp.sshConfig : mcp.dbConfig));
-const status = computed(() => (isSsh.value ? mcp.sshStatus : mcp.dbStatus));
+const config = computed(() => {
+  if (isSsh.value) return mcp.sshConfig;
+  if (isFile.value) return mcp.fileConfig;
+  return mcp.dbConfig;
+});
+const status = computed(() => {
+  if (isSsh.value) return mcp.sshStatus;
+  if (isFile.value) return mcp.fileStatus;
+  return mcp.dbStatus;
+});
 const loading = computed(() => mcp.loading[props.kind]);
 
-/** 客户端直连模式（免绑定实例）：目标与账密由调用方在工具参数中传入。 */
-const clientMode = computed(() => config.value.resourceMode === "client");
+/** 客户端直连模式（免绑定实例）：目标与账密由调用方在工具参数中传入。File 不支持。 */
+const clientMode = computed(() => !isFile.value && config.value.resourceMode === "client");
 
 /** 该 kind 是否有可用资源可选。 */
-const hasResources = computed(() =>
-  isSsh.value ? sshSessions.value.length > 0 : dbProfiles.value.length > 0,
-);
+const hasResources = computed(() => {
+  if (isSsh.value) return sshSessions.value.length > 0;
+  if (isFile.value) return fileAccounts.value.length > 0;
+  return dbProfiles.value.length > 0;
+});
 
 /** 绑定资源的展示名（用于运行状态/提示）。 */
 const boundResourceName = computed(() => {
@@ -76,26 +96,32 @@ const boundResourceName = computed(() => {
   if (isSsh.value) {
     return sshSessions.value.find((s) => s.id === id)?.name ?? "(会话已删除)";
   }
+  if (isFile.value) {
+    return fileAccounts.value.find((a) => a.id === id)?.name ?? "(账号已删除)";
+  }
   return dbProfiles.value.find((p) => p.id === id)?.name ?? "(连接已删除)";
 });
 
 /** 完整 MCP 端点 URL（Streamable HTTP 用 Authorization 头鉴权，URL 不带 token）。 */
 const fullUrl = computed(() => {
   if (!status.value.running) return "";
-  return `http://${status.value.host}:${status.value.port}/mcp`;
+  // 绑定地址是 0.0.0.0（对所有网卡监听）时，0.0.0.0 不是合法客户端目的地
+  // （多数系统上连接 0.0.0.0 失败或行为未定义），展示为 127.0.0.1 才是实际可用地址。
+  const host = status.value.host === "0.0.0.0" ? "127.0.0.1" : status.value.host;
+  return `http://${host}:${status.value.port}/mcp`;
 });
 
 /** 客户端配置 JSON（一键复制）。 */
 const clientConfig = computed(() => {
   if (!fullUrl.value) return "";
+  const serverKey = isSsh.value ? "x-term-ssh" : isFile.value ? "x-term-file" : "x-term-db";
   const cfg: Record<string, unknown> = {
     mcpServers: {
-      [isSsh.value ? "x-term-ssh" : "x-term-db"]: { url: fullUrl.value },
+      [serverKey]: { url: fullUrl.value },
     },
   };
   if (config.value.token) {
-    const key = isSsh.value ? "x-term-ssh" : "x-term-db";
-    (cfg.mcpServers as Record<string, Record<string, unknown>>)[key].headers = {
+    (cfg.mcpServers as Record<string, Record<string, unknown>>)[serverKey].headers = {
       Authorization: `Bearer ${config.value.token}`,
     };
   }
@@ -117,6 +143,12 @@ async function loadResources() {
     sshSessions.value = sessions.sessions.filter(
       (s) => s.protocol === "ssh" || !s.protocol,
     );
+  } else if (isFile.value) {
+    try {
+      fileAccounts.value = await fileAccountList();
+    } catch (e) {
+      ElMessage.error("加载 S3 文件账号列表失败：" + String(e));
+    }
   } else {
     try {
       dbProfiles.value = await dbListProfiles();
@@ -150,8 +182,8 @@ async function loadDatabases(profileId: string) {
 
 /** 绑定资源变更处理。 */
 async function onResourceChange() {
-  // DB kind：加载该 profile 的数据库列表。
-  if (!isSsh.value && config.value.resourceId) {
+  // 仅 DB kind：加载该 profile 的数据库列表。
+  if (props.kind === "db" && config.value.resourceId) {
     await loadDatabases(config.value.resourceId);
   }
   await saveConfigAndMaybeWarn();
@@ -181,7 +213,8 @@ async function saveAutoApprove() {
 
 async function start() {
   if (!clientMode.value && !config.value.resourceId) {
-    ElMessage.warning(`请先选择一个${isSsh.value ? "SSH 会话" : "数据库连接"}，或开启「客户端直连模式」`);
+    const resName = isSsh.value ? "SSH 会话" : isFile.value ? "S3 文件账号" : "数据库连接";
+    ElMessage.warning(`请先选择一个${resName}，或开启「客户端直连模式」`);
     return;
   }
   if (!config.value.token) {
@@ -228,8 +261,8 @@ async function copy(text: string, label = "已复制") {
 
 onMounted(async () => {
   await loadResources();
-  // DB kind：若已有绑定 profile，加载其数据库列表。
-  if (!isSsh.value && config.value.resourceId) {
+  // 仅 DB kind：若已有绑定 profile，加载其数据库列表。
+  if (props.kind === "db" && config.value.resourceId) {
     await loadDatabases(config.value.resourceId);
   }
 });
@@ -241,8 +274,8 @@ onMounted(async () => {
       <div class="card-title">{{ title }}</div>
       <div class="card-desc">{{ toolHint }}</div>
 
-      <!-- 资源模式开关：绑定模式 / 客户端直连模式 -->
-      <div class="mode-row">
+      <!-- 资源模式开关：绑定模式 / 客户端直连模式（File kind 仅支持 bound，隐藏开关） -->
+      <div v-if="!isFile" class="mode-row">
         <div class="switch-label">
           <div>客户端直连模式（免绑定实例）</div>
           <div class="switch-desc">
@@ -277,12 +310,12 @@ onMounted(async () => {
       <!-- 绑定资源（仅绑定模式） -->
       <div v-if="!clientMode" class="field-row">
         <label class="field-label">
-          绑定{{ isSsh ? "SSH 会话" : "数据库连接" }}
+          绑定{{ isSsh ? "SSH 会话" : isFile ? "S3 文件账号" : "数据库连接" }}
           <span class="required">*</span>
         </label>
         <el-select
           v-model="config.resourceId"
-          :placeholder="`选择一个${isSsh ? 'SSH 会话' : '数据库连接'}`"
+          :placeholder="`选择一个${isSsh ? 'SSH 会话' : isFile ? 'S3 文件账号' : '数据库连接'}`"
           filterable
           class="field-control"
           :disabled="!hasResources"
@@ -296,6 +329,14 @@ onMounted(async () => {
               :value="s.id"
             />
           </template>
+          <template v-else-if="isFile">
+            <el-option
+              v-for="a in fileAccounts"
+              :key="a.id"
+              :label="`${a.name} (${a.bucket || a.endpoint})`"
+              :value="a.id"
+            />
+          </template>
           <template v-else>
             <el-option
               v-for="p in dbProfiles"
@@ -307,8 +348,8 @@ onMounted(async () => {
         </el-select>
       </div>
 
-      <!-- DB MCP：绑定具体数据库（仅绑定模式） -->
-      <div v-if="!isSsh && !clientMode" class="field-row">
+      <!-- DB MCP：绑定具体数据库（仅 db kind + 绑定模式） -->
+      <div v-if="kind === 'db' && !clientMode" class="field-row">
         <label class="field-label">绑定数据库（可选）</label>
         <el-select
           v-model="config.boundDatabase"
@@ -334,7 +375,7 @@ onMounted(async () => {
         :closable="false"
         show-icon
         class="mt8"
-        :title="`暂无可用${isSsh ? 'SSH 会话' : '数据库连接'}，请先在对应页面创建，或开启「客户端直连模式」`"
+        :title="`暂无可用${isSsh ? 'SSH 会话' : isFile ? 'S3 文件账号' : '数据库连接'}，请先在对应页面创建${isFile ? '' : '，或开启「客户端直连模式」'}`"
       />
 
       <!-- 监听地址 + 端口 -->

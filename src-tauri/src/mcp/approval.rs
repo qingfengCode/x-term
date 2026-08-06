@@ -34,15 +34,17 @@ pub const MCP_APPROVAL_REQUEST: &str = "mcp:approval_request";
 /// MCP 确认请求过期事件名（超时后 emit 给前端，通知移除对应浮层卡片）。
 pub const MCP_APPROVAL_EXPIRED: &str = "mcp:approval_expired";
 
-/// MCP 服务端种类：SSH MCP（暴露 exec_ssh）或 DB MCP（暴露 exec_sql）。
+/// MCP 服务端种类：SSH MCP（暴露 exec_ssh + 文件工具）/ DB MCP（暴露 exec_sql）/
+/// File MCP（暴露 list_files / upload_file / download_file，基于绑定的 S3 账号）。
 ///
-/// 两个 kind 各自独立的监听实例、端口、token、绑定的资源。序列化为小写字符串
-/// "ssh" / "db"（serde rename_all 在 enum 上对单元变体取小写名）。
+/// 每个 kind 各自独立的监听实例、端口、token、绑定的资源。序列化为小写字符串
+/// "ssh" / "db" / "file"（serde rename_all 在 enum 上对单元变体取小写名）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum McpKind {
     Ssh,
     Db,
+    File,
 }
 
 impl McpKind {
@@ -50,6 +52,7 @@ impl McpKind {
     pub fn parse(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
             "db" => McpKind::Db,
+            "file" => McpKind::File,
             _ => McpKind::Ssh,
         }
     }
@@ -59,6 +62,7 @@ impl McpKind {
         match self {
             McpKind::Ssh => "SSH MCP",
             McpKind::Db => "DB MCP",
+            McpKind::File => "File MCP",
         }
     }
 }
@@ -131,11 +135,7 @@ impl ApprovalRegistry {
     /// - `Ok(true)`：用户批准。
     /// - `Ok(false)`：用户拒绝，或前端未在超时内回应。
     /// - `Err(_)`：emit 事件失败（极端情况，一般不会发生）。
-    pub async fn request_approval(
-        &self,
-        req: ApprovalRequest,
-        app: &AppHandle,
-    ) -> AppResult<bool> {
+    pub async fn request_approval(&self, req: ApprovalRequest, app: &AppHandle) -> AppResult<bool> {
         let (tx, rx) = oneshot::channel::<bool>();
         {
             let mut map = self.pending.lock().await;

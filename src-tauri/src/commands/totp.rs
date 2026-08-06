@@ -65,9 +65,8 @@ pub fn totp_add(input: TotpAddInput, state: State<'_, AppState>) -> AppResult<to
             parsed.account
         };
         // 从 URI 中提取 secret 原文（解析时只校验存在，这里再取一次）。
-        let secret_str = extract_secret_from_uri(&input.secret).ok_or_else(|| {
-            AppError::InvalidInput("otpauth URI 缺少 secret 参数".into())
-        })?;
+        let secret_str = extract_secret_from_uri(&input.secret)
+            .ok_or_else(|| AppError::InvalidInput("otpauth URI 缺少 secret 参数".into()))?;
         (
             totp::TotpEntry {
                 id: String::new(),
@@ -105,9 +104,7 @@ pub fn totp_add(input: TotpAddInput, state: State<'_, AppState>) -> AppResult<to
 
     // 2. 校验 secret 可生成码。
     totp::generate_now(&plain_secret, &entry.algorithm, entry.digits, entry.period)
-        .map_err(|_| {
-            AppError::InvalidInput("无效的 TOTP secret：无法生成验证码".into())
-        })?;
+        .map_err(|_| AppError::InvalidInput("无效的 TOTP secret：无法生成验证码".into()))?;
 
     // 3. vault 加密。
     let vault_guard = state.vault_read()?;
@@ -115,7 +112,7 @@ pub fn totp_add(input: TotpAddInput, state: State<'_, AppState>) -> AppResult<to
         .as_ref()
         .ok_or_else(|| AppError::Auth("保险库未解锁".into()))?;
     let blob = vault.encrypt_str(&plain_secret)?;
-    let enc_secret = CredentialVault::encode_blob(&blob);
+    let enc_secret = CredentialVault::encode_blob(&blob)?;
     drop(vault_guard); // 释放读锁后再操作 DB。
 
     // 4. 生成 id 并入库。

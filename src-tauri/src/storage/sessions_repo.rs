@@ -2,7 +2,7 @@
 //!
 //! 所有函数都接受一个 `&DbConn`（来自 [`crate::storage::db`] 的连接），便于在命令处理器
 //! 中以连接为单位操作。`auth_type` 在数据库中以 TEXT 存储，值为
-//! `"Password"` / `"PrivateKey"` / `"Agent"`，与 [`AuthType`] 的 `as_str` 一致。
+//! `"Password"` / `"PrivateKey"`，与 [`AuthType`] 的 `as_str` 一致。
 
 use serde::{Deserialize, Serialize};
 
@@ -15,15 +15,14 @@ use crate::storage::db::DbConn;
 
 /// 会话认证方式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-// 注意：此处必须用 PascalCase（"Password"/"PrivateKey"/"Agent"），与 `as_str()`、
+// 注意：此处必须用 PascalCase（"Password"/"PrivateKey"），与 `as_str()`、
 // 数据库存储格式以及前端 TS 枚举 (`AuthType`) 保持一致。之前用 camelCase 会导致
 // 前端调用 save_session 时 serde 反序列化失败：
-// "unknown variant `Password`, expected one of `password`, `privateKey`, `agent`"。
+// "unknown variant `Password`, expected one of `password`, `privateKey`"。
 #[serde(rename_all = "PascalCase")]
 pub enum AuthType {
     Password,
     PrivateKey,
-    Agent,
 }
 
 impl AuthType {
@@ -32,17 +31,20 @@ impl AuthType {
         match self {
             AuthType::Password => "Password",
             AuthType::PrivateKey => "PrivateKey",
-            AuthType::Agent => "Agent",
         }
     }
 
     /// 从数据库存储的字符串解析。
+    ///
+    /// 历史上曾存在 `Agent` 变体（ssh-agent 认证），后因 russh 0.45 不原生支持
+    /// agent 认证、UI 也从未提供该选项而已移除。老数据库里若残留 `"Agent"` 值，
+    /// 这里返回 `None`，由调用方兜底降级为密码认证（见 [`crate::storage::db`]
+    /// 中 `row_to_session` 的 `unwrap_or(AuthType::Password)`）。
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "Password" => Some(AuthType::Password),
             "PrivateKey" => Some(AuthType::PrivateKey),
-            "Agent" => Some(AuthType::Agent),
             _ => None,
         }
     }
@@ -211,12 +213,23 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     let auth_type_str: String = row.get(6)?;
     let auth_type = AuthType::from_str(&auth_type_str).unwrap_or(AuthType::Password);
     let port: i64 = row.get(4)?;
+    // 端口越界（>65535 或负数）报错而不是 `as u16` 静默截断（截断会连到错误端口）。
+    let port = u16::try_from(port).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            4,
+            rusqlite::types::Type::Integer,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("端口号超出 0-65535: {}", port),
+            )),
+        )
+    })?;
     Ok(Session {
         id: row.get(0)?,
         name: row.get(1)?,
         group_id: row.get(2)?,
         host: row.get(3)?,
-        port: port as u16,
+        port,
         username: row.get(5)?,
         auth_type,
         credential_id: row.get(7)?,

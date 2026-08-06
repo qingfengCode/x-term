@@ -2,7 +2,7 @@
   Settings.vue — 应用设置视图
 
   两个 Tab：
-  1. 终端：主题 / 字体 / 字号 / 行高 / 滚屏 / 选中复制 / WebGL 渲染
+  1. 终端：主题 / 字体 / 字号 / 行高 / 滚屏 / 选中复制 / WebGL 渲染 / SSH 空闲断开时间
   2. AI 助手（BYOK 多模型）：管理 provider 列表、设置激活模型
 
   所有改动通过 settingsStore.save() 持久化；主题切换同时切换 document.documentElement 的 'dark' class。
@@ -11,13 +11,18 @@
 import { computed, onMounted, reactive, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import type { FormInstance, FormRules } from "element-plus";
-import { Delete, Plus, Refresh, Folder } from "@element-plus/icons-vue";
+import { Delete, Plus, Refresh, Folder, Setting } from "@element-plus/icons-vue";
 import { open } from "@tauri-apps/plugin-dialog";
 import { setWorkspaceDir } from "@/api/ai";
 import { useSettingsStore } from "@/stores/settings";
 import { useUpdateStore } from "@/stores/update";
-import { ProviderKind } from "@/api/types";
-import { APP_SHORTCUT_METAS, SQL_MODE_OPTIONS, defaultAppShortcuts } from "@/api/types";
+import { ProviderKind, PROVIDER_DEFAULTS } from "@/api/types";
+import {
+  APP_SHORTCUT_METAS,
+  RUN_MODE_OPTIONS,
+  SQL_MODE_OPTIONS,
+  defaultAppShortcuts,
+} from "@/api/types";
 import { eventToCombo, isModifierOnly } from "@/utils/shortcut";
 import type {
   AppShortcutAction,
@@ -26,6 +31,7 @@ import type {
   ProviderKind as ProviderKindType,
   ShortcutCommand,
   TerminalSettings,
+  ToolRunMode,
 } from "@/api/types";
 
 const settings = useSettingsStore();
@@ -33,14 +39,12 @@ const updater = useUpdateStore();
 const activeTab = ref<"terminal" | "shortcuts" | "appShortcuts" | "ai" | "about">("terminal");
 
 // --- 关于 / 更新 -----------------------------------------------------------
-/** 更新源输入框本地副本（编辑后点保存才回写）。 */
-const manifestUrlInput = ref("");
-const savingUrl = ref(false);
 
 /** 字节数格式化为人类可读单位。 */
 function formatBytes(n: number): string {
   if (!n) return "0 B";
-  const units = ["B", "KB", "MB", "GB"];
+  // 升级包可能超过 1TB（大体积应用），缺 TB 会把 1.5TB 显示成 "1536.0 GB"。
+  const units = ["B", "KB", "MB", "GB", "TB"];
   let i = 0;
   let v = n;
   while (v >= 1024 && i < units.length - 1) {
@@ -48,19 +52,6 @@ function formatBytes(n: number): string {
     i++;
   }
   return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${units[i]}`;
-}
-
-/** 保存更新源地址。 */
-async function saveUrl() {
-  savingUrl.value = true;
-  try {
-    await updater.saveManifestUrl(manifestUrlInput.value);
-    ElMessage.success("已保存更新源");
-  } catch (e) {
-    ElMessage.error("保存失败：" + (e instanceof Error ? e.message : String(e)));
-  } finally {
-    savingUrl.value = false;
-  }
 }
 
 /** 安装前二次确认（会退出应用）。 */
@@ -83,7 +74,6 @@ watch(activeTab, (tab) => {
 });
 async function loadAbout() {
   await updater.loadInfo();
-  manifestUrlInput.value = updater.info?.manifestUrl ?? "";
 }
 
 // --- 应用快捷键（独立 tab） ----------------------------------------------
@@ -181,19 +171,33 @@ const termForm = reactive<TerminalSettings>({ ...settings.terminal });
 // AI 激活模型（value 为 `${kind}:${model}` 字符串）
 const activeValue = ref<string>("");
 
-// 添加 provider 弹窗
+// 添加/编辑 provider 弹窗
 const providerDialogVisible = ref(false);
 const providerFormRef = ref<FormInstance>();
+/** 编辑模式：正在编辑的 provider 下标；null 表示新增。 */
+const editingIndex = ref<number | null>(null);
 const providerForm = reactive<{
   kind: ProviderKindType;
   baseUrl: string;
   apiKey: string;
   model: string;
+  maxOutput: number;
+  contextWindow: number;
+  maxToolCalls: number;
+  temperature: number | null;
+  connectTimeoutSecs: number;
+  readTimeoutSecs: number;
 }>({
   kind: ProviderKind.OpenAi,
   baseUrl: defaultBaseUrl(ProviderKind.OpenAi),
   apiKey: "",
   model: "",
+  maxOutput: PROVIDER_DEFAULTS.maxOutput,
+  contextWindow: PROVIDER_DEFAULTS.contextWindow,
+  maxToolCalls: PROVIDER_DEFAULTS.maxToolCalls,
+  temperature: null,
+  connectTimeoutSecs: PROVIDER_DEFAULTS.connectTimeoutSecs,
+  readTimeoutSecs: PROVIDER_DEFAULTS.readTimeoutSecs,
 });
 
 const providerRules: FormRules = {
@@ -201,6 +205,29 @@ const providerRules: FormRules = {
   baseUrl: [{ required: false }],
   apiKey: [{ required: true, message: "请输入 API Key", trigger: "blur" }],
   model: [{ required: true, message: "请输入模型名", trigger: "blur" }],
+  maxOutput: [
+    { required: true, message: "请输入最大输出", trigger: "blur" },
+    { type: "number", min: 1, max: 1000000, message: "1 ~ 1000000", trigger: "blur" },
+  ],
+  contextWindow: [
+    { required: true, message: "请输入上下文大小", trigger: "blur" },
+    { type: "number", min: 1, max: 10000000, message: "1 ~ 10000000", trigger: "blur" },
+  ],
+  maxToolCalls: [
+    { required: true, message: "请输入工具调用数", trigger: "blur" },
+    { type: "number", min: 1, max: 1000, message: "1 ~ 1000", trigger: "blur" },
+  ],
+  temperature: [
+    { type: "number", min: 0, max: 2, message: "0 ~ 2（留空则不发送）", trigger: "blur" },
+  ],
+  connectTimeoutSecs: [
+    { required: true, message: "请输入建连超时", trigger: "blur" },
+    { type: "number", min: 1, max: 3600, message: "1 ~ 3600 秒", trigger: "blur" },
+  ],
+  readTimeoutSecs: [
+    { required: true, message: "请输入读取超时", trigger: "blur" },
+    { type: "number", min: 1, max: 3600, message: "1 ~ 3600 秒", trigger: "blur" },
+  ],
 };
 
 // ProviderKind 选项
@@ -280,10 +307,33 @@ async function onActiveChange(val: string) {
 }
 
 function openProviderDialog() {
+  editingIndex.value = null;
   providerForm.kind = ProviderKind.OpenAi;
   providerForm.baseUrl = defaultBaseUrl(ProviderKind.OpenAi);
   providerForm.apiKey = "";
   providerForm.model = "";
+  providerForm.maxOutput = PROVIDER_DEFAULTS.maxOutput;
+  providerForm.contextWindow = PROVIDER_DEFAULTS.contextWindow;
+  providerForm.maxToolCalls = PROVIDER_DEFAULTS.maxToolCalls;
+  providerForm.temperature = null;
+  providerForm.connectTimeoutSecs = PROVIDER_DEFAULTS.connectTimeoutSecs;
+  providerForm.readTimeoutSecs = PROVIDER_DEFAULTS.readTimeoutSecs;
+  providerDialogVisible.value = true;
+}
+
+/** 编辑已有 provider：回填表单（apiKey 为明文，方便修改）。 */
+function openEditProvider(p: ProviderConfig, index: number) {
+  editingIndex.value = index;
+  providerForm.kind = p.kind;
+  providerForm.baseUrl = p.baseUrl;
+  providerForm.apiKey = p.apiKey;
+  providerForm.model = p.model;
+  providerForm.maxOutput = p.maxOutput ?? PROVIDER_DEFAULTS.maxOutput;
+  providerForm.contextWindow = p.contextWindow ?? PROVIDER_DEFAULTS.contextWindow;
+  providerForm.maxToolCalls = p.maxToolCalls ?? PROVIDER_DEFAULTS.maxToolCalls;
+  providerForm.temperature = p.temperature ?? null;
+  providerForm.connectTimeoutSecs = p.connectTimeoutSecs ?? PROVIDER_DEFAULTS.connectTimeoutSecs;
+  providerForm.readTimeoutSecs = p.readTimeoutSecs ?? PROVIDER_DEFAULTS.readTimeoutSecs;
   providerDialogVisible.value = true;
 }
 
@@ -299,23 +349,40 @@ async function submitProvider() {
     baseUrl: providerForm.baseUrl.trim(),
     apiKey: providerForm.apiKey.trim(),
     model: providerForm.model.trim(),
+    maxOutput: providerForm.maxOutput,
+    contextWindow: providerForm.contextWindow,
+    maxToolCalls: providerForm.maxToolCalls,
+    temperature: providerForm.temperature,
+    connectTimeoutSecs: providerForm.connectTimeoutSecs,
+    readTimeoutSecs: providerForm.readTimeoutSecs,
   };
-  // 同 kind+model 视为重复，覆盖 apiKey/baseUrl
-  const idx = settings.aiProviders.findIndex(
-    (p) => p.kind === cfg.kind && p.model === cfg.model,
-  );
-  if (idx >= 0) {
+  if (editingIndex.value !== null) {
+    // 编辑模式：按下标覆盖。
+    const idx = editingIndex.value;
+    const old = settings.aiProviders[idx];
     settings.aiProviders[idx] = cfg;
+    // 激活项标识是 `${kind}:${model}`，若编辑后变了则同步更新。
+    if (settings.aiActive === `${old.kind}:${old.model}`) {
+      settings.aiActive = `${cfg.kind}:${cfg.model}`;
+    }
   } else {
-    settings.aiProviders.push(cfg);
-  }
-  // 若尚无激活模型，自动设为激活
-  if (!settings.aiActive) {
-    settings.aiActive = `${cfg.kind}:${cfg.model}`;
+    // 新增模式：同 kind+model 视为重复，覆盖 apiKey/baseUrl 及参数
+    const idx = settings.aiProviders.findIndex(
+      (p) => p.kind === cfg.kind && p.model === cfg.model,
+    );
+    if (idx >= 0) {
+      settings.aiProviders[idx] = cfg;
+    } else {
+      settings.aiProviders.push(cfg);
+    }
+    // 若尚无激活模型，自动设为激活
+    if (!settings.aiActive) {
+      settings.aiActive = `${cfg.kind}:${cfg.model}`;
+    }
   }
   try {
     await settings.save();
-    ElMessage.success("已添加 provider");
+    ElMessage.success(editingIndex.value !== null ? "已保存修改" : "已添加 provider");
     providerDialogVisible.value = false;
   } catch (e: any) {
     ElMessage.error("保存失败：" + (e?.message ?? String(e)));
@@ -467,7 +534,7 @@ onMounted(async () => {
 // 用多行文本编辑：每行一个命令前缀。失焦/保存时同步到 settings store。
 const whitelistText = ref("");
 
-/** SSH 开关（白名单自动放行/终端可视化）切换后立即保存。 */
+/** SSH 开关（运行模式/终端可视化）切换后立即保存。 */
 async function saveSshSwitches() {
   try {
     await settings.save();
@@ -505,13 +572,32 @@ function resetWhitelist() {
 }
 
 // --- SQL 智能体：执行模式开关 --------------------------------------------
-/** SQL 开关（模式/只读自动放行）切换后立即保存。 */
+/** SQL 开关（模式/运行模式/可视化）切换后立即保存。 */
 async function saveSqlSwitches() {
   try {
     await settings.save();
   } catch (e: unknown) {
     ElMessage.error("保存失败：" + String(e));
   }
+}
+
+/** 运行模式针对各智能体的说明文案（下拉下方显示当前模式的具体行为）。 */
+function runModeDesc(mode: ToolRunMode, agent: "ssh" | "sql"): string {
+  const map: Record<string, Record<ToolRunMode, string>> = {
+    ssh: {
+      manual: "所有命令执行都需人工确认，批准后才执行。",
+      auto: "所有命令自动执行（含 rm/mkfs/dd 等危险命令），完全无人值守，风险自负。",
+      whitelist:
+        "命令落在白名单内且非危险时免确认直接执行，其余（含危险命令）弹人工确认。",
+    },
+    sql: {
+      manual: "所有 SQL 都需人工确认，批准后才执行。",
+      auto: "所有 SQL 自动执行（含 DROP/TRUNCATE 等危险语句），完全无人值守，风险自负。",
+      whitelist:
+        "只读查询（SELECT/SHOW/EXPLAIN 等）免确认直接执行，写操作与危险语句弹人工确认。",
+    },
+  };
+  return map[agent][mode];
 }
 
 // --- 本地文件读写：开关 + 工作目录 ----------------------------------------
@@ -567,7 +653,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
 <template>
   <div class="settings-view">
     <div class="header">
-      <h2>设置</h2>
+      <h2><el-icon><Setting /></el-icon> 设置</h2>
     </div>
 
     <el-tabs v-model="activeTab" class="settings-tabs">
@@ -615,6 +701,18 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
 
             <el-form-item label="启用 WebGL 渲染">
               <el-switch v-model="termForm.enableWebgl" />
+            </el-form-item>
+
+            <el-form-item label="SSH 空闲断开">
+              <el-input-number
+                v-model="termForm.sshIdleTimeoutMinutes"
+                :min="0"
+                :max="1440"
+                controls-position="right"
+              />
+              <span style="margin-left: 8px; color: var(--el-text-color-secondary); font-size: 13px">
+                分钟，0 表示永不自动断开
+              </span>
             </el-form-item>
 
             <el-form-item>
@@ -812,6 +910,16 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
               </template>
             </el-table-column>
 
+            <el-table-column label="参数" min-width="220">
+              <template #default="{ row }">
+                <span class="muted mono">
+                  输出 {{ row.maxOutput ?? 16000 }} · 窗口 {{ row.contextWindow ?? 184000 }} ·
+                  工具 {{ row.maxToolCalls ?? 200 }} 次
+                  <template v-if="row.temperature != null"> · 温度 {{ row.temperature }}</template>
+                </span>
+              </template>
+            </el-table-column>
+
             <el-table-column label="API Key" width="120">
               <template #default>
                 <span class="secret">***</span>
@@ -832,14 +940,17 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
               </template>
             </el-table-column>
 
-            <el-table-column label="操作" width="180" align="center" fixed="right">
-              <template #default="{ row }">
+            <el-table-column label="操作" width="240" align="center" fixed="right">
+              <template #default="{ row, $index }">
                 <el-button
                   size="small"
                   :disabled="settings.aiActive === `${row.kind}:${row.model}`"
                   @click="setActive(row)"
                 >
                   设为激活
+                </el-button>
+                <el-button size="small" @click="openEditProvider(row, $index)">
+                  编辑
                 </el-button>
                 <el-button size="small" type="danger" @click="removeProvider(row)">
                   删除
@@ -853,17 +964,30 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
         <div class="form-card">
           <div class="card-title">SSH 智能体（终端命令执行）</div>
           <div class="card-desc">
-            控制 AI 在 SSH 终端上执行命令的行为：白名单、自动放行、可视化。
+            控制 AI 在 SSH 终端上执行命令的行为：运行模式、白名单、可视化。
           </div>
           <div class="switch-row">
             <div class="switch-label">
-              <div>白名单自动放行</div>
+              <div>运行模式</div>
               <div class="switch-desc">
-                开启后，命令落在白名单内时<strong>免确认按钮</strong>直接执行。
-                危险命令（rm/mkfs/dd 等）仍强制人工确认。
+                控制 AI 执行命令前是否需要你确认。
               </div>
             </div>
-            <el-switch v-model="settings.sshAgent.autoApproveSafe" @change="saveSshSwitches" />
+            <el-select
+              v-model="settings.sshAgent.runMode"
+              style="width: 140px"
+              @change="saveSshSwitches"
+            >
+              <el-option
+                v-for="opt in RUN_MODE_OPTIONS"
+                :key="opt.value"
+                :label="opt.label"
+                :value="opt.value"
+              />
+            </el-select>
+          </div>
+          <div class="mode-desc">
+            {{ runModeDesc(settings.sshAgent.runMode, "ssh") }}
           </div>
           <div class="switch-row">
             <div class="switch-label">
@@ -899,7 +1023,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
         <div class="form-card">
           <div class="card-title">SQL 智能体（数据库语句执行）</div>
           <div class="card-desc">
-            控制 AI 在 MySQL 上执行 SQL 的行为：执行模式与自动放行。
+            控制 AI 在 MySQL 上执行 SQL 的行为：执行模式与运行模式。
           </div>
           <div class="switch-row">
             <div class="switch-label">
@@ -926,13 +1050,26 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
           </div>
           <div class="switch-row" style="margin-top: 12px">
             <div class="switch-label">
-              <div>只读查询自动放行</div>
+              <div>运行模式</div>
               <div class="switch-desc">
-                开启后，SELECT/SHOW/EXPLAIN/DESCRIBE 等<strong>只读查询</strong>免确认直接执行。
-                写操作（INSERT/UPDATE/DELETE/DDL）仍需人工确认。
+                控制 AI 执行 SQL 前是否需要你确认。
               </div>
             </div>
-            <el-switch v-model="settings.sqlAgent.autoApproveSafe" @change="saveSqlSwitches" />
+            <el-select
+              v-model="settings.sqlAgent.runMode"
+              style="width: 140px"
+              @change="saveSqlSwitches"
+            >
+              <el-option
+                v-for="opt in RUN_MODE_OPTIONS"
+                :key="opt.value"
+                :label="opt.label"
+                :value="opt.value"
+              />
+            </el-select>
+          </div>
+          <div class="mode-desc">
+            {{ runModeDesc(settings.sqlAgent.runMode, "sql") }}
           </div>
           <div class="switch-row" style="margin-top: 12px">
             <div class="switch-label">
@@ -992,11 +1129,11 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
           </template>
         </div>
 
-        <!-- 添加 Provider 弹窗 -->
+        <!-- 添加/编辑 Provider 弹窗 -->
         <el-dialog
           v-model="providerDialogVisible"
-          title="添加 Provider"
-          width="520px"
+          :title="editingIndex !== null ? '编辑 Provider' : '添加 Provider'"
+          width="560px"
           :close-on-click-modal="false"
         >
           <el-form
@@ -1032,11 +1169,81 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
             <el-form-item label="Model" prop="model">
               <el-input v-model="providerForm.model" placeholder="例如 gpt-4o-mini" />
             </el-form-item>
+
+            <el-divider content-position="left">模型参数</el-divider>
+
+            <el-form-item label="最大输出" prop="maxOutput">
+              <el-input-number
+                v-model="providerForm.maxOutput"
+                :min="1"
+                :max="1000000"
+                :step="1024"
+                style="width: 180px"
+              />
+              <span class="muted form-hint">tokens（请求体 max_tokens）</span>
+            </el-form-item>
+
+            <el-form-item label="上下文大小" prop="contextWindow">
+              <el-input-number
+                v-model="providerForm.contextWindow"
+                :min="1"
+                :max="10000000"
+                :step="4096"
+                style="width: 180px"
+              />
+              <span class="muted form-hint">tokens，超出部分的历史消息会被裁剪</span>
+            </el-form-item>
+
+            <el-form-item label="工具调用数" prop="maxToolCalls">
+              <el-input-number
+                v-model="providerForm.maxToolCalls"
+                :min="1"
+                :max="1000"
+                style="width: 180px"
+              />
+              <span class="muted form-hint">智能体模式单次对话的最大工具调用数</span>
+            </el-form-item>
+
+            <el-form-item label="温度" prop="temperature">
+              <el-input-number
+                v-model="providerForm.temperature"
+                :min="0"
+                :max="2"
+                :step="0.1"
+                :precision="1"
+                :controls="false"
+                placeholder="留空由服务端默认"
+                style="width: 180px"
+              />
+              <span class="muted form-hint">采样温度，留空表示不发送</span>
+            </el-form-item>
+
+            <el-form-item label="建连超时" prop="connectTimeoutSecs">
+              <el-input-number
+                v-model="providerForm.connectTimeoutSecs"
+                :min="1"
+                :max="3600"
+                style="width: 180px"
+              />
+              <span class="muted form-hint">秒，DNS 解析/建连最长等待</span>
+            </el-form-item>
+
+            <el-form-item label="读取超时" prop="readTimeoutSecs">
+              <el-input-number
+                v-model="providerForm.readTimeoutSecs"
+                :min="1"
+                :max="3600"
+                style="width: 180px"
+              />
+              <span class="muted form-hint">秒，流式响应间隔最长等待；长思考模型需调大</span>
+            </el-form-item>
           </el-form>
 
           <template #footer>
             <el-button @click="providerDialogVisible = false">取消</el-button>
-            <el-button type="primary" @click="submitProvider">添加</el-button>
+            <el-button type="primary" @click="submitProvider">
+              {{ editingIndex !== null ? "保存修改" : "添加" }}
+            </el-button>
           </template>
         </el-dialog>
       </el-tab-pane>
@@ -1119,20 +1326,6 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
             </div>
           </div>
 
-          <!-- 更新源配置 -->
-          <div class="form-card about-source">
-            <div class="about-card-title">更新源</div>
-            <div class="about-source-row">
-              <el-input
-                v-model="manifestUrlInput"
-                placeholder="http://your-server/x-term/update.json"
-                clearable
-              />
-              <el-button type="primary" :loading="savingUrl" @click="saveUrl">保存</el-button>
-            </div>
-            <div class="about-hint">指向自建服务器上的 update.json，包含 version / notes / url / sha256。</div>
-          </div>
-
           <!-- 技术信息 -->
           <div class="form-card about-meta">
             <div class="about-card-title">技术信息</div>
@@ -1164,6 +1357,9 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
   font-size: 20px;
   font-weight: 600;
   color: var(--el-text-color-primary);
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .settings-tabs {
@@ -1218,6 +1414,12 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
 
 .muted {
   color: var(--el-text-color-placeholder);
+}
+
+/* 表单输入框右侧的说明文字。 */
+.form-hint {
+  margin-left: 10px;
+  font-size: 12px;
 }
 
 .card-title {
@@ -1485,11 +1687,6 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
 .about-hint {
   font-size: 12px;
   color: var(--el-text-color-placeholder);
-}
-.about-source-row {
-  display: flex;
-  gap: 10px;
-  margin-bottom: 8px;
 }
 .about-meta-grid {
   display: grid;

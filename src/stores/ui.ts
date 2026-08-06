@@ -9,6 +9,9 @@ export const useUiStore = defineStore("ui", () => {
   /** AI 面板是否折叠。 */
   const aiCollapsed = ref(true);
 
+  /** AI 面板展开宽度（按 domain 独立记忆，拖拽调整后保持，重启恢复默认）。 */
+  const aiWidths = ref<Record<"ssh" | "db", number>>({ ssh: 340, db: 340 });
+
   function toggleAi() {
     aiCollapsed.value = !aiCollapsed.value;
   }
@@ -17,5 +20,9 @@ export const useUiStore = defineStore("ui", () => {
     aiCollapsed.value = v;
   }
 
-  return { aiCollapsed, toggleAi, setAiCollapsed };
+  function setAiWidth(domain: "ssh" | "db", w: number) {
+    aiWidths.value = { ...aiWidths.value, [domain]: Math.round(w) };
+  }
+
+  return { aiCollapsed, toggleAi, setAiCollapsed, aiWidths, setAiWidth };
 });

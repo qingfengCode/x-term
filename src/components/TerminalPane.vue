@@ -8,6 +8,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import * as terminalApi from "@/api/terminal";
 import { useSettingsStore } from "@/stores/settings";
+import { matchesCombo } from "@/utils/shortcut";
 import { base64ToBytes, bytesToBase64 } from "@/utils/binary";
 import "@xterm/xterm/css/xterm.css";
 
@@ -154,20 +155,58 @@ onMounted(async () => {
   window.addEventListener("keydown", onGlobalKeydown);
 });
 
-// Ctrl+F 打开搜索；Esc 关闭。
+// 搜索（组合键跟随设置页绑定，默认 Ctrl+F）、复制/粘贴、字号缩放。
 function onGlobalKeydown(e: KeyboardEvent) {
-  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
-    // 仅当本终端面板可见（父容器有尺寸）时响应。
+  // 搜索：仅当本终端面板可见（父容器有尺寸）时响应。
+  const searchCombo = settings.getAppShortcut("search");
+  if (searchCombo && matchesCombo(e, searchCombo)) {
     const el = containerRef.value;
     if (!el) return;
     const rect = el.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) return;
     e.preventDefault();
     openSearch();
+    return;
   }
   if (e.key === "Escape" && searchOpen.value) {
     closeSearch();
   }
+
+  // 以下仅当终端拥有焦点时响应，避免与 AI 输入框等抢快捷键。
+  if (!containerRef.value?.contains(document.activeElement)) return;
+
+  // 复制 / 粘贴：组合键跟随设置页"快捷键"tab（默认 Ctrl+Shift+C / Ctrl+Shift+V）。
+  const copyCombo = settings.getAppShortcut("copy");
+  if (copyCombo && matchesCombo(e, copyCombo)) {
+    e.preventDefault();
+    menuCopy();
+    return;
+  }
+  const pasteCombo = settings.getAppShortcut("paste");
+  if (pasteCombo && matchesCombo(e, pasteCombo)) {
+    e.preventDefault();
+    void menuPaste();
+    return;
+  }
+
+  // 字号缩放：Ctrl+= / Ctrl+- / Ctrl+0（重置为默认 14）。与工具条按钮一致，仅存内存。
+  if (e.ctrlKey || e.metaKey) {
+    if (e.key === "=" || e.key === "+") {
+      e.preventDefault();
+      zoomFont(1);
+    } else if (e.key === "-") {
+      e.preventDefault();
+      zoomFont(-1);
+    } else if (e.key === "0") {
+      e.preventDefault();
+      settings.setTerminal({ fontSize: 14 });
+    }
+  }
+}
+
+function zoomFont(delta: number) {
+  const next = Math.max(8, Math.min(36, settings.terminal.fontSize + delta));
+  settings.setTerminal({ fontSize: next });
 }
 
 // 设置变化时重建主题。

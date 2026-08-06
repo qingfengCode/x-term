@@ -46,8 +46,8 @@ use tauri::AppHandle;
 use tokio::time::timeout;
 
 use crate::error::{AppError, AppResult};
-use crate::utils::{format_query_result, strip_ansi};
 use crate::state::AppState;
+use crate::utils::{format_query_result, strip_ansi};
 
 // ===========================================================================
 // 类型定义
@@ -140,7 +140,8 @@ pub fn ssh_tools() -> Vec<ToolDef> {
             name: "exec_ssh".into(),
             description: "在指定的 SSH 终端会话对应的服务器上执行一条 shell 命令，\
 返回标准输出和标准错误的合并文本。适用于查询系统状态（如 ps、df、netstat、\
-cat 配置文件等）。单命令超时 30 秒，输出截断 16KB。".into(),
+cat 配置文件等）。单命令超时 30 秒，输出截断 16KB。"
+                .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -159,7 +160,8 @@ cat 配置文件等）。单命令超时 30 秒，输出截断 16KB。".into(),
         ToolDef {
             name: "terminal_snapshot".into(),
             description: "获取指定 SSH 终端会话最近的屏幕输出（最近 8KB），\
-用于了解用户当前看到了什么、上下文是什么。".into(),
+用于了解用户当前看到了什么、上下文是什么。"
+                .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -245,7 +247,8 @@ pub fn file_tools() -> Vec<ToolDef> {
             name: "read_file".into(),
             description: "读取本地工作目录内的文本文件内容，返回原始文本。\
 path 是相对工作目录的路径（如 data/users.csv），不允许绝对路径或 .. 逃逸。\
-单文件上限 1MB；二进制文件会被拒绝。".into(),
+单文件上限 1MB；二进制文件会被拒绝。"
+                .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -261,7 +264,8 @@ path 是相对工作目录的路径（如 data/users.csv），不允许绝对路
             name: "write_file".into(),
             description: "把文本内容写入本地工作目录内的文件。path 是相对工作目录的路径，\
 不允许绝对路径或 .. 逃逸。父目录需已存在（不会自动创建多级目录）。\
-若目标文件已存在会被覆盖（用户会收到危险确认）。适合导出数据、保存脚本等。".into(),
+若目标文件已存在会被覆盖（用户会收到危险确认）。适合导出数据、保存脚本等。"
+                .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -280,7 +284,8 @@ path 是相对工作目录的路径（如 data/users.csv），不允许绝对路
         ToolDef {
             name: "list_files".into(),
             description: "列出工作目录（或相对其的子目录）内的条目：文件名、类型（文件/目录）、\
-大小。path 省略时列工作目录根。用于了解有哪些文件可用、确认输出文件是否已存在。".into(),
+大小。path 省略时列工作目录根。用于了解有哪些文件可用、确认输出文件是否已存在。"
+                .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -361,7 +366,7 @@ pub async fn execute_tool(
         ));
     }
     match call.name.as_str() {
-        "exec_ssh" => exec_ssh(app, state, &call.arguments, visualization).await,
+        "exec_ssh" => exec_ssh(state, &call.arguments, visualization).await,
         "terminal_snapshot" => terminal_snapshot(state, &call.arguments),
         "exec_sql" => exec_sql(app, state, &call.arguments, visualization).await,
         "list_db_tables" => list_db_tables(state, &call.arguments).await,
@@ -384,12 +389,7 @@ pub async fn execute_tool(
 ///   （russh 0.45 的 `Handle` 未实现 `Clone`），而是基于该会话的 `session_config_id`
 ///   新建一条独立 SSH 连接，用 `channel.exec` 执行命令，读完输出后断开。输出干净
 ///   （无 PTY 转义污染）、隔离性好、规避所有权问题，但用户在终端里看不到。
-async fn exec_ssh(
-    app: &AppHandle,
-    state: &AppState,
-    args: &Value,
-    visualization: bool,
-) -> ToolResult {
+async fn exec_ssh(state: &AppState, args: &Value, visualization: bool) -> ToolResult {
     // 1. 解析参数。
     let (session_id, command) = match (
         args.get("sessionId").and_then(Value::as_str),
@@ -405,7 +405,11 @@ async fn exec_ssh(
 
     log::info!(
         "[agent] exec_ssh 开始：会话 {session_id}，模式 {}，命令：{command}",
-        if visualization { "可视化(写PTY)" } else { "独立连接" }
+        if visualization {
+            "可视化(写PTY)"
+        } else {
+            "独立连接"
+        }
     );
 
     // 1.5 终端可视化模式：把命令写入用户活动终端的 PTY（命令实时显示在 xterm），
@@ -437,9 +441,7 @@ async fn exec_ssh(
         let session_config = {
             let conn = state.conn()?;
             crate::storage::sessions_repo::get_session(&conn, &session_config_id)?
-                .ok_or_else(|| {
-                    AppError::NotFound(format!("会话配置 {session_config_id} 不存在"))
-                })?
+                .ok_or_else(|| AppError::NotFound(format!("会话配置 {session_config_id} 不存在")))?
         };
         let vault = {
             let guard = state.vault_read()?;
@@ -449,11 +451,7 @@ async fn exec_ssh(
                 .clone()
         };
         let conn = state.conn()?;
-        let resolved = crate::ssh::session::resolve_credential(
-            &session_config,
-            &vault,
-            &conn,
-        )?;
+        let resolved = crate::ssh::session::resolve_credential(&session_config, &vault, &conn)?;
         Ok((session_config, resolved))
     })();
     let (session_config, resolved) = match setup {
@@ -462,15 +460,16 @@ async fn exec_ssh(
     };
 
     // 4. 新建连接 + exec（整体 30s 超时）。
-    let app_clone = app.clone();
+    let state_clone = state.clone();
     let run = async {
         // 连接（这里复用 SshSession::open 用的 connect_direct）。
         let handle = crate::ssh::client::connect_direct(
             &session_config.host,
             session_config.port,
             &session_config.username,
+            &session_config.id,
             resolved.auth_method,
-            app_clone,
+            state_clone,
         )
         .await?;
 
@@ -621,25 +620,35 @@ async fn exec_ssh_visual(state: &AppState, session_id: &str, command: &str) -> T
 
 /// 从 snapshot 中提取"命令执行期间的新增输出"。
 ///
-/// - `baseline`：命令写入前缓冲的字节数；snapshot 是定长环形缓冲，可能已环绕，
-///   这里用"哨兵位置"做主要锚点：取从命令回显结束到哨兵之间的内容。
+/// - `baseline`：命令写入前缓冲的字节数（保留参数，已不用于截取逻辑）；
 /// - `sentinel`：哨兵字符串（超时时为空）。
+///
+/// 哨兵会出现在两处：**命令回显行**（PTY 回显 `cmd; echo SENTINEL`，是第一次出现）
+/// 和 **echo 命令的实际输出行**（最后一次出现）。用 `find` 取第一次会出现会把
+/// "提示符+命令残片"当作输出，因此这里按行匹配：取第一个含哨兵的行之后、
+/// 最后一个含哨兵的行之前的内容，即真正的命令输出。
 fn extract_new_output(snapshot: &str, _baseline: usize, sentinel: &str) -> String {
-    // 策略：找到哨兵所在行，取该行之前的所有内容；再尝试去掉第一行（命令回显）。
-    let end = if sentinel.is_empty() {
-        snapshot.len()
-    } else {
-        snapshot.find(sentinel).unwrap_or(snapshot.len())
-    };
-    let before_sentinel = &snapshot[..end];
-    // 去掉末尾的空行/哨兵前导。
-    let trimmed = before_sentinel.trim_end_matches(['\n', '\r']);
-    // 命令回显通常是第一行（用户在 xterm 看到的 `<cmd>; echo SENTINEL`）。
-    // 去掉第一行以减少噪音。
-    if let Some(nl) = trimmed.find('\n') {
-        trimmed[nl + 1..].to_string()
-    } else {
-        trimmed.to_string()
+    if sentinel.is_empty() {
+        // 超时路径：返回快照全量。
+        return snapshot.to_string();
+    }
+    let lines: Vec<&str> = snapshot.split_inclusive('\n').collect();
+    let mut first: Option<usize> = None;
+    let mut last: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate() {
+        if line.contains(sentinel) {
+            if first.is_none() {
+                first = Some(i);
+            }
+            last = Some(i);
+        }
+    }
+    match (first, last) {
+        (Some(f), Some(l)) if l > f => lines[f + 1..l].concat(),
+        // 只有一处含哨兵（输出被环形缓冲滚掉等）：取该行之后的内容。
+        (Some(f), Some(_)) => lines[f + 1..].concat(),
+        // 快照里找不到哨兵：返回全量（调用方按超时/部分输出处理）。
+        _ => snapshot.to_string(),
     }
 }
 
@@ -648,7 +657,12 @@ fn truncate_output(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
     }
-    let cut = s.char_indices().take_while(|(i, _)| *i <= max_bytes).last().map(|(i, _)| i).unwrap_or(max_bytes);
+    let cut = s
+        .char_indices()
+        .take_while(|(i, _)| *i <= max_bytes)
+        .last()
+        .map(|(i, _)| i)
+        .unwrap_or(max_bytes);
     format!("{}…\n(输出已截断，共 {} 字节)", &s[..cut], s.len())
 }
 
@@ -682,7 +696,12 @@ fn terminal_snapshot(state: &AppState, args: &Value) -> ToolResult {
 /// `visualization` 为 true（SQL 终端可视化开启）时，执行后额外 emit
 /// `ai:sql_result` 事件，携带结构化结果（columns/rows/affected/elapsed/error），
 /// 前端 SQL 控制台据此把 SQL 与结果回显进输出流（命令行模式）。
-async fn exec_sql(app: &AppHandle, state: &AppState, args: &Value, visualization: bool) -> ToolResult {
+async fn exec_sql(
+    app: &AppHandle,
+    state: &AppState,
+    args: &Value,
+    visualization: bool,
+) -> ToolResult {
     let (conn_id, sql) = match (
         args.get("dbConnId").and_then(Value::as_str),
         args.get("sql").and_then(Value::as_str),
@@ -722,7 +741,12 @@ async fn exec_sql(app: &AppHandle, state: &AppState, args: &Value, visualization
     if visualization {
         let (columns, rows, affected, error) = match &res {
             Ok(qr) => (qr.columns.clone(), qr.rows.clone(), qr.affected, None),
-            Err(e) => (Vec::new(), Vec::new(), 0u64, Some(format!("SQL 执行失败: {e}"))),
+            Err(e) => (
+                Vec::new(),
+                Vec::new(),
+                0u64,
+                Some(format!("SQL 执行失败: {e}")),
+            ),
         };
         crate::events::emit(
             app,
@@ -763,16 +787,8 @@ async fn list_db_tables(state: &AppState, args: &Value) -> ToolResult {
 
     match res {
         Ok(qr) => {
-            let tables: Vec<String> = qr
-                .rows
-                .into_iter()
-                .filter_map(|mut r| r.pop())
-                .collect();
-            ToolResult::ok(format!(
-                "共 {} 张表：\n{}",
-                tables.len(),
-                tables.join("\n")
-            ))
+            let tables: Vec<String> = qr.rows.into_iter().filter_map(|mut r| r.pop()).collect();
+            ToolResult::ok(format!("共 {} 张表：\n{}", tables.len(), tables.join("\n")))
         }
         Err(e) => ToolResult::err(format!("列出表失败: {e}")),
     }
@@ -1018,7 +1034,7 @@ static DANGEROUS_CMD_REGEXES: Lazy<Vec<Regex>> = Lazy::new(|| {
         r"(?i)\bdd\s+if=.*of=/dev/(?:sd|nvme|hd|vd|xvd)",
         r"(?i)\b(shutdown|reboot|halt|poweroff)\b",
         r"(?i)\binit\s+[06]\b",
-        r":\(\)\s*\{",                       // fork bomb :(){:|:&};:
+        r":\(\)\s*\{", // fork bomb :(){:|:&};:
         r"(?i)>\s*/dev/(?:sd|nvme|hd|vd|xvd)",
         r"(?i)chmod\s+-R\s+777\s+/(?:\s|$)",
     ]
@@ -1027,21 +1043,19 @@ static DANGEROUS_CMD_REGEXES: Lazy<Vec<Regex>> = Lazy::new(|| {
     .collect()
 });
 
-/// 危险 SQL 关键字（exec_sql 用）。
-static DROP_TRUNCATE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)^\s*(DROP|TRUNCATE)\b").expect("无效正则")
-});
-
-/// DELETE 无 WHERE 子句。
+/// DELETE 无 WHERE 子句（非锚定：主语句可能是 CTE 之后的 DELETE，见
+/// [`sql_first_keyword`]；同时覆盖 `DELETE t1 FROM t2` 别名形式）。
 static DELETE_NO_WHERE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)^\s*DELETE\s+FROM\s+\S+\s*(?:;|$)").expect("无效正则")
+    Regex::new(r"(?i)\bDELETE\s+(?:[A-Za-z_][A-Za-z0-9_.]*\s+)?FROM\s+\S+\s*(?:;|$)")
+        .expect("无效正则")
 });
 
 /// 判断一个工具调用是否危险。
 ///
 /// - exec_ssh：command 命中危险命令模式（rm -rf /、mkfs、dd 写块设备、
 ///   shutdown/reboot、fork bomb、chmod -R 777 / 等）。
-/// - exec_sql：DROP/TRUNCATE 开头，或 DELETE 无 WHERE 子句。
+/// - exec_sql：有效关键字为 DROP/TRUNCATE，或 DELETE 无 WHERE 子句
+///   （含 `WITH ... DELETE` 形式，见 [`sql_first_keyword`]）。
 /// - write_file：目标文件已存在（覆盖已有数据）→ 危险。
 /// - 其它工具默认安全。
 ///
@@ -1052,24 +1066,22 @@ pub fn is_dangerous(name: &str, arguments: &Value, workspace: Option<&Path>) -> 
         "exec_ssh" => arguments
             .get("command")
             .and_then(Value::as_str)
-            .map(|cmd| {
-                DANGEROUS_CMD_REGEXES
-                    .iter()
-                    .any(|re| re.is_match(cmd))
-            })
+            .map(|cmd| DANGEROUS_CMD_REGEXES.iter().any(|re| re.is_match(cmd)))
             .unwrap_or(false),
         "exec_sql" => arguments
             .get("sql")
             .and_then(Value::as_str)
-            .map(|sql| DROP_TRUNCATE_RE.is_match(sql) || DELETE_NO_WHERE_RE.is_match(sql))
+            .map(|sql| {
+                let kw = sql_first_keyword(sql);
+                kw == "DROP"
+                    || kw == "TRUNCATE"
+                    || (kw == "DELETE" && DELETE_NO_WHERE_RE.is_match(sql))
+            })
             .unwrap_or(false),
         "write_file" => {
             // 覆盖已有文件：解析出沙箱路径后检查存在性（解析失败视为不危险，
             // 执行阶段会返回错误，不需要提前标记）。
-            match (
-                arguments.get("path").and_then(Value::as_str),
-                workspace,
-            ) {
+            match (arguments.get("path").and_then(Value::as_str), workspace) {
                 (Some(p), Some(ws)) => resolve_workspace_path(ws, p)
                     .map(|p| p.exists())
                     .unwrap_or(false),
@@ -1080,27 +1092,104 @@ pub fn is_dangerous(name: &str, arguments: &Value, workspace: Option<&Path>) -> 
     }
 }
 
-/// 取一条 SQL 语句的第一个关键字（trim、不区分大小写）。多语句时只看第一条。
+/// 剥掉 SQL 里的注释（`--` / `#` 行注释、`/* */` 块注释），替换为空格。
 ///
-/// 用于按 SQL 模式（readonly/restricted/full）做粗粒度放行判定。
+/// 防止 `-- 注释\nDELETE FROM t` 这类语句的第一个 token 是注释、绕过关键字判定。
+fn strip_sql_comments(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    let n = bytes.len();
+    while i < n {
+        if i + 1 < n && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+            // -- 行注释：到行尾。
+            while i < n && bytes[i] != b'\n' {
+                i += 1;
+            }
+            out.push(' ');
+        } else if bytes[i] == b'#' {
+            // # 行注释：到行尾。
+            while i < n && bytes[i] != b'\n' {
+                i += 1;
+            }
+            out.push(' ');
+        } else if i + 1 < n && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            // /* */ 块注释。
+            i += 2;
+            while i + 1 < n && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(n);
+            out.push(' ');
+        } else {
+            let ch = sql[i..].chars().next().unwrap_or_default();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
+/// 取一条 SQL 语句的"有效"关键字（trim、不区分大小写）。多语句时只看第一条。
+///
+/// - 先剥离前导/行内注释；
+/// - `WITH` 引导的 CTE 语句返回其后的主语句关键字（如
+///   `WITH cte AS (SELECT 1) DELETE FROM t` → `DELETE`），防止 CTE 携带写语句
+///   绕过只读/危险判定（MySQL 8 支持 `WITH ... DELETE/UPDATE/INSERT` 单语句）；
+/// - 其余返回首个关键字；空语句或无法判定返回空串（调用方保守拒绝）。
 fn sql_first_keyword(sql: &str) -> String {
-    // 只看第一条语句（按 ; 切分），取首个非空 token。
-    let first_stmt = sql.split(';').next().unwrap_or("").trim();
-    first_stmt
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_ascii_uppercase()
+    let clean = strip_sql_comments(sql);
+    let first_stmt = clean.split(';').next().unwrap_or("").trim();
+    let tokens: Vec<&str> = first_stmt.split_whitespace().collect();
+    let Some(first) = tokens.first() else {
+        return String::new();
+    };
+    let first_up = first.to_ascii_uppercase();
+    if first_up != "WITH" {
+        return first_up;
+    }
+
+    // WITH 引导：跟踪括号深度，取 CTE 定义之后、括号外的第一个语句关键字。
+    // 例：`WITH cte AS (SELECT 1) DELETE FROM t` → 括号外第一个关键字是 DELETE。
+    let mut depth: i32 = 0;
+    for tok in tokens.iter().skip(1) {
+        depth += tok.matches('(').count() as i32 - tok.matches(')').count() as i32;
+        if depth != 0 {
+            continue;
+        }
+        let up = tok.to_ascii_uppercase();
+        if matches!(
+            up.as_str(),
+            "SELECT"
+                | "INSERT"
+                | "UPDATE"
+                | "DELETE"
+                | "MERGE"
+                | "REPLACE"
+                | "DROP"
+                | "TRUNCATE"
+                | "CREATE"
+                | "ALTER"
+                | "CALL"
+        ) {
+            return up;
+        }
+    }
+    // 未找到主语句关键字（残缺语句）→ 返回 WITH 本身；WITH 不在任何放行集合内，
+    // 调用方会按"不允许"处理，属保守拒绝。
+    "WITH".to_string()
 }
 
 /// 根据 `sql_mode` 判断一条 SQL 是否被允许执行。
 ///
-/// - `readonly`：只允许 `SELECT` / `SHOW` / `EXPLAIN` / `DESCRIBE` / `DESC` / `WITH`。
+/// - `readonly`：只允许 `SELECT` / `SHOW` / `EXPLAIN` / `DESCRIBE` / `DESC`。
+///   注意 `WITH` 不在集合内——[`sql_first_keyword`] 会把 CTE 语句解析成其主语句
+///   关键字（`WITH cte AS (...) SELECT ...` → SELECT，仍放行；而
+///   `WITH cte AS (...) DELETE ...` → DELETE，被拦截）。
 /// - `restricted`：上述 + 允许 `INSERT` / `UPDATE` / `DELETE` / `MERGE`（DDL 仍禁止）。
 /// - `full`：允许一切（但 `is_dangerous` 仍生效，由上层确认）。
 ///
-/// 按第一条语句的第一个关键字判断（trim、不区分大小写）。未知关键字在非 `full`
-/// 模式下一律视为不允许（保守策略）。
+/// 未知关键字在非 `full` 模式下一律视为不允许（保守策略）。
 pub fn sql_allowed_by_mode(sql: &str, mode: &str) -> bool {
     let kw = sql_first_keyword(sql);
     if kw.is_empty() {
@@ -1110,35 +1199,21 @@ pub fn sql_allowed_by_mode(sql: &str, mode: &str) -> bool {
         "full" => true,
         "restricted" => matches!(
             kw.as_str(),
-            "SELECT"
-                | "SHOW"
-                | "EXPLAIN"
-                | "DESCRIBE"
-                | "DESC"
-                | "WITH"
-                | "INSERT"
-                | "UPDATE"
-                | "DELETE"
-                | "MERGE"
+            "SELECT" | "SHOW" | "EXPLAIN" | "DESCRIBE" | "DESC" | "INSERT" | "UPDATE" | "DELETE" | "MERGE"
         ),
         // 默认（含 "readonly" 及任何未知值）按只读处理。
-        _ => matches!(
-            kw.as_str(),
-            "SELECT" | "SHOW" | "EXPLAIN" | "DESCRIBE" | "DESC" | "WITH"
-        ),
+        _ => matches!(kw.as_str(), "SELECT" | "SHOW" | "EXPLAIN" | "DESCRIBE" | "DESC"),
     }
 }
 
-/// 判断一条 SQL 是否为只读查询（用于 `auto_approve_safe` 自动放行判定）。
+/// 判断一条 SQL 是否为只读查询（用于"白名单运行"模式下自动放行判定）。
 ///
-/// 只读 = SELECT / SHOW / EXPLAIN / DESCRIBE / DESC / WITH。与
+/// 只读 = SELECT / SHOW / EXPLAIN / DESCRIBE / DESC（CTE 语句由
+/// [`sql_first_keyword`] 解析成主语句关键字后再判定）。与
 /// [`sql_allowed_by_mode`] 的 readonly 集合一致。
 pub fn is_readonly_sql(sql: &str) -> bool {
     let kw = sql_first_keyword(sql);
-    matches!(
-        kw.as_str(),
-        "SELECT" | "SHOW" | "EXPLAIN" | "DESCRIBE" | "DESC" | "WITH"
-    )
+    matches!(kw.as_str(), "SELECT" | "SHOW" | "EXPLAIN" | "DESCRIBE" | "DESC")
 }
 
 /// Shell 元字符正则：命中任一即视为"复合命令"，**不**算白名单内。
@@ -1146,9 +1221,14 @@ pub fn is_readonly_sql(sql: &str) -> bool {
 /// 严格模式禁用：命令分隔符（;、&&、||、|）、命令替换（$()、反引号）、
 /// 重定向（>、<、>>）、后台（&）、子 shell（括号）。这样保证白名单内命令是
 /// "单一 argv 形式"，无法通过 `cat x; rm -rf /` 这类拼接绕过。
+///
+/// **`\n`/`\r` 必须拒绝**：换行是 shell 命令分隔符。`"ls\nrm -rf /"` 若只按空白
+/// 分词会被拆成 `["ls", "rm", "-rf", "/"]`，前 3 个 token 恰好命中白名单项 `ls`，
+/// 导致第二条命令在 whitelist 模式下免确认执行（提示注入可触发）。
 static COMMAND_METACHAR_RE: Lazy<Regex> = Lazy::new(|| {
-    // 任一元字符出现即匹配。
-    Regex::new(r"[;&|<>`]|\$\(|&&|\|\||>>").expect("无效元字符正则")
+    // 任一元字符出现即匹配。`\x00` 是 NUL（regex crate 不支持 `\0` 写法，
+    // 会 panic）；命令字符串不应含 NUL，出现即视为恶意输入拒绝。
+    Regex::new(r"[;&|<>`\n\r\x00]|\$\(|&&|\|\||>>").expect("无效元字符正则")
 });
 
 /// 判断一条 exec_ssh 命令是否落在白名单内（用于前端绿色卡片 + 默认放行 UX）。
@@ -1213,9 +1293,7 @@ pub fn check_command_whitelist(command: &str, whitelist: &[String]) -> Result<()
     if is_whitelisted(command, whitelist) {
         Ok(())
     } else {
-        Err(format!(
-            "命令 `{command}` 不在白名单中，需用户人工确认"
-        ))
+        Err(format!("命令 `{command}` 不在白名单中，需用户人工确认"))
     }
 }
 
@@ -1241,10 +1319,7 @@ pub fn describe_call(name: &str, arguments: &Value) -> String {
             format!("读取终端 {sid} 最近输出")
         }
         "exec_sql" => {
-            let sql = arguments
-                .get("sql")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let sql = arguments.get("sql").and_then(Value::as_str).unwrap_or("");
             let preview: String = sql.chars().take(60).collect();
             if sql.chars().count() > 60 {
                 format!("执行 SQL: {preview}...")
@@ -1261,17 +1336,11 @@ pub fn describe_call(name: &str, arguments: &Value) -> String {
             format!("查看表 {t} 结构")
         }
         "read_file" => {
-            let p = arguments
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or("?");
+            let p = arguments.get("path").and_then(Value::as_str).unwrap_or("?");
             format!("读取文件: {p}")
         }
         "write_file" => {
-            let p = arguments
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or("?");
+            let p = arguments.get("path").and_then(Value::as_str).unwrap_or("?");
             format!("写入文件: {p}")
         }
         "list_files" => {
@@ -1286,3 +1355,52 @@ pub fn describe_call(name: &str, arguments: &Value) -> String {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 白名单元字符正则必须能正常编译（回归：曾用 `\0` 写法导致 regex crate
+    /// 拒绝编译，首次使用 `Lazy` 初始化时直接 panic）。访问 `COMMAND_METACHAR_RE`
+    /// 即触发编译，编译失败会让本测试（及所有依赖它的用例）直接报错。
+    #[test]
+    fn metachar_regex_compiles() {
+        assert!(COMMAND_METACHAR_RE.is_match("ls; rm -rf /"));
+    }
+
+    /// 各类 shell 分隔符/重定向/命令替换必须被判定为"非白名单"（防拼接绕过）。
+    #[test]
+    fn whitelist_rejects_metachars() {
+        let wl: Vec<String> = vec!["ls".into(), "cat".into()];
+        // 注释里记录的注入场景：换行拆分后 token 恰好命中白名单项。
+        assert!(!is_whitelisted("ls\nrm -rf /", &wl));
+        assert!(!is_whitelisted("ls; rm -rf /", &wl));
+        assert!(!is_whitelisted("cat a.txt | rm -rf /", &wl));
+        assert!(!is_whitelisted("ls && whoami", &wl));
+        assert!(!is_whitelisted("ls $(whoami)", &wl));
+        assert!(!is_whitelisted("echo `whoami`", &wl));
+        assert!(!is_whitelisted("ls > out", &wl));
+        assert!(!is_whitelisted("cat x >> log", &wl));
+        // NUL 字符（`\x00`）：命令字符串不应含 NUL，出现即拒绝。
+        assert!(!is_whitelisted("ls\x00rm -rf /", &wl));
+        assert!(!is_whitelisted("cat x &", &wl));
+    }
+
+    /// 纯白名单命令（无元字符、前缀命中）应放行；大小写不敏感。
+    #[test]
+    fn whitelist_accepts_simple_commands() {
+        let wl: Vec<String> = vec!["systemctl".into(), "docker ps".into()];
+        assert!(is_whitelisted("systemctl status nginx", &wl));
+        assert!(is_whitelisted("SYSTEMCTL status", &wl));
+        assert!(is_whitelisted("docker ps -a", &wl));
+        // 未命中白名单的普通命令：无元字符但不在白名单 → false。
+        assert!(!is_whitelisted("reboot now", &wl));
+        assert!(!is_whitelisted("", &wl));
+        // 白名单前缀必须 ≥2 字符且以空格/结尾对齐，单字符 "s" 不允许。
+        let wl_short: Vec<String> = vec!["s".into()];
+        assert!(!is_whitelisted("systemctl status", &wl_short));
+        // 白名单项是命令前缀时需 token 边界：白名单 "sys" 不命中 "systemctl"。
+        let wl_prefix: Vec<String> = vec!["sys".into()];
+        assert!(is_whitelisted("sys", &wl_prefix));
+        assert!(!is_whitelisted("systemctl status", &wl_prefix));
+    }
+}

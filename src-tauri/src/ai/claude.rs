@@ -35,26 +35,50 @@ use crate::events::{self, AiChunkEvent, AiDoneEvent, AiErrorEvent};
 /// Anthropic API 要求附带的本协议版本号。
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
-/// 单次响应的 max_tokens 上限。Claude 必传该字段。
-///
-/// 智能体模式下工具调用 + 较长解释可能超过 2048，故放宽到 8192。
-const MAX_TOKENS: u32 = 8192;
-
 /// Claude Provider。
 pub struct ClaudeProvider {
     client: reqwest::Client,
     base_url: String,
     api_key: String,
     model: String,
+    /// 单次响应 max_tokens 上限。Claude 必传该字段，取自 ProviderConfig。
+    max_output: u32,
+    /// 采样温度（`None` 不发送）。
+    temperature: Option<f32>,
 }
 
 impl ClaudeProvider {
     pub fn new(cfg: &ProviderConfig) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            // 超时取自模型配置（connect_timeout_secs / read_timeout_secs，0=默认）：
+            // connect_timeout 防 DNS/建连挂死；read_timeout 兜底防止连接假死后
+            // 流式读取无限阻塞。长思考模型可调大 read_timeout。
+            client: reqwest::Client::builder()
+                .connect_timeout(crate::ai::provider::timeout_secs(
+                    cfg.connect_timeout_secs,
+                    crate::ai::provider::DEFAULT_CONNECT_TIMEOUT_SECS,
+                ))
+                .read_timeout(crate::ai::provider::timeout_secs(
+                    cfg.read_timeout_secs,
+                    crate::ai::provider::DEFAULT_READ_TIMEOUT_SECS,
+                ))
+                .build()
+                .expect("构造 reqwest Client 失败"),
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
             api_key: cfg.api_key.clone(),
             model: cfg.model.clone(),
+            max_output: cfg.max_output,
+            temperature: cfg.temperature,
+        }
+    }
+
+    /// Claude API 必传 max_tokens 且必须 ≥ 1：配置为 0（表示未设置）时回退 4096，
+    /// 否则请求会被 API 直接以 400 拒绝。
+    fn max_tokens(&self) -> u32 {
+        if self.max_output == 0 {
+            4096
+        } else {
+            self.max_output
         }
     }
 }
@@ -75,6 +99,8 @@ struct ReqMessage<'a> {
 struct MessagesRequest<'a> {
     model: &'a str,
     max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<String>,
     messages: Vec<ReqMessage<'a>>,
@@ -134,7 +160,8 @@ impl LlmProvider for ClaudeProvider {
 
         let body = MessagesRequest {
             model: &self.model,
-            max_tokens: MAX_TOKENS,
+            max_tokens: self.max_tokens(),
+            temperature: self.temperature,
             system,
             messages: conv,
             stream: true,
@@ -360,11 +387,16 @@ impl LlmProvider for ClaudeProvider {
 
         let body = MessagesToolsRequest {
             model: &self.model,
-            max_tokens: MAX_TOKENS,
+            max_tokens: self.max_tokens(),
+            temperature: self.temperature,
             system: system.as_deref(),
             messages: conv,
             stream: true,
-            tools: if tools_payload.is_empty() { None } else { Some(tools_payload) },
+            tools: if tools_payload.is_empty() {
+                None
+            } else {
+                Some(tools_payload)
+            },
         };
 
         let url = format!("{}/v1/messages", self.base_url);
@@ -439,17 +471,16 @@ impl LlmProvider for ClaudeProvider {
 
                 match current_event.as_str() {
                     "content_block_start" => {
-                        let parsed: ContentBlockStart =
-                            match serde_json::from_str(payload) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    log::warn!(
-                                        "[ai:{}:claude/tools] 解析 content_block_start 失败: {e}",
-                                        request_id
-                                    );
-                                    continue;
-                                }
-                            };
+                        let parsed: ContentBlockStart = match serde_json::from_str(payload) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                log::warn!(
+                                    "[ai:{}:claude/tools] 解析 content_block_start 失败: {e}",
+                                    request_id
+                                );
+                                continue;
+                            }
+                        };
                         if parsed.content_block.type_ == "tool_use" {
                             let entry = tool_blocks.entry(parsed.index).or_default();
                             entry.id = parsed.content_block.id;
@@ -457,17 +488,16 @@ impl LlmProvider for ClaudeProvider {
                         }
                     }
                     "content_block_delta" => {
-                        let parsed: ContentBlockDelta =
-                            match serde_json::from_str(payload) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    log::warn!(
-                                        "[ai:{}:claude/tools] 解析 content_block_delta 失败: {e}",
-                                        request_id
-                                    );
-                                    continue;
-                                }
-                            };
+                        let parsed: ContentBlockDelta = match serde_json::from_str(payload) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                log::warn!(
+                                    "[ai:{}:claude/tools] 解析 content_block_delta 失败: {e}",
+                                    request_id
+                                );
+                                continue;
+                            }
+                        };
                         match parsed.delta.type_.as_str() {
                             "text_delta" => {
                                 if let Some(text) = parsed.delta.text {
@@ -508,9 +538,8 @@ impl LlmProvider for ClaudeProvider {
             let arguments = if buf.input_buffer.is_empty() {
                 Value::Object(serde_json::Map::new())
             } else {
-                serde_json::from_str(&buf.input_buffer).unwrap_or_else(|_| {
-                    json!({ "_raw": buf.input_buffer })
-                })
+                serde_json::from_str(&buf.input_buffer)
+                    .unwrap_or_else(|_| json!({ "_raw": buf.input_buffer }))
             };
             tool_calls.push(ToolCall {
                 id,
@@ -598,6 +627,8 @@ fn emit_error(app: &tauri::AppHandle, request_id: &str, message: &str) {
 struct MessagesToolsRequest<'a> {
     model: &'a str,
     max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<&'a str>,
     messages: Vec<Value>,

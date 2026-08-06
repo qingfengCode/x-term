@@ -23,8 +23,8 @@
 //! - `ai:done` —— 响应完成（携带累计的完整文本）
 //! - `ai:error` —— 出错时携带可读错误信息
 
-pub mod provider;
-pub mod openai;
 pub mod claude;
+pub mod openai;
 pub mod prompts;
+pub mod provider;
 pub mod tools;

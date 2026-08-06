@@ -91,6 +91,7 @@ use crate::events::{
     TERMINAL_DATA, TERMINAL_EXIT,
 };
 use crate::ssh::client::{self, AuthMethod, ClientHandler};
+use crate::state::AppState;
 use crate::storage::db::DbConn;
 use crate::storage::secure::CredentialVault;
 use crate::storage::sessions_repo::{AuthType, Session};
@@ -130,7 +131,6 @@ struct CredentialData {
 /// - [`AuthType::PrivateKey`]：优先使用会话配置中的 `key_path`（私钥文件路径）；
 ///   若未设置则回退到凭据中的私钥文本（`kind = "private_key_text"`）。
 ///   带 passphrase 时一并传入。
-/// - [`AuthType::Agent`]：MVP 暂未实现 ssh-agent，返回错误。
 ///
 /// # 参数
 /// - `session_config`: 会话配置。
@@ -198,9 +198,6 @@ pub fn resolve_credential(
                 },
             })
         }
-        AuthType::Agent => Err(AppError::Auth(
-            "ssh-agent 认证暂未实现".into(),
-        )),
     }
 }
 
@@ -214,10 +211,9 @@ fn fetch_enc_data(conn: &DbConn, id: &str) -> AppResult<String> {
         |r| r.get::<_, String>(0),
     ) {
         Ok(s) => Ok(s),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Err(AppError::NotFound(format!(
-            "凭据 {} 不存在",
-            id
-        ))),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            Err(AppError::NotFound(format!("凭据 {} 不存在", id)))
+        }
         Err(e) => Err(e.into()),
     }
 }
@@ -274,17 +270,22 @@ impl SshSession {
     ///
     /// 返回的 [`SshSession`] 尚未启动 reader；调用方应在随后调用
     /// [`SshSession::spawn_reader`] 把输出推送到前端。
+    ///
+    /// `state` 提供认证所需的全局状态（keyboard-interactive 二次认证时
+    /// 需要它注册挑战、emit 事件），与 `app` 句柄。
     pub async fn open(
         session_config: &Session,
         resolved_credential: ResolvedCredential,
-        app: tauri::AppHandle,
+        state: AppState,
     ) -> AppResult<Self> {
+        let app = state.app.clone();
         let handle = client::connect_direct(
             &session_config.host,
             session_config.port,
             &session_config.username,
+            &session_config.id,
             resolved_credential.auth_method,
-            app.clone(),
+            state,
         )
         .await?;
 
@@ -399,7 +400,8 @@ impl SshSession {
             loop {
                 tokio::select! {
                     // 远程 → 前端：channel 输出。
-                    biased;
+                    // 注意：不能用 biased —— 高吞吐输出流会持续占用第一分支，
+                    // 导致输入分支（用户按键/Ctrl+C）被饿死。
                     msg = channel.wait() => {
                         match msg {
                             Some(ChannelMsg::Data { ref data }) => {
@@ -466,11 +468,7 @@ impl SshSession {
                     code: exit_code.map(|c| c as i32),
                 },
             );
-            events::emit(
-                &app,
-                TERMINAL_CLOSED,
-                TerminalClosedEvent { session_id },
-            );
+            events::emit(&app, TERMINAL_CLOSED, TerminalClosedEvent { session_id });
         });
 
         self.reader_handle = Some(join);

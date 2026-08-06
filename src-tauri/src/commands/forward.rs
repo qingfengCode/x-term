@@ -12,6 +12,22 @@ use crate::ssh::session::resolve_credential;
 use crate::ssh::tunnel::{TunnelKind, TunnelSpec};
 use crate::state::AppState;
 
+/// 从查询结果读取端口列；越界（> 65535 或负数）报错而非 `as u16` 静默截断
+/// （截断会把 70000 静默变成 4464，绑定到错误的端口）。
+fn port_col(r: &rusqlite::Row, idx: usize) -> rusqlite::Result<u16> {
+    let v = r.get::<_, i64>(idx)?;
+    u16::try_from(v).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            idx,
+            rusqlite::types::Type::Integer,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("端口号超出 0-65535: {}", v),
+            )),
+        )
+    })
+}
+
 /// 转发规则（与数据库表对应）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -48,9 +64,9 @@ pub fn forward_list_rules(state: State<'_, AppState>) -> AppResult<Vec<ForwardRu
             session_id: r.get(2)?,
             kind: r.get(3)?,
             local_host: r.get(4)?,
-            local_port: r.get::<_, i64>(5)? as u16,
+            local_port: port_col(r, 5)?,
             remote_host: r.get(6)?,
-            remote_port: r.get::<_, i64>(7)? as u16,
+            remote_port: port_col(r, 7)?,
             auto_start: auto != 0,
             created_at: r.get(9)?,
         })
@@ -108,11 +124,7 @@ pub fn forward_delete_rule(id: String, state: State<'_, AppState>) -> AppResult<
 
 /// 启动一条转发规则（按规则建立新连接并开始转发）。返回规则 id（便于前端引用）。
 #[tauri::command]
-pub async fn forward_start(
-    rule_id: String,
-    state: State<'_, AppState>,
-    app: tauri::AppHandle,
-) -> AppResult<String> {
+pub async fn forward_start(rule_id: String, state: State<'_, AppState>) -> AppResult<String> {
     // 取规则。
     let rule = {
         let conn = state.conn()?;
@@ -128,9 +140,9 @@ pub async fn forward_start(
                 session_id: r.get(2)?,
                 kind: r.get(3)?,
                 local_host: r.get(4)?,
-                local_port: r.get::<_, i64>(5)? as u16,
+                local_port: port_col(r, 5)?,
                 remote_host: r.get(6)?,
-                remote_port: r.get::<_, i64>(7)? as u16,
+                remote_port: port_col(r, 7)?,
                 auto_start: auto != 0,
                 created_at: r.get(9)?,
             })
@@ -144,12 +156,7 @@ pub async fn forward_start(
         "Local" => TunnelKind::Local,
         "Remote" => TunnelKind::Remote,
         "Dynamic" => TunnelKind::Dynamic,
-        other => {
-            return Err(AppError::InvalidInput(format!(
-                "未知的转发类型: {}",
-                other
-            )))
-        }
+        other => return Err(AppError::InvalidInput(format!("未知的转发类型: {}", other))),
     };
 
     // 若已经在运行，先报错（避免重复）。
@@ -174,15 +181,6 @@ pub async fn forward_start(
         resolve_credential(&session_config, &vault, &conn)?
     };
 
-    let handle = crate::ssh::client::connect_direct(
-        &session_config.host,
-        session_config.port,
-        &session_config.username,
-        resolved.auth_method,
-        app,
-    )
-    .await?;
-
     let spec = TunnelSpec {
         id: rule.id.clone(),
         session_id: rule.session_id.clone(),
@@ -193,14 +191,61 @@ pub async fn forward_start(
         remote_port: rule.remote_port,
     };
 
+    // 远程转发（-R）需要把 forwards 注册表注入 handler（russh 0.45 的 Handle 不
+    // 暴露 handler 访问器，故由 connect_direct_tunnel 在构造时注入并回传）。
+    // 本地/动态转发无需 forwards，走普通 connect_direct。
     let tunnel = match kind {
-        TunnelKind::Local => crate::ssh::tunnel::start_local(handle, spec).await?,
-        // Remote / Dynamic MVP 阶段占位：返回错误（tunnel.rs 内已实现为 InvalidInput）。
-        TunnelKind::Remote => crate::ssh::tunnel::start_remote(&handle, spec).await?,
-        TunnelKind::Dynamic => crate::ssh::tunnel::start_dynamic(&handle, spec).await?,
+        TunnelKind::Remote => {
+            let (handle, forwards) = crate::ssh::client::connect_direct_tunnel(
+                &session_config.host,
+                session_config.port,
+                &session_config.username,
+                &session_config.id,
+                resolved.auth_method,
+                state.inner().clone(),
+            )
+            .await?;
+            crate::ssh::tunnel::start_remote(handle, spec, forwards).await?
+        }
+        TunnelKind::Local => {
+            let handle = crate::ssh::client::connect_direct(
+                &session_config.host,
+                session_config.port,
+                &session_config.username,
+                &session_config.id,
+                resolved.auth_method,
+                state.inner().clone(),
+            )
+            .await?;
+            crate::ssh::tunnel::start_local(handle, spec).await?
+        }
+        TunnelKind::Dynamic => {
+            let handle = crate::ssh::client::connect_direct(
+                &session_config.host,
+                session_config.port,
+                &session_config.username,
+                &session_config.id,
+                resolved.auth_method,
+                state.inner().clone(),
+            )
+            .await?;
+            crate::ssh::tunnel::start_dynamic(handle, spec).await?
+        }
     };
 
-    state.tunnels.lock().insert(rule.id.clone(), tunnel);
+    // 竞态防护：上面的 contains_key 检查与这里的 insert 之间隔了完整的 SSH
+    // 建连过程（可能数秒），并发点击启动时两个请求都会通过检查。必须在 insert
+    // 时再次确认；若已被他人注册，立即停掉自己刚建立的连接，避免泄漏。
+    // 注意：parking_lot guard 非 Send，不能持锁 await stop，用 spawn 异步停。
+    {
+        let mut guard = state.tunnels.lock();
+        if guard.contains_key(&rule.id) {
+            drop(guard);
+            tokio::spawn(crate::ssh::tunnel::stop(tunnel));
+            return Err(AppError::InvalidInput(format!("转发 {} 已在运行", rule.id)));
+        }
+        guard.insert(rule.id.clone(), tunnel);
+    }
     Ok(rule.id)
 }
 

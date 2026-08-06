@@ -64,7 +64,12 @@ pub struct McpServerStatus {
 /// 全局运行中服务端的句柄（JoinHandle + shutdown 信号 + 状态）。
 struct ServerHandle {
     join: JoinHandle<()>,
+    /// abort 兜底（与 join 解耦：join 被 timeout 消费后仍可 abort）。
+    abort: tokio::task::AbortHandle,
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    /// 通知所有 SSE 长连接结束（停止服务时先断开，避免 graceful shutdown 被
+    /// 常驻 SSE 连接阻塞、端口无法释放）。
+    sse_shutdown: Arc<tokio::sync::Notify>,
     status: McpServerStatus,
 }
 
@@ -73,8 +78,7 @@ static SERVERS: Lazy<Mutex<HashMap<McpKind, ServerHandle>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// 运行时自动放行开关（per-kind）。`mcp_save_config` 更新此值，改后立即生效无需重启。
-static AUTO_APPROVE: Lazy<Mutex<HashMap<McpKind, bool>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static AUTO_APPROVE: Lazy<Mutex<HashMap<McpKind, bool>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// 设置指定 kind 的自动放行开关（由 commands::mcp::mcp_save_config 调用）。
 pub fn set_auto_approve(kind: McpKind, enabled: bool) {
@@ -143,17 +147,20 @@ pub async fn start_mcp_server(
     let bound_resource_id = bound_resource_id.unwrap_or_default();
 
     // 绑定监听端口。
-    let addr: SocketAddr = format!("{}:{}", host, port)
-        .parse()
-        .map_err(|e| AppError::InvalidInput(format!("非法 host:port ({}:{}): {}", host, port, e)))?;
-    let listener = TcpListener::bind(addr)
-        .await
-        .map_err(|e| AppError::Io(std::io::Error::new(
+    let addr: SocketAddr = format!("{}:{}", host, port).parse().map_err(|e| {
+        AppError::InvalidInput(format!("非法 host:port ({}:{}): {}", host, port, e))
+    })?;
+    let listener = TcpListener::bind(addr).await.map_err(|e| {
+        AppError::Io(std::io::Error::new(
             e.kind(),
             format!("绑定 {}:{} 失败: {}", host, port, e),
-        )))?;
+        ))
+    })?;
     let bound_addr = listener.local_addr().map_err(|e| {
-        AppError::Io(std::io::Error::new(e.kind(), format!("获取本地地址失败: {}", e)))
+        AppError::Io(std::io::Error::new(
+            e.kind(),
+            format!("获取本地地址失败: {}", e),
+        ))
     })?;
     let bound_port = bound_addr.port();
 
@@ -165,6 +172,7 @@ pub async fn start_mcp_server(
         let kind_str = match kind {
             McpKind::Ssh => "ssh",
             McpKind::Db => "db",
+            McpKind::File => "file",
         };
         let path = log_dir.join(format!("mcp-{}-{}.log", kind_str, ts));
         let bound_desc = if resource_mode == "client" {
@@ -191,6 +199,7 @@ pub async fn start_mcp_server(
     };
 
     // 共享给所有路由：app 句柄、AppState 克隆、kind、token、绑定资源 id、SSE 客户端表。
+    let sse_shutdown: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
     let shared = Arc::new(SharedState {
         app: app.clone(),
         state: state.clone(),
@@ -201,6 +210,7 @@ pub async fn start_mcp_server(
         token,
         clients: Arc::new(Mutex::new(HashMap::new())),
         streamable_sessions: Arc::new(Mutex::new(HashMap::new())),
+        sse_shutdown: sse_shutdown.clone(),
         log_path,
     });
 
@@ -217,15 +227,8 @@ pub async fn start_mcp_server(
     // shutdown 信号。
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-    let serve = axum::serve(listener, app_router)
-        .with_graceful_shutdown(async move {
-            let _ = shutdown_rx.await;
-        });
-
-    let join = tokio::spawn(async move {
-        if let Err(e) = serve.await {
-            log::error!("[mcp] {} axum 服务退出出错: {}", kind.label(), e);
-        }
+    let serve = axum::serve(listener, app_router).with_graceful_shutdown(async move {
+        let _ = shutdown_rx.await;
     });
 
     let status = McpServerStatus {
@@ -236,13 +239,32 @@ pub async fn start_mcp_server(
     };
     log::info!("[mcp] {} 已启动: {}", kind.label(), status.endpoint);
 
+    // 并发启动竞态防护：注册前在锁内再检查一次。两个并发 start（如不同端口）
+    // 可能都通过函数开头的 contains 检查；这里若发现已有实例，drop serve 关闭
+    // 已绑定的 listener 后报错，避免产生无法停止的孤儿服务。
     {
         let mut guard = SERVERS.lock();
+        if guard.contains_key(&kind) {
+            drop(serve);
+            log::warn!("[mcp] {} 已在运行（并发启动），已释放本次绑定", kind.label());
+            return Err(AppError::InvalidInput(format!(
+                "{} 已在运行，请先停止",
+                kind.label()
+            )));
+        }
+        let join = tokio::spawn(async move {
+            if let Err(e) = serve.await {
+                log::error!("[mcp] {} axum 服务退出出错: {}", kind.label(), e);
+            }
+        });
+        let abort = join.abort_handle();
         guard.insert(
             kind,
             ServerHandle {
                 join,
+                abort,
                 shutdown_tx,
+                sse_shutdown,
                 status,
             },
         );
@@ -253,8 +275,8 @@ pub async fn start_mcp_server(
 
 /// 停止指定 kind 的 MCP 服务端。
 ///
-/// 发送 graceful shutdown 信号，axum 会等待进行中的请求完成后退出。
-/// 若 3 秒内任务未自行退出则 abort 兜底（防止僵死）。
+/// 先通知所有 SSE 长连接结束（否则 graceful shutdown 会被常驻连接无限阻塞、
+/// 端口无法释放），再发 shutdown 信号；若 3 秒内任务未退出则 abort 兜底。
 pub fn stop_mcp_server(kind: McpKind) -> AppResult<()> {
     let handle = {
         let mut guard = SERVERS.lock();
@@ -262,18 +284,21 @@ pub fn stop_mcp_server(kind: McpKind) -> AppResult<()> {
     };
     match handle {
         Some(h) => {
-            // 发送 graceful shutdown 信号，让 axum 优雅退出。
+            // 1. 主动结束所有 SSE 长连接（它们不结束，axum graceful shutdown
+            //    会一直等待，端口永远释放不了）。
+            h.sse_shutdown.notify_waiters();
+            // 2. 发送 graceful shutdown 信号，让 axum 优雅退出。
             let _ = h.shutdown_tx.send(());
-            // spawn 一个兜底任务：3 秒后若仍未退出则 abort。
+            // 3. 兜底任务：3 秒后仍未退出则 abort（abort 与 join 解耦，join 被
+            //    timeout 消费后仍可 abort）。
             let join = h.join;
+            let abort = h.abort;
             tokio::spawn(async move {
                 match tokio::time::timeout(std::time::Duration::from_secs(3), join).await {
                     Ok(_) => {}
                     Err(_) => {
-                        // 超时：JoinHandle 已被 consume，无法再 abort；
-                        // 但 timeout 返回 Err 意味着任务仍在运行，这里无法再干预。
-                        // 实际上 axum graceful shutdown 通常在毫秒级完成，3s 足够。
-                        log::warn!("[mcp] 服务停止超时（3s），任务可能仍在运行");
+                        abort.abort();
+                        log::warn!("[mcp] 服务停止超时（3s），已强制 abort");
                     }
                 }
             });
@@ -310,6 +335,8 @@ struct SharedState {
     clients: Arc<Mutex<HashMap<String, SseSender>>>,
     /// Streamable HTTP 会话表：session_id -> ()（仅记录存在性，spec 2025-03-26）。
     streamable_sessions: Arc<Mutex<HashMap<String, ()>>>,
+    /// 服务停止信号：`stop_mcp_server` 通知后所有 SSE 流结束（关闭长连接）。
+    sse_shutdown: Arc<tokio::sync::Notify>,
     /// 执行日志文件路径（None = 未开启日志）。
     log_path: Option<PathBuf>,
 }
@@ -322,28 +349,33 @@ struct SharedState {
 ///
 /// 生成 sessionId，登记一个 mpsc 发送端到 clients map（供 POST 推送响应），
 /// 先推一条 `event: endpoint` 事件告知客户端消息端点，随后把 mpsc 接收端转成
-/// `Stream<Event>` 作为 SSE 响应体，保持长连接直到客户端断开或收到 None。
+/// `Stream<Event>` 作为 SSE 响应体，保持长连接直到客户端断开、收到 None 或
+/// 服务停止（[`SharedState::sse_shutdown`] 被触发）。
 ///
 /// 客户端断开时（stream 被 drop），通过 [`SseCleanupGuard`] 自动从 clients map
 /// 移除对应条目，防止内存泄漏。
 async fn sse_handler(
     State(shared): State<Arc<SharedState>>,
+    Query(q): Query<MessagesQuery>,
+    headers: HeaderMap,
 ) -> Response {
+    // token 校验（与 /messages 一致：Authorization 头或 ?token= 二选一）。
+    // 不校验会导致未认证连接无限填充 clients 表。
+    if !check_token(&shared, q.token.as_deref(), &headers) {
+        log::warn!("[mcp] GET /sse token 校验失败");
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
     let session_id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = mpsc::unbounded_channel::<String>();
 
-    shared
-        .clients
-        .lock()
-        .insert(session_id.clone(), tx);
+    shared.clients.lock().insert(session_id.clone(), tx);
 
     log::info!("[mcp] SSE 客户端连接: {}", session_id);
 
     // 先推 endpoint 事件（告知客户端消息端点）。
     let endpoint_url = format!("/messages?sessionId={}", session_id);
-    let initial = Some(Event::default()
-        .event("endpoint")
-        .data(endpoint_url));
+    let initial = Some(Event::default().event("endpoint").data(endpoint_url));
 
     // cleanup guard：stream 被 drop 时（客户端断开）自动清理 clients map。
     let cleanup = SseCleanupGuard {
@@ -351,22 +383,39 @@ async fn sse_handler(
         session_id: session_id.clone(),
     };
 
-    // 把 mpsc 接收端转成 Stream<Event>：先发 initial，再持续从 rx 取消息。
-    // Result<Event, Infallible> 是 axum Sse 要求的 Item 类型（infallible 表示
-    // 流内部不会产生错误）。
+    // 把 mpsc 接收端转成 Stream<Event>：先发 initial，再持续从 rx 取消息；
+    // 同时监听服务停止信号，触发时结束流（否则 stop_mcp_server 的 graceful
+    // shutdown 会被本长连接无限阻塞）。
+    let shutdown = shared.sse_shutdown.clone();
+    // FnMut 闭包 + async move：session_id 会被多次消费，闭包内每次调用先 clone
+    // 一份（async move 会把引用到的变量按值捕获进协程，外层直接捕获会 move 错）。
+    let sid_for_log = session_id.clone();
     let stream = stream::unfold(
-        (initial, rx, cleanup),
-        move |(mut first, mut rx, cleanup)| async move {
-            if let Some(ev) = first.take() {
-                return Some((Ok::<_, std::convert::Infallible>(ev), (first, rx, cleanup)));
-            }
-            match rx.recv().await {
-                Some(json_str) => {
-                    // 每条消息作为一个 default-event 的 data 行。
-                    let ev = Event::default().data(json_str);
-                    Some((Ok::<_, std::convert::Infallible>(ev), (first, rx, cleanup)))
+        (initial, rx, cleanup, shutdown),
+        move |(mut first, mut rx, cleanup, shutdown)| {
+            let sid = sid_for_log.clone();
+            async move {
+                if let Some(ev) = first.take() {
+                    return Some((
+                        Ok::<_, std::convert::Infallible>(ev),
+                        (first, rx, cleanup, shutdown),
+                    ));
                 }
-                None => None, // 发送端全部 drop → 结束流（cleanup 随 state 被 drop）。
+                tokio::select! {
+                    m = rx.recv() => match m {
+                        Some(json_str) => {
+                            // 每条消息作为一个 default-event 的 data 行。
+                            let ev = Event::default().data(json_str);
+                            Some((Ok::<_, std::convert::Infallible>(ev), (first, rx, cleanup, shutdown)))
+                        }
+                        None => None, // 发送端全部 drop → 结束流（cleanup 随 state 被 drop）。
+                    },
+                    _ = shutdown.notified() => {
+                        // 服务停止：结束 SSE 流，让 graceful shutdown 能完成。
+                        log::info!("[mcp] 服务停止，SSE 会话 {} 结束", sid);
+                        None
+                    }
+                }
             }
         },
     );
@@ -620,7 +669,11 @@ async fn dispatch(shared: &Arc<SharedState>, req: &JsonRpcRequest) -> JsonRpcRes
             JsonRpcResponse::success(req.id.clone(), result)
         }
         "tools/list" => {
-            let tools = tool_defs(shared.kind, &shared.resource_mode, shared.bound_database.as_deref());
+            let tools = tool_defs(
+                shared.kind,
+                &shared.resource_mode,
+                shared.bound_database.as_deref(),
+            );
             JsonRpcResponse::success(req.id.clone(), json!({ "tools": tools }))
         }
         "tools/call" => {
@@ -637,11 +690,7 @@ async fn dispatch(shared: &Arc<SharedState>, req: &JsonRpcRequest) -> JsonRpcRes
             let content = handle_tool_call(shared, &name, &arguments).await;
             JsonRpcResponse::success(req.id.clone(), content)
         }
-        other => JsonRpcResponse::error(
-            req.id.clone(),
-            -32601,
-            &format!("未知方法: {}", other),
-        ),
+        other => JsonRpcResponse::error(req.id.clone(), -32601, &format!("未知方法: {}", other)),
     }
 }
 
@@ -672,22 +721,43 @@ fn parse_call_params(params: &Option<Value>) -> Result<(String, Value), String> 
 ///   确认请求中的参数副本会剔除 password（防明文出现在前端浮层/事件）。
 ///
 /// 写操作仍经人工确认。
-async fn handle_tool_call(
-    shared: &Arc<SharedState>,
-    name: &str,
-    arguments: &Value,
-) -> Value {
-    // 校验：工具名必须与该实例的 kind 匹配。
-    let expected = match shared.kind {
-        McpKind::Ssh => "exec_ssh",
-        McpKind::Db => "exec_sql",
-    };
-    if name != expected {
+async fn handle_tool_call(shared: &Arc<SharedState>, name: &str, arguments: &Value) -> Value {
+    // 校验：工具名必须在该实例 kind 允许的工具集合内。
+    if !kind_supports_tool(shared.kind, name) {
         return tool_text_result(Err(AppError::InvalidInput(format!(
             "{} 不提供工具 `{}`",
             shared.kind.label(),
             name
         ))));
+    }
+
+    // 只读工具（list_files）跳过人工确认，直接执行。
+    if is_readonly_tool(name) {
+        log::info!(
+            "[mcp] {} 只读工具 `{}` 直接执行（目标: {}）",
+            shared.kind.label(),
+            name,
+            resolve_target_display(shared, arguments)
+        );
+        let target = match resolve_target(shared, arguments) {
+            Ok(t) => t,
+            Err(e) => return tool_text_result(Err(e)),
+        };
+        let started = std::time::Instant::now();
+        let res = run_target(shared, name, &target, arguments).await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        log_execution(
+            shared,
+            name,
+            &format!(
+                "[只读] {} | {}",
+                target.display_name(),
+                readonly_detail(name, arguments)
+            ),
+            &res,
+            elapsed_ms,
+        );
+        return tool_text_result(res);
     }
 
     // 解析本次调用的执行目标（bound：绑定资源；client：参数直连）。
@@ -697,11 +767,8 @@ async fn handle_tool_call(
     };
     let resource_name = target.display_name();
 
-    // 执行内容原文（记录到日志：SSH 命令 / SQL，不含密码）。
-    let exec_detail = match shared.kind {
-        McpKind::Ssh => format!("command: {}", exec::arg_command(arguments).unwrap_or_default()),
-        McpKind::Db => format!("sql: {}", exec::arg_sql(arguments).unwrap_or_default()),
-    };
+    // 执行内容原文（记录到日志，按工具名提取关键字段，不含密码）。
+    let exec_detail = exec_detail_for(name, arguments);
 
     // 自动放行：跳过人工确认直接执行。
     if is_auto_approved(shared.kind) {
@@ -711,18 +778,21 @@ async fn handle_tool_call(
             resource_name
         );
         let started = std::time::Instant::now();
-        let res = run_target(shared, &target, arguments).await;
+        let res = run_target(shared, name, &target, arguments).await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
-        log_execution(shared, name, &format!("[自动放行] {} | {}", resource_name, exec_detail), &res, elapsed_ms);
+        log_execution(
+            shared,
+            name,
+            &format!("[自动放行] {} | {}", resource_name, exec_detail),
+            &res,
+            elapsed_ms,
+        );
         return tool_text_result(res);
     }
 
     // 人工确认流程（默认路径）。
     let client_name = client_name_from_args(arguments);
-    let description = match shared.kind {
-        McpKind::Ssh => describe_exec_ssh(arguments, &resource_name),
-        McpKind::Db => describe_exec_sql(arguments, &resource_name),
-    };
+    let description = describe_tool(name, arguments, &resource_name);
     // client 模式：确认请求的参数副本剔除 password，避免明文密码出现在前端浮层/事件。
     let approval_args = redact_arguments(shared, arguments);
     let approval = ApprovalRequest {
@@ -742,9 +812,15 @@ async fn handle_tool_call(
     {
         Ok(true) => {
             let started = std::time::Instant::now();
-            let res = run_target(shared, &target, arguments).await;
+            let res = run_target(shared, name, &target, arguments).await;
             let elapsed_ms = started.elapsed().as_millis() as u64;
-            log_execution(shared, name, &format!("[已确认] {} | {}", resource_name, exec_detail), &res, elapsed_ms);
+            log_execution(
+                shared,
+                name,
+                &format!("[已确认] {} | {}", resource_name, exec_detail),
+                &res,
+                elapsed_ms,
+            );
             tool_text_result(res)
         }
         Ok(false) => {
@@ -772,7 +848,10 @@ async fn handle_tool_call(
 #[derive(Debug)]
 enum ResolvedTarget {
     /// 绑定模式：本地资源 id（SSH 会话 / DB profile）。
-    Bound { resource_id: String, display: String },
+    Bound {
+        resource_id: String,
+        display: String,
+    },
     /// 客户端直连模式：目标与凭据全部来自工具参数。
     Direct {
         host: String,
@@ -854,27 +933,43 @@ fn resolve_target(shared: &SharedState, arguments: &Value) -> Result<ResolvedTar
                 display,
             })
         }
+        // File MCP 仅支持 bound 模式（绑定 file_account）；client 模式拒绝。
+        McpKind::File if client_mode => Err(AppError::InvalidInput(format!(
+            "{} 不支持客户端直连模式，请在页面绑定 S3 文件账号",
+            shared.kind.label()
+        ))),
+        McpKind::File => {
+            if shared.bound_resource_id.is_empty() {
+                return Err(AppError::InvalidInput(format!(
+                    "{} 未绑定资源",
+                    shared.kind.label()
+                )));
+            }
+            let display = exec::account_name_by_id(&shared.state, &shared.bound_resource_id);
+            Ok(ResolvedTarget::Bound {
+                resource_id: shared.bound_resource_id.clone(),
+                display,
+            })
+        }
     }
 }
 
 /// 按已解析的目标执行工具（bound → 本地绑定资源；client → 参数直连）。
+///
+/// 按 `(kind, tool_name)` 双维度分派。SSH kind 下支持 exec_ssh / list_files /
+/// upload_file / download_file；DB kind 下支持 exec_sql。
 async fn run_target(
     shared: &Arc<SharedState>,
+    tool_name: &str,
     target: &ResolvedTarget,
     arguments: &Value,
 ) -> AppResult<String> {
-    match shared.kind {
-        McpKind::Ssh => {
+    match (shared.kind, tool_name) {
+        (McpKind::Ssh, "exec_ssh") => {
             let command = exec::arg_command(arguments)?;
             match target {
                 ResolvedTarget::Bound { resource_id, .. } => {
-                    exec::exec_ssh_by_id(
-                        &shared.state,
-                        resource_id,
-                        &command,
-                        shared.app.clone(),
-                    )
-                    .await
+                    exec::exec_ssh_by_id(&shared.state, resource_id, &command).await
                 }
                 ResolvedTarget::Direct {
                     host,
@@ -889,13 +984,94 @@ async fn run_target(
                         username,
                         password,
                         &command,
-                        shared.app.clone(),
+                        shared.state.clone(),
                     )
                     .await
                 }
             }
         }
-        McpKind::Db => {
+        (McpKind::Ssh, "list_files") => {
+            let path = exec::arg_path(arguments)?;
+            match target {
+                ResolvedTarget::Bound { resource_id, .. } => {
+                    exec::list_files_by_id(&shared.state, resource_id, &path).await
+                }
+                ResolvedTarget::Direct {
+                    host,
+                    port,
+                    username,
+                    password,
+                    ..
+                } => {
+                    exec::list_files_direct(
+                        host,
+                        *port,
+                        username,
+                        password,
+                        &path,
+                        shared.state.clone(),
+                    )
+                    .await
+                }
+            }
+        }
+        (McpKind::Ssh, "upload_file") => {
+            let local_path = exec::arg_local_path(arguments)?;
+            let remote_path = exec::arg_remote_path(arguments)?;
+            match target {
+                ResolvedTarget::Bound { resource_id, .. } => {
+                    exec::upload_file_by_id(&shared.state, resource_id, &local_path, &remote_path)
+                        .await
+                }
+                ResolvedTarget::Direct {
+                    host,
+                    port,
+                    username,
+                    password,
+                    ..
+                } => {
+                    exec::upload_file_direct(
+                        host,
+                        *port,
+                        username,
+                        password,
+                        &local_path,
+                        &remote_path,
+                        shared.state.clone(),
+                    )
+                    .await
+                }
+            }
+        }
+        (McpKind::Ssh, "download_file") => {
+            let remote_path = exec::arg_remote_path(arguments)?;
+            let local_path = exec::arg_local_path(arguments)?;
+            match target {
+                ResolvedTarget::Bound { resource_id, .. } => {
+                    exec::download_file_by_id(&shared.state, resource_id, &remote_path, &local_path)
+                        .await
+                }
+                ResolvedTarget::Direct {
+                    host,
+                    port,
+                    username,
+                    password,
+                    ..
+                } => {
+                    exec::download_file_direct(
+                        host,
+                        *port,
+                        username,
+                        password,
+                        &remote_path,
+                        &local_path,
+                        shared.state.clone(),
+                    )
+                    .await
+                }
+            }
+        }
+        (McpKind::Db, "exec_sql") => {
             let sql = exec::arg_sql(arguments)?;
             let limit = exec::arg_limit(arguments);
             match target {
@@ -906,7 +1082,6 @@ async fn run_target(
                         &sql,
                         limit,
                         shared.bound_database.as_deref(),
-                        shared.app.clone(),
                     )
                     .await
                 }
@@ -932,6 +1107,63 @@ async fn run_target(
                 }
             }
         }
+        // File MCP（绑定 S3 账号）：三个文件工具，仅 bound 模式。
+        (McpKind::File, "list_files") => {
+            let path = exec::arg_path(arguments)?;
+            match target {
+                ResolvedTarget::Bound { resource_id, .. } => {
+                    exec::list_files_by_account(&shared.state, resource_id, &path).await
+                }
+                // resolve_target 已拒绝 File 的 client 模式，这里不会命中。
+                ResolvedTarget::Direct { .. } => Err(AppError::InvalidInput(format!(
+                    "{} 不支持客户端直连模式",
+                    shared.kind.label()
+                ))),
+            }
+        }
+        (McpKind::File, "upload_file") => {
+            let local_path = exec::arg_local_path(arguments)?;
+            let remote_path = exec::arg_remote_path(arguments)?;
+            match target {
+                ResolvedTarget::Bound { resource_id, .. } => {
+                    exec::upload_file_by_account(
+                        &shared.state,
+                        resource_id,
+                        &local_path,
+                        &remote_path,
+                    )
+                    .await
+                }
+                ResolvedTarget::Direct { .. } => Err(AppError::InvalidInput(format!(
+                    "{} 不支持客户端直连模式",
+                    shared.kind.label()
+                ))),
+            }
+        }
+        (McpKind::File, "download_file") => {
+            let remote_path = exec::arg_remote_path(arguments)?;
+            let local_path = exec::arg_local_path(arguments)?;
+            match target {
+                ResolvedTarget::Bound { resource_id, .. } => {
+                    exec::download_file_by_account(
+                        &shared.state,
+                        resource_id,
+                        &remote_path,
+                        &local_path,
+                    )
+                    .await
+                }
+                ResolvedTarget::Direct { .. } => Err(AppError::InvalidInput(format!(
+                    "{} 不支持客户端直连模式",
+                    shared.kind.label()
+                ))),
+            }
+        }
+        _ => Err(AppError::InvalidInput(format!(
+            "{} 不提供工具 `{}`",
+            shared.kind.label(),
+            tool_name
+        ))),
     }
 }
 
@@ -1013,94 +1245,317 @@ fn describe_exec_ssh(arguments: &Value, resource: &str) -> String {
 
 /// 生成 exec_sql 的可读描述（用于确认弹窗）。`resource` 为绑定的 DB profile 名。
 fn describe_exec_sql(arguments: &Value, resource: &str) -> String {
-    let sql = arguments
-        .get("sql")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let sql = arguments.get("sql").and_then(Value::as_str).unwrap_or("");
     let preview: String = sql.chars().take(80).collect();
     format!("[DB MCP · {}] {}", resource, preview)
+}
+
+// ===========================================================================
+// 工具元信息辅助：名称校验 / 只读判定 / 日志与确认描述
+// ===========================================================================
+
+/// 该 kind 的 MCP 实例是否支持指定工具。
+///
+/// SSH MCP 暴露 exec_ssh + 3 个文件工具；DB MCP 仅暴露 exec_sql。
+fn kind_supports_tool(kind: McpKind, name: &str) -> bool {
+    matches!(
+        (kind, name),
+        (McpKind::Ssh, "exec_ssh")
+            | (McpKind::Ssh, "list_files")
+            | (McpKind::Ssh, "upload_file")
+            | (McpKind::Ssh, "download_file")
+            | (McpKind::Db, "exec_sql")
+            | (McpKind::File, "list_files")
+            | (McpKind::File, "upload_file")
+            | (McpKind::File, "download_file")
+    )
+}
+
+/// 工具是否为只读（跳过人工确认）。目前 `list_files` 是只读。
+fn is_readonly_tool(name: &str) -> bool {
+    matches!(name, "list_files")
+}
+
+/// 只读工具执行前预先解析目标展示名（用于日志，失败时回退占位）。
+fn resolve_target_display(shared: &SharedState, arguments: &Value) -> String {
+    resolve_target(shared, arguments)
+        .map(|t| t.display_name())
+        .unwrap_or_else(|_| "(未知目标)".into())
+}
+
+/// 只读工具的日志详情（按工具名提取关键字段）。
+fn readonly_detail(name: &str, arguments: &Value) -> String {
+    match name {
+        "list_files" => {
+            let path = arguments.get("path").and_then(Value::as_str).unwrap_or("");
+            format!("list_files: {}", path)
+        }
+        _ => name.to_string(),
+    }
+}
+
+/// 按工具名生成执行内容原文（用于日志，不含密码）。
+fn exec_detail_for(name: &str, arguments: &Value) -> String {
+    match name {
+        "exec_ssh" => {
+            let cmd = arguments
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            format!("command: {}", cmd)
+        }
+        "exec_sql" => {
+            let sql = arguments.get("sql").and_then(Value::as_str).unwrap_or("");
+            format!("sql: {}", sql)
+        }
+        "list_files" => {
+            let path = arguments.get("path").and_then(Value::as_str).unwrap_or("");
+            format!("path: {}", path)
+        }
+        "upload_file" | "download_file" => {
+            let local = arguments
+                .get("localPath")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let remote = arguments
+                .get("remotePath")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            format!("{}: {} ⇄ {}", name, local, remote)
+        }
+        other => other.to_string(),
+    }
+}
+
+/// 按工具名生成确认弹窗的可读描述。
+fn describe_tool(name: &str, arguments: &Value, resource: &str) -> String {
+    match name {
+        "exec_ssh" => describe_exec_ssh(arguments, resource),
+        "exec_sql" => describe_exec_sql(arguments, resource),
+        "upload_file" => {
+            let local = arguments
+                .get("localPath")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let remote = arguments
+                .get("remotePath")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            format!("[SSH MCP · {}] 上传文件: {} → {}", resource, local, remote)
+        }
+        "download_file" => {
+            let local = arguments
+                .get("localPath")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let remote = arguments
+                .get("remotePath")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            format!("[SSH MCP · {}] 下载文件: {} → {}", resource, remote, local)
+        }
+        _ => format!("[SSH MCP · {}] {}", resource, name),
+    }
 }
 
 // ===========================================================================
 // 工具定义（MCP inputSchema）
 // ===========================================================================
 
-/// 返回该 kind 实例对外暴露的唯一工具的 `{name, description, inputSchema}` 定义。
+/// 返回该 kind 实例对外暴露的工具定义列表 `{name, description, inputSchema}`。
 ///
-/// SSH MCP 只暴露 `exec_ssh`（目标由绑定决定，免传连接名）；
-/// DB MCP 只暴露 `exec_sql`（若绑定了具体库，描述中注明）。
+/// - SSH MCP 暴露 `exec_ssh` + `list_files` / `upload_file` / `download_file`（文件
+///   级运维，基于 SFTP 短连接）。
+/// - DB MCP 暴露 `exec_sql`（若绑定了具体库，描述中注明）。
 ///
 /// 按 `resource_mode` 分支：
-/// - `"bound"`（默认）：目标由绑定资源决定，工具参数只传 command/sql。
+/// - `"bound"`（默认）：目标由绑定资源决定，工具参数只传 command/sql/path 等。
 /// - `"client"`（客户端直连）：目标与凭据由调用方在参数中传入
 ///   （host/port/username/password），工具描述中注明密码不存储不落日志。
 fn tool_defs(kind: McpKind, resource_mode: &str, bound_database: Option<&str>) -> Vec<Value> {
     let client_mode = resource_mode == "client";
     match kind {
         McpKind::Ssh => {
-            if client_mode {
-                vec![json!({
-                    "name": "exec_ssh",
-                    "description": "在调用方指定的服务器上执行一条 shell 命令（非交互），\
-返回标准输出和标准错误的合并文本。目标服务器由参数 host/port/username 指定，\
-password 为登录密码（敏感字段，仅本次调用有效，X-Term 不存储、不落日志）。\
-单命令超时 30 秒，输出截断 16KB。执行前需要 X-Term 用户人工确认。",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "host": {
-                                "type": "string",
-                                "description": "目标服务器 IP 或域名"
-                            },
-                            "port": {
-                                "type": "integer",
-                                "description": "SSH 端口，默认 22",
-                                "minimum": 1,
-                                "maximum": 65535
-                            },
-                            "username": {
-                                "type": "string",
-                                "description": "登录用户名"
-                            },
-                            "password": {
-                                "type": "string",
-                                "description": "登录密码（敏感字段，仅本次调用有效）"
-                            },
-                            "command": {
-                                "type": "string",
-                                "description": "要执行的 shell 命令（单条，非交互）"
-                            }
-                        },
-                        "required": ["host", "username", "password", "command"]
+            // 连接参数（client 模式专用）。
+            let conn_props = if client_mode {
+                json!({
+                    "host": { "type": "string", "description": "目标服务器 IP 或域名" },
+                    "port": {
+                        "type": "integer",
+                        "description": "SSH 端口，默认 22",
+                        "minimum": 1,
+                        "maximum": 65535
+                    },
+                    "username": { "type": "string", "description": "登录用户名" },
+                    "password": {
+                        "type": "string",
+                        "description": "登录密码（敏感字段，仅本次调用有效）"
                     }
-                })]
+                })
             } else {
-                vec![json!({
-                    "name": "exec_ssh",
-                    "description": "在当前 SSH MCP 绑定的服务器上执行一条 shell 命令（非交互），\
-返回标准输出和标准错误的合并文本。单命令超时 30 秒，输出截断 16KB。\
-目标服务器由 X-Term 用户在页面绑定（无需传连接名）。执行前需要 X-Term 用户人工确认。",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "command": {
-                                "type": "string",
-                                "description": "要执行的 shell 命令（单条，非交互）"
-                            }
-                        },
-                        "required": ["command"]
-                    }
-                })]
+                json!({})
+            };
+            let conn_required = if client_mode {
+                vec!["host", "username", "password"]
+            } else {
+                vec![]
+            };
+
+            // exec_ssh
+            let mut tools = vec![];
+            let mut exec_props = conn_props.clone();
+            if let Some(obj) = exec_props.as_object_mut() {
+                obj.insert(
+                    "command".into(),
+                    json!({
+                        "type": "string",
+                        "description": "要执行的 shell 命令（单条，非交互）"
+                    }),
+                );
             }
+            let mut exec_required = conn_required.clone();
+            exec_required.push("command");
+            let exec_desc = if client_mode {
+                "在调用方指定的服务器上执行一条 shell 命令（非交互），返回标准输出和标准错误的合并文本。\
+目标服务器由参数 host/port/username 指定，password 为登录密码（敏感字段，仅本次调用有效，\
+X-Term 不存储、不落日志）。单命令超时 30 秒，输出截断 16KB。执行前需要 X-Term 用户人工确认。"
+            } else {
+                "在当前 SSH MCP 绑定的服务器上执行一条 shell 命令（非交互），\
+返回标准输出和标准错误的合并文本。单命令超时 30 秒，输出截断 16KB。\
+目标服务器由 X-Term 用户在页面绑定（无需传连接名）。执行前需要 X-Term 用户人工确认。"
+            };
+            tools.push(json!({
+                "name": "exec_ssh",
+                "description": exec_desc,
+                "inputSchema": {
+                    "type": "object",
+                    "properties": exec_props,
+                    "required": exec_required
+                }
+            }));
+
+            // list_files（只读，免确认）
+            let mut list_props = conn_props.clone();
+            if let Some(obj) = list_props.as_object_mut() {
+                obj.insert(
+                    "path".into(),
+                    json!({
+                        "type": "string",
+                        "description": "要列举的远端目录绝对路径，如 /home/user、/var/log"
+                    }),
+                );
+            }
+            let mut list_required = conn_required.clone();
+            list_required.push("path");
+            let list_desc = if client_mode {
+                "列出调用方指定服务器上某目录的内容（基于 SFTP）。\
+返回 JSON 数组，元素含 name / isDir / size / modified。\
+目标由 host/port/username 指定，password 为登录密码（敏感字段，仅本次调用有效）。\
+只读操作，无需人工确认。"
+            } else {
+                "列出当前 SSH MCP 绑定服务器上某目录的内容（基于 SFTP）。\
+返回 JSON 数组，元素含 name / isDir / size / modified。只读操作，无需人工确认。"
+            };
+            tools.push(json!({
+                "name": "list_files",
+                "description": list_desc,
+                "inputSchema": {
+                    "type": "object",
+                    "properties": list_props,
+                    "required": list_required
+                }
+            }));
+
+            // upload_file（写，需确认）
+            let mut up_props = conn_props.clone();
+            if let Some(obj) = up_props.as_object_mut() {
+                obj.insert(
+                    "localPath".into(),
+                    json!({
+                        "type": "string",
+                        "description": "X-Term 所在主机的本地文件路径（必须已存在）"
+                    }),
+                );
+                obj.insert(
+                    "remotePath".into(),
+                    json!({
+                        "type": "string",
+                        "description": "远端目标路径（绝对路径）"
+                    }),
+                );
+            }
+            let mut up_required = conn_required.clone();
+            up_required.push("localPath");
+            up_required.push("remotePath");
+            let up_desc = if client_mode {
+                "把 X-Term 所在主机的一个本地文件上传到调用方指定服务器的远端路径（基于 SFTP）。\
+目标服务器由 host/port/username 指定，password 为登录密码（敏感字段，仅本次调用有效）。\
+单文件超时 5 分钟。执行前需要 X-Term 用户人工确认。\
+提示：可先用 exec_ssh 配合 shell 命令把内容写入本地文件（如 heredoc），再调用本工具上传。"
+            } else {
+                "把 X-Term 所在主机的一个本地文件上传到当前 SSH MCP 绑定服务器的远端路径（基于 SFTP）。\
+单文件超时 5 分钟。执行前需要 X-Term 用户人工确认。\
+提示：可先用 exec_ssh 配合 shell 命令把内容写入本地文件（如 heredoc），再调用本工具上传。"
+            };
+            tools.push(json!({
+                "name": "upload_file",
+                "description": up_desc,
+                "inputSchema": {
+                    "type": "object",
+                    "properties": up_props,
+                    "required": up_required
+                }
+            }));
+
+            // download_file（写本地，需确认）
+            let mut dl_props = conn_props.clone();
+            if let Some(obj) = dl_props.as_object_mut() {
+                obj.insert(
+                    "remotePath".into(),
+                    json!({
+                        "type": "string",
+                        "description": "要下载的远端文件路径（绝对路径）"
+                    }),
+                );
+                obj.insert(
+                    "localPath".into(),
+                    json!({
+                        "type": "string",
+                        "description": "X-Term 所在主机的本地保存路径（父目录必须存在）"
+                    }),
+                );
+            }
+            let mut dl_required = conn_required.clone();
+            dl_required.push("remotePath");
+            dl_required.push("localPath");
+            let dl_desc = if client_mode {
+                "从调用方指定服务器下载一个远端文件到 X-Term 所在主机的本地路径（基于 SFTP），\
+成功后返回本地路径。目标服务器由 host/port/username 指定，password 为登录密码\
+（敏感字段，仅本次调用有效）。单文件超时 5 分钟。执行前需要 X-Term 用户人工确认。"
+            } else {
+                "从当前 SSH MCP 绑定服务器下载一个远端文件到 X-Term 所在主机的本地路径\
+（基于 SFTP），成功后返回本地路径。单文件超时 5 分钟。执行前需要 X-Term 用户人工确认。"
+            };
+            tools.push(json!({
+                "name": "download_file",
+                "description": dl_desc,
+                "inputSchema": {
+                    "type": "object",
+                    "properties": dl_props,
+                    "required": dl_required
+                }
+            }));
+
+            tools
         }
         McpKind::Db => {
             if client_mode {
                 vec![json!({
                     "name": "exec_sql",
                     "description": "在调用方指定的 MySQL 服务器上执行 SQL，返回结果表格文本。\
-目标数据库由参数 host/port/username 指定，password 为连接密码（敏感字段，仅本次调用有效，\
-X-Term 不存储、不落日志）。database 可选，传则作为默认库。\
-执行前需要 X-Term 用户人工确认。",
+                目标数据库由参数 host/port/username 指定，password 为连接密码（敏感字段，仅本次调用有效，\
+                X-Term 不存储、不落日志）。database 可选，传则作为默认库。\
+                执行前需要 X-Term 用户人工确认。",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -1145,7 +1600,7 @@ X-Term 不存储、不落日志）。database 可选，传则作为默认库。\
                     "name": "exec_sql",
                     "description": format!(
                         "在当前 DB MCP 绑定的 MySQL 上执行 SQL，返回结果表格文本。{}\
-执行前需要 X-Term 用户人工确认。",
+                执行前需要 X-Term 用户人工确认。",
                         db_hint
                     ),
                     "inputSchema": {
@@ -1163,6 +1618,64 @@ X-Term 不存储、不落日志）。database 可选，传则作为默认库。\
                 })]
             }
         }
+        // File MCP：绑定 S3 文件账号，仅 bound 模式，暴露三个文件工具。
+        McpKind::File => vec![
+            json!({
+                "name": "list_files",
+                "description": "列出当前 File MCP 绑定的 S3 存储桶中某前缀下的内容。\
+            返回 JSON 数组，元素含 name / isDir / size / modified。只读操作，无需人工确认。\
+            目标账号由 X-Term 用户在页面绑定（无需传连接信息）。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "对象 key 前缀（目录），以 `/` 结尾，如 logs/、backup/2024/。传空串表示 bucket 根。"
+                        }
+                    },
+                    "required": ["path"]
+                }
+            }),
+            json!({
+                "name": "upload_file",
+                "description": "把 X-Term 所在主机的一个本地文件上传到当前 File MCP 绑定的 S3 存储桶。\
+            单文件超时 5 分钟。执行前需要 X-Term 用户人工确认。\
+            提示：可先用 exec_ssh 配合 shell 命令把内容写入本地文件（如 heredoc），再调用本工具上传。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "localPath": {
+                            "type": "string",
+                            "description": "X-Term 所在主机的本地文件路径（必须已存在）"
+                        },
+                        "remotePath": {
+                            "type": "string",
+                            "description": "S3 对象 key（目标路径），如 logs/app.log"
+                        }
+                    },
+                    "required": ["localPath", "remotePath"]
+                }
+            }),
+            json!({
+                "name": "download_file",
+                "description": "从当前 File MCP 绑定的 S3 存储桶下载一个对象到 X-Term 所在主机的本地路径，\
+            成功后返回本地路径。单文件超时 5 分钟。执行前需要 X-Term 用户人工确认。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "remotePath": {
+                            "type": "string",
+                            "description": "要下载的 S3 对象 key"
+                        },
+                        "localPath": {
+                            "type": "string",
+                            "description": "X-Term 所在主机的本地保存路径（父目录必须存在）"
+                        }
+                    },
+                    "required": ["remotePath", "localPath"]
+                }
+            }),
+        ],
     }
 }
 

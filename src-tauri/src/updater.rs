@@ -154,46 +154,64 @@ pub async fn download(
 
     let total = resp.content_length().unwrap_or(0);
     let mut stream = resp.bytes_stream();
-    let mut file = tokio::fs::File::create(&tmp)
-        .await
-        .map_err(|e| AppError::Update(format!("创建临时文件失败: {}", e)))?;
 
-    let mut received: u64 = 0;
-    let mut last_emitted: u64 = 0;
-    let mut hasher = Sha256::new();
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| AppError::Update(format!("下载中断: {}", e)))?;
-        received += chunk.len() as u64;
-        hasher.update(&chunk);
-        file.write_all(&chunk)
+    // 下载 + 校验整体包一层：任何失败路径都清理 .part 残件（网络中断、写盘失败、
+    // 校验失败等），避免 updates 目录积累半成品；且只在校验通过后才 rename 成
+    // 正式文件，半截安装包永远不会被当作可用包。
+    let result: AppResult<()> = async {
+        let mut file = tokio::fs::File::create(&tmp)
             .await
-            .map_err(|e| AppError::Update(format!("写入安装包失败: {}", e)))?;
+            .map_err(|e| AppError::Update(format!("创建临时文件失败: {}", e)))?;
 
-        // 节流 emit：首次、达到间隔、或结束时推送。
-        if received - last_emitted >= PROGRESS_EMIT_INTERVAL {
-            last_emitted = received;
-            emit_progress(app, received, total);
+        let mut received: u64 = 0;
+        let mut last_emitted: u64 = 0;
+        let mut hasher = Sha256::new();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| AppError::Update(format!("下载中断: {}", e)))?;
+            received += chunk.len() as u64;
+            hasher.update(&chunk);
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| AppError::Update(format!("写入安装包失败: {}", e)))?;
+
+            // 节流 emit：首次、达到间隔、或结束时推送。
+            if received - last_emitted >= PROGRESS_EMIT_INTERVAL {
+                last_emitted = received;
+                emit_progress(app, received, total);
+            }
         }
-    }
-    file.flush()
-        .await
-        .map_err(|e| AppError::Update(format!("刷新安装包失败: {}", e)))?;
-    drop(file);
+        file.flush()
+            .await
+            .map_err(|e| AppError::Update(format!("刷新安装包失败: {}", e)))?;
+        drop(file);
 
-    // 收尾：补发 100% 进度。
-    emit_progress(app, received, total);
+        // 收尾：补发 100% 进度。
+        emit_progress(app, received, total);
 
-    // 完整性校验。
-    if let Some(expected) = manifest.sha256.as_deref().filter(|s| !s.is_empty()) {
-        let actual = format!("{:x}", hasher.finalize());
-        if !actual.eq_ignore_ascii_case(expected.trim()) {
-            let _ = tokio::fs::remove_file(&tmp).await;
+        // 完整性校验：下载字节数与 Content-Length 不符（连接被截断）也视为失败。
+        if total > 0 && received != total {
             return Err(AppError::Update(format!(
-                "安装包校验失败：期望 sha256 {}，实际 {}",
-                expected, actual
+                "下载不完整：已收到 {} 字节，预期 {} 字节",
+                received, total
             )));
         }
+        if let Some(expected) = manifest.sha256.as_deref().filter(|s| !s.is_empty()) {
+            let actual = format!("{:x}", hasher.finalize());
+            if !actual.eq_ignore_ascii_case(expected.trim()) {
+                return Err(AppError::Update(format!(
+                    "安装包校验失败：期望 sha256 {}，实际 {}",
+                    expected, actual
+                )));
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    if let Err(e) = result {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e);
     }
 
     // 覆盖旧文件（若存在）后原子改名。
@@ -208,14 +226,20 @@ pub async fn download(
 /// 计算并广播一次下载进度。
 fn emit_progress(app: &AppHandle, received: u64, total: u64) {
     let percent = if total > 0 {
-        ((received as f64 / total as f64) * 100.0).round().clamp(0.0, 100.0) as u8
+        ((received as f64 / total as f64) * 100.0)
+            .round()
+            .clamp(0.0, 100.0) as u8
     } else {
         0
     };
     events::emit(
         app,
         events::UPDATE_PROGRESS,
-        UpdateProgressEvent { received, total, percent },
+        UpdateProgressEvent {
+            received,
+            total,
+            percent,
+        },
     );
 }
 
@@ -225,8 +249,10 @@ fn emit_progress(app: &AppHandle, received: u64, total: u64) {
 
 /// 拉起安装器并退出当前进程。
 ///
-/// Windows 下用 `cmd /C start "" <installer>` 让安装器在独立进程运行，随后退出本应用，
-/// 由 NSIS 安装器接管覆盖升级。
+/// Windows 下直接 `spawn` 安装器进程（不经 `cmd /C start`——cmd 会对路径做
+/// 二次解析，路径含 `&` 等字符时会被当成多条命令执行，存在命令注入面；且
+/// 含空格的路径会被截断导致启动失败）。spawn 出的进程独立于本应用，父进程
+/// 退出后安装器继续运行，由 NSIS 安装器接管覆盖升级。
 pub fn install_and_exit(app: &AppHandle, installer: &Path) -> AppResult<()> {
     if !installer.exists() {
         return Err(AppError::Update(format!(
@@ -235,19 +261,9 @@ pub fn install_and_exit(app: &AppHandle, installer: &Path) -> AppResult<()> {
         )));
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", &installer.to_string_lossy()])
-            .spawn()
-            .map_err(|e| AppError::Update(format!("启动安装器失败: {}", e)))?;
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::process::Command::new(installer)
-            .spawn()
-            .map_err(|e| AppError::Update(format!("启动安装器失败: {}", e)))?;
-    }
+    std::process::Command::new(installer)
+        .spawn()
+        .map_err(|e| AppError::Update(format!("启动安装器失败: {}", e)))?;
 
     // 触发 Tauri 正常退出流程（含清理），由安装器接管升级。
     app.exit(0);

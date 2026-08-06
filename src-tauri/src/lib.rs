@@ -12,6 +12,7 @@ pub mod config;
 pub mod database;
 pub mod error;
 pub mod events;
+pub mod file_backend;
 pub mod mcp;
 pub mod ssh;
 pub mod state;
@@ -48,7 +49,7 @@ pub fn run() {
             let settings_path = data_dir.clone();
 
             // 4. 注入状态。
-            let state = AppState::new(data_dir, pool, settings_path);
+            let state = AppState::new(data_dir, pool, settings_path, app.handle().clone());
             app.manage(state);
 
             Ok(())

@@ -96,6 +96,7 @@ fn default_port_for(kind: McpKind) -> u16 {
     match kind {
         McpKind::Ssh => 8765,
         McpKind::Db => 8766,
+        McpKind::File => 8767,
     }
 }
 
@@ -116,7 +117,7 @@ impl McpInstanceConfig {
     }
 }
 
-/// `mcp.json` 根结构：两个 kind 各一份配置。
+/// `mcp.json` 根结构：三个 kind 各一份配置。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct McpConfigFile {
@@ -124,6 +125,8 @@ struct McpConfigFile {
     ssh: McpInstanceConfig,
     #[serde(default)]
     db: McpInstanceConfig,
+    #[serde(default)]
+    file: McpInstanceConfig,
 }
 
 // ===========================================================================
@@ -162,6 +165,7 @@ fn instance_config(state: &AppState, kind: McpKind) -> McpInstanceConfig {
     let mut c = match kind {
         McpKind::Ssh => file.ssh,
         McpKind::Db => file.db,
+        McpKind::File => file.file,
     };
     // 兜底：host 空则默认，port 为 0 则默认。
     if c.host.trim().is_empty() {
@@ -179,6 +183,7 @@ fn set_instance_config(state: &AppState, kind: McpKind, c: McpInstanceConfig) ->
     match kind {
         McpKind::Ssh => file.ssh = c,
         McpKind::Db => file.db = c,
+        McpKind::File => file.file = c,
     }
     write_config_file(state, &file)
 }
@@ -225,6 +230,7 @@ pub async fn mcp_start(
                 match kind {
                     McpKind::Ssh => "SSH 会话",
                     McpKind::Db => "数据库连接",
+                    McpKind::File => "S3 文件账号",
                 }
             ))
         })?)
@@ -284,10 +290,7 @@ pub fn mcp_load_config(kind: String, state: State<'_, AppState>) -> AppResult<Mc
 
 /// 为指定 kind 生成随机 token（uuid 去横线），写入配置文件并返回。
 #[tauri::command]
-pub fn mcp_generate_token(
-    kind: String,
-    state: State<'_, AppState>,
-) -> AppResult<String> {
+pub fn mcp_generate_token(kind: String, state: State<'_, AppState>) -> AppResult<String> {
     let kind = McpKind::parse(&kind);
     let mut cfg = instance_config(state.inner(), kind);
     let token = uuid::Uuid::new_v4().simple().to_string();
@@ -305,10 +308,7 @@ pub async fn mcp_respond_approval(
     approved: bool,
     state: State<'_, AppState>,
 ) -> AppResult<bool> {
-    let hit = state
-        .approval_registry
-        .respond(&request_id, approved)
-        .await;
+    let hit = state.approval_registry.respond(&request_id, approved).await;
     Ok(hit)
 }
 
@@ -342,6 +342,7 @@ pub fn mcp_log(
     let kind_str = match kind {
         McpKind::Ssh => "ssh",
         McpKind::Db => "db",
+        McpKind::File => "file",
     };
     let log_dir = state.data_dir.join("mcp-logs");
     let prefix = format!("mcp-{}-", kind_str);

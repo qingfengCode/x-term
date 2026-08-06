@@ -76,6 +76,8 @@ export interface AiMessage {
  */
 const makeAiStore = (id: string) =>
   defineStore(id, () => {
+  // 从 store id 派生 domain（"ai:ssh"→"ssh"），用于持久化文件名。
+  const domain = id.split(":")[1] ?? "ssh";
   // --- 多会话状态 ----------------------------------------------------------
   // 每个对话独立持有 messages / activeRequestId / sending。事件通过 requestId
   // 在 requestToCid 映射中定位所属会话，从而支持多个对话并发收发。
@@ -123,6 +125,45 @@ const makeAiStore = (id: string) =>
     if (!activeCid.value) activeCid.value = conversations.value[0].id;
   }
 
+  // --- 持久化（独立 JSON 文件，按 domain 分文件）---------------------------
+  let persistTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** 防抖持久化：把 conversations 映射为可序列化结构后全量写文件。
+   *  streaming 字段强制为 false（避免重启后卡在"生成中"）；不存 activeRequestId/sending。 */
+  function persist() {
+    if (persistTimer) clearTimeout(persistTimer);
+    persistTimer = setTimeout(() => {
+      const data = conversations.value.map((c) => ({
+        id: c.id,
+        title: c.title,
+        messages: c.messages.map((m) => ({ ...m, streaming: false })),
+      }));
+      aiApi.aiSaveConversations(domain, data).catch(() => {
+        /* 持久化失败不阻塞对话（如磁盘满），仅忽略 */
+      });
+    }, 800);
+  }
+
+  /** 启动时从文件加载历史会话，替换默认的空对话。文件为空则保留默认。 */
+  async function loadPersisted() {
+    try {
+      const list = await aiApi.aiListConversations(domain);
+      if (list.length > 0) {
+        conversations.value = list.map((c) => ({
+          id: c.id,
+          title: c.title || "新对话",
+          // 还原消息，确保 streaming 为 false。
+          messages: (c.messages as AiMessage[]).map((m) => ({ ...m, streaming: false })),
+          activeRequestId: null,
+          sending: false,
+        }));
+        activeCid.value = conversations.value[0].id;
+      }
+    } catch {
+      /* 读失败保持默认 */
+    }
+  }
+
   /** 当前活动会话对象。 */
   const activeConversation = computed<Conversation | null>(() => {
     if (!activeCid.value) return null;
@@ -149,6 +190,7 @@ const makeAiStore = (id: string) =>
     };
     conversations.value.push(c);
     activeCid.value = c.id;
+    persist();
     return c.id;
   }
 
@@ -159,11 +201,18 @@ const makeAiStore = (id: string) =>
   function closeConversation(cid: string) {
     const idx = conversations.value.findIndex((c) => c.id === cid);
     if (idx < 0) return;
+    const closed = conversations.value[idx];
     conversations.value.splice(idx, 1);
+    // 若该对话正在流式生成，先中止后端任务：否则关闭后 token 还在继续消耗、
+    // 事件无人接收，且后端 pending_ai_tasks 里的 JoinHandle 会一直挂到自然结束。
+    if (closed.activeRequestId) {
+      void stop(closed.activeRequestId);
+    }
     if (activeCid.value === cid) {
       activeCid.value = conversations.value[0]?.id ?? null;
       if (!activeCid.value) ensureConversation();
     }
+    persist();
   }
 
   /**
@@ -299,6 +348,7 @@ const makeAiStore = (id: string) =>
     conv.sending = false;
     conv.activeRequestId = null;
     requestToCid.delete(requestId);
+    persist();
   }
 
   function onError(requestId: string, message: string) {
@@ -312,6 +362,7 @@ const makeAiStore = (id: string) =>
     conv.sending = false;
     conv.activeRequestId = null;
     requestToCid.delete(requestId);
+    persist();
   }
 
   /** AI 请求被用户终止（后端 ai:stopped 事件）。 */
@@ -339,12 +390,12 @@ const makeAiStore = (id: string) =>
     conv.sending = false;
     conv.activeRequestId = null;
     requestToCid.delete(requestId);
+    persist();
   }
 
-  /** 用户点击"终止"按钮：调用后端 ai_stop。 */
-  async function stop() {
-    const conv = activeConversation.value;
-    const rid = conv?.activeRequestId;
+  /** 用户点击"终止"按钮：调用后端 ai_stop。默认停当前对话；关闭对话时传显式 requestId。 */
+  async function stop(requestId?: string) {
+    const rid = requestId ?? activeConversation.value?.activeRequestId;
     if (!rid) return;
     try {
       await aiApi.aiStop(rid);
@@ -421,16 +472,25 @@ const makeAiStore = (id: string) =>
   }
 
   /** 用户点击"加入白名单并执行"：先把命令前缀加入白名单（持久化），再正常 approve。
-   * 仅对 exec_ssh 工具有意义；其它工具直接 approve。 */
-  async function addToWhitelistAndApprove(toolCallId: string) {
+   * 仅对 exec_ssh 工具有意义；其它工具直接 approve。
+   * @returns 白名单是否写入成功（false 时 UI 不应提示"已加入白名单"）。 */
+  async function addToWhitelistAndApprove(toolCallId: string): Promise<boolean> {
     // 找到该工具调用的命令参数。
     const cmd = findCommandByToolCallId(toolCallId);
+    // 非 exec_ssh（无 command 参数）无需白名单，视为成功。
+    let whitelisted = true;
     if (cmd) {
-      await dbApi.aiAddToWhitelist(cmd).catch(() => {
-        /* ignore — 即使加白名单失败也继续 approve */
-      });
+      try {
+        await dbApi.aiAddToWhitelist(cmd);
+      } catch (e) {
+        // 白名单失败仍执行（用户已显式批准执行），但把失败结果返回给 UI——
+        // 否则按钮显示"已加入白名单并执行"而实际没写入，误导用户。
+        whitelisted = false;
+        console.error("加入白名单失败:", e);
+      }
     }
     await approveToolCall(toolCallId);
+    return whitelisted;
   }
 
   /** 在所有会话中按 toolCallId 找到 exec_ssh 的 command 参数。 */
@@ -475,6 +535,7 @@ const makeAiStore = (id: string) =>
     if (conv) {
       conv.messages = [];
       conv.title = "新对话";
+      persist();
     }
   }
 
@@ -484,7 +545,10 @@ const makeAiStore = (id: string) =>
    */
   function renameConversation(cid: string, title: string) {
     const conv = conversations.value.find((c) => c.id === cid);
-    if (conv) conv.title = title.trim() || "新对话";
+    if (conv) {
+      conv.title = title.trim() || "新对话";
+      persist();
+    }
   }
 
   /**
@@ -551,6 +615,7 @@ const makeAiStore = (id: string) =>
     clear,
     renameConversation,
     regenerate,
+    loadPersisted,
   };
 });
 

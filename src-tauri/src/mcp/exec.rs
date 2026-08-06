@@ -6,10 +6,13 @@
 //! - [`exec_ssh_by_name`]：SSH exec（参考 `ai::tools::exec_ssh` 的"独立连接"分支）。
 //! - [`exec_sql_by_name`]：MySQL 执行（解析密码 → 直连或 SSH 隧道）。
 //! - [`list_ssh_sessions_view`] / [`list_db_profiles_view`]：只读元数据视图。
+//! - [`list_files_by_id`] / [`upload_file_by_id`] / [`download_file_by_id`]：基于
+//!   SFTP 的文件级运维工具（MCP 绑定模式）；`*_direct` 为客户端直连模式。
 //!
 //! 注意 `resolve_credential` / `fetch_mysql_password` 都是同步的且需要短生命 DB
 //! 连接，本模块在调用前集中获取连接、解析凭据后立即释放，不在 `.await` 间持有。
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -19,14 +22,20 @@ use tokio::time::timeout;
 use crate::database::mysql::{connect_direct as mysql_connect_direct, connect_via_ssh};
 use crate::database::profiles::{list_db_profiles, DbProfile};
 use crate::error::{AppError, AppResult};
+use crate::file_backend::s3::{S3Backend, S3Config};
+use crate::file_backend::FileBackend;
 use crate::ssh::client::AuthMethod;
+use crate::ssh::sftp::open_sftp;
 use crate::state::AppState;
+use crate::storage::file_accounts_repo::{fetch_s3_credential, get_file_account, FileAccount};
 use crate::storage::sessions_repo::{get_session, list_sessions, Session};
 
 /// exec_ssh 单命令执行超时（30 秒）。
 const EXEC_TIMEOUT: Duration = Duration::from_secs(30);
 /// exec_ssh 输出截断上限（16 KiB）。
 const EXEC_OUTPUT_CAP: usize = 16 * 1024;
+/// SFTP 文件操作超时（5 分钟）。文件传输比单条命令耗时，给较大余量。
+const SFTP_OP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 // ===========================================================================
 // 视图（不含敏感字段）
@@ -157,10 +166,9 @@ pub async fn exec_ssh_by_name(
     state: &AppState,
     session_name: &str,
     command: &str,
-    app: tauri::AppHandle,
 ) -> AppResult<String> {
     let session_config = find_session_by_name(state, session_name)?;
-    exec_ssh_with_config(state, session_config, command, app).await
+    exec_ssh_with_config(state, session_config, command).await
 }
 
 /// 在指定（按 id 查到的）SSH 会话对应的服务器上执行一条命令（MCP 绑定模式）。
@@ -170,10 +178,9 @@ pub async fn exec_ssh_by_id(
     state: &AppState,
     session_id: &str,
     command: &str,
-    app: tauri::AppHandle,
 ) -> AppResult<String> {
     let session_config = find_session_by_id(state, session_id)?;
-    exec_ssh_with_config(state, session_config, command, app).await
+    exec_ssh_with_config(state, session_config, command).await
 }
 
 /// 在调用方指定的服务器上执行一条命令（MCP 客户端直连模式）。
@@ -187,7 +194,7 @@ pub async fn exec_ssh_direct(
     username: &str,
     password: &str,
     command: &str,
-    app: tauri::AppHandle,
+    state: AppState,
 ) -> AppResult<String> {
     if command.trim().is_empty() {
         return Err(AppError::InvalidInput("command 不能为空".into()));
@@ -206,9 +213,11 @@ pub async fn exec_ssh_direct(
         host,
         port,
         username,
+        // 直连模式没有会话配置，二次认证弹窗仅展示 host:port。
+        "direct",
         AuthMethod::Password(password.to_string()),
         command,
-        app,
+        state,
     )
     .await
 }
@@ -224,7 +233,6 @@ async fn exec_ssh_with_config(
     state: &AppState,
     session_config: Session,
     command: &str,
-    app: tauri::AppHandle,
 ) -> AppResult<String> {
     if command.trim().is_empty() {
         return Err(AppError::InvalidInput("command 不能为空".into()));
@@ -255,9 +263,10 @@ async fn exec_ssh_with_config(
         &session_config.host,
         session_config.port,
         &session_config.username,
+        &session_config.id,
         resolved.auth_method,
         command,
-        app,
+        state.clone(),
     )
     .await
 }
@@ -267,17 +276,27 @@ async fn exec_ssh_with_config(
 /// 流程：connect_direct → channel_open_session → `channel.exec(false, command)` →
 /// 循环 channel.wait() 收集 Data / ExtendedData（去 ANSI，截断 16KB）→ disconnect。
 /// 整个过程用 30s 超时包裹。`auth` 由调用方决定（vault 解析 / 参数直传）。
+/// `session_config_id` 用于二次认证弹窗展示；直连模式传占位串。
 async fn exec_ssh_with_auth(
     host: &str,
     port: u16,
     username: &str,
+    session_config_id: &str,
     auth: AuthMethod,
     command: &str,
-    app: tauri::AppHandle,
+    state: AppState,
 ) -> AppResult<String> {
     // 连接 + exec（30s 超时）。
     let run = async {
-        let handle = crate::ssh::client::connect_direct(host, port, username, auth, app).await?;
+        let handle = crate::ssh::client::connect_direct(
+            host,
+            port,
+            username,
+            session_config_id,
+            auth,
+            state,
+        )
+        .await?;
 
         let mut channel = handle
             .channel_open_session()
@@ -359,10 +378,9 @@ pub async fn exec_sql_by_name(
     profile_name: &str,
     sql: &str,
     limit: u32,
-    app: tauri::AppHandle,
 ) -> AppResult<String> {
     let profile = find_profile_by_name(state, profile_name)?;
-    exec_sql_with_profile(state, profile, sql, limit, None, app).await
+    exec_sql_with_profile(state, profile, sql, limit, None).await
 }
 
 /// 在指定（按 id 查到的）DB profile 对应的数据库上执行 SQL（MCP 绑定模式）。
@@ -374,10 +392,9 @@ pub async fn exec_sql_by_id(
     sql: &str,
     limit: u32,
     database: Option<&str>,
-    app: tauri::AppHandle,
 ) -> AppResult<String> {
     let profile = find_profile_by_id(state, profile_id)?;
-    exec_sql_with_profile(state, profile, sql, limit, database, app).await
+    exec_sql_with_profile(state, profile, sql, limit, database).await
 }
 
 /// 共用的"取密码 → 建连 → 执行 → 关闭"实现（by_name / by_id 都委托到此）。
@@ -389,7 +406,6 @@ async fn exec_sql_with_profile(
     sql: &str,
     limit: u32,
     database_override: Option<&str>,
-    app: tauri::AppHandle,
 ) -> AppResult<String> {
     if sql.trim().is_empty() {
         return Err(AppError::InvalidInput("sql 不能为空".into()));
@@ -414,13 +430,14 @@ async fn exec_sql_with_profile(
         crate::database::mysql::fetch_mysql_password(&conn, cred_id, &vault)?
     };
 
+    // SQL 全文可能含敏感数据（INSERT/UPDATE 的明文值），日志只记前 200 字符。
     log::info!(
         "[mcp] exec_sql 开始：{}@{}:{}/{}, SQL: {}",
         profile.username,
         profile.host,
         profile.port,
         effective_db.unwrap_or(""),
-        sql
+        truncate_log(&sql, 200)
     );
 
     // 建立连接。
@@ -450,7 +467,7 @@ async fn exec_sql_with_profile(
             &profile.username,
             &mysql_pass,
             effective_db,
-            app,
+            state.clone(),
         )
         .await?
     } else {
@@ -496,13 +513,14 @@ pub async fn exec_sql_direct(
     if password.is_empty() {
         return Err(AppError::Auth("password 不能为空".into()));
     }
+    // SQL 全文可能含敏感数据（INSERT/UPDATE 的明文值），日志只记前 200 字符。
     log::info!(
         "[mcp] exec_sql（直连）开始：{}@{}:{}/{}, SQL: {}",
         username,
         host,
         port,
         database.unwrap_or(""),
-        sql
+        truncate_log(sql, 200)
     );
 
     // 直连（不走 SSH 隧道）→ 执行 → 立即关闭。
@@ -607,4 +625,488 @@ pub fn arg_database(args: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty())
+}
+
+// ===========================================================================
+// 文件操作（list_files / upload_file / download_file）
+// ===========================================================================
+//
+// 三个文件级 MCP 工具的底层实现。与 exec_ssh 同样采用"短连接"语义：
+// connect_direct → open_sftp → 单次操作 → disconnect，不复用前端长连接 SFTP。
+//
+// 文件数据采用"本地路径往返"语义：
+// - upload_file：AI 传 localPath（本机已存在的文件）→ 上传到远端 remotePath。
+// - download_file：远端 remotePath → 下载到本机 localPath，返回本地路径。
+// AI 可配合 exec_ssh 先把内容写到本地（如 `cat > /tmp/x`），再上传；避免 base64
+// 编码大文件膨胀 context。
+
+/// 日志截断：命令/SQL 等用户输入可能很长且含敏感内容，日志只保留前 `max` 字符。
+fn truncate_log(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max).collect();
+        format!("{}…", head)
+    }
+}
+
+/// 解析工具参数中 `path` 字段（list_files 用，必填）。
+pub fn arg_path(args: &Value) -> AppResult<String> {
+    args.get("path")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::InvalidInput("缺少 path 参数".into()))
+}
+
+/// 解析工具参数中 `localPath` 字段（upload/download 用，必填）。
+pub fn arg_local_path(args: &Value) -> AppResult<String> {
+    args.get("localPath")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::InvalidInput("缺少 localPath 参数".into()))
+}
+
+/// 解析工具参数中 `remotePath` 字段（upload/download 用，必填）。
+pub fn arg_remote_path(args: &Value) -> AppResult<String> {
+    args.get("remotePath")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::InvalidInput("缺少 remotePath 参数".into()))
+}
+
+/// 共用的"解析凭据 → 建连 → 打开 SFTP → 操作 → 断开"实现，返回 SFTP 后端句柄。
+///
+/// 与 [`exec_ssh_with_config`] 一致的凭据解析流程，但在拿到 SSH Handle 后调用
+/// [`open_sftp`] 而非 `channel.exec`。返回 `(FileBackend, Handle)`，调用方
+/// 完成操作后用 handle 断开连接。
+async fn open_sftp_for_config(
+    state: &AppState,
+    session_config: Session,
+) -> AppResult<(
+    std::sync::Arc<dyn FileBackend>,
+    russh::client::Handle<crate::ssh::client::ClientHandler>,
+)> {
+    let resolved = {
+        let vault = {
+            let guard = state.vault_read()?;
+            guard
+                .as_ref()
+                .ok_or_else(|| AppError::Auth("保险库未解锁".into()))?
+                .clone()
+        };
+        let conn = state.conn()?;
+        crate::ssh::session::resolve_credential(&session_config, &vault, &conn)?
+    };
+
+    let handle = crate::ssh::client::connect_direct(
+        &session_config.host,
+        session_config.port,
+        &session_config.username,
+        &session_config.id,
+        resolved.auth_method,
+        state.clone(),
+    )
+    .await?;
+
+    let sftp = open_sftp(&handle).await?;
+    Ok((std::sync::Arc::new(sftp), handle))
+}
+
+/// 在指定（按 id 查到的）SSH 会话对应的服务器上列举目录（MCP 绑定模式）。
+///
+/// 返回 JSON 序列化的 `Vec<FileEntry>`（字段：name / isDir / size / modified）。
+pub async fn list_files_by_id(state: &AppState, session_id: &str, path: &str) -> AppResult<String> {
+    let session_config = find_session_by_id(state, session_id)?;
+    let run = async {
+        let (backend, handle) = open_sftp_for_config(state, session_config).await?;
+        let entries = backend.list_dir(path).await?;
+        let _ = handle
+            .disconnect(russh::Disconnect::ByApplication, "bye", "en")
+            .await;
+        Ok::<_, AppError>(entries)
+    };
+    let entries = match timeout(SFTP_OP_TIMEOUT, run).await {
+        Ok(Ok(e)) => e,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err(AppError::Ssh("list_files 执行超时".into())),
+    };
+    serde_json::to_string(&entries)
+        .map_err(|e| AppError::Storage(format!("序列化目录列表失败: {}", e)))
+}
+
+/// 在调用方指定的服务器上列举目录（MCP 客户端直连模式）。
+pub async fn list_files_direct(
+    host: &str,
+    port: u16,
+    username: &str,
+    password: &str,
+    path: &str,
+    state: AppState,
+) -> AppResult<String> {
+    if password.is_empty() {
+        return Err(AppError::Auth("password 不能为空".into()));
+    }
+    log::info!(
+        "[mcp] list_files（直连）开始：{}@{}:{} {}",
+        username,
+        host,
+        port,
+        path
+    );
+    let run = async {
+        let handle = crate::ssh::client::connect_direct(
+            host,
+            port,
+            username,
+            "direct",
+            AuthMethod::Password(password.to_string()),
+            state,
+        )
+        .await?;
+        let sftp = open_sftp(&handle).await?;
+        let backend: std::sync::Arc<dyn FileBackend> = std::sync::Arc::new(sftp);
+        let entries = backend.list_dir(path).await?;
+        let _ = handle
+            .disconnect(russh::Disconnect::ByApplication, "bye", "en")
+            .await;
+        Ok::<_, AppError>(entries)
+    };
+    let entries = match timeout(SFTP_OP_TIMEOUT, run).await {
+        Ok(Ok(e)) => e,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err(AppError::Ssh("list_files 执行超时".into())),
+    };
+    serde_json::to_string(&entries)
+        .map_err(|e| AppError::Storage(format!("序列化目录列表失败: {}", e)))
+}
+
+/// 在指定（按 id 查到的）SSH 会话对应的服务器上上传文件（MCP 绑定模式）。
+///
+/// `local_path` 必须是 X-Term 所在主机的本地路径；`remote_path` 为远端目标。
+/// 进度回调为空操作（MCP 工具不向客户端推送进度事件，与 exec_ssh 一致）。
+pub async fn upload_file_by_id(
+    state: &AppState,
+    session_id: &str,
+    local_path: &str,
+    remote_path: &str,
+) -> AppResult<String> {
+    let session_config = find_session_by_id(state, session_id)?;
+    let local = PathBuf::from(local_path);
+    if !local.exists() {
+        return Err(AppError::InvalidInput(format!(
+            "本地文件 `{}` 不存在",
+            local_path
+        )));
+    }
+    let run = async {
+        let (backend, handle) = open_sftp_for_config(state, session_config).await?;
+        let noop: crate::file_backend::ProgressCb = std::sync::Arc::new(|_, _| {});
+        backend.upload(&local, remote_path, noop).await?;
+        let _ = handle
+            .disconnect(russh::Disconnect::ByApplication, "bye", "en")
+            .await;
+        Ok::<_, AppError>(())
+    };
+    match timeout(SFTP_OP_TIMEOUT, run).await {
+        Ok(Ok(())) => Ok(format!("已上传 {} → {}", local_path, remote_path)),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(AppError::Ssh("upload_file 执行超时".into())),
+    }
+}
+
+/// 在调用方指定的服务器上上传文件（MCP 客户端直连模式）。
+pub async fn upload_file_direct(
+    host: &str,
+    port: u16,
+    username: &str,
+    password: &str,
+    local_path: &str,
+    remote_path: &str,
+    state: AppState,
+) -> AppResult<String> {
+    if password.is_empty() {
+        return Err(AppError::Auth("password 不能为空".into()));
+    }
+    let local = PathBuf::from(local_path);
+    if !local.exists() {
+        return Err(AppError::InvalidInput(format!(
+            "本地文件 `{}` 不存在",
+            local_path
+        )));
+    }
+    log::info!(
+        "[mcp] upload_file（直连）开始：{}@{}:{} {} → {}",
+        username,
+        host,
+        port,
+        local_path,
+        remote_path
+    );
+    let run = async {
+        let handle = crate::ssh::client::connect_direct(
+            host,
+            port,
+            username,
+            "direct",
+            AuthMethod::Password(password.to_string()),
+            state,
+        )
+        .await?;
+        let sftp = open_sftp(&handle).await?;
+        let backend: std::sync::Arc<dyn FileBackend> = std::sync::Arc::new(sftp);
+        let noop: crate::file_backend::ProgressCb = std::sync::Arc::new(|_, _| {});
+        backend.upload(&local, remote_path, noop).await?;
+        let _ = handle
+            .disconnect(russh::Disconnect::ByApplication, "bye", "en")
+            .await;
+        Ok::<_, AppError>(())
+    };
+    match timeout(SFTP_OP_TIMEOUT, run).await {
+        Ok(Ok(())) => Ok(format!("已上传 {} → {}", local_path, remote_path)),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(AppError::Ssh("upload_file 执行超时".into())),
+    }
+}
+
+/// 在指定（按 id 查到的）SSH 会话对应的服务器上下载文件（MCP 绑定模式）。
+///
+/// 下载到 X-Term 所在主机的 `local_path`，返回该本地路径。
+pub async fn download_file_by_id(
+    state: &AppState,
+    session_id: &str,
+    remote_path: &str,
+    local_path: &str,
+) -> AppResult<String> {
+    let session_config = find_session_by_id(state, session_id)?;
+    let local = PathBuf::from(local_path);
+    if let Some(parent) = local.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            return Err(AppError::InvalidInput(format!(
+                "本地目标目录 `{}` 不存在",
+                parent.display()
+            )));
+        }
+    }
+    let run = async {
+        let (backend, handle) = open_sftp_for_config(state, session_config).await?;
+        let noop: crate::file_backend::ProgressCb = std::sync::Arc::new(|_, _| {});
+        backend.download(remote_path, &local, noop).await?;
+        let _ = handle
+            .disconnect(russh::Disconnect::ByApplication, "bye", "en")
+            .await;
+        Ok::<_, AppError>(())
+    };
+    match timeout(SFTP_OP_TIMEOUT, run).await {
+        Ok(Ok(())) => Ok(format!("已下载 {} → {}", remote_path, local_path)),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(AppError::Ssh("download_file 执行超时".into())),
+    }
+}
+
+/// 在调用方指定的服务器上下载文件（MCP 客户端直连模式）。
+pub async fn download_file_direct(
+    host: &str,
+    port: u16,
+    username: &str,
+    password: &str,
+    remote_path: &str,
+    local_path: &str,
+    state: AppState,
+) -> AppResult<String> {
+    if password.is_empty() {
+        return Err(AppError::Auth("password 不能为空".into()));
+    }
+    let local = PathBuf::from(local_path);
+    if let Some(parent) = local.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            return Err(AppError::InvalidInput(format!(
+                "本地目标目录 `{}` 不存在",
+                parent.display()
+            )));
+        }
+    }
+    log::info!(
+        "[mcp] download_file（直连）开始：{}@{}:{} {} → {}",
+        username,
+        host,
+        port,
+        remote_path,
+        local_path
+    );
+    let run = async {
+        let handle = crate::ssh::client::connect_direct(
+            host,
+            port,
+            username,
+            "direct",
+            AuthMethod::Password(password.to_string()),
+            state,
+        )
+        .await?;
+        let sftp = open_sftp(&handle).await?;
+        let backend: std::sync::Arc<dyn FileBackend> = std::sync::Arc::new(sftp);
+        let noop: crate::file_backend::ProgressCb = std::sync::Arc::new(|_, _| {});
+        backend.download(remote_path, &local, noop).await?;
+        let _ = handle
+            .disconnect(russh::Disconnect::ByApplication, "bye", "en")
+            .await;
+        Ok::<_, AppError>(())
+    };
+    match timeout(SFTP_OP_TIMEOUT, run).await {
+        Ok(Ok(())) => Ok(format!("已下载 {} → {}", remote_path, local_path)),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(AppError::Ssh("download_file 执行超时".into())),
+    }
+}
+
+// ===========================================================================
+// 文件操作（File MCP · S3 账号）：list_files / upload_file / download_file
+// ===========================================================================
+//
+// 与 SSH kind 的文件工具并列，但底层走 S3（绑定 file_account，仅 bound 模式）。
+// 范式与 SSH 短连接一致：每次调用读配置 → 解密凭据 → 构造 S3Backend → 操作。
+// S3 无长连接，S3Backend 构造零成本，Arc drop 即释放。
+
+/// 按 id 查 FileAccount；不存在则报错。
+fn find_file_account_by_id(state: &AppState, id: &str) -> AppResult<FileAccount> {
+    let conn = state.conn()?;
+    get_file_account(&conn, id)?
+        .ok_or_else(|| AppError::NotFound(format!("找不到 id 为 `{}` 的 S3 文件账号", id)))
+}
+
+/// 按 id 查 S3 文件账号的展示名（供前端确认浮层标注来源；找不到时返回占位）。
+pub fn account_name_by_id(state: &AppState, id: &str) -> String {
+    find_file_account_by_id(state, id)
+        .map(|a| a.name)
+        .unwrap_or_else(|_| "(未知账号)".into())
+}
+
+/// 解析 file_account 凭据并构造 S3 后端（短连接，Arc drop 即释放）。
+///
+/// 流程：读 file_account → vault 解密 access_key/secret_key → S3Backend::new。
+/// 与 [`open_sftp_for_config`] 的区别：无 disconnect 步骤（S3 无长连接）。
+async fn open_s3_for_account(
+    state: &AppState,
+    account: FileAccount,
+) -> AppResult<std::sync::Arc<dyn FileBackend>> {
+    let cred_id = account
+        .credential_id
+        .as_ref()
+        .ok_or_else(|| AppError::Auth(format!("文件账号 `{}` 缺少 credential_id", account.name)))?;
+    let (access_key, secret_key) = {
+        let vault = {
+            let guard = state.vault_read()?;
+            guard
+                .as_ref()
+                .ok_or_else(|| AppError::Auth("保险库未解锁".into()))?
+                .clone()
+        };
+        let conn = state.conn()?;
+        fetch_s3_credential(&conn, cred_id, &vault)?
+    };
+    let config = S3Config {
+        endpoint: account.endpoint,
+        region: account.region,
+        bucket: account.bucket,
+        access_key,
+        secret_key,
+        path_style: account.path_style,
+    };
+    let backend = S3Backend::new(config)?;
+    Ok(std::sync::Arc::new(backend))
+}
+
+/// 在指定（按 id 查到的）S3 账号对应的存储桶上列举目录（File MCP 绑定模式）。
+///
+/// `path` 为对象 key 前缀（约定以 `/` 结尾表示目录）。返回 JSON 序列化的 `Vec<FileEntry>`。
+pub async fn list_files_by_account(
+    state: &AppState,
+    account_id: &str,
+    path: &str,
+) -> AppResult<String> {
+    let account = find_file_account_by_id(state, account_id)?;
+    let run = async {
+        let backend = open_s3_for_account(state, account).await?;
+        let entries = backend.list_dir(path).await?;
+        Ok::<_, AppError>(entries)
+    };
+    let entries = match timeout(SFTP_OP_TIMEOUT, run).await {
+        Ok(Ok(e)) => e,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(AppError::Storage(format!(
+                "list_files(S3) 执行超时（目录 `{}`，上限 5 分钟）",
+                path
+            )))
+        }
+    };
+    serde_json::to_string(&entries)
+        .map_err(|e| AppError::Storage(format!("序列化目录列表失败: {}", e)))
+}
+
+/// 上传本地文件到指定 S3 账号对应的存储桶（File MCP 绑定模式）。
+pub async fn upload_file_by_account(
+    state: &AppState,
+    account_id: &str,
+    local_path: &str,
+    remote_path: &str,
+) -> AppResult<String> {
+    let account = find_file_account_by_id(state, account_id)?;
+    let local = PathBuf::from(local_path);
+    if !local.exists() {
+        return Err(AppError::InvalidInput(format!(
+            "本地文件 `{}` 不存在",
+            local_path
+        )));
+    }
+    let run = async {
+        let backend = open_s3_for_account(state, account).await?;
+        let noop: crate::file_backend::ProgressCb = std::sync::Arc::new(|_, _| {});
+        backend.upload(&local, remote_path, noop).await?;
+        Ok::<_, AppError>(())
+    };
+    match timeout(SFTP_OP_TIMEOUT, run).await {
+        Ok(Ok(())) => Ok(format!("已上传 {} → {}", local_path, remote_path)),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(AppError::Storage(format!(
+            "upload_file(S3) 执行超时（`{}` → `{}`，上限 5 分钟；文件可能过大）",
+            local_path, remote_path
+        ))),
+    }
+}
+
+/// 从指定 S3 账号对应的存储桶下载文件到本地（File MCP 绑定模式）。
+pub async fn download_file_by_account(
+    state: &AppState,
+    account_id: &str,
+    remote_path: &str,
+    local_path: &str,
+) -> AppResult<String> {
+    let account = find_file_account_by_id(state, account_id)?;
+    let local = PathBuf::from(local_path);
+    if let Some(parent) = local.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            return Err(AppError::InvalidInput(format!(
+                "本地目标目录 `{}` 不存在",
+                parent.display()
+            )));
+        }
+    }
+    let run = async {
+        let backend = open_s3_for_account(state, account).await?;
+        let noop: crate::file_backend::ProgressCb = std::sync::Arc::new(|_, _| {});
+        backend.download(remote_path, &local, noop).await?;
+        Ok::<_, AppError>(())
+    };
+    match timeout(SFTP_OP_TIMEOUT, run).await {
+        Ok(Ok(())) => Ok(format!("已下载 {} → {}", remote_path, local_path)),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(AppError::Storage(format!(
+            "download_file(S3) 执行超时（`{}` → `{}`，上限 5 分钟；文件可能过大）",
+            remote_path, local_path
+        ))),
+    }
 }

@@ -9,6 +9,7 @@ const routes: RouteRecordRaw[] = [
       { path: "", redirect: "/terminals" },
       { path: "terminals", name: "terminals", component: () => import("@/views/Workspace.vue") },
       { path: "sftp", name: "sftp", component: () => import("@/views/SftpView.vue") },
+      { path: "files", name: "files", component: () => import("@/views/FileExplorerView.vue") },
       { path: "sql", name: "sql", component: () => import("@/views/SqlConsoleView.vue") },
       { path: "forward", name: "forward", component: () => import("@/views/ForwardView.vue") },
       { path: "remote", name: "remote", component: () => import("@/views/RemoteDesktopView.vue") },

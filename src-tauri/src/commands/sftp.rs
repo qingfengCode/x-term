@@ -27,7 +27,11 @@ pub async fn sftp_list(
     path: String,
     state: State<'_, AppState>,
 ) -> AppResult<Vec<FileEntry>> {
-    let sftp = state.sftp_sessions.lock().get(&sftp_id).map(|(s, _)| s.clone());
+    let sftp = state
+        .sftp_sessions
+        .lock()
+        .get(&sftp_id)
+        .map(|(s, _)| s.clone());
     let sftp = sftp.ok_or_else(|| AppError::NotFound(format!("SFTP 会话 {} 不存在", sftp_id)))?;
     sftp.list_dir(&path).await
 }
@@ -39,7 +43,11 @@ pub async fn sftp_stat(
     path: String,
     state: State<'_, AppState>,
 ) -> AppResult<FileMeta> {
-    let sftp = state.sftp_sessions.lock().get(&sftp_id).map(|(s, _)| s.clone());
+    let sftp = state
+        .sftp_sessions
+        .lock()
+        .get(&sftp_id)
+        .map(|(s, _)| s.clone());
     let sftp = sftp.ok_or_else(|| AppError::NotFound(format!("SFTP 会话 {} 不存在", sftp_id)))?;
     sftp.stat(&path).await
 }
@@ -51,7 +59,11 @@ pub async fn sftp_mkdir(
     path: String,
     state: State<'_, AppState>,
 ) -> AppResult<()> {
-    let sftp = state.sftp_sessions.lock().get(&sftp_id).map(|(s, _)| s.clone());
+    let sftp = state
+        .sftp_sessions
+        .lock()
+        .get(&sftp_id)
+        .map(|(s, _)| s.clone());
     let sftp = sftp.ok_or_else(|| AppError::NotFound(format!("SFTP 会话 {} 不存在", sftp_id)))?;
     sftp.mkdir(&path).await
 }
@@ -64,7 +76,11 @@ pub async fn sftp_rename(
     newpath: String,
     state: State<'_, AppState>,
 ) -> AppResult<()> {
-    let sftp = state.sftp_sessions.lock().get(&sftp_id).map(|(s, _)| s.clone());
+    let sftp = state
+        .sftp_sessions
+        .lock()
+        .get(&sftp_id)
+        .map(|(s, _)| s.clone());
     let sftp = sftp.ok_or_else(|| AppError::NotFound(format!("SFTP 会话 {} 不存在", sftp_id)))?;
     sftp.rename(&oldpath, &newpath).await
 }
@@ -77,7 +93,11 @@ pub async fn sftp_remove(
     is_dir: bool,
     state: State<'_, AppState>,
 ) -> AppResult<()> {
-    let sftp = state.sftp_sessions.lock().get(&sftp_id).map(|(s, _)| s.clone());
+    let sftp = state
+        .sftp_sessions
+        .lock()
+        .get(&sftp_id)
+        .map(|(s, _)| s.clone());
     let sftp = sftp.ok_or_else(|| AppError::NotFound(format!("SFTP 会话 {} 不存在", sftp_id)))?;
     if is_dir {
         sftp.remove_dir(&path).await
@@ -109,26 +129,29 @@ pub async fn sftp_download(
         .lock()
         .get(&params.sftp_id)
         .map(|(s, _)| s.clone());
-    let sftp = sftp.ok_or_else(|| {
-        AppError::NotFound(format!("SFTP 会话 {} 不存在", params.sftp_id))
-    })?;
+    let sftp =
+        sftp.ok_or_else(|| AppError::NotFound(format!("SFTP 会话 {} 不存在", params.sftp_id)))?;
     let local = PathBuf::from(&params.local_path);
     let task_id = params.task_id.clone();
     let app_for_progress = app.clone();
 
     let result = sftp
-        .download(&params.remote_path, &local, move |transferred, total| {
-            events::emit(
-                &app_for_progress,
-                TRANSFER_PROGRESS,
-                TransferProgressEvent {
-                    task_id: task_id.clone(),
-                    transferred,
-                    total,
-                    speed: 0,
-                },
-            );
-        })
+        .download(
+            &params.remote_path,
+            &local,
+            std::sync::Arc::new(move |transferred, total| {
+                events::emit(
+                    &app_for_progress,
+                    TRANSFER_PROGRESS,
+                    TransferProgressEvent {
+                        task_id: task_id.clone(),
+                        transferred,
+                        total,
+                        speed: 0,
+                    },
+                );
+            }) as crate::file_backend::ProgressCb,
+        )
         .await;
 
     match result {
@@ -180,26 +203,29 @@ pub async fn sftp_upload(
         .lock()
         .get(&params.sftp_id)
         .map(|(s, _)| s.clone());
-    let sftp = sftp.ok_or_else(|| {
-        AppError::NotFound(format!("SFTP 会话 {} 不存在", params.sftp_id))
-    })?;
+    let sftp =
+        sftp.ok_or_else(|| AppError::NotFound(format!("SFTP 会话 {} 不存在", params.sftp_id)))?;
     let local = PathBuf::from(&params.local_path);
     let task_id = params.task_id.clone();
     let app_for_progress = app.clone();
 
     let result = sftp
-        .upload(&local, &params.remote_path, move |transferred, total| {
-            events::emit(
-                &app_for_progress,
-                TRANSFER_PROGRESS,
-                TransferProgressEvent {
-                    task_id: task_id.clone(),
-                    transferred,
-                    total,
-                    speed: 0,
-                },
-            );
-        })
+        .upload(
+            &local,
+            &params.remote_path,
+            std::sync::Arc::new(move |transferred, total| {
+                events::emit(
+                    &app_for_progress,
+                    TRANSFER_PROGRESS,
+                    TransferProgressEvent {
+                        task_id: task_id.clone(),
+                        transferred,
+                        total,
+                        speed: 0,
+                    },
+                );
+            }) as crate::file_backend::ProgressCb,
+        )
         .await;
 
     match result {

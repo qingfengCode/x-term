@@ -158,18 +158,21 @@ SSH 侧和数据库侧各有独立的 AI 助手面板。支持多模型（OpenAI
 # 1. 安装依赖
 pnpm install
 
-# 2. 构建安装包（Windows）
-scripts\build.bat
+# 2. 发布构建（版本号 +1、生成 update.json）
+python scripts/build-update.py
+
+# 3. 或纯构建（版本号不变）
+python scripts/build.py
 ```
 
 产物位于 `src-tauri/target/release/bundle/nsis/`。
 
-> **注意**：构建脚本会加载 MSVC 环境并强制使用 cl.exe 编译器，避免 MinGW 链接冲突。请勿在未加载 VS 环境的情况下直接 `cargo build`。
+> **注意**：构建脚本会加载 MSVC 环境并强制使用 cl.exe 编译器，避免 MinGW 链接冲突。请勿在未加载 VS 环境的情况下直接 `cargo build`。脚本详情见 `scripts/README.md`（构建脚本目录已 git 忽略，不入库）。
 
 ### 开发模式
 
 ```bash
-scripts\dev.bat
+python scripts/dev.py
 ```
 
 启动热更新开发服务器，修改代码后自动刷新。
@@ -198,7 +201,7 @@ scripts\dev.bat
 
 ## 📄 技术文档
 
-详细的技术架构、模块设计、数据模型等信息，请参阅 [技术设计文档](TECHNICAL_DESIGN.md)。
+详细的技术架构、模块设计、数据模型等信息，请参阅 [技术设计文档](docs/TECHNICAL_DESIGN.md)。
 
 ---
 

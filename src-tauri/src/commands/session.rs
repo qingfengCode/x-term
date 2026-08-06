@@ -114,7 +114,8 @@ pub async fn connect_session(
                 resolve_credential(&session_config, &vault, &conn)?
             };
             // 打开 SSH 会话。
-            let mut ssh = SshSession::open(&session_config, resolved, app).await?;
+            let mut ssh =
+                SshSession::open(&session_config, resolved, state.inner().clone()).await?;
             ssh.spawn_reader()?;
             let id = ssh.id.clone();
             state
@@ -130,10 +131,7 @@ pub async fn connect_session(
 
 /// 断开一个终端实例。
 #[tauri::command]
-pub async fn disconnect_session(
-    instance_id: String,
-    state: State<'_, AppState>,
-) -> AppResult<()> {
+pub async fn disconnect_session(instance_id: String, state: State<'_, AppState>) -> AppResult<()> {
     let session = state
         .terminals
         .lock()
@@ -157,7 +155,6 @@ pub async fn disconnect_session(
 pub async fn open_sftp_for_session(
     session_config_id: String,
     state: State<'_, AppState>,
-    app: tauri::AppHandle,
 ) -> AppResult<String> {
     let session_config = {
         let conn = state.conn()?;
@@ -181,20 +178,84 @@ pub async fn open_sftp_for_session(
         &session_config.host,
         session_config.port,
         &session_config.username,
+        &session_config.id,
         resolved.auth_method,
-        app,
+        state.inner().clone(),
     )
     .await?;
 
     let sftp = crate::ssh::sftp::open_sftp(&handle).await?;
     let sftp_id = uuid::Uuid::new_v4().to_string();
-    state
-        .sftp_sessions
-        .lock()
-        .insert(
-            sftp_id.clone(),
-            (std::sync::Arc::new(sftp), std::sync::Arc::new(handle)),
-        );
+    state.sftp_sessions.lock().insert(
+        sftp_id.clone(),
+        (std::sync::Arc::new(sftp), std::sync::Arc::new(handle)),
+    );
 
     Ok(sftp_id)
+}
+
+/// 前端回复 SSH 二次认证挑战（keyboard-interactive）。
+///
+/// 后端在认证过程中 emit `ssh:auth_challenge` 事件并阻塞等待本命令回传：
+/// - `responses` 为 `Some(vec)` 表示提交，数组与事件中 `prompts` 一一对应；
+/// - `responses` 为 `None` 表示用户取消认证。
+///
+/// 挑战不存在（已超时/已取消）时返回 NotFound，前端可忽略。
+#[tauri::command]
+pub fn ssh_auth_respond(
+    challenge_id: String,
+    responses: Option<Vec<String>>,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    let tx = state
+        .pending_auth_challenges
+        .lock()
+        .remove(&challenge_id)
+        .ok_or_else(|| AppError::NotFound(format!("认证挑战 {} 不存在或已超时", challenge_id)))?;
+    let reply = match responses {
+        Some(responses) => crate::ssh::client::AuthChallengeReply::Respond(responses),
+        None => crate::ssh::client::AuthChallengeReply::Cancel,
+    };
+    tx.send(reply)
+        .map_err(|_| AppError::Auth("认证挑战已关闭".into()))?;
+    Ok(())
+}
+
+/// 前端回复 SSH 主机公钥变更确认。
+///
+/// 后端在 [`crate::ssh::client::ClientHandler::check_server_key`] 检测到主机
+/// 公钥与 known_hosts 记录不符时 emit `ssh:host_key_challenge` 事件并阻塞等待
+/// 本命令回传 `decision`：
+/// - `AcceptAndUpdate`：接受新公钥并更新 known_hosts 记录；
+/// - `AcceptOnce`：仅本次接受，不更新记录；
+/// - `Reject`：拒绝连接（认证失败）。
+///
+/// 挑战不存在（已超时/已关闭）时返回 NotFound，前端可忽略。
+#[tauri::command]
+pub fn ssh_host_key_respond(
+    challenge_id: String,
+    decision: String,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    let tx = state
+        .pending_host_keys
+        .lock()
+        .remove(&challenge_id)
+        .ok_or_else(|| {
+            AppError::NotFound(format!("主机公钥确认 {} 不存在或已超时", challenge_id))
+        })?;
+    let decision = match decision.as_str() {
+        "AcceptAndUpdate" => crate::ssh::client::HostKeyDecision::AcceptAndUpdate,
+        "AcceptOnce" => crate::ssh::client::HostKeyDecision::AcceptOnce,
+        "Reject" => crate::ssh::client::HostKeyDecision::Reject,
+        other => {
+            return Err(AppError::InvalidInput(format!(
+                "未知的主机公钥决策: {}（应为 AcceptAndUpdate / AcceptOnce / Reject）",
+                other
+            )))
+        }
+    };
+    tx.send(decision)
+        .map_err(|_| AppError::Auth("主机公钥确认已关闭".into()))?;
+    Ok(())
 }

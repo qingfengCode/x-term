@@ -143,10 +143,13 @@ impl CredentialVault {
     }
 
     /// 便捷方法：把 [`EncryptedBlob`] 编码为 base64 字符串（用于存入数据库）。
-    pub fn encode_blob(blob: &EncryptedBlob) -> String {
+    ///
+    /// 序列化失败时返回错误而不是静默产出空串的 base64（否则会把损坏数据写进
+    /// 数据库，且无法被任何调用方感知）。
+    pub fn encode_blob(blob: &EncryptedBlob) -> AppResult<String> {
         use base64::{engine::general_purpose::STANDARD, Engine};
-        let json = serde_json::to_string(blob).unwrap_or_default();
-        STANDARD.encode(json)
+        let json = serde_json::to_string(blob)?;
+        Ok(STANDARD.encode(json))
     }
 
     /// 便捷方法：从 base64 字符串解码出 [`EncryptedBlob`]。
@@ -216,8 +219,15 @@ impl CredentialVault {
             salt: salt.to_vec(),
             verifier: verifier_blob,
         };
-        let content = serde_json::to_string(&file)?;
-        std::fs::write(&path, content)?;
+        // 原子写：master.key 损坏等于保险库永久不可用（所有凭据无法解密）。
+        // 先写唯一 tmp 再 rename，避免进程中途崩溃留下截断文件。
+        crate::storage::json_store::write_json(&path, &file)?;
+        // Unix 下收紧权限：主密钥文件仅当前用户可读写。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
 
         Ok(vault)
     }
@@ -229,9 +239,7 @@ impl CredentialVault {
     pub fn unlock(app_data_dir: &Path, passphrase: &str) -> AppResult<CredentialVault> {
         let path = master_key_path(app_data_dir);
         if !path.exists() {
-            return Err(AppError::NotFound(
-                "凭据保险库不存在，请先创建".to_string(),
-            ));
+            return Err(AppError::NotFound("凭据保险库不存在，请先创建".to_string()));
         }
 
         let content = std::fs::read_to_string(&path)?;
@@ -249,9 +257,7 @@ impl CredentialVault {
         };
         match vault.decrypt(&blob) {
             Ok(decrypted) if decrypted == VERIFIER_PLAINTEXT => Ok(vault),
-            _ => Err(AppError::Auth(
-                "口令错误，无法解锁凭据保险库".to_string(),
-            )),
+            _ => Err(AppError::Auth("口令错误，无法解锁凭据保险库".to_string())),
         }
     }
 
@@ -276,7 +282,7 @@ mod tests {
         assert_eq!(vault.decrypt_str(&blob).unwrap(), "hello world");
 
         // base64 编解码往返。
-        let encoded = CredentialVault::encode_blob(&blob);
+        let encoded = CredentialVault::encode_blob(&blob).unwrap();
         let decoded = CredentialVault::decode_blob(&encoded).unwrap();
         assert_eq!(vault.decrypt_str(&decoded).unwrap(), "hello world");
 

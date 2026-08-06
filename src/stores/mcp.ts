@@ -6,35 +6,39 @@ import type { McpKind, McpInstanceConfig, McpServerStatus, McpApprovalRequest } 
 /**
  * MCP（Model Context Protocol）服务端状态。
  *
- * 两个独立 MCP 实例：
- * - SSH MCP（ssh）：对外暴露 exec_ssh，绑定一个 SSH 会话。
+ * 三个独立 MCP 实例：
+ * - SSH MCP（ssh）：对外暴露 exec_ssh + 文件工具，绑定一个 SSH 会话。
  * - DB MCP（db）：对外暴露 exec_sql，绑定一个 DB profile。
+ * - File MCP（file）：对外暴露 list_files/upload_file/download_file，绑定一个 S3 文件账号。
  * 各自独立配置（host/port/token/resourceId）与运行状态。
  *
  * 待确认请求队列（pendingApprovals）由全局浮层 McpApprovalToast 呈现——外部客户端
- * 发起的 exec_ssh/exec_sql 与当前页面无关，属全局事件。
+ * 发起的工具调用与当前页面无关，属全局事件。
  */
 export const useMcpStore = defineStore("mcp", () => {
-  /** 两个 kind 各自的配置（从 mcp.json 加载）。 */
+  /** 三个 kind 各自的配置（从 mcp.json 加载）。 */
   const sshConfig = ref<McpInstanceConfig>(makeDefault("ssh"));
   const dbConfig = ref<McpInstanceConfig>(makeDefault("db"));
+  const fileConfig = ref<McpInstanceConfig>(makeDefault("file"));
 
-  /** 两个 kind 各自的运行状态。 */
+  /** 三个 kind 各自的运行状态。 */
   const sshStatus = ref<McpServerStatus>({ running: false, host: "", port: 0, endpoint: "" });
   const dbStatus = ref<McpServerStatus>({ running: false, host: "", port: 0, endpoint: "" });
+  const fileStatus = ref<McpServerStatus>({ running: false, host: "", port: 0, endpoint: "" });
 
   /** 各 kind 操作的按钮 loading。 */
-  const loading = ref<Record<McpKind, boolean>>({ ssh: false, db: false });
+  const loading = ref<Record<McpKind, boolean>>({ ssh: false, db: false, file: false });
 
   /** 待确认的请求队列（按到达顺序）。 */
   const pendingApprovals = ref<McpApprovalRequest[]>([]);
 
   /** 该 kind 的默认配置。 */
   function makeDefault(kind: McpKind): McpInstanceConfig {
+    const port = kind === "ssh" ? 8765 : kind === "db" ? 8766 : 8767;
     return {
       enabled: false,
       host: "0.0.0.0",
-      port: kind === "ssh" ? 8765 : 8766,
+      port,
       token: undefined,
       resourceId: undefined,
       resourceMode: "bound",
@@ -46,15 +50,26 @@ export const useMcpStore = defineStore("mcp", () => {
 
   /** 取该 kind 的配置/状态引用。 */
   function configOf(kind: McpKind) {
-    return kind === "ssh" ? sshConfig : dbConfig;
+    if (kind === "ssh") return sshConfig;
+    if (kind === "db") return dbConfig;
+    return fileConfig;
   }
   function statusOf(kind: McpKind) {
-    return kind === "ssh" ? sshStatus : dbStatus;
+    if (kind === "ssh") return sshStatus;
+    if (kind === "db") return dbStatus;
+    return fileStatus;
   }
 
-  /** 加载两个 kind 的配置与状态。 */
+  /** 加载三个 kind 的配置与状态。 */
   async function loadAll() {
-    await Promise.all([loadConfig("ssh"), loadConfig("db"), refresh("ssh"), refresh("db")]);
+    await Promise.all([
+      loadConfig("ssh"),
+      loadConfig("db"),
+      loadConfig("file"),
+      refresh("ssh"),
+      refresh("db"),
+      refresh("file"),
+    ]);
   }
 
   /** 加载该 kind 的配置。 */
@@ -134,8 +149,10 @@ export const useMcpStore = defineStore("mcp", () => {
   return {
     sshConfig,
     dbConfig,
+    fileConfig,
     sshStatus,
     dbStatus,
+    fileStatus,
     loading,
     pendingApprovals,
     loadAll,

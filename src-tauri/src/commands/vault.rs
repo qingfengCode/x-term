@@ -24,7 +24,9 @@ pub fn vault_exists(state: State<'_, AppState>) -> AppResult<bool> {
 #[tauri::command]
 pub fn vault_create(passphrase: String, state: State<'_, AppState>) -> AppResult<()> {
     if CredentialVault::exists(&state.data_dir) {
-        return Err(AppError::InvalidInput("保险库已存在，请使用解锁功能".into()));
+        return Err(AppError::InvalidInput(
+            "保险库已存在，请使用解锁功能".into(),
+        ));
     }
     if passphrase.len() < 6 {
         return Err(AppError::InvalidInput("主密码至少 6 位".into()));
@@ -96,7 +98,7 @@ pub fn credential_save(input: CredentialInput, state: State<'_, AppState>) -> Ap
     });
     let payload_str = serde_json::to_string(&payload)?;
     let blob = vault.encrypt_str(&payload_str)?;
-    let enc_data = CredentialVault::encode_blob(&blob);
+    let enc_data = CredentialVault::encode_blob(&blob)?;
 
     let id = input.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let now = chrono::Utc::now().to_rfc3339();
@@ -115,9 +117,8 @@ pub fn credential_save(input: CredentialInput, state: State<'_, AppState>) -> Ap
 #[tauri::command]
 pub fn credential_list(state: State<'_, AppState>) -> AppResult<Vec<CredentialView>> {
     let conn = state.conn()?;
-    let mut stmt = conn.prepare(
-        "SELECT id, name, kind, created_at FROM credentials ORDER BY created_at DESC",
-    )?;
+    let mut stmt = conn
+        .prepare("SELECT id, name, kind, created_at FROM credentials ORDER BY created_at DESC")?;
     let rows = stmt.query_map([], |r| {
         let kind: String = r.get(2).unwrap_or_else(|_| "password".into());
         Ok(CredentialView {

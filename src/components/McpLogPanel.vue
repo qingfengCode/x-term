@@ -24,8 +24,16 @@ const loading = ref(false);
 const autoScroll = ref(true);
 const scrollerRef = ref<HTMLDivElement | null>(null);
 
-const config = computed(() => (props.kind === "ssh" ? mcp.sshConfig : mcp.dbConfig));
-const status = computed(() => (props.kind === "ssh" ? mcp.sshStatus : mcp.dbStatus));
+const config = computed(() => {
+  if (props.kind === "ssh") return mcp.sshConfig;
+  if (props.kind === "db") return mcp.dbConfig;
+  return mcp.fileConfig;
+});
+const status = computed(() => {
+  if (props.kind === "ssh") return mcp.sshStatus;
+  if (props.kind === "db") return mcp.dbStatus;
+  return mcp.fileStatus;
+});
 /** 运行中且开启日志 → 显示 LIVE 指示。 */
 const live = computed(() => status.value.running && config.value.enableLog);
 

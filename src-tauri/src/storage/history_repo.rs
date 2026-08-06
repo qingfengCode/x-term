@@ -25,7 +25,12 @@ pub fn add_history(conn: &DbConn, entry: &HistoryEntry) -> AppResult<i64> {
     conn.execute(
         "INSERT INTO history (session_id, command, exit_code, run_at) \
          VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![entry.session_id, entry.command, entry.exit_code, entry.run_at],
+        rusqlite::params![
+            entry.session_id,
+            entry.command,
+            entry.exit_code,
+            entry.run_at
+        ],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -38,10 +43,7 @@ pub fn list_history(conn: &DbConn, session_id: &str, limit: u32) -> AppResult<Ve
          ORDER BY run_at DESC, id DESC LIMIT ?2",
     )?;
 
-    let rows = stmt.query_map(
-        rusqlite::params![session_id, limit as i64],
-        row_to_entry,
-    )?;
+    let rows = stmt.query_map(rusqlite::params![session_id, limit as i64], row_to_entry)?;
 
     let mut out = Vec::new();
     for row in rows {
@@ -52,10 +54,16 @@ pub fn list_history(conn: &DbConn, session_id: &str, limit: u32) -> AppResult<Ve
 
 /// 关键字模糊搜索历史（在所有会话范围内匹配 command），按 `run_at` 降序。
 pub fn search_history(conn: &DbConn, keyword: &str, limit: u32) -> AppResult<Vec<HistoryEntry>> {
-    let pattern = format!("%{}%", keyword);
+    // LIKE 通配符转义：用户搜 "%" / "_" 时按字面匹配，而不是当成任意字符通配
+    // （否则搜 "50%" 会命中所有含 "50" 的纪录）。
+    let escaped = keyword
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = format!("%{}%", escaped);
     let mut stmt = conn.prepare(
         "SELECT id, session_id, command, exit_code, run_at \
-         FROM history WHERE command LIKE ?1 \
+         FROM history WHERE command LIKE ?1 ESCAPE '\\' \
          ORDER BY run_at DESC, id DESC LIMIT ?2",
     )?;
 

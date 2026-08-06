@@ -110,8 +110,9 @@ impl TelnetSession {
 
             loop {
                 tokio::select! {
-                    biased;
                     // 远端 → 前端。
+                    // 注意：不能用 biased —— 远端持续输出时会饿死输入分支，
+                    // 用户按键（含 Ctrl+C 等中断）得不到处理。
                     n = read_half.read(&mut buf) => {
                         match n {
                             Ok(0) | Err(_) => break, // 连接关闭

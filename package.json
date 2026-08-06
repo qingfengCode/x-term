@@ -1,6 +1,6 @@
 {
   "name": "x-term",
-  "version": "0.1.0",
+  "version": "0.1.11",
   "description": "X-Term - 现代化运维终端客户端",
   "type": "module",
   "scripts": {

@@ -37,6 +37,10 @@ pub struct TerminalSettings {
     /// 是否启用 Webgl 渲染。
     #[serde(default = "default_enable_webgl")]
     pub enable_webgl: bool,
+    /// SSH 空闲断开时间（分钟）：终端空闲（无服务端输出）超过此时长自动断开。
+    /// 0 表示永不自动断开。作用于所有 SSH 连接（终端 / SFTP / 隧道 / AI 执行）。
+    #[serde(default = "default_ssh_idle_timeout_minutes")]
+    pub ssh_idle_timeout_minutes: u32,
 }
 
 fn default_theme() -> String {
@@ -60,6 +64,9 @@ fn default_copy_on_select() -> bool {
 fn default_enable_webgl() -> bool {
     true
 }
+fn default_ssh_idle_timeout_minutes() -> u32 {
+    30
+}
 
 impl Default for TerminalSettings {
     fn default() -> Self {
@@ -71,6 +78,7 @@ impl Default for TerminalSettings {
             scrollback: default_scrollback(),
             copy_on_select: default_copy_on_select(),
             enable_webgl: default_enable_webgl(),
+            ssh_idle_timeout_minutes: default_ssh_idle_timeout_minutes(),
         }
     }
 }
@@ -136,6 +144,27 @@ fn default_app_shortcuts() -> std::collections::BTreeMap<String, String> {
     m
 }
 
+/// 一条可复用 skill（由历史对话总结生成，注入对应 domain 的 system prompt）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillConfig {
+    /// 唯一 id。
+    pub id: String,
+    /// 展示标题。
+    pub title: String,
+    /// skill 内容（直接作为系统提示词片段注入）。
+    pub content: String,
+    /// 所属助手域："ssh" | "db"。注入时只取匹配当前 domain 的。
+    pub domain: String,
+    /// 是否启用。禁用的 skill 不注入 prompt。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 /// AI 设置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -156,6 +185,9 @@ pub struct AiSettings {
     /// 本地文件读写配置（read_file / write_file / list_files 工具）。
     #[serde(default)]
     pub file_access: FileAccessSettings,
+    /// 可复用 skill 列表（由对话总结生成，注入对应 domain 的 system prompt）。
+    #[serde(default)]
+    pub skills: Vec<SkillConfig>,
 
     // === 向后兼容：旧字段（已迁移到 ssh_agent）。保留字段以便读取旧 settings.json，
     //     迁移逻辑见 [`migrate_legacy_ai`]。序列化时跳过写出，避免数据重复丢失。 ===
@@ -175,11 +207,29 @@ impl Default for AiSettings {
             ssh_agent: SshAgentSettings::default(),
             sql_agent: SqlAgentSettings::default(),
             file_access: FileAccessSettings::default(),
+            skills: Vec::new(),
             command_whitelist: Vec::new(),
             auto_approve_whitelist: false,
             terminal_visualization: false,
         }
     }
+}
+
+/// 工具运行模式（SSH / SQL 智能体各自独立设置）。
+///
+/// - `"manual"`：所有工具调用都弹确认，等用户批准后才执行；
+/// - `"auto"`：所有工具调用自动执行，不弹确认（**含危险操作**；SQL 仍受
+///   `sql_mode` 边界约束）；
+/// - `"whitelist"`：白名单内（SSH 命令白名单 / SQL 只读查询）且非危险自动执行，
+///   其余弹确认（危险操作仍强制确认）。
+///
+/// 未知字符串按 `"manual"` 处理（配置容错）。
+pub const RUN_MODE_MANUAL: &str = "manual";
+pub const RUN_MODE_AUTO: &str = "auto";
+pub const RUN_MODE_WHITELIST: &str = "whitelist";
+
+fn default_run_mode() -> String {
+    RUN_MODE_MANUAL.into()
 }
 
 /// SSH 智能体配置（exec_ssh 工具专用）。
@@ -188,14 +238,19 @@ impl Default for AiSettings {
 pub struct SshAgentSettings {
     /// 智能体 `exec_ssh` 命令白名单：命令前缀（如 "df"、"ps"、"systemctl status"）。
     ///
-    /// 命中即视为"白名单内"，前端绿色卡片。配合 [`Self::auto_approve_safe`]
-    /// 开关可自动放行（详见该字段）。详见 [`crate::ai::tools::check_command_whitelist`]。
+    /// 命中即视为"白名单内"，前端绿色卡片；在 `whitelist` 运行模式下自动放行。
+    /// 详见 [`crate::ai::tools::check_command_whitelist`]。
     #[serde(default = "default_command_whitelist")]
     pub command_whitelist: Vec<String>,
-    /// 白名单内且非危险时自动放行（跳过人工确认按钮）；`false` 时所有命令都需点"执行"确认。
+    /// 运行模式：`"manual"` 手动 / `"auto"` 自动 / `"whitelist"` 白名单运行。
     ///
-    /// 安全护栏：`is_dangerous` 判定为危险的命令**永远**走人工确认，不受此开关影响。
-    #[serde(default)]
+    /// `whitelist` 模式下白名单内且非危险的命令自动执行，其余弹确认；
+    /// `auto` 模式全部自动执行（含危险命令，用户需自行承担风险）。
+    #[serde(default = "default_run_mode")]
+    pub run_mode: String,
+    /// 旧字段（v0.1 时代的"白名单内自动放行"开关）。仅用于读取旧配置并迁移到
+    /// [`Self::run_mode`]，序列化时跳过写出。
+    #[serde(default, skip_serializing)]
     pub auto_approve_safe: bool,
     /// 终端可视化：`true` 时 `exec_ssh` 命令写入用户活动终端的 PTY（命令和输出
     /// 实时显示在 xterm）；`false` 时走独立 `channel.exec` 连接（输出只在 AI 面板）。
@@ -207,6 +262,7 @@ impl Default for SshAgentSettings {
     fn default() -> Self {
         Self {
             command_whitelist: default_command_whitelist(),
+            run_mode: default_run_mode(),
             auto_approve_safe: false,
             terminal_visualization: false,
         }
@@ -224,11 +280,15 @@ pub struct SqlAgentSettings {
     /// - `full`：允许一切（危险操作仍走 `is_dangerous` + 人工确认）。
     #[serde(default = "default_sql_mode")]
     pub sql_mode: String,
-    /// 只读查询（SELECT/SHOW/EXPLAIN/DESCRIBE）自动放行（免确认）。
+    /// 运行模式：`"manual"` 手动 / `"auto"` 自动 / `"whitelist"` 白名单运行。
     ///
-    /// 安全护栏：`is_dangerous` 判定为危险的 SQL（DROP/TRUNCATE/无 WHERE 的 DELETE）
-    /// **永远**走人工确认，不受此开关影响。
-    #[serde(default = "default_sql_auto_approve_safe")]
+    /// `whitelist` 模式下只读查询自动执行，其余弹确认；`auto` 模式全部自动执行
+    /// （含危险 SQL，但 `sql_mode` 边界校验始终生效，不允许的语句仍被拒绝）。
+    #[serde(default = "default_run_mode")]
+    pub run_mode: String,
+    /// 旧字段（v0.1 时代的"只读查询自动放行"开关）。仅用于读取旧配置并迁移到
+    /// [`Self::run_mode`]，序列化时跳过写出。
+    #[serde(default = "default_sql_auto_approve_safe", skip_serializing)]
     pub auto_approve_safe: bool,
     /// 终端可视化：`true` 时 AI 执行的 SQL 及结构化结果回显到 SQL 控制台输出流
     /// （命令行模式），就像用户自己敲的一样；`false` 时结果只在 AI 面板。
@@ -241,6 +301,7 @@ impl Default for SqlAgentSettings {
     fn default() -> Self {
         Self {
             sql_mode: default_sql_mode(),
+            run_mode: default_run_mode(),
             auto_approve_safe: default_sql_auto_approve_safe(),
             terminal_visualization: false,
         }
@@ -289,12 +350,24 @@ fn default_sql_auto_approve_safe() -> bool {
 /// 重复迁移（旧字段 `skip_serializing`，不会写出，但内存里清空以保持一致语义）。
 pub fn migrate_legacy_ai(ai: &mut AiSettings) {
     // command_whitelist：旧字段非空、且 ssh_agent 仍是默认白名单时迁移。
-    if !ai.command_whitelist.is_empty() && ai.ssh_agent.command_whitelist == default_command_whitelist()
+    if !ai.command_whitelist.is_empty()
+        && ai.ssh_agent.command_whitelist == default_command_whitelist()
     {
         ai.ssh_agent.command_whitelist = ai.command_whitelist.clone();
     }
-    if ai.auto_approve_whitelist && !ai.ssh_agent.auto_approve_safe {
-        ai.ssh_agent.auto_approve_safe = true;
+    // 旧版"自动放行"开关 → 白名单运行模式：
+    // - 顶层 legacy 字段 auto_approve_whitelist（v0.1，SSH）；
+    // - ssh_agent.auto_approve_safe / sql_agent.auto_approve_safe（v0.2 字段）。
+    // 新配置不会写出这些旧字段（skip_serializing），因此只在旧文件加载时生效一次；
+    // 加 run_mode 仍是默认值（manual）的判定，避免覆盖用户手改的 run_mode。
+    if ai.auto_approve_whitelist && ai.ssh_agent.run_mode == default_run_mode() {
+        ai.ssh_agent.run_mode = RUN_MODE_WHITELIST.into();
+    }
+    if ai.ssh_agent.auto_approve_safe && ai.ssh_agent.run_mode == default_run_mode() {
+        ai.ssh_agent.run_mode = RUN_MODE_WHITELIST.into();
+    }
+    if ai.sql_agent.auto_approve_safe && ai.sql_agent.run_mode == default_run_mode() {
+        ai.sql_agent.run_mode = RUN_MODE_WHITELIST.into();
     }
     if ai.terminal_visualization && !ai.ssh_agent.terminal_visualization {
         ai.ssh_agent.terminal_visualization = true;
@@ -418,6 +491,16 @@ pub struct Settings {
     /// 是否首次启动（已保存后置 false）。
     #[serde(default)]
     pub first_run: bool,
+    /// 会话侧栏宽度（px）。拖拽调整后持久化；老配置缺失时按 240（前端兜底）。
+    #[serde(default = "default_sidebar_width")]
+    pub sidebar_width: f32,
+    /// 最近成功连接的会话 id（最近的在前，最多保留 10 个）。
+    #[serde(default)]
+    pub recent_session_ids: Vec<String>,
+}
+
+fn default_sidebar_width() -> f32 {
+    240.0
 }
 
 /// 内置默认快捷命令（首次启动时填充，给用户一个起步样例）。
@@ -478,12 +561,21 @@ pub fn settings_load_inner(state: &AppState) -> AppResult<Settings> {
 pub const APP_CONFIG_FILENAME: &str = "app.json";
 
 /// 自更新相关配置。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateConfig {
     /// 更新清单（update.json）地址，指向自建服务器。为空则检查更新时报错提示配置。
     #[serde(default)]
     pub manifest_url: String,
+}
+
+/// 默认更新源：TOS 对象存储托管的更新清单。
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            manifest_url: "https://qf99.tos-cn-beijing.volces.com/x-term/update.json".into(),
+        }
+    }
 }
 
 /// 应用级配置（区别于用户设置 settings.json，存放更新源等运行期配置）。

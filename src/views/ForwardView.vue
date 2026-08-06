@@ -5,7 +5,7 @@
   - 列出所有转发规则（forwardListRules）
   - 新建 / 编辑 / 删除规则
   - 启动 / 停止隧道（forwardStart / forwardStop）
-  - 仅 Local 类型在 MVP 阶段可用，Remote / Dynamic 由后端返回 InvalidInput，前端 catch 展示
+  - 支持三类转发：Local（-L）、Remote（-R）、Dynamic SOCKS5（-D）
 
   运行状态采用纯前端内存维护（Set<string>），刷新页面后默认为停止。
 -->
@@ -359,17 +359,23 @@ onMounted(async () => {
           </el-select>
         </el-form-item>
 
-        <el-form-item label="本地绑定">
+        <el-form-item :label="form.kind === 'Remote' ? '本地目标' : '本地绑定'">
           <div class="port-row">
             <el-input v-model="form.localHost" placeholder="127.0.0.1" />
             <el-input-number v-model="form.localPort" :min="1" :max="65535" controls-position="right" />
           </div>
+          <div v-if="form.kind === 'Remote'" class="form-hint">
+            远端入站连接将被转发到的本地地址
+          </div>
         </el-form-item>
 
-        <el-form-item label="远程目标">
+        <el-form-item v-if="form.kind !== 'Dynamic'" label="远程目标">
           <div class="port-row">
             <el-input v-model="form.remoteHost" placeholder="127.0.0.1" />
             <el-input-number v-model="form.remotePort" :min="1" :max="65535" controls-position="right" />
+          </div>
+          <div v-if="form.kind === 'Remote'" class="form-hint">
+            SSH 服务端监听的远端地址（通常填 0.0.0.0 或 localhost）
           </div>
         </el-form-item>
 

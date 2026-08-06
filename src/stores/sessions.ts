@@ -2,6 +2,7 @@ import { defineStore } from "pinia";
 import { computed, ref } from "vue";
 import * as sessionApi from "@/api/session";
 import type { Group, Session } from "@/api/types";
+import { useSettingsStore } from "@/stores/settings";
 
 /**
  * 会话与分组数据（来自 SQLite）。
@@ -9,6 +10,7 @@ import type { Group, Session } from "@/api/types";
  * UI 通过本 store 读取/修改，所有变更同步写回后端。
  */
 export const useSessionsStore = defineStore("sessions", () => {
+  const settings = useSettingsStore();
   const sessions = ref<Session[]>([]);
   const groups = ref<Group[]>([]);
   const loaded = ref(false);
@@ -20,6 +22,15 @@ export const useSessionsStore = defineStore("sessions", () => {
   /** 终端会话（SSH/Telnet）——终端页会话树只显示这些。 */
   const terminalSessions = computed(() =>
     sessions.value.filter((s) => s.protocol === "ssh" || s.protocol === "telnet" || !s.protocol),
+  );
+
+  /** 最近成功连接的会话（按记录顺序；只保留仍存在且为 SSH/Telnet 的）。 */
+  const recentSessions = computed(() =>
+    settings.recentSessionIds
+      .map((id) => sessions.value.find((s) => s.id === id))
+      .filter(
+        (s): s is Session => !!s && (s.protocol === "ssh" || s.protocol === "telnet" || !s.protocol),
+      ),
   );
 
   async function load() {
@@ -61,6 +72,7 @@ export const useSessionsStore = defineStore("sessions", () => {
     tree,
     terminalSessions,
     terminalTree,
+    recentSessions,
     load,
     saveSession,
     removeSession,

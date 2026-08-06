@@ -55,9 +55,11 @@ fn launch_rdp(addr: &str, username: Option<&str>, password: Option<&str>) -> App
 
     // 写入临时文件。
     let temp_dir = std::env::temp_dir();
-    let rdp_path = temp_dir.join(format!("xterm-{}.rdp", chrono::Utc::now().timestamp_millis()));
-    std::fs::write(&rdp_path, &rdp)
-        .map_err(|e| AppError::Ssh(format!("写 RDP 文件失败: {e}")))?;
+    let rdp_path = temp_dir.join(format!(
+        "xterm-{}.rdp",
+        chrono::Utc::now().timestamp_millis()
+    ));
+    std::fs::write(&rdp_path, &rdp).map_err(|e| AppError::Ssh(format!("写 RDP 文件失败: {e}")))?;
 
     log::info!("[remote-desktop] 启动 mstsc, rdp 文件: {:?}", rdp_path);
 
@@ -71,17 +73,21 @@ fn launch_rdp(addr: &str, username: Option<&str>, password: Option<&str>) -> App
     #[cfg(target_os = "macos")]
     {
         // macOS 无原生 RDP，提示用户。
-        return Err(AppError::Ssh("macOS 请安装 Microsoft Remote Desktop 后手动连接".into()));
+        return Err(AppError::Ssh(
+            "macOS 请安装 Microsoft Remote Desktop 后手动连接".into(),
+        ));
     }
     #[cfg(target_os = "linux")]
     {
         Command::new("xfreerdp")
             .arg(format!("/v:{}", addr))
             .spawn()
-            .or_else(|_| {
-                Command::new("remmina").spawn()
-            })
-            .map_err(|e| AppError::Ssh(format!("启动 RDP 客户端失败（请安装 xfreerdp/remmina）: {e}")))?;
+            .or_else(|_| Command::new("remmina").spawn())
+            .map_err(|e| {
+                AppError::Ssh(format!(
+                    "启动 RDP 客户端失败（请安装 xfreerdp/remmina）: {e}"
+                ))
+            })?;
     }
 
     Ok(format!("已启动 RDP 客户端连接 {}", addr))
@@ -112,7 +118,9 @@ fn launch_vnc(addr: &str) -> AppResult<String> {
         } else {
             format!("vnc://{}:5900", addr)
         };
-        Command::new("open").arg(url).spawn()
+        Command::new("open")
+            .arg(url)
+            .spawn()
             .map_err(|e| AppError::Ssh(format!("启动 Screen Sharing 失败: {e}")))?;
     }
     #[cfg(target_os = "linux")]

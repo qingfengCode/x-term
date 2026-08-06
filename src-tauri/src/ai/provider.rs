@@ -161,6 +161,17 @@ impl ProviderKind {
 // `rename_all = "camelCase"`：前端 (`src/api/types.ts` 的 `ProviderConfig`) 使用
 // baseUrl / apiKey（camelCase）。之前这里漏了 rename，导致后端期望 base_url/api_key
 // （snake_case），前端发来 baseUrl 时 serde 报 "missing field `base_url`"。
+/// 单次请求最大输出 tokens 的默认值（Claude 必传 max_tokens，其它厂商也发送）。
+const DEFAULT_MAX_OUTPUT: u32 = 16_000;
+/// 上下文窗口大小（tokens）默认值：超出部分的历史消息会在发送前被裁剪。
+const DEFAULT_CONTEXT_WINDOW: u32 = 184_000;
+/// 智能体模式最大工具调用数默认值（对应旧的硬编码 `MAX_ITER`）。
+const DEFAULT_MAX_TOOL_CALLS: usize = 200;
+/// 建连超时默认值（秒）。
+pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 15;
+/// 读取（流式响应）超时默认值（秒）。300s 足够覆盖长思考模型的首 token 延迟。
+pub const DEFAULT_READ_TIMEOUT_SECS: u64 = 300;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderConfig {
@@ -172,6 +183,55 @@ pub struct ProviderConfig {
     pub api_key: String,
     /// 模型名，如 `gpt-4o-mini`、`claude-3-5-sonnet-20241022`、`deepseek-chat`。
     pub model: String,
+    /// 单次请求最大输出 tokens（请求体 `max_tokens`）。Claude 必传该字段。
+    #[serde(default = "default_max_output")]
+    pub max_output: u32,
+    /// 上下文窗口大小（tokens）。发送前按 token 估算裁剪历史消息，超出部分丢弃最旧消息。
+    /// 裁剪预算会预留 [`ProviderConfig::max_output`] 的空间，防止输出撑爆窗口。
+    #[serde(default = "default_context_window")]
+    pub context_window: u32,
+    /// 智能体模式最大工具调用数（防止模型陷入工具调用死循环）。
+    #[serde(default = "default_max_tool_calls")]
+    pub max_tool_calls: usize,
+    /// 采样温度。`None` 表示不发送该参数，由服务端使用默认值。
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// 建连超时（秒）。0 或缺失表示使用默认值（[`DEFAULT_CONNECT_TIMEOUT_SECS`]）。
+    /// 覆盖 DNS 解析/建连挂死场景。
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    /// 读取（流式响应）超时（秒）。0 或缺失表示使用默认值
+    /// （[`DEFAULT_READ_TIMEOUT_SECS`]）。防止连接假死后流式读取无限阻塞；
+    /// 长思考模型的首 token 延迟可能达数分钟，按需调大。
+    #[serde(default = "default_read_timeout_secs")]
+    pub read_timeout_secs: u64,
+}
+
+fn default_max_output() -> u32 {
+    DEFAULT_MAX_OUTPUT
+}
+
+fn default_context_window() -> u32 {
+    DEFAULT_CONTEXT_WINDOW
+}
+
+fn default_max_tool_calls() -> usize {
+    DEFAULT_MAX_TOOL_CALLS
+}
+
+fn default_connect_timeout_secs() -> u64 {
+    DEFAULT_CONNECT_TIMEOUT_SECS
+}
+
+fn default_read_timeout_secs() -> u64 {
+    DEFAULT_READ_TIMEOUT_SECS
+}
+
+/// 把配置的秒数转换为 [`std::time::Duration`]；0（未设置）回退默认值，
+/// 避免 `connect_timeout(0)` 在 reqwest 里变成"立即超时"。
+pub fn timeout_secs(secs: u64, default: u64) -> std::time::Duration {
+    let s = if secs == 0 { default } else { secs };
+    std::time::Duration::from_secs(s)
 }
 
 // ===========================================================================

@@ -58,6 +58,19 @@ pub const DB_QUERY_RESULT: &str = "db:query_result";
 /// 应用更新下载进度。payload: [`UpdateProgressEvent`]。
 pub const UPDATE_PROGRESS: &str = "update:progress";
 
+/// SSH 二次认证挑战（keyboard-interactive）。payload: [`SshAuthChallengeEvent`]。
+///
+/// 后端在认证过程中收到服务器发来的键盘交互挑战（如 OTP/验证码）时 emit，
+/// 前端弹出输入框收集用户输入后通过 `ssh_auth_respond` 命令回传。
+pub const SSH_AUTH_CHALLENGE: &str = "ssh:auth_challenge";
+
+/// SSH 主机公钥变更确认。payload: [`SshHostKeyEvent`]。
+///
+/// 后端在 [`crate::ssh::client::ClientHandler::check_server_key`] 检测到主机公钥
+/// 与 known_hosts 记录不符时 emit，前端弹窗展示新旧指纹对比，用户选择后通过
+/// `ssh_host_key_respond` 命令回传决策（接受并更新 / 仅本次接受 / 拒绝）。
+pub const SSH_HOST_KEY_CHALLENGE: &str = "ssh:host_key_challenge";
+
 // ===========================================================================
 // 事件 payload 结构体
 // ===========================================================================
@@ -236,6 +249,66 @@ pub struct UpdateProgressEvent {
     pub total: u64,
     /// 百分比（0~100；total 未知时为 0）。
     pub percent: u8,
+}
+
+/// SSH keyboard-interactive 挑战中需要用户输入的单个项。
+///
+/// 已被后端用保存密码自动填充的提示（如 "Password: "）**不会**出现在事件里，
+/// 避免把凭据信息发往前端。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshAuthPrompt {
+    /// 服务器给出的提示文本（如 "Password: " / "Verification code: "）。
+    pub prompt: String,
+    /// 是否回显输入。false 表示密码类输入，前端应用 password 输入框。
+    pub echo: bool,
+}
+
+/// SSH 二次认证挑战事件。
+///
+/// 前端按 `challenge_id` 用 `ssh_auth_respond` 命令回传答案：
+/// - 提交：`responses` 数组与 `prompts` 一一对应；
+/// - 取消：`responses` 传 `null`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshAuthChallengeEvent {
+    /// 挑战 id（前端回传用）。
+    pub challenge_id: String,
+    /// 会话配置 id（用于展示会话名/主机）。
+    pub session_config_id: String,
+    /// 目标主机。
+    pub host: String,
+    /// 目标端口。
+    pub port: u16,
+    /// 登录用户名。
+    pub username: String,
+    /// 服务器返回的挑战名称（如 "SSH-2.0-keyboard-interactive"）。
+    pub name: String,
+    /// 服务器返回的说明文字（可为空）。
+    pub instructions: String,
+    /// 需要用户填写的输入项（已自动填充的密码提示不会出现在这里）。
+    pub prompts: Vec<SshAuthPrompt>,
+}
+
+/// SSH 主机公钥变更确认事件。
+///
+/// 前端按 `challenge_id` 用 `ssh_host_key_respond` 命令回传决策：
+/// `AcceptAndUpdate` / `AcceptOnce` / `Reject`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshHostKeyEvent {
+    /// 挑战 id（前端回传用）。
+    pub challenge_id: String,
+    /// 目标主机。
+    pub host: String,
+    /// 目标端口。
+    pub port: u16,
+    /// 服务器实际公钥的算法名（如 `"ssh-ed25519"`）。
+    pub key_type: String,
+    /// 服务器实际公钥指纹（SHA-256 base64）。
+    pub fingerprint: String,
+    /// known_hosts 中记录的旧指纹（用于前端展示新旧对比）。
+    pub known_fingerprint: String,
 }
 
 // ===========================================================================

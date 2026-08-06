@@ -34,6 +34,26 @@ function filterNode(value: string, data: TreeNode) {
   return data.label.toLowerCase().includes(value);
 }
 
+/** 把标签按过滤关键词切成片段，用于匹配子串高亮（大小写不敏感）。 */
+function highlightParts(label: string): { text: string; hit: boolean }[] {
+  const kw = filterText.value;
+  if (!kw) return [{ text: label, hit: false }];
+  const parts: { text: string; hit: boolean }[] = [];
+  const lower = label.toLowerCase();
+  let i = 0;
+  while (i < label.length) {
+    const idx = lower.indexOf(kw, i);
+    if (idx < 0) {
+      parts.push({ text: label.slice(i), hit: false });
+      break;
+    }
+    if (idx > i) parts.push({ text: label.slice(i, idx), hit: false });
+    parts.push({ text: label.slice(idx, idx + kw.length), hit: true });
+    i = idx + kw.length;
+  }
+  return parts;
+}
+
 const isEmpty = computed(
   () => sessionsStore.terminalSessions.length === 0 && sessionsStore.groups.length === 0
 );
@@ -88,10 +108,11 @@ async function connectSession(s: Session) {
 
 // --- 点击 / 交互 --------------------------------------------------------
 // 单击会话节点即连接（更顺手，符合常见终端管理器习惯）。
-// 分组节点单击仅展开/折叠（由 el-tree 的 expand-on-click-node=false 关闭，
-// 默认点击箭头才展开，避免误连）。
+// 分组节点单击切换展开/折叠（此前依赖 expand-on-click-node=false 只点箭头，
+// 现在点击标签也能展开，避免误连会话）。
 function onNodeClick(data: TreeNode) {
   if (data.type === "session") connectSession(data.raw as Session);
+  else treeRef.value?.toggleExpand(data.id);
 }
 
 // --- 右键菜单（el-dropdown 方式，更可控）--------------------------------
@@ -312,6 +333,40 @@ async function onNodeDrop(
       />
     </div>
 
+    <!-- 最近连接（最近成功连接的会话，单击连接；Ctrl+T 会连第一个） -->
+    <div v-if="sessionsStore.recentSessions.length" class="recent-section">
+      <div class="recent-header">
+        <el-icon class="recent-icon"><Clock /></el-icon>
+        <span>最近</span>
+      </div>
+      <div v-for="s in sessionsStore.recentSessions" :key="s.id" class="recent-item">
+        <span
+          class="recent-name"
+          :style="s.color ? { borderLeftColor: s.color } : undefined"
+          :title="`${s.username}@${s.host}:${s.port}`"
+          @click="connectSession(s)"
+          >{{ s.name }}</span
+        >
+        <el-dropdown
+          class="recent-menu"
+          trigger="click"
+          placement="bottom-end"
+          @command="(cmd: string) => onCommand(cmd, { type: 'session', id: s.id, label: s.name, raw: s })"
+          @click.stop
+        >
+          <el-icon class="node-menu-icon"><MoreFilled /></el-icon>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item command="connect" :icon="'Link'">连接</el-dropdown-item>
+              <el-dropdown-item command="edit" :icon="'Edit'">编辑</el-dropdown-item>
+              <el-dropdown-item command="copy" :icon="'CopyDocument'">复制</el-dropdown-item>
+              <el-dropdown-item command="delete" :icon="'Delete'" divided>删除</el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
+      </div>
+    </div>
+
     <!-- 树 -->
     <div class="tree-wrap">
       <el-tree
@@ -346,8 +401,13 @@ async function onNodeDrop(
                     ? { borderLeftColor: String((data.raw as Session).color) }
                     : undefined
                 "
-                >{{ data.label }}</span
               >
+                <!-- 搜索时高亮匹配子串 -->
+                <template v-for="(p, i) in highlightParts(data.label)" :key="i">
+                  <mark v-if="p.hit" class="hl">{{ p.text }}</mark>
+                  <template v-else>{{ p.text }}</template>
+                </template>
+              </span>
             </span>
 
             <!-- 悬浮操作按钮（右键菜单等价物） -->
@@ -406,8 +466,8 @@ async function onNodeDrop(
 .session-sidebar {
   display: flex;
   flex-direction: column;
-  width: 240px;
-  min-width: 240px;
+  /* 宽度由父级 inline style 控制（MainLayout 拖拽调整） */
+  flex-shrink: 0;
   height: 100%;
   padding: 8px;
   background: var(--el-bg-color-overlay);
@@ -437,6 +497,64 @@ async function onNodeDrop(
 
 .search-wrap {
   padding: 0 4px 8px;
+}
+
+/* --- 最近连接 --- */
+.recent-section {
+  padding: 2px 4px 6px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+}
+.recent-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 4px 4px;
+  font-size: 11px;
+  color: var(--el-text-color-placeholder);
+  letter-spacing: 0.5px;
+}
+.recent-icon {
+  font-size: 12px;
+}
+.recent-item {
+  display: flex;
+  align-items: center;
+  height: 26px;
+  border-radius: 4px;
+}
+.recent-item:hover {
+  background: var(--el-fill-color-light);
+}
+.recent-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--el-text-color-primary);
+  padding: 2px 6px;
+  border-left: 3px solid transparent;
+}
+.recent-menu {
+  display: none;
+  align-items: center;
+  cursor: pointer;
+  padding: 2px;
+}
+.recent-item:hover .recent-menu,
+.recent-menu:focus-within {
+  display: flex;
+}
+
+/* 搜索高亮 */
+.node-text mark.hl {
+  background: var(--el-color-primary-light-5);
+  color: var(--el-color-primary);
+  border-radius: 2px;
+  padding: 0;
 }
 
 .tree-wrap {

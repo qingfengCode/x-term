@@ -49,15 +49,15 @@ pub fn init_pool(app_data_dir: &Path) -> AppResult<DbPool> {
         )
     });
 
-    let pool = Pool::builder().build(manager).map_err(|e| {
-        crate::error::AppError::Storage(format!("无法建立数据库连接池: {}", e))
-    })?;
+    let pool = Pool::builder()
+        .build(manager)
+        .map_err(|e| crate::error::AppError::Storage(format!("无法建立数据库连接池: {}", e)))?;
 
     // 对首个连接运行迁移。
     {
-        let conn = pool.get().map_err(|e| {
-            crate::error::AppError::Storage(format!("无法获取数据库连接: {}", e))
-        })?;
+        let conn = pool
+            .get()
+            .map_err(|e| crate::error::AppError::Storage(format!("无法获取数据库连接: {}", e)))?;
         run_migrations(&conn)?;
     }
 
@@ -181,6 +181,20 @@ pub fn run_migrations(conn: &Connection) -> AppResult<()> {
             sort_order  INTEGER NOT NULL DEFAULT 0,
             created_at  TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS file_accounts (
+            id            TEXT PRIMARY KEY,
+            name          TEXT NOT NULL,
+            kind          TEXT NOT NULL DEFAULT 's3',
+            endpoint      TEXT NOT NULL,
+            region        TEXT NOT NULL DEFAULT '',
+            bucket        TEXT NOT NULL DEFAULT '',
+            credential_id TEXT,
+            path_style    INTEGER NOT NULL DEFAULT 1,
+            sort_order    INTEGER NOT NULL DEFAULT 0,
+            created_at    TEXT NOT NULL,
+            updated_at    TEXT NOT NULL
+        );
         ",
     )?;
 
@@ -189,11 +203,28 @@ pub fn run_migrations(conn: &Connection) -> AppResult<()> {
     // 给 sessions 加 protocol 列（ssh/telnet/rdp/vnc），默认 ssh（兼容已有数据）。
     add_column_if_missing(conn, "sessions", "protocol", "TEXT NOT NULL DEFAULT 'ssh'")?;
     // 给 credentials 加 kind 列（password/private_key_text），避免列表时解密每个 blob。
-    add_column_if_missing(conn, "credentials", "kind", "TEXT NOT NULL DEFAULT 'password'")?;
+    add_column_if_missing(
+        conn,
+        "credentials",
+        "kind",
+        "TEXT NOT NULL DEFAULT 'password'",
+    )?;
     // 给 sessions 加 space_id 列：会话所属空间（"local" 或 JumpServer 空间 id）。
-    add_column_if_missing(conn, "sessions", "space_id", "TEXT NOT NULL DEFAULT 'local'")?;
+    add_column_if_missing(
+        conn,
+        "sessions",
+        "space_id",
+        "TEXT NOT NULL DEFAULT 'local'",
+    )?;
     // 给 db_profiles 加 group_id 列：数据库连接所属分组。
     add_column_if_missing(conn, "db_profiles", "group_id", "TEXT")?;
+    // 给 file_accounts 加 path_style 列（true=path-style 默认，false=virtual-hosted）。
+    add_column_if_missing(
+        conn,
+        "file_accounts",
+        "path_style",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
 
     Ok(())
 }

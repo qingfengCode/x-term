@@ -416,17 +416,41 @@ async function disconnectSftp() {
   } catch {
     return;
   }
-  try {
-    await sftpClose(sftpId.value);
+  if (await closeSftpCore()) {
     ElMessage.success("已关闭 SFTP 连接");
+  } else {
+    ElMessage.error("关闭 SFTP 连接失败");
+  }
+}
+
+/**
+ * 关闭 SFTP 连接并清空本地状态，返回是否成功。
+ *
+ * 无确认弹窗/无提示：供 disconnectSftp 确认后调用，也供视图卸载时静默调用
+ * （组件可能已销毁，此时不应弹 ElMessage）。
+ */
+async function closeSftpCore(): Promise<boolean> {
+  const id = sftpId.value;
+  if (!id) return true;
+  sftpId.value = "";
+  let ok = false;
+  try {
+    await sftpClose(id);
+    ok = true;
   } catch (e) {
-    ElMessage.error("关闭失败: " + String(e));
+    // 连接已死时 sftpClose 失败属正常。
+    console.warn("关闭 SFTP 连接失败:", e);
   } finally {
-    sftpId.value = "";
     remotePath.value = "";
     remoteEntries.value = [];
     selectedRemote.value = null;
   }
+  return ok;
+}
+
+/** 视图卸载时的静默清理。 */
+function closeSftpSilently() {
+  void closeSftpCore();
 }
 
 // ---------------------------------------------------------------------------
@@ -485,6 +509,9 @@ async function uploadOne(localAbs: string, name: string) {
     total: 0,
     status: "pending",
   });
+  // 后端命令整体 await（完成才返回），"运行中"须在发起前标记，
+  // 否则完成后才更新会覆盖 transfer:done 事件的完成状态。
+  transfer.update(taskId, { status: "running" });
   try {
     await sftpUpload({
       sftpId: sftpId.value,
@@ -492,8 +519,7 @@ async function uploadOne(localAbs: string, name: string) {
       remotePath: remoteAbs,
       taskId,
     });
-    transfer.update(taskId, { status: "running" });
-    ElMessage.success(`已开始上传 ${name}`);
+    ElMessage.success(`上传完成 ${name}`);
   } catch (e) {
     transfer.update(taskId, { status: "error", message: String(e) });
     ElMessage.error("上传失败: " + String(e));
@@ -579,6 +605,7 @@ async function downloadSelected() {
     total: remoteFile.size || 0,
     status: "pending",
   });
+  transfer.update(taskId, { status: "running" });
   try {
     await sftpDownload({
       sftpId: sftpId.value,
@@ -586,8 +613,7 @@ async function downloadSelected() {
       localPath: savePath,
       taskId,
     });
-    transfer.update(taskId, { status: "running" });
-    ElMessage.success(`已开始下载 ${remoteFile.name}`);
+    ElMessage.success(`下载完成 ${remoteFile.name}`);
   } catch (e) {
     transfer.update(taskId, { status: "error", message: String(e) });
     ElMessage.error("下载失败: " + String(e));
@@ -606,6 +632,7 @@ async function downloadOne(remoteAbs: string, name: string) {
     total: 0,
     status: "pending",
   });
+  transfer.update(taskId, { status: "running" });
   try {
     await sftpDownload({
       sftpId: sftpId.value,
@@ -613,8 +640,7 @@ async function downloadOne(remoteAbs: string, name: string) {
       localPath: localAbs,
       taskId,
     });
-    transfer.update(taskId, { status: "running" });
-    ElMessage.success(`已开始下载 ${name}`);
+    ElMessage.success(`下载完成 ${name}`);
   } catch (e) {
     transfer.update(taskId, { status: "error", message: String(e) });
     ElMessage.error("下载失败: " + String(e));
@@ -739,6 +765,9 @@ onBeforeUnmount(() => {
     transferDoneUnlisten();
     transferDoneUnlisten = null;
   }
+  // 视图卸载（切换路由/关闭）时关闭 SFTP 会话，否则后端 SSH 连接与
+  // sftp_sessions 注册表条目会一直驻留泄漏。
+  closeSftpSilently();
 });
 </script>
 

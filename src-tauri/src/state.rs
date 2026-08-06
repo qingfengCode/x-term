@@ -105,21 +105,61 @@ pub struct AppState {
     /// 正在运行的端口转发隧道：tunnelId -> Tunnel。
     pub tunnels: Arc<Mutex<HashMap<String, Tunnel>>>,
 
+    /// 已打开的文件后端连接（S3 等）：accountId -> (backendId, Arc<dyn FileBackend>)。
+    ///
+    /// 按 account_id 索引：S3 等后端无状态、可安全复用，重复 connect 同一账号返回同一
+    /// backendId，避免泄漏。`backendId` 为 uuid 字符串，前端文件操作时持有。
+    /// 删除账号时按 account_id 精确清理。SFTP 会话独立存放在 `sftp_sessions`。
+    pub file_backends:
+        Arc<Mutex<HashMap<String, (String, std::sync::Arc<dyn crate::file_backend::FileBackend>)>>>,
+
     /// 已建立的 MySQL 业务连接：connId -> MySqlConn。
     pub mysql_conns: Arc<Mutex<HashMap<String, crate::database::mysql::MySqlConn>>>,
 
-    /// 待确认执行的 AI 工具调用：toolCallId -> oneshot 发送端。
+    /// 待确认执行的 AI 工具调用：toolCallId -> (requestId, oneshot 发送端)。
     ///
     /// AI 编排循环发起 tool_call 后阻塞在此等待前端确认；前端通过
-    /// `ai_execute_tool` / `ai_cancel_tool` 命令把结果发回。
-    pub pending_tool_calls:
-        Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<crate::ai::tools::ToolApproval>>>>,
+    /// `ai_execute_tool` / `ai_cancel_tool` 命令把结果发回。附带 requestId，
+    /// 使 `ai_stop` 能精确清理**属于被终止请求**的确认项，不误伤并发会话。
+    pub pending_tool_calls: Arc<
+        Mutex<
+            HashMap<
+                String,
+                (
+                    String,
+                    tokio::sync::oneshot::Sender<crate::ai::tools::ToolApproval>,
+                ),
+            >,
+        >,
+    >,
 
     /// 正在运行的 AI 请求后台任务：requestId -> JoinHandle。
     ///
     /// `ai_chat` spawn 时登记，`ai_stop` 取出 handle 调 `abort()` 终止；
     /// 任务自然结束时由其自身清理（run_agent_loop 返回后 remove）。
     pub pending_ai_tasks: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+
+    /// 待用户填写的 SSH 二次认证挑战：challengeId -> oneshot 发送端。
+    ///
+    /// keyboard-interactive 认证过程中后端 emit `ssh:auth_challenge` 后阻塞在此,
+    /// 等待前端通过 `ssh_auth_respond` 命令回传答案（仿照 [`Self::pending_tool_calls`]）。
+    pub pending_auth_challenges: Arc<
+        Mutex<
+            HashMap<String, tokio::sync::oneshot::Sender<crate::ssh::client::AuthChallengeReply>>,
+        >,
+    >,
+
+    /// 待用户确认的 SSH 主机公钥变更：challengeId -> oneshot 发送端。
+    ///
+    /// [`crate::ssh::client::ClientHandler::check_server_key`] 在检测到主机公钥
+    /// 与 known_hosts 记录不符时，emit `ssh:host_key_challenge` 后阻塞在此，
+    /// 等待前端通过 `ssh_host_key_respond` 命令回传决策（接受并更新 / 仅本次接受 / 拒绝）。
+    pub pending_host_keys: Arc<
+        Mutex<HashMap<String, tokio::sync::oneshot::Sender<crate::ssh::client::HostKeyDecision>>>,
+    >,
+
+    /// Tauri 应用句柄（事件发射、日志等）。
+    pub app: tauri::AppHandle,
 
     /// MCP 人工确认注册表（exec_ssh / exec_sql 必须经前端确认）。
     ///
@@ -134,7 +174,12 @@ pub struct AppState {
 
 impl AppState {
     /// 构造初始状态。
-    pub fn new(data_dir: PathBuf, db: DbPool, settings_path: PathBuf) -> Self {
+    pub fn new(
+        data_dir: PathBuf,
+        db: DbPool,
+        settings_path: PathBuf,
+        app: tauri::AppHandle,
+    ) -> Self {
         Self {
             data_dir: Arc::new(data_dir),
             db: Arc::new(db),
@@ -142,9 +187,13 @@ impl AppState {
             terminals: Arc::new(Mutex::new(HashMap::new())),
             sftp_sessions: Arc::new(Mutex::new(HashMap::new())),
             tunnels: Arc::new(Mutex::new(HashMap::new())),
+            file_backends: Arc::new(Mutex::new(HashMap::new())),
             mysql_conns: Arc::new(Mutex::new(HashMap::new())),
             pending_tool_calls: Arc::new(Mutex::new(HashMap::new())),
             pending_ai_tasks: Arc::new(Mutex::new(HashMap::new())),
+            pending_auth_challenges: Arc::new(Mutex::new(HashMap::new())),
+            pending_host_keys: Arc::new(Mutex::new(HashMap::new())),
+            app,
             approval_registry: Arc::new(crate::mcp::approval::ApprovalRegistry::new()),
             settings_path: Arc::new(settings_path),
         }
@@ -152,9 +201,9 @@ impl AppState {
 
     /// 从池中获取一个数据库连接。
     pub fn conn(&self) -> AppResult<crate::storage::db::DbConn> {
-        self.db.get().map_err(|e| {
-            AppError::Storage(format!("无法获取数据库连接: {}", e))
-        })
+        self.db
+            .get()
+            .map_err(|e| AppError::Storage(format!("无法获取数据库连接: {}", e)))
     }
 
     /// 设置保险库（解锁/创建后调用）。
@@ -166,7 +215,9 @@ impl AppState {
     ///
     /// 返回的 `RwLockReadGuard` 用于在凭据解析期间持有读锁；为避免在异步等待中
     /// 长时间持锁，调用方应在使用前先把所需数据 clone 出来。
-    pub fn vault_read(&self) -> AppResult<parking_lot::RwLockReadGuard<'_, Option<CredentialVault>>> {
+    pub fn vault_read(
+        &self,
+    ) -> AppResult<parking_lot::RwLockReadGuard<'_, Option<CredentialVault>>> {
         let guard = self.vault.read();
         if guard.is_none() {
             return Err(AppError::Auth("凭据保险库尚未解锁，请先输入主密码".into()));

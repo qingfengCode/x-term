@@ -88,7 +88,10 @@ fn decode_secret(secret: &str) -> AppResult<Vec<u8>> {
 
     // 先按 base32 解码（trim 掉空白与可能的填充符）。
     let trimmed = secret.trim();
-    let cleaned: String = trimmed.chars().filter(|c| *c != '=' && !c.is_whitespace()).collect();
+    let cleaned: String = trimmed
+        .chars()
+        .filter(|c| *c != '=' && !c.is_whitespace())
+        .collect();
     if !cleaned.is_empty() {
         if let Ok(bytes) = Secret::Encoded(cleaned).to_bytes() {
             return Ok(bytes);
@@ -98,10 +101,7 @@ fn decode_secret(secret: &str) -> AppResult<Vec<u8>> {
     // 且 SecretParseError 未实现 From<...> for AppError，这里显式映射。
     match Secret::Raw(trimmed.as_bytes().to_vec()).to_bytes() {
         Ok(bytes) => Ok(bytes),
-        Err(e) => Err(AppError::InvalidInput(format!(
-            "secret 解码失败: {}",
-            e
-        ))),
+        Err(e) => Err(AppError::InvalidInput(format!("secret 解码失败: {}", e))),
     }
 }
 
@@ -122,9 +122,17 @@ pub fn generate_now(
     period: u32,
 ) -> AppResult<TotpCode> {
     if period == 0 {
-        return Err(AppError::InvalidInput(
-            "TOTP period 必须大于 0".into(),
-        ));
+        return Err(AppError::InvalidInput("TOTP period 必须大于 0".into()));
+    }
+    // digits 必须落在 totp-rs 的合法区间（RFC 4226: 6..=8）。
+    // new_unchecked 会绕过 totp-rs 的校验：digits=0 时 `10^0=1` 取模后返回空串
+    // 验证码；digits>=10 时 `10u32.pow` 溢出，debug 构建直接 panic、release
+    // 构建静默回绕产生错误验证码。
+    if !(6..=8).contains(&digits) {
+        return Err(AppError::InvalidInput(format!(
+            "TOTP digits 必须是 6~8，实际 {}",
+            digits
+        )));
     }
     let algo = parse_algorithm(algorithm)?;
     let secret_bytes = decode_secret(secret)?;
@@ -132,17 +140,11 @@ pub fn generate_now(
     // 使用 new_unchecked 构造：兼容真实 Authenticator 中常见的 < 128 位短 secret
     // 以及部分用户自定义的 digits。实际可用性由下面的 generate_current 兜底校验。
     // totp-rs 5.x 在不带 otpauth feature 时签名为 (algorithm, digits, skew, step, secret)。
-    let totp = totp_rs::TOTP::new_unchecked(
-        algo,
-        digits as usize,
-        1,
-        period as u64,
-        secret_bytes,
-    );
+    let totp = totp_rs::TOTP::new_unchecked(algo, digits as usize, 1, period as u64, secret_bytes);
 
-    let code = totp.generate_current().map_err(|e| {
-        AppError::Crypto(format!("获取系统时间失败: {}", e))
-    })?;
+    let code = totp
+        .generate_current()
+        .map_err(|e| AppError::Crypto(format!("获取系统时间失败: {}", e)))?;
 
     let now_unix = chrono::Utc::now().timestamp().max(0) as u64;
     let elapsed_in_period = now_unix % (period as u64);
@@ -221,10 +223,7 @@ pub fn parse_otpauth_uri(uri: &str) -> AppResult<TotpEntry> {
 
     // 3. 分离 host（第一个 / 之前）与 path。
     let (host, path) = match authority_and_path.find('/') {
-        Some(idx) => (
-            &authority_and_path[..idx],
-            &authority_and_path[idx + 1..],
-        ),
+        Some(idx) => (&authority_and_path[..idx], &authority_and_path[idx + 1..]),
         None => (authority_and_path, ""),
     };
     if !host.eq_ignore_ascii_case("totp") {
@@ -261,9 +260,8 @@ pub fn parse_otpauth_uri(uri: &str) -> AppResult<TotpEntry> {
     }
 
     // secret 必填。
-    let _secret = secret.ok_or_else(|| {
-        AppError::InvalidInput("otpauth URI 缺少必填的 secret 参数".into())
-    })?;
+    let _secret = secret
+        .ok_or_else(|| AppError::InvalidInput("otpauth URI 缺少必填的 secret 参数".into()))?;
 
     // issuer：path 优先，否则取 query。
     if issuer.is_empty() {
@@ -406,8 +404,19 @@ mod tests {
         // 仅验证不报错、长度正确、剩余秒数在范围内。
         let code = generate_now("TestSecretSuperSecret", "SHA1", 6, 30).unwrap();
         assert_eq!(code.code.len(), 6);
-        assert!(code.remaining_seconds < 30, "{}", code.remaining_seconds);
+        // 周期内剩余秒数 ∈ (0, 30]；恰好整周期触发时剩余 = 30，不能用 < 30 否则偶发失败。
+        assert!(code.remaining_seconds <= 30 && code.remaining_seconds > 0, "{}", code.remaining_seconds);
         assert_eq!(code.period, 30);
+    }
+
+    #[test]
+    fn reject_invalid_digits() {
+        // digits 越界必须报错而非生成空码/溢出。
+        assert!(generate_now("TestSecretSuperSecret", "SHA1", 0, 30).is_err());
+        assert!(generate_now("TestSecretSuperSecret", "SHA1", 5, 30).is_err());
+        assert!(generate_now("TestSecretSuperSecret", "SHA1", 9, 30).is_err());
+        assert!(generate_now("TestSecretSuperSecret", "SHA1", 10, 30).is_err());
+        assert!(generate_now("TestSecretSuperSecret", "SHA1", 6, 0).is_err());
     }
 
     #[test]

@@ -13,7 +13,7 @@ use std::time::Instant;
 use tauri::{AppHandle, State};
 
 use crate::database::mysql::{connect_direct, connect_via_ssh, MySqlConn};
-use crate::database::profiles::{list_db_profiles, upsert_db_profile, DbProfile, DbGroup};
+use crate::database::profiles::{list_db_profiles, upsert_db_profile, DbGroup, DbProfile};
 use crate::error::{AppError, AppResult};
 use crate::events::{emit, DbQueryResultEvent, DB_QUERY_RESULT};
 use crate::state::AppState;
@@ -72,11 +72,7 @@ pub fn db_delete_group(id: String, state: State<'_, AppState>) -> AppResult<()> 
 /// 根据 profile 是否设置了 `ssh_session_config_id` 选择直连或 SSH 隧道。
 /// 建好的 [`MySqlConn`] 存入 `state.mysql_conns`。
 #[tauri::command]
-pub async fn db_connect(
-    profile_id: String,
-    state: State<'_, AppState>,
-    app: AppHandle,
-) -> AppResult<String> {
+pub async fn db_connect(profile_id: String, state: State<'_, AppState>) -> AppResult<String> {
     // 1. 取 profile。
     let profile = {
         let conn = state.conn()?;
@@ -86,9 +82,10 @@ pub async fn db_connect(
 
     // 2. 解析 MySQL 密码。
     let mysql_pass = {
-        let cred_id = profile.credential_id.as_ref().ok_or_else(|| {
-            AppError::Auth("DB profile 缺少 credential_id".to_string())
-        })?;
+        let cred_id = profile
+            .credential_id
+            .as_ref()
+            .ok_or_else(|| AppError::Auth("DB profile 缺少 credential_id".to_string()))?;
         let vault_guard = state.vault_read()?;
         let vault = vault_guard
             .as_ref()
@@ -127,7 +124,7 @@ pub async fn db_connect(
             &profile.username,
             &mysql_pass,
             profile.default_database.as_deref(),
-            app,
+            state.inner().clone(),
         )
         .await?
     } else {
@@ -177,7 +174,15 @@ pub async fn db_exec_sql(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> AppResult<()> {
-    log::info!("[db_exec_sql] 收到请求: conn_id={}, query_id={}, sql={}", conn_id, query_id, sql);
+    // SQL 全文可能含敏感数据（INSERT/UPDATE 的明文值），日志只记前 200 字符。
+    let sql_log: String = sql.chars().take(200).collect();
+    log::info!(
+        "[db_exec_sql] 收到请求: conn_id={}, query_id={}, sql={}{}",
+        conn_id,
+        query_id,
+        sql_log,
+        if sql.chars().count() > 200 { "…" } else { "" }
+    );
     // 取出 conn（不持有锁跨 await：clone 出 pool 句柄）。
     // mysql_conns 存的是 MySqlConn（含 pool），无法 clone；这里改为先取出整个
     // MySqlConn，执行完再放回。但若并发执行会互相阻塞。MVP 接受这一限制。
@@ -191,7 +196,11 @@ pub async fn db_exec_sql(
     let start = Instant::now();
     let res = conn_obj.execute(&sql, 1000).await;
     let elapsed_ms = start.elapsed().as_millis() as u64;
-    log::info!("[db_exec_sql] 执行完成, 耗时 {}ms, 结果: {}", elapsed_ms, if res.is_ok() { "ok" } else { "err" });
+    log::info!(
+        "[db_exec_sql] 执行完成, 耗时 {}ms, 结果: {}",
+        elapsed_ms,
+        if res.is_ok() { "ok" } else { "err" }
+    );
 
     // 无论成功失败都把 conn 放回。
     state.mysql_conns.lock().insert(conn_id.clone(), conn_obj);
@@ -241,7 +250,9 @@ pub async fn db_list_tables(
     // 构造 SQL：指定库时用 SHOW TABLES FROM <db>。库名做简单防注入。
     let sql = match &database {
         Some(db) => {
-            if db.chars().any(|c| c.is_whitespace() || c == ';' || c == '-' || c == '/' || c == '`')
+            if db
+                .chars()
+                .any(|c| c.is_whitespace() || c == ';' || c == '-' || c == '/' || c == '`')
             {
                 state.mysql_conns.lock().insert(conn_id, conn_obj);
                 return Err(AppError::InvalidInput(format!("非法库名: {}", db)));

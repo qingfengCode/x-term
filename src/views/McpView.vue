@@ -1,7 +1,7 @@
 <!--
-  McpView — MCP 服务端管理页（两个独立 MCP：SSH / DB）。
+  McpView — MCP 服务端管理页（三个独立 MCP：SSH / DB / File）。
 
-  布局：顶部 Tab 切换 SSH MCP / DB MCP；下方左右分栏——
+  布局：顶部 Tab 切换 SSH MCP / DB MCP / File MCP；下方左右分栏——
   左侧为配置卡片（绑定资源 / 地址端口 / token / 启停 / 开关），
   右侧为执行日志实时面板（终端风格，轮询刷新）。
 
@@ -17,7 +17,7 @@ import McpLogPanel from "@/components/McpLogPanel.vue";
 defineOptions({ name: "McpView" });
 
 const mcp = useMcpStore();
-const activeTab = ref<"ssh" | "db">("ssh");
+const activeTab = ref<"ssh" | "db" | "file">("ssh");
 
 onMounted(async () => {
   await mcp.loadAll();
@@ -29,7 +29,7 @@ onMounted(async () => {
     <header class="mcp-header">
       <h2>MCP 服务端</h2>
       <span class="subtitle">
-        把 X-Term 的 SSH / MySQL 执行能力，通过标准 MCP 暴露给 Claude Desktop、Cursor 等外部客户端
+        把 X-Term 的 SSH / MySQL / 对象存储能力，通过标准 MCP 暴露给 Claude Desktop、Cursor 等外部客户端
       </span>
     </header>
 
@@ -38,20 +38,19 @@ onMounted(async () => {
       <el-tabs v-model="activeTab" class="mcp-tabs">
         <el-tab-pane label="SSH MCP" name="ssh" />
         <el-tab-pane label="DB MCP" name="db" />
+        <el-tab-pane label="File MCP" name="file" />
       </el-tabs>
     </div>
 
-    <!-- 左右分栏：配置卡片 | 日志输出 -->
+    <!-- 左右分栏：配置卡片 | 日志输出。用 :key 触发组件按 kind 重建 -->
     <div class="mcp-columns">
       <div class="mcp-config">
         <el-scrollbar class="config-scroller">
-          <McpInstancePanel v-if="activeTab === 'ssh'" kind="ssh" />
-          <McpInstancePanel v-else kind="db" />
+          <McpInstancePanel :key="activeTab" :kind="activeTab" />
         </el-scrollbar>
       </div>
       <div class="mcp-log">
-        <McpLogPanel v-if="activeTab === 'ssh'" kind="ssh" />
-        <McpLogPanel v-else kind="db" />
+        <McpLogPanel :key="activeTab" :kind="activeTab" />
       </div>
     </div>
   </div>

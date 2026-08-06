@@ -68,11 +68,16 @@ pub fn update_set_manifest_url(url: String, state: State<'_, AppState>) -> AppRe
 
 /// 检查更新：返回可用清单，若已是最新返回 `None`（前端收到 null）。
 #[tauri::command]
-pub async fn update_check(app: AppHandle, state: State<'_, AppState>) -> AppResult<Option<UpdateManifest>> {
+pub async fn update_check(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<Option<UpdateManifest>> {
     let cfg = crate::config::app_config_load_inner(&app_config_path(&state))?;
     let url = cfg.update.manifest_url.trim().to_string();
     if url.is_empty() {
-        return Err(AppError::Update("尚未配置更新源地址，请先在下方填写".into()));
+        return Err(AppError::Update(
+            "尚未配置更新源地址，请先在下方填写".into(),
+        ));
     }
     crate::updater::check(&url, &current_version(&app)).await
 }

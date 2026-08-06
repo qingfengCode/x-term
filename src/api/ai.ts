@@ -27,3 +27,28 @@ export function aiStop(requestId: string): Promise<void> {
 export function setWorkspaceDir(domain: string, path: string): Promise<void> {
   return invoke<void>("set_workspace_dir", { domain, path });
 }
+
+// ---------------------------------------------------------------------------
+// 对话历史持久化（独立 JSON 文件，按 domain 分文件）
+// ---------------------------------------------------------------------------
+
+/** 可序列化的对话（持久化用）。只保留 id/title/messages。 */
+export interface SerializableConversation {
+  id: string;
+  title: string;
+  /** messages 原样透传（结构同 AiMessage，后端不解释）。 */
+  messages: unknown[];
+}
+
+/** 读取指定 domain（"ssh" / "db"）的对话历史。 */
+export function aiListConversations(domain: string): Promise<SerializableConversation[]> {
+  return invoke<SerializableConversation[]>("ai_list_conversations", { domain });
+}
+
+/** 全量保存指定 domain 的对话历史（覆盖旧文件）。 */
+export function aiSaveConversations(
+  domain: string,
+  conversations: SerializableConversation[],
+): Promise<void> {
+  return invoke<void>("ai_save_conversations", { domain, conversations });
+}

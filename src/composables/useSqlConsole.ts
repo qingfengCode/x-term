@@ -57,11 +57,36 @@ const WRITE_KEYWORDS = new Set([
 ]);
 const DANGEROUS_KEYWORDS = new Set(["DROP", "TRUNCATE"]);
 
+/**
+ * 去掉 SQL 开头的注释（`--` 行注释 / `#` 行注释 / `斜杠星号` 块注释，可连续多层）。
+ *
+ * 不做注释剥离时，`-- 注释\nDROP TABLE users` 的首个关键字是 `--`，
+ * 既不在 WRITE_KEYWORDS 里也不在 DANGEROUS_KEYWORDS 里——只读模式的写保护
+ * 与危险确认都会被整段绕过（与后端 tools.rs 的 strip_sql_comments 对应）。
+ */
+function stripLeadingComments(sql: string): string {
+  let s = sql;
+  for (;;) {
+    const t = s.trimStart();
+    if (t.startsWith("--") || t.startsWith("#")) {
+      const nl = t.indexOf("\n");
+      if (nl < 0) return ""; // 纯注释
+      s = t.slice(nl + 1);
+    } else if (t.startsWith("/*")) {
+      const end = t.indexOf("*/");
+      if (end < 0) return ""; // 未闭合的块注释
+      s = t.slice(end + 2);
+    } else {
+      return t;
+    }
+  }
+}
+
 function firstKeyword(sql: string): string {
-  return (sql.trimStart().split(/\s+/)[0] || "").toUpperCase();
+  return (stripLeadingComments(sql).trimStart().split(/\s+/)[0] || "").toUpperCase();
 }
 function isDeleteWithoutWhere(sql: string): boolean {
-  return /^\s*DELETE\s+FROM\s+\S+\s*(;|$)/i.test(sql);
+  return /^\s*DELETE\s+FROM\s+\S+\s*(;|$)/i.test(stripLeadingComments(sql));
 }
 
 // ---------------------------------------------------------------------------
@@ -210,8 +235,13 @@ export function useSqlConsole(
     if (!connIdRef.value) return false;
     const sqlRaw = (sqlOverride ?? sqlTextRef.value).trim();
     if (!sqlRaw) return false;
+    // 先剥离开头注释再按分号切分：注释内的分号（如 `-- a;b\nDROP TABLE x`）
+    // 若直接切分会把 `b\nDROP TABLE x` 当成最后一条语句，绕过关键字判定。
+    const stmts = stripLeadingComments(sqlRaw)
+      .split(";")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
     // 编辑器可能含多条语句（分号分隔）；只执行最后一条非空语句，避免多语句语法错误。
-    const stmts = sqlRaw.split(";").map((s) => s.trim()).filter((s) => s.length > 0);
     const sql = stmts.length > 0 ? stmts[stmts.length - 1] : sqlRaw;
     if (executing.value) return false;
 

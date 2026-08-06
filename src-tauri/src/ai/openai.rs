@@ -37,16 +37,35 @@ pub struct OpenAiProvider {
     base_url: String,
     api_key: String,
     model: String,
+    /// 单次请求最大输出 tokens（请求体 `max_tokens`；0 表示不发送，由服务端默认）。
+    max_output: u32,
+    /// 采样温度（`None` 不发送）。
+    temperature: Option<f32>,
 }
 
 impl OpenAiProvider {
     /// 从配置构造实例。`base_url` 末尾的 `/` 会被去除以便后续拼接路径。
     pub fn new(cfg: &ProviderConfig) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            // 超时取自模型配置（connect_timeout_secs / read_timeout_secs，0=默认）：
+            // connect_timeout 防 DNS/建连挂死；read_timeout 兜底防止连接假死后
+            // 流式读取无限阻塞。长思考模型可调大 read_timeout。
+            client: reqwest::Client::builder()
+                .connect_timeout(crate::ai::provider::timeout_secs(
+                    cfg.connect_timeout_secs,
+                    crate::ai::provider::DEFAULT_CONNECT_TIMEOUT_SECS,
+                ))
+                .read_timeout(crate::ai::provider::timeout_secs(
+                    cfg.read_timeout_secs,
+                    crate::ai::provider::DEFAULT_READ_TIMEOUT_SECS,
+                ))
+                .build()
+                .expect("构造 reqwest Client 失败"),
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
             api_key: cfg.api_key.clone(),
             model: cfg.model.clone(),
+            max_output: cfg.max_output,
+            temperature: cfg.temperature,
         }
     }
 }
@@ -68,6 +87,10 @@ struct ChatRequest<'a> {
     model: &'a str,
     messages: Vec<ReqMessage<'a>>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
 }
 
 /// 流式 chunk 顶层结构。
@@ -116,6 +139,8 @@ impl LlmProvider for OpenAiProvider {
             model: &self.model,
             messages: req_messages,
             stream: true,
+            max_tokens: (self.max_output > 0).then_some(self.max_output),
+            temperature: self.temperature,
         };
 
         let url = format!("{}/chat/completions", self.base_url);
@@ -257,6 +282,8 @@ impl LlmProvider for OpenAiProvider {
             model: &self.model,
             messages: oa_messages,
             stream: true,
+            max_tokens: (self.max_output > 0).then_some(self.max_output),
+            temperature: self.temperature,
             tools: if tools.is_empty() {
                 None
             } else {
@@ -312,6 +339,9 @@ impl LlmProvider for OpenAiProvider {
         // index → (id, name, arguments_buffer)
         let mut tool_buffers: BTreeMap<u32, ToolBuf> = BTreeMap::new();
         let mut finish_reason: Option<String> = None;
+        // [DONE] 是流结束标记，但只出现在某一行内：需跳出内层行循环后
+        // 再跳出外层 chunk 循环，否则残留 buffer 会被继续解析。
+        let mut done = false;
 
         while let Some(chunk_res) = stream.next().await {
             let chunk = match chunk_res {
@@ -340,6 +370,7 @@ impl LlmProvider for OpenAiProvider {
                 }
                 if payload == "[DONE]" {
                     // 流结束。
+                    done = true;
                     break;
                 }
                 let parsed: StreamChunkTools = match serde_json::from_str(payload) {
@@ -381,6 +412,10 @@ impl LlmProvider for OpenAiProvider {
                         }
                     }
                 }
+            }
+
+            if done {
+                break;
             }
         }
 
@@ -560,6 +595,10 @@ struct ChatToolsRequest<'a> {
     model: &'a str,
     messages: Vec<OpenAiMessage>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<OpenAiTool<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]

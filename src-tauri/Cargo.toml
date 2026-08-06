@@ -1,6 +1,6 @@
 [package]
 name = "x-term"
-version = "0.1.0"
+version = "0.1.11"
 description = "X-Term 现代化运维终端客户端"
 authors = ["x-term"]
 edition = "2021"
@@ -39,7 +39,8 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.25"
 # MySQL（SQL 控制台 + AI 工具）
-sqlx = { version = "0.8", default-features = false, features = ["mysql", "runtime-tokio-rustls", "chrono", "json"] }
+# rust_decimal：DECIMAL 列解码（sqlx 的 String 解码不兼容 DECIMAL）
+sqlx = { version = "0.8", default-features = false, features = ["mysql", "runtime-tokio-rustls", "chrono", "json", "rust_decimal"] }
 
 # 加密
 aes-gcm = "0.10"
@@ -75,6 +76,19 @@ async-trait = "0.1"
 base64 = "0.22"
 regex = "1"
 zmodem2 = "0.7.1"
+
+# 文件后端（S3 / 兼容存储）
+# S3 SigV4 签名手写实现，复用 sha2 / reqwest；下列为签名/编码/响应解析所需。
+hmac = "0.12"
+hex = "0.4"
+percent-encoding = "2"
+quick-xml = { version = "0.36", features = ["serialize"] }
+# 流式上传：bytes 提供 reqwest::Body::wrap_stream 所需的 Bytes，
+# async_stream 简化异步流构造（均为 reqwest 已有传递依赖，此处显式声明）。
+bytes = "1"
+async-stream = "0.3"
+# md-5：S3 DeleteObjects 批量删除要求的 Content-MD5 头。
+md-5 = "0.10"
 
 [profile.release]
 panic = "abort"

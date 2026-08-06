@@ -6,17 +6,27 @@
 //!
 //! 上传/下载采用分块循环 + 进度回调的形式，调用方（传输命令层）可在回调里
 //! emit [`crate::events::TRANSFER_PROGRESS`] 等事件。
+//!
+//! 本类型同时实现 [`crate::file_backend::FileBackend`] trait，作为文件后端抽象
+//! 的 SFTP 实现（S3 等其他协议见 [`crate::file_backend::s3`]）。
 
 use std::path::Path;
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use russh::client::Handle;
 use russh_sftp::client::SftpSession as RawSftpSession;
-use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::error::{AppError, AppResult};
+use crate::file_backend::{FileBackend, ProgressCb};
 use crate::ssh::client::ClientHandler;
+
+// ===========================================================================
+// 数据模型（已迁移至 [`crate::file_backend`]，此处 re-export 以保持向后兼容）
+// ===========================================================================
+
+pub use crate::file_backend::{FileEntry, FileMeta};
 
 /// SFTP 客户端侧的文件元信息类型别名（russh-sftp 把它定义为
 /// `protocol::FileAttributes` 的别名）。
@@ -24,29 +34,6 @@ type SftpMetadata = russh_sftp::client::fs::Metadata;
 
 /// 默认的读写块大小（64 KiB），兼顾吞吐与进度刷新频率。
 const CHUNK_SIZE: usize = 64 * 1024;
-
-// ===========================================================================
-// 数据模型
-// ===========================================================================
-
-/// 目录项的精简信息（serde 友好，直接序列化给前端）。
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FileEntry {
-    pub name: String,
-    pub is_dir: bool,
-    pub size: u64,
-    pub modified: Option<String>,
-}
-
-/// 文件元信息。
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FileMeta {
-    pub size: u64,
-    pub is_dir: bool,
-    pub modified: Option<String>,
-}
 
 // ===========================================================================
 // SftpSession 包装
@@ -118,15 +105,12 @@ impl SftpSession {
     ///
     /// `progress(transferred, total)`：`total` 来自远程文件元信息；若获取失败
     /// 则传 0，调用方可据此判断能否显示百分比。
-    pub async fn download<F>(
+    pub async fn download(
         &self,
         remote: &str,
         local_path: &Path,
-        progress: F,
-    ) -> AppResult<()>
-    where
-        F: Fn(u64, u64),
-    {
+        progress: ProgressCb,
+    ) -> AppResult<()> {
         // 取文件大小用于进度百分比（失败则置 0）。
         let total = self
             .channel
@@ -181,15 +165,12 @@ impl SftpSession {
     /// 上传本地文件到远程路径，逐块上传并回调进度。
     ///
     /// `progress(transferred, total)`：`total` 来自本地文件元信息。
-    pub async fn upload<F>(
+    pub async fn upload(
         &self,
         local_path: &Path,
         remote: &str,
-        progress: F,
-    ) -> AppResult<()>
-    where
-        F: Fn(u64, u64),
-    {
+        progress: ProgressCb,
+    ) -> AppResult<()> {
         let local_meta = tokio::fs::metadata(local_path).await.map_err(|e| {
             AppError::Io(std::io::Error::new(
                 e.kind(),
@@ -246,10 +227,9 @@ impl SftpSession {
 
     /// 重命名远程文件或目录。
     pub async fn rename(&self, oldpath: &str, newpath: &str) -> AppResult<()> {
-        self.channel
-            .rename(oldpath, newpath)
-            .await
-            .map_err(|e| AppError::Ssh(format!("rename `{}` -> `{}` 失败: {}", oldpath, newpath, e)))
+        self.channel.rename(oldpath, newpath).await.map_err(|e| {
+            AppError::Ssh(format!("rename `{}` -> `{}` 失败: {}", oldpath, newpath, e))
+        })
     }
 
     /// 创建远程目录。
@@ -274,6 +254,50 @@ impl SftpSession {
             .remove_dir(path)
             .await
             .map_err(|e| AppError::Ssh(format!("remove_dir `{}` 失败: {}", path, e)))
+    }
+}
+
+// ===========================================================================
+// FileBackend trait 实现（让 SftpSession 可作为通用文件后端使用）
+// ===========================================================================
+
+#[async_trait]
+impl FileBackend for SftpSession {
+    async fn list_dir(&self, path: &str) -> AppResult<Vec<FileEntry>> {
+        SftpSession::list_dir(self, path).await
+    }
+
+    async fn stat(&self, path: &str) -> AppResult<FileMeta> {
+        SftpSession::stat(self, path).await
+    }
+
+    async fn download(
+        &self,
+        remote: &str,
+        local_path: &Path,
+        progress: ProgressCb,
+    ) -> AppResult<()> {
+        SftpSession::download(self, remote, local_path, progress).await
+    }
+
+    async fn upload(&self, local_path: &Path, remote: &str, progress: ProgressCb) -> AppResult<()> {
+        SftpSession::upload(self, local_path, remote, progress).await
+    }
+
+    async fn rename(&self, oldpath: &str, newpath: &str) -> AppResult<()> {
+        SftpSession::rename(self, oldpath, newpath).await
+    }
+
+    async fn mkdir(&self, path: &str) -> AppResult<()> {
+        SftpSession::mkdir(self, path).await
+    }
+
+    async fn remove_file(&self, path: &str) -> AppResult<()> {
+        SftpSession::remove_file(self, path).await
+    }
+
+    async fn remove_dir(&self, path: &str) -> AppResult<()> {
+        SftpSession::remove_dir(self, path).await
     }
 }
 
