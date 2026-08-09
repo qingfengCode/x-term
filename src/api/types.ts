@@ -86,6 +86,7 @@ export const PROVIDER_DEFAULTS = {
   temperature: null,
   connectTimeoutSecs: 15,
   readTimeoutSecs: 300,
+  multimodal: false,
 } as const;
 
 export interface ProviderConfig {
@@ -105,6 +106,8 @@ export interface ProviderConfig {
   connectTimeoutSecs: number;
   /** 读取（流式响应）超时（秒）；0 表示使用默认值。长思考模型需调大。 */
   readTimeoutSecs: number;
+  /** 是否支持多模态（图片输入）。开启后终端助手 / 数据库助手可附带图片。 */
+  multimodal: boolean;
 }
 
 export interface TerminalSettings {
@@ -117,6 +120,10 @@ export interface TerminalSettings {
   enableWebgl: boolean;
   /** SSH 空闲断开时间（分钟），0 = 永不自动断开。 */
   sshIdleTimeoutMinutes: number;
+  /** SSH 保活间隔（秒），0 = 不发送保活包。 */
+  sshKeepaliveSecs: number;
+  /** SSH 连接超时时间（秒），0 = 永不超时。 */
+  sshConnectTimeoutSecs: number;
 }
 
 /** 工具运行模式（SSH / SQL 智能体各自独立设置）。 */
@@ -239,6 +246,8 @@ export interface ShortcutSettings {
   groups?: string[];
   /** 应用级快捷键绑定（action -> 组合键字符串）。 */
   app?: AppShortcuts;
+  /** 终端快捷命令栏是否展开（多行换行显示全部命令）。持久化。 */
+  expanded?: boolean;
 }
 
 /**
@@ -298,9 +307,19 @@ export interface Settings {
   sidebarWidth: number;
   /** 最近成功连接的会话 id（最近的在前）。 */
   recentSessionIds: string[];
+  /** 是否启用锁定功能（导航栏显示「锁定」按钮）。默认 true。 */
+  vaultLockEnabled: boolean;
 }
 
 export type ChatRole = "system" | "user" | "assistant" | "tool";
+
+/** 一张多模态图片（用户消息附带）。与后端 provider.rs 的 ImagePart 对应。 */
+export interface ImagePart {
+  /** MIME 类型，如 image/png / image/jpeg。 */
+  mimeType: string;
+  /** 图片原始字节的 base64 编码（不含 data: URL 前缀）。 */
+  dataBase64: string;
+}
 
 export interface ChatMessage {
   role: ChatRole;
@@ -309,6 +328,8 @@ export interface ChatMessage {
   toolCalls?: ToolCall[];
   /** tool 角色时存在（对应工具调用 id）。 */
   toolCallId?: string;
+  /** 用户消息附带的多模态图片（后端按厂商协议转成图片块）。 */
+  images?: ImagePart[];
 }
 
 // ---------------------------------------------------------------------------
@@ -396,6 +417,8 @@ export interface QueryResult {
   columns: string[];
   rows: string[][];
   affected: number;
+  /** 结果是否被 limit 截断（查询实际返回超过 limit 行）。 */
+  truncated?: boolean;
 }
 
 /** SQL 控制台查询结果事件。对应后端 db:query_result。 */
@@ -404,6 +427,8 @@ export interface DbQueryResultEvent {
   columns: string[];
   rows: string[][];
   affected: number;
+  /** 结果是否被 limit 截断。 */
+  truncated?: boolean;
   error: string | null;
   elapsedMs: number;
 }

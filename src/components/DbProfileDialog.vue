@@ -197,13 +197,14 @@ async function submit() {
     :title="dialogTitle"
     width="520px"
     :close-on-click-modal="false"
+    append-to-body
     @update:model-value="emit('update:visible', $event)"
   >
     <el-form
       ref="formRef"
       :model="form"
       :rules="formRules"
-      label-width="100px"
+      label-width="92px"
       label-position="right"
     >
       <el-form-item label="名称" prop="name">

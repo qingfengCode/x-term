@@ -9,4 +9,5 @@ export * as forwardApi from "./forward";
 export * as aiApi from "./ai";
 export * as dbApi from "./db";
 export * as configApi from "./config";
+export * as backupApi from "./backup";
 export * from "./types";

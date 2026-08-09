@@ -6,6 +6,7 @@
 //! 命令的完整列表在 [`register_handlers`] 中通过 `generate_handler!` 宏注册。
 
 pub mod ai;
+pub mod backup;
 pub mod config;
 pub mod db;
 pub mod file_backend;
@@ -27,6 +28,7 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
         crate::commands::vault::vault_create,
         crate::commands::vault::vault_unlock,
         crate::commands::vault::vault_unlocked,
+        crate::commands::vault::vault_lock,
         crate::commands::vault::credential_save,
         crate::commands::vault::credential_list,
         crate::commands::vault::credential_rename,
@@ -51,6 +53,7 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
         // sftp
         crate::commands::sftp::sftp_list,
         crate::commands::sftp::sftp_stat,
+        crate::commands::sftp::sftp_pwd,
         crate::commands::sftp::sftp_mkdir,
         crate::commands::sftp::sftp_rename,
         crate::commands::sftp::sftp_remove,
@@ -74,6 +77,7 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
         crate::commands::forward::forward_start,
         crate::commands::forward::forward_stop,
         crate::commands::forward::forward_list_rules,
+        crate::commands::forward::forward_list_running,
         crate::commands::forward::forward_save_rule,
         crate::commands::forward::forward_delete_rule,
         // remote desktop
@@ -109,6 +113,7 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
         crate::commands::db::db_delete_group,
         crate::commands::db::db_connect,
         crate::commands::db::db_disconnect,
+        crate::commands::db::db_use_database,
         crate::commands::db::db_exec_sql,
         crate::commands::db::db_list_tables,
         crate::commands::db::db_list_databases,
@@ -122,6 +127,7 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
         crate::commands::mcp::mcp_load_config,
         crate::commands::mcp::mcp_generate_token,
         crate::commands::mcp::mcp_respond_approval,
+        crate::commands::mcp::mcp_rebind,
         crate::commands::mcp::mcp_log,
         // update（应用自更新）
         crate::commands::update::update_get_info,
@@ -130,5 +136,9 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
         crate::commands::update::update_check,
         crate::commands::update::update_download,
         crate::commands::update::update_install_and_exit,
+        // backup（数据迁移：加密导入/导出）
+        crate::commands::backup::backup_export,
+        crate::commands::backup::backup_inspect,
+        crate::commands::backup::backup_import,
     ])
 }

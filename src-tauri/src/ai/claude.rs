@@ -87,11 +87,72 @@ impl ClaudeProvider {
 // 请求 / 响应 serde 结构
 // ---------------------------------------------------------------------------
 
+/// 消息 content：纯文本字符串，或「文本 + 图片」块数组（多模态模型）。
+/// `#[serde(untagged)]` 使字符串变体序列化为 JSON 字符串、数组变体序列化为数组，
+/// 与 Claude Messages API 的 content 两种合法形态一一对应。
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum ClaudeContent {
+    Text(String),
+    Parts(Vec<ClaudeContentPart>),
+}
+
+/// content 数组中的单个块（text / image 二选一）。
+#[derive(Debug, Serialize)]
+struct ClaudeContentPart {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<ClaudeImageSource>,
+}
+
+/// image 块的 source：Claude 用 base64 + media_type 内联图片。
+#[derive(Debug, Serialize)]
+struct ClaudeImageSource {
+    /// 固定 "base64"。
+    #[serde(rename = "type")]
+    kind: &'static str,
+    media_type: String,
+    data: String,
+}
+
+/// 把通用 [`ChatMessage`] 的 content 转成 Claude 的 content 形态：
+/// 无图片 → 纯文本字符串；有图片 → 文本 + image 块数组。
+fn claude_content(m: &ChatMessage) -> ClaudeContent {
+    match &m.images {
+        Some(imgs) if !imgs.is_empty() => {
+            let mut parts = Vec::with_capacity(imgs.len() + 1);
+            if !m.content.is_empty() {
+                parts.push(ClaudeContentPart {
+                    kind: "text",
+                    text: Some(m.content.clone()),
+                    source: None,
+                });
+            }
+            for img in imgs {
+                parts.push(ClaudeContentPart {
+                    kind: "image",
+                    text: None,
+                    source: Some(ClaudeImageSource {
+                        kind: "base64",
+                        media_type: img.mime_type.clone(),
+                        data: img.data_base64.clone(),
+                    }),
+                });
+            }
+            ClaudeContent::Parts(parts)
+        }
+        _ => ClaudeContent::Text(m.content.clone()),
+    }
+}
+
 /// 请求体中的对话消息（仅 user / assistant）。
 #[derive(Debug, Serialize)]
 struct ReqMessage<'a> {
     role: &'a str,
-    content: &'a str,
+    content: ClaudeContent,
 }
 
 /// Messages API 顶层请求体。
@@ -142,11 +203,11 @@ impl LlmProvider for ClaudeProvider {
                 Role::System => system_parts.push(m.content.clone()),
                 Role::User => conv.push(ReqMessage {
                     role: "user",
-                    content: m.content.as_str(),
+                    content: claude_content(m),
                 }),
                 Role::Assistant => conv.push(ReqMessage {
                     role: "assistant",
-                    content: m.content.as_str(),
+                    content: claude_content(m),
                 }),
                 // chat_stream（非工具流）不处理 tool 消息；忽略。
                 Role::Tool => {}
@@ -318,6 +379,27 @@ impl LlmProvider for ClaudeProvider {
                 Role::System => system_parts.push(m.content.clone()),
                 Role::User => {
                     flush_tool_results(&mut conv, &mut pending_tool_results);
+                    // 多模态：带图片时 content 改为「文本 + image 块」数组。
+                    if let Some(imgs) = &m.images {
+                        if !imgs.is_empty() {
+                            let mut blocks: Vec<Value> = Vec::with_capacity(imgs.len() + 1);
+                            if !m.content.is_empty() {
+                                blocks.push(json!({ "type": "text", "text": m.content }));
+                            }
+                            for img in imgs {
+                                blocks.push(json!({
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": img.mime_type,
+                                        "data": img.data_base64,
+                                    }
+                                }));
+                            }
+                            conv.push(json!({ "role": "user", "content": blocks }));
+                            continue;
+                        }
+                    }
                     conv.push(json!({ "role": "user", "content": m.content }));
                 }
                 Role::Assistant => {
@@ -681,4 +763,74 @@ struct ToolUseBuf {
     id: Option<String>,
     name: Option<String>,
     input_buffer: String,
+}
+
+// ---------------------------------------------------------------------------
+// 单元测试：多模态 content 序列化
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::provider::{ChatMessage, ImagePart, Role};
+
+    fn img() -> ImagePart {
+        ImagePart {
+            mime_type: "image/png".into(),
+            data_base64: "AAAA".into(),
+        }
+    }
+
+    /// 无图片：content 保持纯文本字符串。
+    #[test]
+    fn plain_text_content() {
+        let m = ChatMessage::new(Role::User, "hello");
+        assert_eq!(serde_json::to_string(&claude_content(&m)).unwrap(), r#""hello""#);
+    }
+
+    /// 带图片：content 序列化为 text + image 块数组（base64 source）。
+    #[test]
+    fn image_content_parts() {
+        let m = ChatMessage {
+            role: Role::User,
+            content: "看看这张图".into(),
+            tool_calls: None,
+            tool_call_id: None,
+            images: Some(vec![img()]),
+        };
+        let json = serde_json::to_string(&claude_content(&m)).unwrap();
+        assert!(json.contains(r#"{"type":"text","text":"看看这张图"}"#), "{json}");
+        assert!(
+            json.contains(
+                r#"{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}"#
+            ),
+            "{json}"
+        );
+    }
+
+    /// 完整请求体：多模态消息转成 Claude /v1/messages 请求体。
+    #[test]
+    fn full_request_body() {
+        let m = ChatMessage {
+            role: Role::User,
+            content: "这是什么".into(),
+            tool_calls: None,
+            tool_call_id: None,
+            images: Some(vec![img()]),
+        };
+        let body = MessagesRequest {
+            model: "claude-3-5-sonnet",
+            max_tokens: 100,
+            temperature: None,
+            system: None,
+            messages: vec![ReqMessage {
+                role: "user",
+                content: claude_content(&m),
+            }],
+            stream: true,
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(json.contains(r#""content":[{"type":"text""#), "{json}");
+        assert!(json.contains(r#""type":"image""#), "{json}");
+    }
 }

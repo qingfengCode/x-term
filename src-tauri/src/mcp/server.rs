@@ -71,6 +71,8 @@ struct ServerHandle {
     /// 常驻 SSE 连接阻塞、端口无法释放）。
     sse_shutdown: Arc<tokio::sync::Notify>,
     status: McpServerStatus,
+    /// 路由共享状态（`mcp_rebind` 热切换绑定资源时直接改这里的字段）。
+    shared: Arc<SharedState>,
 }
 
 /// 两个 kind 各自最多一个运行实例：Ssh / Db。
@@ -109,9 +111,10 @@ pub fn mcp_server_status(kind: McpKind) -> McpServerStatus {
 /// 绑定 `host:port`，用 `token` 做 Bearer 校验。成功后后台 spawn 一个 axum 任务运行，
 /// 句柄存入全局 [`SERVERS`]。
 ///
-/// `bound_resource_id` 是该 MCP 绑定的资源 id（SSH 会话 id 或 DB profile id），执行
-/// 工具时按此 id 解析目标；`resource_mode == "client"`（客户端直连）时传 `None`，
-/// 目标与凭据由调用方在工具参数中传入。若该 kind 已有实例运行则返回错误。
+/// `bound_resource_id` 是该 MCP 绑定的资源 id（SSH 会话 id 或 DB profile id，或
+/// bound_source=terminal 时的终端实例 id），执行工具时按此 id 解析目标；
+/// `resource_mode == "client"`（客户端直连）时传 `None`，目标与凭据由调用方在
+/// 工具参数中传入。若该 kind 已有实例运行则返回错误。
 pub async fn start_mcp_server(
     kind: McpKind,
     app: AppHandle,
@@ -120,6 +123,7 @@ pub async fn start_mcp_server(
     port: u16,
     token: String,
     bound_resource_id: Option<String>,
+    bound_source: String,
     bound_database: Option<String>,
     resource_mode: String,
     auto_approve: bool,
@@ -145,6 +149,13 @@ pub async fn start_mcp_server(
         "bound"
     };
     let bound_resource_id = bound_resource_id.unwrap_or_default();
+    // 绑定来源规范化：仅 "terminal" 视为终端标签页绑定，其余一律按 "config"。
+    // （commands 层已校验合法性，这里双保险。）
+    let bound_source = if bound_source == "terminal" {
+        "terminal"
+    } else {
+        "config"
+    };
 
     // 绑定监听端口。
     let addr: SocketAddr = format!("{}:{}", host, port).parse().map_err(|e| {
@@ -177,6 +188,8 @@ pub async fn start_mcp_server(
         let path = log_dir.join(format!("mcp-{}-{}.log", kind_str, ts));
         let bound_desc = if resource_mode == "client" {
             "(客户端直连，未绑定)".to_string()
+        } else if bound_source == "terminal" {
+            format!("(终端标签页) {}", bound_resource_id)
         } else {
             bound_resource_id.clone()
         };
@@ -205,7 +218,8 @@ pub async fn start_mcp_server(
         state: state.clone(),
         kind,
         resource_mode: resource_mode.to_string(),
-        bound_resource_id,
+        bound_source: Mutex::new(bound_source.to_string()),
+        bound_resource_id: Mutex::new(bound_resource_id),
         bound_database,
         token,
         clients: Arc::new(Mutex::new(HashMap::new())),
@@ -222,7 +236,7 @@ pub async fn start_mcp_server(
         .route("/sse", get(sse_handler))
         .route("/messages", post(messages_handler))
         .layer(cors)
-        .with_state(shared);
+        .with_state(shared.clone());
 
     // shutdown 信号。
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -266,6 +280,7 @@ pub async fn start_mcp_server(
                 shutdown_tx,
                 sse_shutdown,
                 status,
+                shared,
             },
         );
     }
@@ -293,7 +308,10 @@ pub fn stop_mcp_server(kind: McpKind) -> AppResult<()> {
             //    timeout 消费后仍可 abort）。
             let join = h.join;
             let abort = h.abort;
-            tokio::spawn(async move {
+            // 注意：本函数是同步的（经同步 Tauri 命令在主线程调用，无 tokio 运行时
+            // 上下文），不能直接用 tokio::spawn（会 panic 导致整个程序崩溃）。
+            // tauri::async_runtime::spawn 内部会先 enter 运行时，任意线程均可安全调用。
+            tauri::async_runtime::spawn(async move {
                 match tokio::time::timeout(std::time::Duration::from_secs(3), join).await {
                     Ok(_) => {}
                     Err(_) => {
@@ -306,6 +324,32 @@ pub fn stop_mcp_server(kind: McpKind) -> AppResult<()> {
             Ok(())
         }
         None => Err(AppError::InvalidInput(format!("{} 未运行", kind.label()))),
+    }
+}
+
+/// 运行中热切换绑定的资源（会话配置 / 终端标签页），立即生效无需重启。
+///
+/// 由 `commands::mcp::mcp_rebind` 调用：`bound_source` 已规范化（"config"|"terminal"），
+/// `resource_id` 已做存在性校验。服务未运行时返回错误（此时只需保存配置，
+/// 启动时自然生效）。
+pub fn rebind_mcp(kind: McpKind, bound_source: &str, resource_id: &str) -> AppResult<()> {
+    let guard = SERVERS.lock();
+    match guard.get(&kind) {
+        Some(h) => {
+            *h.shared.bound_source.lock() = bound_source.to_string();
+            *h.shared.bound_resource_id.lock() = resource_id.to_string();
+            log::info!(
+                "[mcp] {} 热切换绑定：来源 {}, 资源 {}",
+                kind.label(),
+                bound_source,
+                resource_id
+            );
+            Ok(())
+        }
+        None => Err(AppError::InvalidInput(format!(
+            "{} 未运行，无需热切换（配置已保存，启动时生效）",
+            kind.label()
+        ))),
     }
 }
 
@@ -325,9 +369,15 @@ struct SharedState {
     /// 资源模式："bound"（绑定本地资源）| "client"（客户端直连，目标/凭据来自参数）。
     /// 决定工具定义、目标解析与确认请求的脱敏行为。
     resource_mode: String,
-    /// 绑定的资源 id：SSH 会话 id（kind=Ssh）或 DB profile id（kind=Db）。
-    /// 工具执行时按此 id 解析目标，外部客户端无需传连接名。client 模式下为空串。
-    bound_resource_id: String,
+    /// 绑定来源："config"（绑定会话配置，执行时新建短连接，默认）|
+    /// "terminal"（绑定已打开的终端标签页，命令写入该终端 PTY 执行，支持
+    /// A→B→C 跳板嵌套场景）。仅 SSH kind + bound 模式有效。
+    /// 用 Mutex 包裹支持运行中热切换（`mcp_rebind`）。
+    bound_source: Mutex<String>,
+    /// 绑定的资源 id：SSH 会话 id / DB profile id（bound_source=config）或
+    /// 终端实例 id（bound_source=terminal）。工具执行时按此 id 解析目标，
+    /// 外部客户端无需传连接名。client 模式下为空串。
+    bound_resource_id: Mutex<String>,
     /// 绑定的具体数据库名（仅 kind=Db 有效）。设置后 exec_sql 只针对该库。
     bound_database: Option<String>,
     token: String,
@@ -672,6 +722,7 @@ async fn dispatch(shared: &Arc<SharedState>, req: &JsonRpcRequest) -> JsonRpcRes
             let tools = tool_defs(
                 shared.kind,
                 &shared.resource_mode,
+                &shared.bound_source.lock(),
                 shared.bound_database.as_deref(),
             );
             JsonRpcResponse::success(req.id.clone(), json!({ "tools": tools }))
@@ -852,6 +903,11 @@ enum ResolvedTarget {
         resource_id: String,
         display: String,
     },
+    /// 终端标签页绑定模式：命令写入该终端 PTY 执行（支持跳板嵌套）。
+    Terminal {
+        instance_id: String,
+        display: String,
+    },
     /// 客户端直连模式：目标与凭据全部来自工具参数。
     Direct {
         host: String,
@@ -863,12 +919,13 @@ enum ResolvedTarget {
 }
 
 impl ResolvedTarget {
-    /// 展示名：bound 为资源名，client 为 `user@host:port`（供确认浮层/日志标注来源）。
+    /// 展示名：bound 为资源名，terminal 为终端名，client 为 `user@host:port`
+    /// （供确认浮层/日志标注来源）。
     fn display_name(&self) -> String {
         match self {
-            ResolvedTarget::Bound { display, .. } | ResolvedTarget::Direct { display, .. } => {
-                display.clone()
-            }
+            ResolvedTarget::Bound { display, .. }
+            | ResolvedTarget::Terminal { display, .. }
+            | ResolvedTarget::Direct { display, .. } => display.clone(),
         }
     }
 }
@@ -895,17 +952,34 @@ fn resolve_target(shared: &SharedState, arguments: &Value) -> Result<ResolvedTar
             })
         }
         McpKind::Ssh => {
-            if shared.bound_resource_id.is_empty() {
-                return Err(AppError::InvalidInput(format!(
-                    "{} 未绑定资源",
-                    shared.kind.label()
-                )));
+            // 终端标签页绑定：命令写入该终端 PTY 执行（支持 A→B→C 跳板嵌套）。
+            if shared.bound_source.lock().as_str() == "terminal" {
+                let instance_id = shared.bound_resource_id.lock().clone();
+                if instance_id.is_empty() {
+                    return Err(AppError::InvalidInput(format!(
+                        "{} 未绑定终端标签页",
+                        shared.kind.label()
+                    )));
+                }
+                let display = exec::terminal_display_name(&shared.state, &instance_id);
+                Ok(ResolvedTarget::Terminal {
+                    instance_id,
+                    display,
+                })
+            } else {
+                if shared.bound_resource_id.lock().is_empty() {
+                    return Err(AppError::InvalidInput(format!(
+                        "{} 未绑定资源",
+                        shared.kind.label()
+                    )));
+                }
+                let resource_id = shared.bound_resource_id.lock().clone();
+                let display = exec::session_name_by_id(&shared.state, &resource_id);
+                Ok(ResolvedTarget::Bound {
+                    resource_id,
+                    display,
+                })
             }
-            let display = exec::session_name_by_id(&shared.state, &shared.bound_resource_id);
-            Ok(ResolvedTarget::Bound {
-                resource_id: shared.bound_resource_id.clone(),
-                display,
-            })
         }
         McpKind::Db if client_mode => {
             let host = exec::arg_host(arguments)?;
@@ -921,15 +995,16 @@ fn resolve_target(shared: &SharedState, arguments: &Value) -> Result<ResolvedTar
             })
         }
         McpKind::Db => {
-            if shared.bound_resource_id.is_empty() {
+            if shared.bound_resource_id.lock().is_empty() {
                 return Err(AppError::InvalidInput(format!(
                     "{} 未绑定资源",
                     shared.kind.label()
                 )));
             }
-            let display = exec::profile_name_by_id(&shared.state, &shared.bound_resource_id);
+            let resource_id = shared.bound_resource_id.lock().clone();
+            let display = exec::profile_name_by_id(&shared.state, &resource_id);
             Ok(ResolvedTarget::Bound {
-                resource_id: shared.bound_resource_id.clone(),
+                resource_id,
                 display,
             })
         }
@@ -939,15 +1014,16 @@ fn resolve_target(shared: &SharedState, arguments: &Value) -> Result<ResolvedTar
             shared.kind.label()
         ))),
         McpKind::File => {
-            if shared.bound_resource_id.is_empty() {
+            if shared.bound_resource_id.lock().is_empty() {
                 return Err(AppError::InvalidInput(format!(
                     "{} 未绑定资源",
                     shared.kind.label()
                 )));
             }
-            let display = exec::account_name_by_id(&shared.state, &shared.bound_resource_id);
+            let resource_id = shared.bound_resource_id.lock().clone();
+            let display = exec::account_name_by_id(&shared.state, &resource_id);
             Ok(ResolvedTarget::Bound {
-                resource_id: shared.bound_resource_id.clone(),
+                resource_id,
                 display,
             })
         }
@@ -970,6 +1046,10 @@ async fn run_target(
             match target {
                 ResolvedTarget::Bound { resource_id, .. } => {
                     exec::exec_ssh_by_id(&shared.state, resource_id, &command).await
+                }
+                ResolvedTarget::Terminal { instance_id, .. } => {
+                    // 终端标签页绑定：命令写入该终端 PTY 执行（支持跳板嵌套）。
+                    exec::exec_ssh_terminal(&shared.state, instance_id, &command).await
                 }
                 ResolvedTarget::Direct {
                     host,
@@ -996,6 +1076,10 @@ async fn run_target(
                 ResolvedTarget::Bound { resource_id, .. } => {
                     exec::list_files_by_id(&shared.state, resource_id, &path).await
                 }
+                // 终端标签页绑定只支持命令执行，文件操作走 SFTP 短连接不可用。
+                ResolvedTarget::Terminal { .. } => Err(AppError::InvalidInput(
+                    "终端标签页绑定模式仅支持 exec_ssh；文件操作请改绑会话配置".into(),
+                )),
                 ResolvedTarget::Direct {
                     host,
                     port,
@@ -1023,6 +1107,9 @@ async fn run_target(
                     exec::upload_file_by_id(&shared.state, resource_id, &local_path, &remote_path)
                         .await
                 }
+                ResolvedTarget::Terminal { .. } => Err(AppError::InvalidInput(
+                    "终端标签页绑定模式仅支持 exec_ssh；文件操作请改绑会话配置".into(),
+                )),
                 ResolvedTarget::Direct {
                     host,
                     port,
@@ -1051,6 +1138,9 @@ async fn run_target(
                     exec::download_file_by_id(&shared.state, resource_id, &remote_path, &local_path)
                         .await
                 }
+                ResolvedTarget::Terminal { .. } => Err(AppError::InvalidInput(
+                    "终端标签页绑定模式仅支持 exec_ssh；文件操作请改绑会话配置".into(),
+                )),
                 ResolvedTarget::Direct {
                     host,
                     port,
@@ -1085,6 +1175,10 @@ async fn run_target(
                     )
                     .await
                 }
+                // DB MCP 不会产生 Terminal 目标（resolve_target 已限定），防御性分支。
+                ResolvedTarget::Terminal { .. } => Err(AppError::InvalidInput(
+                    "数据库 MCP 不支持终端标签页绑定".into(),
+                )),
                 ResolvedTarget::Direct {
                     host,
                     port,
@@ -1114,9 +1208,10 @@ async fn run_target(
                 ResolvedTarget::Bound { resource_id, .. } => {
                     exec::list_files_by_account(&shared.state, resource_id, &path).await
                 }
-                // resolve_target 已拒绝 File 的 client 模式，这里不会命中。
-                ResolvedTarget::Direct { .. } => Err(AppError::InvalidInput(format!(
-                    "{} 不支持客户端直连模式",
+                // resolve_target 已拒绝 File 的 client/terminal 模式，这里不会命中。
+                ResolvedTarget::Terminal { .. }
+                | ResolvedTarget::Direct { .. } => Err(AppError::InvalidInput(format!(
+                    "{} 不支持终端绑定/客户端直连模式",
                     shared.kind.label()
                 ))),
             }
@@ -1134,8 +1229,9 @@ async fn run_target(
                     )
                     .await
                 }
-                ResolvedTarget::Direct { .. } => Err(AppError::InvalidInput(format!(
-                    "{} 不支持客户端直连模式",
+                ResolvedTarget::Terminal { .. }
+                | ResolvedTarget::Direct { .. } => Err(AppError::InvalidInput(format!(
+                    "{} 不支持终端绑定/客户端直连模式",
                     shared.kind.label()
                 ))),
             }
@@ -1153,8 +1249,9 @@ async fn run_target(
                     )
                     .await
                 }
-                ResolvedTarget::Direct { .. } => Err(AppError::InvalidInput(format!(
-                    "{} 不支持客户端直连模式",
+                ResolvedTarget::Terminal { .. }
+                | ResolvedTarget::Direct { .. } => Err(AppError::InvalidInput(format!(
+                    "{} 不支持终端绑定/客户端直连模式",
                     shared.kind.label()
                 ))),
             }
@@ -1372,7 +1469,12 @@ fn describe_tool(name: &str, arguments: &Value, resource: &str) -> String {
 /// - `"bound"`（默认）：目标由绑定资源决定，工具参数只传 command/sql/path 等。
 /// - `"client"`（客户端直连）：目标与凭据由调用方在参数中传入
 ///   （host/port/username/password），工具描述中注明密码不存储不落日志。
-fn tool_defs(kind: McpKind, resource_mode: &str, bound_database: Option<&str>) -> Vec<Value> {
+fn tool_defs(
+    kind: McpKind,
+    resource_mode: &str,
+    bound_source: &str,
+    bound_database: Option<&str>,
+) -> Vec<Value> {
     let client_mode = resource_mode == "client";
     match kind {
         McpKind::Ssh => {
@@ -1415,10 +1517,17 @@ fn tool_defs(kind: McpKind, resource_mode: &str, bound_database: Option<&str>) -
             }
             let mut exec_required = conn_required.clone();
             exec_required.push("command");
+            // 终端标签页绑定：命令写入用户已打开的终端执行（支持跳板嵌套）。
+            let terminal_bound = !client_mode && bound_source == "terminal";
             let exec_desc = if client_mode {
                 "在调用方指定的服务器上执行一条 shell 命令（非交互），返回标准输出和标准错误的合并文本。\
 目标服务器由参数 host/port/username 指定，password 为登录密码（敏感字段，仅本次调用有效，\
 X-Term 不存储、不落日志）。单命令超时 30 秒，输出截断 16KB。执行前需要 X-Term 用户人工确认。"
+            } else if terminal_bound {
+                "在 X-Term 中绑定的**终端标签页**里执行一条 shell 命令（非交互）。\
+命令写入该终端 PTY 执行：终端当前在哪个远端主机（含 A→B→C 跳板嵌套），\
+命令就在哪个主机上执行，用户可实时看到命令与输出。\
+单命令超时 30 秒，输出截断 16KB。执行前需要 X-Term 用户人工确认。"
             } else {
                 "在当前 SSH MCP 绑定的服务器上执行一条 shell 命令（非交互），\
 返回标准输出和标准错误的合并文本。单命令超时 30 秒，输出截断 16KB。\

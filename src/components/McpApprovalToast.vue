@@ -115,11 +115,19 @@ function kindLabel(kind: string): string {
           size="small"
           :type="isDangerous(req.toolName, req.arguments) ? 'danger' : 'primary'"
           :icon="Check"
+          :disabled="mcp.respondingIds.has(req.requestId)"
           @click="approve(req.requestId)"
         >
           {{ isDangerous(req.toolName, req.arguments) ? "确认执行危险操作" : "允许" }}
         </el-button>
-        <el-button size="small" :icon="Close" @click="reject(req.requestId)">拒绝</el-button>
+        <el-button
+          size="small"
+          :icon="Close"
+          :disabled="mcp.respondingIds.has(req.requestId)"
+          @click="reject(req.requestId)"
+        >
+          拒绝
+        </el-button>
       </div>
     </div>
   </TransitionGroup>
@@ -134,7 +142,10 @@ function kindLabel(kind: string): string {
   display: flex;
   flex-direction: column-reverse; /* 最新的在最下方堆叠，靠近右下角 */
   gap: 12px;
-  max-width: 380px;
+  max-width: min(380px, calc(100vw - 40px));
+  /* 连续工具调用会同时弹多张卡片，限制总高并在容器内滚动，防止堆出屏幕顶部 */
+  max-height: calc(100vh - 40px);
+  overflow-y: auto;
   pointer-events: none;
 }
 

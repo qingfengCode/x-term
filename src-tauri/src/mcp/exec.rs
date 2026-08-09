@@ -1,4 +1,4 @@
-//! 不依赖活跃终端实例的执行实现（MCP 专用）。
+//! MCP 的执行实现（MCP 专用）。
 //!
 //! 外部 MCP 客户端不知道 X-Term 内部的 instanceId / connId，只传"连接名"。本模块
 //! 负责：按名查 Session/DbProfile → 解析凭据 → 建立短连接 → 执行 → 返回输出。
@@ -8,6 +8,8 @@
 //! - [`list_ssh_sessions_view`] / [`list_db_profiles_view`]：只读元数据视图。
 //! - [`list_files_by_id`] / [`upload_file_by_id`] / [`download_file_by_id`]：基于
 //!   SFTP 的文件级运维工具（MCP 绑定模式）；`*_direct` 为客户端直连模式。
+//! - [`exec_ssh_terminal`]：**终端标签页绑定**模式 —— 命令写入用户已打开的终端
+//!   PTY 执行（支持 A→B→C 跳板嵌套场景，命令在终端当前所在的远端主机上执行）。
 //!
 //! 注意 `resolve_credential` / `fetch_mysql_password` 都是同步的且需要短生命 DB
 //! 连接，本模块在调用前集中获取连接、解析凭据后立即释放，不在 `.await` 间持有。
@@ -26,7 +28,7 @@ use crate::file_backend::s3::{S3Backend, S3Config};
 use crate::file_backend::FileBackend;
 use crate::ssh::client::AuthMethod;
 use crate::ssh::sftp::open_sftp;
-use crate::state::AppState;
+use crate::state::{AppState, TerminalSession};
 use crate::storage::file_accounts_repo::{fetch_s3_credential, get_file_account, FileAccount};
 use crate::storage::sessions_repo::{get_session, list_sessions, Session};
 
@@ -181,6 +183,283 @@ pub async fn exec_ssh_by_id(
 ) -> AppResult<String> {
     let session_config = find_session_by_id(state, session_id)?;
     exec_ssh_with_config(state, session_config, command).await
+}
+
+// ===========================================================================
+// 终端标签页绑定（exec_ssh_terminal）
+// ===========================================================================
+//
+// MCP「终端绑定」模式：绑定的是**已打开的终端标签页**（终端实例 id），命令写入
+// 该标签页的 PTY 执行。与短连接模式（exec_ssh_by_id）的区别：
+// - 命令在终端当前所在的远端主机上执行，天然支持 A→B→C 跳板嵌套场景
+//   （终端里已嵌套 ssh 到 C，命令就会在 C 上执行，无需额外配置跳板链）。
+// - 用户在终端里能实时看到 AI 执行的命令和输出（终端可视化）。
+//
+// 完成检测沿用内部 AI 的"哨兵 echo"机制：把命令包装为 `<cmd>; echo <SENTINEL>`
+// 写入 PTY，轮询终端输出环形缓冲直到哨兵出现（命令执行完毕）或 30s 超时。
+
+/// 终端标签页是否存在且为 SSH 终端（MCP「终端绑定」校验用）。
+///
+/// 仅 SSH 终端支持哨兵执行（Telnet 无 shell 语义，不可靠）。
+pub fn ssh_terminal_exists(state: &AppState, instance_id: &str) -> bool {
+    state
+        .terminals
+        .lock()
+        .get(instance_id)
+        .map_or(false, |t| matches!(t, TerminalSession::Ssh(_)))
+}
+
+/// 终端标签页的展示名（确认浮层/日志标注来源用）。
+///
+/// 优先取该终端对应的会话配置名（如「终端 · 生产机」）；配置已被删除时回退
+/// 短 id（`终端 #a1b2c3d4`）。
+pub fn terminal_display_name(state: &AppState, instance_id: &str) -> String {
+    let cfg_id = state
+        .terminals
+        .lock()
+        .get(instance_id)
+        .map(|t| t.session_config_id().to_string());
+    match cfg_id {
+        Some(cfg) => {
+            let name = session_name_by_id(state, &cfg);
+            if name != "(未知会话)" {
+                format!("终端 · {}", name)
+            } else {
+                format!("终端 #{}", short_id(instance_id))
+            }
+        }
+        None => format!("终端 #{}", short_id(instance_id)),
+    }
+}
+
+/// 实例 id 的短形式（前 8 位，展示用）。
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+/// 在绑定的终端标签页的 PTY 中执行一条命令（MCP「终端绑定」模式）。
+///
+/// 流程（参考 `ai::tools::exec_ssh_visual`）：
+/// 1. 生成唯一哨兵，把命令包装为 `<cmd>; echo <SENTINEL>` 写入终端 PTY
+///    （终端里用户能看到 AI 实际敲的命令和输出）。
+/// 2. 轮询终端完整快照，直到"回显行 + echo 输出行"都出现哨兵（或哨兵仅
+///    一次且输出停止增长 1s）判定命令执行完毕，最长 30s 超时。
+/// 3. 截取回显行之后、哨兵输出行之前的输出，去 ANSI、截断 16KB 后返回。
+///
+/// 同一终端同时只允许一个调用（`state.mcp_terminal_busy` 互斥，防止并发写
+/// 导致输出交叉、哨兵互相干扰）。
+pub async fn exec_ssh_terminal(
+    state: &AppState,
+    instance_id: &str,
+    command: &str,
+) -> AppResult<String> {
+    use rand::Rng;
+
+    if command.trim().is_empty() {
+        return Err(AppError::InvalidInput("command 不能为空".into()));
+    }
+    if !ssh_terminal_exists(state, instance_id) {
+        return Err(AppError::NotFound(format!(
+            "终端会话 {} 不存在或已断开（可能已关闭），请重新绑定终端标签页",
+            instance_id
+        )));
+    }
+
+    // 占用该终端：同一终端同一时刻只允许一个 MCP 调用写入。
+    {
+        let mut busy = state.mcp_terminal_busy.lock().await;
+        if busy.insert(instance_id.to_string(), ()).is_some() {
+            return Err(AppError::InvalidInput(
+                "该终端正有另一个 MCP 调用在执行，请稍后再试".into(),
+            ));
+        }
+    }
+
+    // 整个执行过程包在 async block 里，无论成功/超时/出错都在末尾释放占用。
+    let result = async {
+        // 生成唯一哨兵（避免与正常输出撞车）。
+        let nonce: u64 = rand::thread_rng().gen();
+        let sentinel = format!("__XTERM_DONE_{nonce:x}__");
+
+        // 构造实际执行的命令：原命令 + 哨兵 echo。
+        // 用 `;` 连接（无论原命令成功与否哨兵都会输出），保证能检测到完成。
+        let cmd = command.trim_end_matches(['\n', '\r']);
+        let wrapped = format!("{cmd}; echo {sentinel}\n");
+
+        log::info!(
+            "[mcp] exec_ssh（终端绑定）开始：终端 {}, 命令：{}",
+            instance_id,
+            command
+        );
+
+        // 写入 PTY（mpsc send，非阻塞）。
+        {
+            let terminals = state.terminals.lock();
+            match terminals.get(instance_id) {
+                Some(t) => {
+                    if let Err(e) = t.write(wrapped.into_bytes()) {
+                        return Err(AppError::Ssh(format!("写入终端失败: {e}")));
+                    }
+                }
+                None => {
+                    return Err(AppError::NotFound(format!(
+                        "终端会话 {instance_id} 已断开"
+                    )))
+                }
+            }
+        }
+
+        // 轮询等待命令执行完毕（最长 30 秒）。
+        // 完成信号（与 ai::tools::exec_ssh_visual 对齐）：
+        // - 哨兵出现 ≥2 次：命令回显行与 echo 输出行都已出现，命令已结束；
+        // - 哨兵只出现 1 次且**不在回显行**（无回显 shell、或回显行已滚出
+        //   环形缓冲），且输出停止增长一段时间：echo 输出行即唯一哨兵，
+        //   输出停止即视为结束；
+        // - 其它情况继续等待。哨兵在回显行里的特征：PTY 回显的是包装后的
+        //   `cmd; echo SENTINEL`，整行包含 `echo <SENTINEL>`；真正的 echo
+        //   输出行则只是哨兵本身，二者由此区分。
+        //
+        // 注意必须用 full_snapshot()（整个环形缓冲）而不是 snapshot(0)
+        // （8KiB 窗口）：输出稍大回显行就会被窗口截没，既误判完成又截丢内容。
+        let echo_marker = format!("echo {sentinel}");
+        const POLL_INTERVAL: Duration = Duration::from_millis(200);
+        /// 哨兵出现且输出停止后，视为执行完成的静默宽限时间。
+        const SILENCE_GRACE: Duration = Duration::from_secs(1);
+        let deadline = std::time::Instant::now() + EXEC_TIMEOUT;
+        #[allow(unused_assignments)]
+        let mut snapshot = String::new();
+        let mut last_total = 0usize;
+        let mut silence_since = std::time::Instant::now();
+        loop {
+            tokio::time::sleep(POLL_INTERVAL).await;
+            let (snap, total) = {
+                let terminals = state.terminals.lock();
+                match terminals.get(instance_id) {
+                    Some(t) => (t.full_snapshot(), t.total_output_bytes()),
+                    None => {
+                        return Err(AppError::NotFound(format!(
+                            "终端会话 {instance_id} 已断开"
+                        )))
+                    }
+                }
+            };
+            snapshot = snap;
+
+            let occurrences = snapshot.matches(&sentinel).count();
+            // 常规 shell：回显行 + echo 输出行都出现 → 命令已结束。
+            if occurrences >= 2 {
+                break;
+            }
+            // 无回显 shell / 回显行已滚出缓冲：哨兵只出现一次（echo 输出行），
+            // 且输出停止增长一段时间 → 命令已结束。
+            if occurrences == 1
+                && !sentinel_in_echo_line(&snapshot, &sentinel, &echo_marker)
+                && total == last_total
+                && silence_since.elapsed() >= SILENCE_GRACE
+            {
+                break;
+            }
+            // 输出仍在增长 → 重置静默计时。
+            if total != last_total {
+                silence_since = std::time::Instant::now();
+            }
+            last_total = total;
+
+            if std::time::Instant::now() >= deadline {
+                // 超时：返回目前已收集到的输出（可能命令还在跑或卡住等输入）。
+                let cleaned = strip_ansi(&snapshot);
+                return Ok(format!(
+                    "命令已写入终端执行，但 30 秒内未检测到完成（可能仍在运行或等待输入）。\n目前输出：\n{}",
+                    truncate_output(&cleaned)
+                ));
+            }
+        }
+
+        // 截取回显行之后、echo 输出行之前的新增输出（去掉命令回显、哨兵本身）。
+        let new_output = extract_terminal_output(&snapshot, &sentinel);
+        let cleaned = strip_ansi(&new_output);
+        Ok(truncate_output(&cleaned))
+    }
+    .await;
+
+    // 释放占用（无论成功/超时/出错）。
+    state.mcp_terminal_busy.lock().await.remove(instance_id);
+    result
+}
+
+/// 从终端快照中提取"命令执行期间的新增输出"。
+///
+/// 哨兵会出现在两处：**命令回显行**（PTY 回显 `cmd; echo SENTINEL`，第一次
+/// 出现）和 **echo 命令的实际输出行**（最后一次出现）。正常返回第一个含哨兵
+/// 行之后、最后一个含哨兵行之前的内容；若输出末尾没有换行（printf/echo -n/
+/// 进度条），哨兵会与最后一行输出粘在同一行，剥离行内哨兵后再并入。
+///
+/// 只有一处哨兵时（无回显 shell、或命令输出过大导致回显行已滚出环形缓冲），
+/// 取哨兵行**之前**的内容——命令已完成，输出都在哨兵行之前（或与行内哨兵
+/// 粘在一起）。语义与 `ai::tools::extract_new_output` 保持一致。
+fn extract_terminal_output(snapshot: &str, sentinel: &str) -> String {
+    let lines: Vec<&str> = snapshot.split_inclusive('\n').collect();
+    let mut first: Option<usize> = None;
+    let mut last: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate() {
+        if line.contains(sentinel) {
+            if first.is_none() {
+                first = Some(i);
+            }
+            last = Some(i);
+        }
+    }
+    match (first, last) {
+        (Some(f), Some(l)) => {
+            let mut out = String::new();
+            if l > f {
+                // 常规路径：回显行与哨兵输出行都在，取两者之间的内容。
+                out.push_str(&lines[f + 1..l].concat());
+                // 输出末尾无换行时哨兵与最后一行输出粘在同一行，剥离后并入。
+                if let Some(p) = lines[l].find(sentinel) {
+                    out.push_str(&lines[l][..p]);
+                }
+            } else {
+                // 只有一处哨兵：输出在哨兵行之前（回显行滚出缓冲/无回显 shell），
+                // 或与该行内哨兵粘在一起（printf/echo -n 无换行输出）。
+                out.push_str(&lines[..f].concat());
+                if let Some(p) = lines[f].find(sentinel) {
+                    out.push_str(&lines[f][..p]);
+                }
+            }
+            out
+        }
+        // 快照里找不到哨兵：返回全量（调用方按超时/部分输出处理）。
+        _ => snapshot.to_string(),
+    }
+}
+
+/// 判断哨兵在快照中的出现位置是否位于"命令回显行"。
+///
+/// 命令写入 PTY 的瞬间，shell 会把包装后的 `cmd; echo SENTINEL` 回显成一行
+/// 输出（该行含 `echo <SENTINEL>` 标记）；而 echo 的实际输出行（哨兵本身）
+/// 只在命令执行完毕后出现。据此区分"命令还在跑"与"命令已结束"，
+/// 避免把回显行误当作完成信号。逻辑与 `ai::tools::sentinel_in_echo_line` 一致。
+fn sentinel_in_echo_line(snapshot: &str, sentinel: &str, echo_marker: &str) -> bool {
+    let Some(pos) = snapshot.find(sentinel) else {
+        return false;
+    };
+    let line_start = snapshot[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line_end = snapshot[pos..]
+        .find('\n')
+        .map(|i| pos + i)
+        .unwrap_or(snapshot.len());
+    snapshot[line_start..line_end].contains(echo_marker)
+}
+
+/// 截断输出到 `EXEC_OUTPUT_CAP` 字节，超出则尾部提示。
+fn truncate_output(s: &str) -> String {
+    if s.len() <= EXEC_OUTPUT_CAP {
+        return s.to_string();
+    }
+    let mut truncated: String = s.chars().take(EXEC_OUTPUT_CAP).collect();
+    truncated.push_str("\n... [输出已截断]");
+    truncated
 }
 
 /// 在调用方指定的服务器上执行一条命令（MCP 客户端直连模式）。
@@ -482,8 +761,22 @@ async fn exec_sql_with_profile(
         .await?
     };
 
+    // USE 语句拦截：prepared 协议不支持 USE（MySQL 1295）；MCP 是一次性连接、
+    // 无跨语句状态，直接返回成功消息，避免把协议错误抛给调用方。
+    if let Some(use_db) = crate::database::mysql::parse_use_statement(sql) {
+        if let Some(db) = &use_db {
+            crate::database::mysql::validate_database_identifier(db)?;
+        }
+        conn_obj.close().await;
+        return Ok(match use_db {
+            Some(db) => format!("已切换到数据库 `{db}`（本次连接）"),
+            None => "USE 语句缺少库名".into(),
+        });
+    }
+
     // 执行并立即关闭连接（MCP 模式不缓存连接池）。
-    let res = conn_obj.execute(sql, limit).await;
+    let cur_db = conn_obj.current_db();
+    let res = conn_obj.execute(sql, limit, cur_db.as_deref()).await;
     conn_obj.close().await;
 
     let qr = res?;
@@ -525,7 +818,21 @@ pub async fn exec_sql_direct(
 
     // 直连（不走 SSH 隧道）→ 执行 → 立即关闭。
     let conn_obj = mysql_connect_direct(host, port, username, password, database).await?;
-    let res = conn_obj.execute(sql, limit).await;
+
+    // USE 语句拦截（同 exec_sql_with_profile）：prepared 协议不支持 USE。
+    if let Some(use_db) = crate::database::mysql::parse_use_statement(sql) {
+        if let Some(db) = &use_db {
+            crate::database::mysql::validate_database_identifier(db)?;
+        }
+        conn_obj.close().await;
+        return Ok(match use_db {
+            Some(db) => format!("已切换到数据库 `{db}`（本次连接）"),
+            None => "USE 语句缺少库名".into(),
+        });
+    }
+
+    let cur_db = conn_obj.current_db();
+    let res = conn_obj.execute(sql, limit, cur_db.as_deref()).await;
     conn_obj.close().await;
 
     let qr = res?;
@@ -1108,5 +1415,59 @@ pub async fn download_file_by_account(
             "download_file(S3) 执行超时（`{}` → `{}`，上限 5 分钟；文件可能过大）",
             remote_path, local_path
         ))),
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const S: &str = "__XTERM_DONE_abcd__";
+
+    /// 常规场景：回显行 + echo 输出行都存在，取两者之间。
+    #[test]
+    fn extract_between_echo_and_output() {
+        let snap = format!("$ echo hi; echo {S}\nhi\n{S}\n$ ");
+        let out = extract_terminal_output(&snap, S);
+        assert_eq!(out, "hi\n");
+    }
+
+    /// 单哨兵（回显行滚出缓冲/无回显 shell）：取哨兵行之前。
+    #[test]
+    fn extract_before_single_sentinel() {
+        let snap = format!("line1\nline2\n{S}\n$ ");
+        let out = extract_terminal_output(&snap, S);
+        assert_eq!(out, "line1\nline2\n");
+    }
+
+    /// 输出末尾无换行：哨兵与最后一行输出粘在同一行，剥离行内哨兵。
+    #[test]
+    fn extract_inline_sentinel_no_newline() {
+        let snap = format!("progress{S}\n");
+        let out = extract_terminal_output(&snap, S);
+        assert_eq!(out, "progress");
+    }
+
+    /// 快照里找不到哨兵：返回全量（超时路径）。
+    #[test]
+    fn extract_missing_sentinel_returns_full() {
+        let snap = "nothing here\n";
+        let out = extract_terminal_output(snap, S);
+        assert_eq!(out, snap);
+    }
+
+    /// 哨兵位于回显行（该行含 `echo SENTINEL` 标记）→ 判定为回显行。
+    #[test]
+    fn sentinel_in_echo_line_detected() {
+        let snap = format!("$ ls; echo {S}\n{S}\n");
+        assert!(sentinel_in_echo_line(&snap, S, &format!("echo {S}")));
+    }
+
+    /// 快照中唯一哨兵为 echo 实际输出行（回显行已滚出）→ 非回显行。
+    #[test]
+    fn sentinel_in_echo_line_false_for_output_only() {
+        let snap = format!("out1\nout2\n{S}\n$ ");
+        assert!(!sentinel_in_echo_line(&snap, S, &format!("echo {S}")));
     }
 }

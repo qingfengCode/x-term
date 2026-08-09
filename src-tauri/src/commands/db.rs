@@ -8,6 +8,7 @@
 //! - [`db_list_tables`]：列出表。
 //! - [`db_describe_table`]：表结构。
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use tauri::{AppHandle, State};
@@ -141,7 +142,7 @@ pub async fn db_connect(profile_id: String, state: State<'_, AppState>) -> AppRe
 
     // 4. 登记。
     let conn_id = uuid::Uuid::new_v4().to_string();
-    state.mysql_conns.lock().insert(conn_id.clone(), conn_obj);
+    state.mysql_conns.lock().insert(conn_id.clone(), Arc::new(conn_obj));
 
     Ok(conn_id)
 }
@@ -158,9 +159,62 @@ pub async fn db_disconnect(conn_id: String, state: State<'_, AppState>) -> AppRe
     Ok(())
 }
 
+/// 切换连接的当前库（schema）。前端点库节点 / 新建库标签时调用。
+///
+/// 之后该连接上的所有查询都会自动带 `USE \`db\``（见 [`MySqlConn::execute`]），
+/// SQL 里无需再写库前缀。传 `None` 清除（回落到连接 URL 里的默认库）。
+#[tauri::command]
+pub async fn db_use_database(
+    conn_id: String,
+    database: Option<String>,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    if let Some(db) = &database {
+        crate::database::mysql::validate_database_identifier(db)?;
+    }
+    let conn_obj = state
+        .mysql_conns
+        .lock()
+        .get(&conn_id)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(format!("DB 连接 {} 不存在", conn_id)))?;
+    conn_obj.set_current_db(database);
+    Ok(())
+}
+
 // ===========================================================================
 // SQL 执行
 // ===========================================================================
+
+/// 只读模式强制校验（后端兜底；前端判定可被 `WITH`/`SELECT INTO OUTFILE` 等
+/// 形式绕过，必须由后端按实际收到的 SQL 复核）。
+///
+/// 逐条检查输入里的每条非空语句：必须通过 [`crate::ai::tools::is_readonly_sql`]
+/// （SELECT/SHOW/EXPLAIN/DESCRIBE/DESC，WITH 引导的 CTE 由 sql_first_keyword
+/// 解析成主语句关键字后再判定），并拒绝 `SELECT ... INTO OUTFILE/DUMPFILE`
+/// （会在服务器文件系统上写文件）。违反任一即返回错误。
+fn enforce_read_only(sql: &str) -> AppResult<()> {
+    for stmt in sql.split(';') {
+        let s = stmt.trim();
+        if s.is_empty() {
+            continue;
+        }
+        if !crate::ai::tools::is_readonly_sql(s) {
+            let kw = s.split_whitespace().next().unwrap_or("?");
+            return Err(AppError::Auth(format!(
+                "只读模式不允许执行写操作（首关键字 {}）",
+                kw
+            )));
+        }
+        let upper = s.to_ascii_uppercase();
+        if upper.contains("INTO OUTFILE") || upper.contains("INTO DUMPFILE") {
+            return Err(AppError::Auth(
+                "只读模式不允许 SELECT INTO OUTFILE/DUMPFILE".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// 执行一条 SQL，结果通过 `db:query_result` 事件推送（前端用 queryId 匹配）。
 ///
@@ -171,6 +225,7 @@ pub async fn db_exec_sql(
     conn_id: String,
     sql: String,
     query_id: String,
+    read_only: bool,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> AppResult<()> {
@@ -183,18 +238,85 @@ pub async fn db_exec_sql(
         sql_log,
         if sql.chars().count() > 200 { "…" } else { "" }
     );
-    // 取出 conn（不持有锁跨 await：clone 出 pool 句柄）。
-    // mysql_conns 存的是 MySqlConn（含 pool），无法 clone；这里改为先取出整个
-    // MySqlConn，执行完再放回。但若并发执行会互相阻塞。MVP 接受这一限制。
+
+    // USE 语句拦截：pool 语义下直接执行 USE 只对单条连接生效，必须由本层记录
+    // 当前库，并在每次查询前自动带上（见 MySqlConn::execute 的 db 参数）。
+    if let Some(use_db) = crate::database::mysql::parse_use_statement(&sql) {
+        let set_res: AppResult<()> = (|| {
+            if let Some(db) = &use_db {
+                crate::database::mysql::validate_database_identifier(db)?;
+            }
+            let conn_obj = state
+                .mysql_conns
+                .lock()
+                .get(&conn_id)
+                .cloned()
+                .ok_or_else(|| AppError::NotFound(format!("DB 连接 {} 不存在", conn_id)))?;
+            conn_obj.set_current_db(use_db.clone());
+            Ok(())
+        })();
+        let event = match set_res {
+            Ok(()) => {
+                log::info!(
+                    "[db_exec_sql] USE 切换当前库: {}",
+                    use_db.as_deref().unwrap_or("(空)")
+                );
+                DbQueryResultEvent {
+                    query_id,
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    affected: 0,
+                    truncated: false,
+                    error: None,
+                    elapsed_ms: 0,
+                }
+            }
+            Err(e) => DbQueryResultEvent {
+                query_id,
+                columns: Vec::new(),
+                rows: Vec::new(),
+                affected: 0,
+                truncated: false,
+                error: Some(e.to_string()),
+                elapsed_ms: 0,
+            },
+        };
+        emit(&app, DB_QUERY_RESULT, event);
+        return Ok(());
+    }
+
+    // 只读模式强制校验：USE 放行（纯切库无副作用），其余语句逐条复核。
+    if read_only {
+        if let Err(e) = enforce_read_only(&sql) {
+            log::info!("[db_exec_sql] 只读模式拦截: query_id={}, {}", query_id, e);
+            let event = DbQueryResultEvent {
+                query_id,
+                columns: Vec::new(),
+                rows: Vec::new(),
+                affected: 0,
+                truncated: false,
+                error: Some(e.to_string()),
+                elapsed_ms: 0,
+            };
+            emit(&app, DB_QUERY_RESULT, event);
+            return Ok(());
+        }
+    }
+
+    // 取出 conn 句柄（Arc 克隆，不持有锁跨 await）；mysql_conns 的值是
+    // Arc<MySqlConn>，多个命令可并发操作同一连接，不会互相 remove/insert 竞争。
     let conn_obj = state
         .mysql_conns
         .lock()
-        .remove(&conn_id)
+        .get(&conn_id)
+        .cloned()
         .ok_or_else(|| AppError::NotFound(format!("DB 连接 {} 不存在", conn_id)))?;
     log::info!("[db_exec_sql] 取出 conn 成功，开始执行");
 
     let start = Instant::now();
-    let res = conn_obj.execute(&sql, 1000).await;
+    // 带当前库执行：连接上的每条查询都先 USE，保证落在当前库上。
+    let cur_db = conn_obj.current_db();
+    let res = conn_obj.execute(&sql, 1000, cur_db.as_deref()).await;
     let elapsed_ms = start.elapsed().as_millis() as u64;
     log::info!(
         "[db_exec_sql] 执行完成, 耗时 {}ms, 结果: {}",
@@ -202,15 +324,13 @@ pub async fn db_exec_sql(
         if res.is_ok() { "ok" } else { "err" }
     );
 
-    // 无论成功失败都把 conn 放回。
-    state.mysql_conns.lock().insert(conn_id.clone(), conn_obj);
-
     let event = match res {
         Ok(qr) => DbQueryResultEvent {
             query_id,
             columns: qr.columns,
             rows: qr.rows,
             affected: qr.affected,
+            truncated: qr.truncated,
             error: None,
             elapsed_ms,
         },
@@ -219,6 +339,7 @@ pub async fn db_exec_sql(
             columns: Vec::new(),
             rows: Vec::new(),
             affected: 0,
+            truncated: false,
             error: Some(e.to_string()),
             elapsed_ms,
         },
@@ -244,7 +365,8 @@ pub async fn db_list_tables(
     let conn_obj = state
         .mysql_conns
         .lock()
-        .remove(&conn_id)
+        .get(&conn_id)
+        .cloned()
         .ok_or_else(|| AppError::NotFound(format!("DB 连接 {} 不存在", conn_id)))?;
 
     // 构造 SQL：指定库时用 SHOW TABLES FROM <db>。库名做简单防注入。
@@ -254,15 +376,15 @@ pub async fn db_list_tables(
                 .chars()
                 .any(|c| c.is_whitespace() || c == ';' || c == '-' || c == '/' || c == '`')
             {
-                state.mysql_conns.lock().insert(conn_id, conn_obj);
                 return Err(AppError::InvalidInput(format!("非法库名: {}", db)));
             }
             format!("SHOW TABLES FROM `{}`", db)
         }
         None => "SHOW TABLES".into(),
     };
-    let res = conn_obj.execute(&sql, 10_000).await;
-    state.mysql_conns.lock().insert(conn_id, conn_obj);
+    // 未指定库时按连接当前库执行（USE 自动带上，SHOW TABLES 即当前库的表）。
+    let cur_db = conn_obj.current_db();
+    let res = conn_obj.execute(&sql, 10_000, cur_db.as_deref()).await;
 
     let qr = res?;
     // SHOW TABLES 只有一列：表名。
@@ -279,11 +401,11 @@ pub async fn db_list_databases(
     let conn_obj = state
         .mysql_conns
         .lock()
-        .remove(&conn_id)
+        .get(&conn_id)
+        .cloned()
         .ok_or_else(|| AppError::NotFound(format!("DB 连接 {} 不存在", conn_id)))?;
 
-    let res = conn_obj.execute("SHOW DATABASES", 1_000).await;
-    state.mysql_conns.lock().insert(conn_id, conn_obj);
+    let res = conn_obj.execute("SHOW DATABASES", 1_000, None).await;
 
     let qr = res?;
     let dbs: Vec<String> = qr.rows.into_iter().filter_map(|mut r| r.pop()).collect();
@@ -306,11 +428,13 @@ pub async fn db_describe_table(
     let conn_obj = state
         .mysql_conns
         .lock()
-        .remove(&conn_id)
+        .get(&conn_id)
+        .cloned()
         .ok_or_else(|| AppError::NotFound(format!("DB 连接 {} 不存在", conn_id)))?;
 
-    let res = conn_obj.execute(&sql, 1000).await;
-    state.mysql_conns.lock().insert(conn_id, conn_obj);
+    // 未限定库名的 DESCRIBE（`DESCRIBE \`table\``）按连接当前库执行。
+    let cur_db = conn_obj.current_db();
+    let res = conn_obj.execute(&sql, 1000, cur_db.as_deref()).await;
 
     res
 }
@@ -346,11 +470,13 @@ pub async fn db_show_create_table(
     let conn_obj = state
         .mysql_conns
         .lock()
-        .remove(&conn_id)
+        .get(&conn_id)
+        .cloned()
         .ok_or_else(|| AppError::NotFound(format!("DB 连接 {} 不存在", conn_id)))?;
 
-    let res = conn_obj.execute(&sql, 1).await;
-    state.mysql_conns.lock().insert(conn_id, conn_obj);
+    // 未限定库名时按连接当前库执行。
+    let cur_db = conn_obj.current_db();
+    let res = conn_obj.execute(&sql, 1, cur_db.as_deref()).await;
 
     let result = res?;
     // SHOW CREATE TABLE 返回一行两列：[表名, DDL 文本]。

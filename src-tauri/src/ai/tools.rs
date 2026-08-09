@@ -113,8 +113,13 @@ const EXEC_OUTPUT_CAP: usize = 16 * 1024;
 ///
 /// 与 [`EXEC_OUTPUT_CAP`] 保持一致：两种执行模式对回填给模型的输出大小限制相同。
 const MAX_EXEC_OUTPUT_BYTES: usize = 16 * 1024;
-/// terminal_snapshot 默认/上限字节数（8 KiB）。
-const SNAPSHOT_DEFAULT_BYTES: usize = 8 * 1024;
+/// terminal_snapshot 默认返回字节数（16 KiB）。
+const SNAPSHOT_DEFAULT_BYTES: usize = 16 * 1024;
+/// terminal_snapshot 允许的最大字节数（与终端输出环形缓冲容量一致）。
+///
+/// 之前上限被死死卡在默认值（8 KiB），模型想取更多也拿不到；现在允许申请
+/// 到环形缓冲全量，作为 exec_ssh 可视化模式截断/失败后的兜底路径。
+const SNAPSHOT_MAX_BYTES: usize = crate::ssh::session::OUTPUT_BUFFER_CAP;
 /// read_file 单文件读取上限（1 MiB）。超出拒绝，防上下文爆炸。
 const MAX_FILE_READ_BYTES: usize = 1024 * 1024;
 /// write_file 单次写入上限（10 MiB）。
@@ -140,7 +145,8 @@ pub fn ssh_tools() -> Vec<ToolDef> {
             name: "exec_ssh".into(),
             description: "在指定的 SSH 终端会话对应的服务器上执行一条 shell 命令，\
 返回标准输出和标准错误的合并文本。适用于查询系统状态（如 ps、df、netstat、\
-cat 配置文件等）。单命令超时 30 秒，输出截断 16KB。"
+cat 配置文件等）。单命令超时 30 秒，输出截断 16KB（超出会附截断提示；\
+如需更完整内容可调用 terminal_snapshot）。"
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -159,8 +165,9 @@ cat 配置文件等）。单命令超时 30 秒，输出截断 16KB。"
         },
         ToolDef {
             name: "terminal_snapshot".into(),
-            description: "获取指定 SSH 终端会话最近的屏幕输出（最近 8KB），\
-用于了解用户当前看到了什么、上下文是什么。"
+            description: "获取指定 SSH 终端会话最近的屏幕输出（默认 16KB，\
+可通过 maxBytes 申请最多 256KB），用于了解用户当前看到了什么、上下文是什么。\
+命令输出被截断或缺失时，用它获取终端最近输出。"
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -544,25 +551,24 @@ async fn exec_ssh(state: &AppState, args: &Value, visualization: bool) -> ToolRe
 /// 流程：
 /// 1. 生成唯一哨兵标记，把命令包装为 `<cmd>; echo <SENTINEL>` 写入 PTY
 ///    （终端里用户能看到 AI 实际敲的命令和输出）。
-/// 2. 轮询终端输出环形缓冲，直到出现哨兵（命令执行完毕）或超时。
-/// 3. 截取"哨兵行之前、命令回显之后"的新增输出，去 ANSI 后返回给 AI。
+/// 2. 轮询终端输出环形缓冲（**全量**，非限长窗口），直到命令执行完毕：
+///    - 哨兵出现 ≥2 次（命令回显行 + echo 实际输出行）即完成——常规 shell；
+///    - 仅出现 1 次（无回显 shell / 回显行已滚出环形缓冲）时，以"缓冲停止
+///      增长"作为完成信号；
+///    - 最长等待 30 秒，超时返回已收集输出 + 引导。
+/// 3. 截取"回显行之后、哨兵输出行之前"的新增输出，去 ANSI 后按 16 KiB
+///    上限截断（超出附截断提示）。
 ///
-/// 这样既保留了"终端可视化"（命令在 xterm 实时显示），又让 AI 拿到真实执行结果。
+/// 注意：**不能**以哨兵首次出现作为完成信号——命令回显行（PTY 回显
+/// `cmd; echo SENTINEL`）在写入瞬间就会出现，此时命令可能仍在执行；
+/// 若在此时返回，AI 拿到的会是空/部分输出（"终端有输出但 AI 分析不到"
+/// 的主要根因）。
 async fn exec_ssh_visual(state: &AppState, session_id: &str, command: &str) -> ToolResult {
     use rand::Rng;
 
     // 生成唯一哨兵（避免与正常输出撞车）。
     let nonce: u64 = rand::thread_rng().gen();
     let sentinel = format!("__XTERM_DONE_{nonce:x}__");
-
-    // 记录写入前的输出基准长度，用于截取新增部分。
-    let baseline = {
-        let terminals = state.terminals.lock();
-        match terminals.get(session_id) {
-            Some(ssh) => ssh.output_offset(),
-            None => return ToolResult::err(format!("终端会话 {session_id} 不存在")),
-        }
-    };
 
     // 构造实际执行的命令：原命令 + 哨兵 echo。
     // 用 `;` 连接（无论原命令成功与否哨兵都会输出），保证能检测到完成。
@@ -583,53 +589,107 @@ async fn exec_ssh_visual(state: &AppState, session_id: &str, command: &str) -> T
         }
     }
 
-    // 轮询等待哨兵出现（最长 30 秒）。
+    // 轮询等待命令执行完毕（最长 30 秒）。
+    // 完成信号：
+    // - 哨兵出现 ≥2 次：命令回显行与 echo 输出行都已出现，命令已结束；
+    // - 哨兵只出现 1 次且**不在回显行**（无回显 shell、或回显行已滚出环形
+    //   缓冲），且输出停止增长一段时间：echo 输出行即唯一哨兵，输出停止
+    //   即视为结束；
+    // - 其它情况继续等待。哨兵在回显行里的特征：PTY 回显的是包装后的
+    //   `cmd; echo SENTINEL`，整行包含 `echo <SENTINEL>`；真正的 echo 输出行
+    //   则只是哨兵本身，二者由此区分。
+    let echo_marker = format!("echo {sentinel}");
+    const POLL_INTERVAL: Duration = Duration::from_millis(200);
+    /// 哨兵出现且输出停止后，视为执行完成的静默宽限时间。
+    const SILENCE_GRACE: Duration = Duration::from_secs(1);
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     #[allow(unused_assignments)]
     let mut snapshot = String::new();
+    let mut last_total = 0usize;
+    let mut silence_since = std::time::Instant::now();
     loop {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        snapshot = {
+        tokio::time::sleep(POLL_INTERVAL).await;
+        let (snap, total) = {
             let terminals = state.terminals.lock();
             match terminals.get(session_id) {
-                Some(ssh) => ssh.snapshot(0),
+                Some(ssh) => (ssh.full_snapshot(), ssh.total_output_bytes()),
                 None => return ToolResult::err("终端会话已断开"),
             }
         };
-        if snapshot.contains(&sentinel) {
+        snapshot = snap;
+
+        let occurrences = snapshot.matches(&sentinel).count();
+        // 常规 shell：回显行 + echo 输出行都出现 → 命令已结束。
+        if occurrences >= 2 {
             break;
         }
+        // 无回显 shell / 回显行已滚出缓冲：哨兵只出现一次（echo 输出行），
+        // 且输出停止增长一段时间 → 命令已结束。
+        if occurrences == 1
+            && !sentinel_in_echo_line(&snapshot, &sentinel, &echo_marker)
+            && total == last_total
+            && silence_since.elapsed() >= SILENCE_GRACE
+        {
+            break;
+        }
+        // 输出仍在增长 → 重置静默计时。
+        if total != last_total {
+            silence_since = std::time::Instant::now();
+        }
+        last_total = total;
+
         if std::time::Instant::now() >= deadline {
             // 超时：返回目前已收集到的输出（可能命令还在跑或卡住等输入）。
-            let partial = extract_new_output(&snapshot, baseline, "");
+            let partial = extract_new_output(&snapshot, "");
             let cleaned = strip_ansi(&partial);
             return ToolResult::ok(format!(
-                "命令已写入终端执行，但 30 秒内未检测到完成（可能仍在运行或等待输入）。\n\
-                 目前输出：\n{}",
+                "命令已写入终端执行，但 30 秒内未检测到执行完成（命令可能仍在运行、\
+                 等待输入，或终端当前不在 shell 提示符）。\n目前捕获到的输出：\n{}\n\
+                 （如需终端当前完整输出，可调用 terminal_snapshot）",
                 truncate_output(&cleaned, MAX_EXEC_OUTPUT_BYTES)
             ));
         }
     }
 
-    // 截取哨兵之前的新增输出（去掉命令回显、哨兵本身）。
-    let new_output = extract_new_output(&snapshot, baseline, &sentinel);
+    // 截取回显行之后、echo 输出行之前的新增输出，去 ANSI 后截断（附提示）。
+    let new_output = extract_new_output(&snapshot, &sentinel);
     let cleaned = strip_ansi(&new_output);
     let result = truncate_output(&cleaned, MAX_EXEC_OUTPUT_BYTES);
     ToolResult::ok(result)
 }
 
-/// 从 snapshot 中提取"命令执行期间的新增输出"。
+/// 判断哨兵在快照中的出现位置是否位于"命令回显行"。
 ///
-/// - `baseline`：命令写入前缓冲的字节数（保留参数，已不用于截取逻辑）；
-/// - `sentinel`：哨兵字符串（超时时为空）。
+/// 命令写入 PTY 的瞬间，shell 会把包装后的 `cmd; echo SENTINEL` 回显成一行
+/// 输出（该行含 `echo <SENTINEL>` 标记）；而 echo 的实际输出行（哨兵本身）
+/// 只在命令执行完毕后出现。据此区分"命令还在跑"与"命令已结束"，
+/// 避免把回显行误当作完成信号。
+fn sentinel_in_echo_line(snapshot: &str, sentinel: &str, echo_marker: &str) -> bool {
+    let Some(pos) = snapshot.find(sentinel) else {
+        return false;
+    };
+    let line_start = snapshot[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line_end = snapshot[pos..]
+        .find('\n')
+        .map(|i| pos + i)
+        .unwrap_or(snapshot.len());
+    snapshot[line_start..line_end].contains(echo_marker)
+}
+
+/// 从快照中提取"命令执行期间的新增输出"。
 ///
-/// 哨兵会出现在两处：**命令回显行**（PTY 回显 `cmd; echo SENTINEL`，是第一次出现）
-/// 和 **echo 命令的实际输出行**（最后一次出现）。用 `find` 取第一次会出现会把
-/// "提示符+命令残片"当作输出，因此这里按行匹配：取第一个含哨兵的行之后、
-/// 最后一个含哨兵的行之前的内容，即真正的命令输出。
-fn extract_new_output(snapshot: &str, _baseline: usize, sentinel: &str) -> String {
+/// `sentinel` 为空表示超时路径（返回快照全量）。
+///
+/// 哨兵会出现在两处：**命令回显行**（PTY 回显 `cmd; echo SENTINEL`，第一次出现）
+/// 和 **echo 命令的实际输出行**（最后一次出现）。正常返回第一个含哨兵行之后、
+/// 最后一个含哨兵行之前的内容；若输出末尾没有换行（printf/echo -n/进度条），
+/// 哨兵会与最后一行输出粘在同一行，剥离行内哨兵后再并入。
+///
+/// 只有一处哨兵时（无回显 shell、或命令输出过大导致回显行已滚出环形缓冲），
+/// 取哨兵行**之前**的内容——调用方只在命令完成后才调用本函数，此时输出都在
+/// 哨兵行之前（或与行内哨兵粘在一起）。
+fn extract_new_output(snapshot: &str, sentinel: &str) -> String {
     if sentinel.is_empty() {
-        // 超时路径：返回快照全量。
         return snapshot.to_string();
     }
     let lines: Vec<&str> = snapshot.split_inclusive('\n').collect();
@@ -644,15 +704,34 @@ fn extract_new_output(snapshot: &str, _baseline: usize, sentinel: &str) -> Strin
         }
     }
     match (first, last) {
-        (Some(f), Some(l)) if l > f => lines[f + 1..l].concat(),
-        // 只有一处含哨兵（输出被环形缓冲滚掉等）：取该行之后的内容。
-        (Some(f), Some(_)) => lines[f + 1..].concat(),
+        (Some(f), Some(l)) => {
+            let mut out = String::new();
+            if l > f {
+                // 常规路径：回显行与哨兵输出行都在，取两者之间的内容。
+                out.push_str(&lines[f + 1..l].concat());
+                // 输出末尾无换行时哨兵与最后一行输出粘在同一行，剥离后并入。
+                if let Some(p) = lines[l].find(sentinel) {
+                    out.push_str(&lines[l][..p]);
+                }
+            } else {
+                // 只有一处哨兵：输出在哨兵行之前（回显行滚出缓冲/无回显 shell），
+                // 或与该行内哨兵粘在一起（printf/echo -n 无换行输出）。
+                out.push_str(&lines[..f].concat());
+                if let Some(p) = lines[f].find(sentinel) {
+                    out.push_str(&lines[f][..p]);
+                }
+            }
+            out
+        }
         // 快照里找不到哨兵：返回全量（调用方按超时/部分输出处理）。
         _ => snapshot.to_string(),
     }
 }
 
-/// 截断输出到指定字节数，超出则尾部提示。
+/// 截断输出到指定字节数，超出则保留开头，并附**面向模型**的截断提示。
+///
+/// 提示含原始字节数，并引导模型用 `terminal_snapshot` 获取更完整内容——
+/// 否则模型会把截断后的输出误当作命令的完整结果。
 fn truncate_output(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
@@ -663,7 +742,11 @@ fn truncate_output(s: &str, max_bytes: usize) -> String {
         .last()
         .map(|(i, _)| i)
         .unwrap_or(max_bytes);
-    format!("{}…\n(输出已截断，共 {} 字节)", &s[..cut], s.len())
+    format!(
+        "{}…\n[输出已截断：共 {} 字节，仅保留开头部分；如需更完整内容可调用 terminal_snapshot]",
+        &s[..cut],
+        s.len()
+    )
 }
 
 /// terminal_snapshot：取指定终端最近输出。
@@ -672,16 +755,17 @@ fn terminal_snapshot(state: &AppState, args: &Value) -> ToolResult {
         Some(s) => s,
         None => return ToolResult::err("terminal_snapshot 缺少 sessionId"),
     };
+    // maxBytes 上限放开到环形缓冲容量（默认 16 KiB），模型可按需申请更多。
     let max_bytes = args
         .get("maxBytes")
         .and_then(Value::as_u64)
-        .map(|n| n as usize)
+        .map(|n| (n as usize).min(SNAPSHOT_MAX_BYTES))
         .unwrap_or(SNAPSHOT_DEFAULT_BYTES);
 
     let terminals = state.terminals.lock();
     match terminals.get(session_id) {
         Some(s) => {
-            let snap = s.snapshot(max_bytes.min(SNAPSHOT_DEFAULT_BYTES));
+            let snap = s.snapshot(max_bytes);
             ToolResult::ok(snap)
         }
         None => ToolResult::err(format!("找不到终端会话 {session_id}")),
@@ -720,31 +804,53 @@ async fn exec_sql(
         if visualization { "是" } else { "否" }
     );
 
-    // 取出 conn → 执行 → 放回（MySqlConn 不 Clone）。
+    // 取出 conn 句柄（Arc 克隆；并发下不会与用户操作互相 remove/insert 竞争）。
     let conn = {
-        let mut map = state.mysql_conns.lock();
-        match map.remove(&conn_id) {
-            Some(c) => c,
+        let map = state.mysql_conns.lock();
+        match map.get(&conn_id) {
+            Some(c) => c.clone(),
             None => {
                 return ToolResult::err(format!("找不到 MySQL 连接 {conn_id}"));
             }
         }
     };
 
+    // USE 语句拦截：与 db_exec_sql 一致——AI 生成的 `USE xxx` 不能直接发给
+    // MySQL（prepared 协议不支持 USE，MySQL 1295），改为更新连接的 current_db。
+    if let Some(use_db) = crate::database::mysql::parse_use_statement(&sql) {
+        if let Some(db) = &use_db {
+            if let Err(e) = crate::database::mysql::validate_database_identifier(db) {
+                return ToolResult::err(e.to_string());
+            }
+        }
+        conn.set_current_db(use_db.clone());
+        return ToolResult::ok(match use_db {
+            Some(db) => format!("已切换到数据库 `{db}`"),
+            None => "USE 语句缺少库名".into(),
+        });
+    }
+
     let started = std::time::Instant::now();
-    let res = conn.execute(&sql, limit).await;
+    // 带当前库执行：AI 工具同样自动落在连接的当前库上（USE 由 execute 自动带上）。
+    let cur_db = conn.current_db();
+    let res = conn.execute(&sql, limit, cur_db.as_deref()).await;
     let elapsed_ms = started.elapsed().as_millis() as u64;
-    // 放回。
-    state.mysql_conns.lock().insert(conn_id, conn);
 
     // SQL 终端可视化：把结构化结果回显给 SQL 控制台（命令行模式）。
     if visualization {
-        let (columns, rows, affected, error) = match &res {
-            Ok(qr) => (qr.columns.clone(), qr.rows.clone(), qr.affected, None),
+        let (columns, rows, affected, truncated, error) = match &res {
+            Ok(qr) => (
+                qr.columns.clone(),
+                qr.rows.clone(),
+                qr.affected,
+                qr.truncated,
+                None,
+            ),
             Err(e) => (
                 Vec::new(),
                 Vec::new(),
                 0u64,
+                false,
                 Some(format!("SQL 执行失败: {e}")),
             ),
         };
@@ -757,6 +863,7 @@ async fn exec_sql(
                 columns,
                 rows,
                 affected,
+                truncated,
                 elapsed_ms,
                 error,
             },
@@ -776,14 +883,15 @@ async fn list_db_tables(state: &AppState, args: &Value) -> ToolResult {
         None => return ToolResult::err("list_db_tables 缺少 dbConnId"),
     };
     let conn = {
-        let mut map = state.mysql_conns.lock();
-        match map.remove(&conn_id) {
-            Some(c) => c,
+        let map = state.mysql_conns.lock();
+        match map.get(&conn_id) {
+            Some(c) => c.clone(),
             None => return ToolResult::err(format!("找不到 MySQL 连接 {conn_id}")),
         }
     };
-    let res = conn.execute("SHOW TABLES", 10_000).await;
-    state.mysql_conns.lock().insert(conn_id, conn);
+    // 带当前库执行（SHOW TABLES 即当前库的表）。
+    let cur_db = conn.current_db();
+    let res = conn.execute("SHOW TABLES", 10_000, cur_db.as_deref()).await;
 
     match res {
         Ok(qr) => {
@@ -811,14 +919,15 @@ async fn describe_table(state: &AppState, args: &Value) -> ToolResult {
     let sql = format!("DESCRIBE {qualified}");
 
     let conn = {
-        let mut map = state.mysql_conns.lock();
-        match map.remove(&conn_id) {
-            Some(c) => c,
+        let map = state.mysql_conns.lock();
+        match map.get(&conn_id) {
+            Some(c) => c.clone(),
             None => return ToolResult::err(format!("找不到 MySQL 连接 {conn_id}")),
         }
     };
-    let res = conn.execute(&sql, 1000).await;
-    state.mysql_conns.lock().insert(conn_id, conn);
+    // 未限定库名的 DESCRIBE（`DESCRIBE \`table\``）按连接当前库执行。
+    let cur_db = conn.current_db();
+    let res = conn.execute(&sql, 1000, cur_db.as_deref()).await;
 
     match res {
         Ok(qr) => ToolResult::ok(format_query_result(&qr)),
@@ -1402,5 +1511,66 @@ mod tests {
         let wl_prefix: Vec<String> = vec!["sys".into()];
         assert!(is_whitelisted("sys", &wl_prefix));
         assert!(!is_whitelisted("systemctl status", &wl_prefix));
+    }
+
+    /// 常规提取：回显行与哨兵输出行都在，返回两者之间的内容。
+    #[test]
+    fn extract_output_normal() {
+        let snap = "$ ls; echo __DONE__\nfile1\nfile2\n__DONE__\nuser@host:~$ ";
+        assert_eq!(extract_new_output(snap, "__DONE__"), "file1\nfile2\n");
+    }
+
+    /// 输出末尾无换行（printf/echo -n）：哨兵与最后一行输出粘在同一行，
+    /// 提取时应剥离行内哨兵。
+    #[test]
+    fn extract_output_glued_sentinel() {
+        let snap = "$ printf abc; echo __DONE__\nabc__DONE__\nuser@host:~$ ";
+        assert_eq!(extract_new_output(snap, "__DONE__"), "abc");
+    }
+
+    /// 只有一处哨兵（回显行滚出环形缓冲 / 无回显 shell）：输出在哨兵行之前。
+    #[test]
+    fn extract_output_single_occurrence() {
+        // 输出过大，回显行已被滚掉，只剩哨兵输出行 + 提示符。
+        let snap = "tail-of-output\n__DONE__\nuser@host:~$ ";
+        assert_eq!(extract_new_output(snap, "__DONE__"), "tail-of-output\n");
+        // 无回显 shell 且输出末尾无换行：输出与哨兵同处一行。
+        let glued = "abc__DONE__\n";
+        assert_eq!(extract_new_output(glued, "__DONE__"), "abc");
+    }
+
+    /// 超时路径：sentinel 为空返回快照全量。
+    #[test]
+    fn extract_output_timeout() {
+        let snap = "partial output";
+        assert_eq!(extract_new_output(snap, ""), snap);
+    }
+
+    /// 回显行判定：含 `echo <SENTINEL>` 的行是命令回显（命令可能仍在执行），
+    /// 纯哨兵行是 echo 的实际输出（命令已结束）。
+    #[test]
+    fn sentinel_echo_line_detection() {
+        let sentinel = "__XTERM_DONE_abc__";
+        let marker = format!("echo {sentinel}");
+        // 命令回显行：行内含 `echo SENTINEL`。
+        let snap = "$ df -h; echo __XTERM_DONE_abc__\n";
+        assert!(sentinel_in_echo_line(snap, sentinel, &marker));
+        // echo 输出行：哨兵独占一行，不判定为回显。
+        let done = "Sizes\n__XTERM_DONE_abc__\nuser@host:~$ ";
+        assert!(!sentinel_in_echo_line(done, sentinel, &marker));
+        // 哨兵尚未出现。
+        assert!(!sentinel_in_echo_line("no sentinel yet\n", sentinel, &marker));
+    }
+
+    /// 截断提示面向模型：包含原始字节数与 terminal_snapshot 引导。
+    #[test]
+    fn truncate_notice_guides_model() {
+        let long = "x".repeat(100);
+        let out = truncate_output(&long, 16);
+        assert!(out.contains("已截断"));
+        assert!(out.contains("100"));
+        assert!(out.contains("terminal_snapshot"));
+        // 未超限时原样返回。
+        assert_eq!(truncate_output(&long, 200), long);
     }
 }

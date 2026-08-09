@@ -286,12 +286,25 @@ pub enum AuthMethod {
 /// 在此时长内没有收到服务端任何数据即自动断开；`None` 表示永不自动断开。
 /// 传 `None` 可关闭该机制（对应设置值 0）。
 ///
+/// `keepalive_interval` 为保活间隔（与设置页"SSH 保活间隔"对应，等价于 OpenSSH
+/// 的 `ServerAliveInterval`）：超过该时长未收到服务端数据即发送一个保活包。
+/// 服务端收到后会回包，既证明连接仍存活（重置双方的空闲计时），又能让中间
+/// NAT/防火墙的闲置超时不断被刷新，避免"挂机一会儿就断"。`None` 表示不保活
+/// （对应设置值 0）。
+///
 /// 另外在主机密钥算法列表末尾追加 `ssh-rsa`，以兼容只提供 `ssh-rsa`（RSA/SHA-1）
 /// 主机密钥的服务器（如部分 JumpServer 堡垒机）。现代算法（ed25519/ecdsa/rsa-sha2）
 /// 仍排在前面，优先级不受影响。
-pub fn default_config(idle_timeout: Option<Duration>) -> client::Config {
+pub fn default_config(
+    idle_timeout: Option<Duration>,
+    keepalive_interval: Option<Duration>,
+) -> client::Config {
     client::Config {
         inactivity_timeout: idle_timeout,
+        // 保活：超过 keepalive_interval 未收到服务端数据即发包探测；
+        // 连续 keepalive_max 次无回应（服务端已死/网络中断）才断开。
+        keepalive_interval,
+        keepalive_max: 3,
         preferred: russh::Preferred {
             key: Cow::Borrowed(&[
                 russh::keys::key::ED25519,
@@ -314,11 +327,6 @@ const AUTH_CHALLENGE_TIMEOUT: Duration = Duration::from_secs(120);
 ///
 /// 比 auth challenge 长，因为用户可能需要比对指纹、思考是否信任。
 const HOST_KEY_CHALLENGE_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// 默认空闲断开时间（分钟），与设置页默认值保持一致；读取设置失败时兜底。
-fn default_ssh_idle_timeout_minutes() -> u32 {
-    30
-}
 
 /// 前端对一次认证挑战的回复（通过 `ssh_auth_respond` 命令回传）。
 #[derive(Debug)]
@@ -423,8 +431,12 @@ pub type ForwardsMap = Arc<parking_lot::Mutex<HashMap<(String, u16), (String, u1
 ///    自动填充，其余提示（OTP/验证码等二次认证）通过
 ///    [`events::SSH_AUTH_CHALLENGE`] 事件发往前端弹窗，等待用户填写后继续认证。
 ///
-/// 客户端配置（含空闲断开时间）从 settings.json 的 `terminal.sshIdleTimeoutMinutes`
-/// 读取：0 = 永不自动断开；否则按分钟映射为 russh 的 `inactivity_timeout`。
+/// 客户端配置（空闲断开、保活、连接超时）从 settings.json 的
+/// `terminal.sshIdleTimeoutMinutes` / `terminal.sshKeepaliveSecs`
+/// / `terminal.sshConnectTimeoutSecs` 读取：空闲断开 0 = 永不自动断开，否则按分钟
+/// 映射为 russh 的 `inactivity_timeout`；保活 0 = 不发送保活包，否则按秒映射为
+/// russh 的 `keepalive_interval`；连接超时 0 = 永不超时，否则 TCP 建连 +
+/// SSH 握手（含密钥交换）超时即失败。
 ///
 /// 认证失败时返回 [`AppError::Auth`]。
 ///
@@ -481,17 +493,26 @@ async fn connect_direct_inner(
     state: AppState,
     forwards: Option<ForwardsMap>,
 ) -> AppResult<Handle<ClientHandler>> {
+    // 终端设置（空闲断开 + 保活 + 连接超时）：读一次 settings.json 复用。
+    let terminal = crate::config::settings_load_inner(&state)
+        .map(|s| s.terminal)
+        .unwrap_or_default();
     // 空闲断开时间：设置 0 表示永不断开（inactivity_timeout 为 None）。
-    let idle_timeout = crate::config::settings_load_inner(&state)
-        .map(|s| s.terminal.ssh_idle_timeout_minutes)
-        .unwrap_or(default_ssh_idle_timeout_minutes());
-    let idle_timeout = if idle_timeout == 0 {
+    let idle_timeout = if terminal.ssh_idle_timeout_minutes == 0 {
         None
     } else {
-        Some(Duration::from_secs(u64::from(idle_timeout) * 60))
+        Some(Duration::from_secs(u64::from(terminal.ssh_idle_timeout_minutes) * 60))
     };
+    // 保活间隔：设置 0 表示不发送保活包（keepalive_interval 为 None）。
+    let keepalive_interval = if terminal.ssh_keepalive_secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(u64::from(terminal.ssh_keepalive_secs)))
+    };
+    // 连接超时（秒）：设置 0 表示永不超时。
+    let connect_timeout_secs = terminal.ssh_connect_timeout_secs;
 
-    let config = Arc::new(default_config(idle_timeout));
+    let config = Arc::new(default_config(idle_timeout, keepalive_interval));
     let handler = ClientHandler {
         app: state.app.clone(),
         host: host.to_string(),
@@ -503,51 +524,75 @@ async fn connect_direct_inner(
     let addr = (host, port);
 
     log::info!("正在连接 SSH {}@{}:{}...", username, host, port);
-    let mut handle = client::connect(config, addr, handler)
-        .await
-        .map_err(|e| AppError::Ssh(format!("连接 SSH 失败: {}", e)))?;
-
-    // 1/2. 公钥或密码认证（按配置的 AuthMethod 单次尝试）。
-    let (mut authenticated, fallback_password) = match auth {
-        AuthMethod::PrivateKey { key_data, .. } => {
-            let key = Arc::new(key_data);
-            let ok = handle
-                .authenticate_publickey(username, key)
+    let connect = client::connect(config, addr, handler);
+    let mut handle = match connect_timeout_secs {
+        // 0 = 永不超时。
+        0 => connect
+            .await
+            .map_err(|e| AppError::Ssh(format!("连接 SSH 失败: {}", e)))?,
+        secs => {
+            tokio::time::timeout(Duration::from_secs(u64::from(secs)), connect)
                 .await
-                .map_err(|e| AppError::Ssh(format!("公钥认证请求失败: {}", e)))?;
-            (ok, None)
-        }
-        AuthMethod::Password(password) => {
-            let ok = handle
-                .authenticate_password(username, password.clone())
-                .await
-                .map_err(|e| AppError::Ssh(format!("密码认证请求失败: {}", e)))?;
-            (ok, Some(password))
+                .map_err(|_| {
+                    AppError::Ssh(format!("连接 SSH 超时（{} 秒，可在设置中调整）", secs))
+                })?
+                .map_err(|e| AppError::Ssh(format!("连接 SSH 失败: {}", e)))?
         }
     };
 
-    // 3. 回退 keyboard-interactive（服务器只提供该方法，或要求二次认证）。
-    if !authenticated {
-        authenticated = auth_keyboard_interactive(
-            &mut handle,
-            host,
-            port,
-            username,
-            session_config_id,
-            fallback_password.as_deref(),
-            &state,
-        )
-        .await?;
-    }
+    // 认证阶段（密码/公钥 + 键盘交互回退）包一层整体超时：`connect` 超时只
+    // 覆盖 TCP+握手，服务器握手后不回应认证请求时，下面的认证会永久挂起。
+    // 超时值固定 120s（与前端认证弹窗兜底对齐），不随连接超时设置收窄——
+    // 用户在弹出的挑战框里输入 OTP 需要完整的时间窗口。
+    let handle = tokio::time::timeout(AUTH_TIMEOUT, async {
+        // 1/2. 公钥或密码认证（按配置的 AuthMethod 单次尝试）。
+        let (mut authenticated, fallback_password) = match auth {
+            AuthMethod::PrivateKey { key_data, .. } => {
+                let key = Arc::new(key_data);
+                let ok = handle
+                    .authenticate_publickey(username, key)
+                    .await
+                    .map_err(|e| AppError::Ssh(format!("公钥认证请求失败: {}", e)))?;
+                (ok, None)
+            }
+            AuthMethod::Password(password) => {
+                let ok = handle
+                    .authenticate_password(username, password.clone())
+                    .await
+                    .map_err(|e| AppError::Ssh(format!("密码认证请求失败: {}", e)))?;
+                (ok, Some(password))
+            }
+        };
 
-    if !authenticated {
-        return Err(AppError::Auth(format!(
-            "SSH 认证失败: {}@{}:{}（若服务器启用了二次认证，请检查验证码输入或稍后重试）",
-            username, host, port
-        )));
-    }
+        // 3. 回退 keyboard-interactive（服务器只提供该方法，或要求二次认证）。
+        if !authenticated {
+            authenticated = auth_keyboard_interactive(
+                &mut handle,
+                host,
+                port,
+                username,
+                session_config_id,
+                fallback_password.as_deref(),
+                &state,
+            )
+            .await?;
+        }
 
-    log::info!("SSH 认证成功: {}@{}", username, host);
+        if !authenticated {
+            return Err(AppError::Auth(format!(
+                "SSH 认证失败: {}@{}:{}（若服务器启用了二次认证，请检查验证码输入或稍后重试）",
+                username, host, port
+            )));
+        }
+
+        log::info!("SSH 认证成功: {}@{}", username, host);
+        Ok::<_, AppError>(handle)
+    })
+    .await
+    .map_err(|_| {
+        AppError::Ssh("SSH 认证超时（120 秒）：服务器未完成认证握手，已断开连接".into())
+    })??;
+
     Ok(handle)
 }
 
@@ -560,6 +605,18 @@ async fn connect_direct_inner(
 ///   等待前端通过 `ssh_auth_respond` 回传；用户取消或超时返回认证错误。
 ///
 /// 返回是否认证成功。
+/// 认证阶段整体超时。
+///
+/// 与前端认证弹窗的 125s 兜底、后端挑战 120s 超时对齐——保证用户有完整的
+/// 输入窗口，同时防止服务器接受 TCP 握手后不回应认证请求导致永久挂起。
+const AUTH_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// keyboard-interactive 最大轮次。
+///
+/// 恶意/故障服务器可反复发 `InfoRequest`（每轮都能自动填充时无需用户介入，
+/// 会形成无限往返忙循环），设上限兜底。
+const MAX_KI_ROUNDS: usize = 5;
+
 async fn auth_keyboard_interactive(
     handle: &mut Handle<ClientHandler>,
     host: &str,
@@ -574,7 +631,15 @@ async fn auth_keyboard_interactive(
         .await
         .map_err(|e| AppError::Ssh(format!("keyboard-interactive 认证请求失败: {}", e)))?;
 
+    let mut rounds = 0usize;
     loop {
+        rounds += 1;
+        if rounds > MAX_KI_ROUNDS {
+            return Err(AppError::Auth(format!(
+                "keyboard-interactive 认证轮次超过上限（{}），服务器可能异常",
+                MAX_KI_ROUNDS
+            )));
+        }
         match reply {
             KeyboardInteractiveAuthResponse::Success => return Ok(true),
             KeyboardInteractiveAuthResponse::Failure => return Ok(false),

@@ -41,6 +41,15 @@ pub struct TerminalSettings {
     /// 0 表示永不自动断开。作用于所有 SSH 连接（终端 / SFTP / 隧道 / AI 执行）。
     #[serde(default = "default_ssh_idle_timeout_minutes")]
     pub ssh_idle_timeout_minutes: u32,
+    /// SSH 保活间隔（秒）：超过该时长未收到服务端数据即发送保活包（等价于
+    /// OpenSSH 的 `ServerAliveInterval`），防止服务端空闲策略或中间 NAT/防火墙
+    /// 掐断闲置连接。0 表示不发送保活包。作用于所有 SSH 连接。
+    #[serde(default = "default_ssh_keepalive_secs")]
+    pub ssh_keepalive_secs: u32,
+    /// SSH 连接超时（秒）：TCP 建连 + SSH 握手（含密钥交换）超过此时长判定连接失败。
+    /// 0 表示永不超时。作用于所有 SSH 连接（终端 / SFTP / 隧道 / AI 执行）。
+    #[serde(default = "default_ssh_connect_timeout_secs")]
+    pub ssh_connect_timeout_secs: u32,
 }
 
 fn default_theme() -> String {
@@ -67,6 +76,15 @@ fn default_enable_webgl() -> bool {
 fn default_ssh_idle_timeout_minutes() -> u32 {
     30
 }
+/// 默认 SSH 保活间隔（秒），与 OpenSSH 常见的 ServerAliveInterval 30 秒一致。
+fn default_ssh_keepalive_secs() -> u32 {
+    30
+}
+/// 默认 SSH 连接超时（秒），与 OpenSSH 的 ConnectTimeout 惯例一致（10s 偏短，
+/// 跨网段易误判，取 15s）。
+fn default_ssh_connect_timeout_secs() -> u32 {
+    15
+}
 
 impl Default for TerminalSettings {
     fn default() -> Self {
@@ -79,6 +97,8 @@ impl Default for TerminalSettings {
             copy_on_select: default_copy_on_select(),
             enable_webgl: default_enable_webgl(),
             ssh_idle_timeout_minutes: default_ssh_idle_timeout_minutes(),
+            ssh_keepalive_secs: default_ssh_keepalive_secs(),
+            ssh_connect_timeout_secs: default_ssh_connect_timeout_secs(),
         }
     }
 }
@@ -127,6 +147,10 @@ pub struct ShortcutSettings {
     /// 老配置文件没有此字段时使用 `default_app_shortcuts`。
     #[serde(default = "default_app_shortcuts")]
     pub app: std::collections::BTreeMap<String, String>,
+    /// 终端快捷命令栏是否展开（多行换行显示全部命令）。
+    /// 展开/折叠状态持久化，重启后保持。
+    #[serde(default)]
+    pub expanded: bool,
 }
 
 /// 默认应用级快捷键（与前端 `APP_SHORTCUT_METAS` 保持一致）。
@@ -497,10 +521,20 @@ pub struct Settings {
     /// 最近成功连接的会话 id（最近的在前，最多保留 10 个）。
     #[serde(default)]
     pub recent_session_ids: Vec<String>,
+    /// 是否启用锁定功能（导航栏显示「锁定」按钮）。默认 true。
+    ///
+    /// 仅控制锁定按钮显隐；无论开关如何，应用重启后保险库都要求重新解锁
+    /// （主密钥只存进程内存）。
+    #[serde(default = "default_vault_lock_enabled")]
+    pub vault_lock_enabled: bool,
 }
 
 fn default_sidebar_width() -> f32 {
     240.0
+}
+
+fn default_vault_lock_enabled() -> bool {
+    true
 }
 
 /// 内置默认快捷命令（首次启动时填充，给用户一个起步样例）。
@@ -538,6 +572,7 @@ fn default_shortcuts() -> ShortcutSettings {
         ],
         groups: vec![],
         app: default_app_shortcuts(),
+        expanded: false,
     }
 }
 

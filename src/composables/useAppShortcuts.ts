@@ -51,6 +51,8 @@ export function useAppShortcuts(
   const editablePassthrough = options.editablePassthrough ?? true;
 
   function onKeydown(e: KeyboardEvent) {
+    // 长按连发（e.repeat）只响应首次按键，避免开/关类动作被连续触发。
+    if (e.repeat) return;
     // 可编辑元素中默认放行（避免误吞 SQL/会话名输入）。
     if (editablePassthrough && isEditableTarget(e)) return;
 

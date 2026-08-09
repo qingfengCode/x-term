@@ -50,6 +50,21 @@ pub fn vault_unlocked(state: State<'_, AppState>) -> AppResult<bool> {
     Ok(state.vault_ready())
 }
 
+/// 锁定保险库：清除内存中的主密钥，之后需重新输入主密码解锁。
+///
+/// 温和锁定：**不断开**已建立的连接（终端/SFTP/隧道/MySQL 继续工作），仅使
+/// 所有需要凭据的操作（新建连接、读取凭据等）在解锁前不可用。
+/// `CredentialVault` Drop 时自动 zeroize 主密钥。
+#[tauri::command]
+pub fn vault_lock(state: State<'_, AppState>) -> AppResult<()> {
+    if !state.vault_ready() {
+        return Err(AppError::Auth("保险库尚未解锁，无需锁定".into()));
+    }
+    *state.vault.write() = None;
+    log::info!("[vault] 保险库已锁定（主密钥已清除，已建立的连接保持）");
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // 凭据 CRUD
 // ---------------------------------------------------------------------------

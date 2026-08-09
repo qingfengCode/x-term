@@ -24,7 +24,7 @@ import {
 import { readDir, mkdir, stat as fsStat } from "@tauri-apps/plugin-fs";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { homeDir, join, sep as pathSep, dirname, basename } from "@tauri-apps/api/path";
+import { homeDir, join, dirname, basename } from "@tauri-apps/api/path";
 
 import { useTransferStore } from "@/stores/transfer";
 import type { FileEntry } from "@/api/types";
@@ -34,6 +34,7 @@ import {
   fileConnect,
   fileDisconnect,
   fileList,
+  fileStat,
   fileMkdir,
   fileRename,
   fileRemove,
@@ -214,10 +215,17 @@ const sortedLocal = computed(() =>
   makeSorted(localEntries.value, localSortKey.value, localSortDesc.value),
 );
 
+// 加载竞态防护：每次加载取递增序号，响应返回时若序号已过期（期间又发起了
+// 新加载）则丢弃结果，避免先发的慢请求覆盖新导航的列表/loading 状态。
+let localLoadSeq = 0;
+let remoteLoadSeq = 0;
+
 async function loadLocal(path: string) {
+  const seq = ++localLoadSeq;
   localLoading.value = true;
   try {
     const raw = await readDir(path);
+    if (seq !== localLoadSeq) return; // 过期响应丢弃。
     const items: UnifiedEntry[] = [];
     for (const e of raw) {
       if (e.name === "." || e.name === "..") continue;
@@ -233,13 +241,15 @@ async function loadLocal(path: string) {
       }
       items.push({ name: e.name, isDir: e.isDirectory, size, modified });
     }
+    if (seq !== localLoadSeq) return;
     sortEntries(items);
     localEntries.value = items;
     localPath.value = path;
   } catch (e) {
+    if (seq !== localLoadSeq) return;
     ElMessage.error("读取本地目录失败: " + String(e));
   } finally {
-    localLoading.value = false;
+    if (seq === localLoadSeq) localLoading.value = false;
   }
 }
 
@@ -324,9 +334,11 @@ function joinRemote(name: string): string {
 
 async function loadRemote(path: string) {
   if (!backendId.value) return;
+  const seq = ++remoteLoadSeq;
   remoteLoading.value = true;
   try {
     const entries = await fileList(backendId.value, path);
+    if (seq !== remoteLoadSeq) return; // 过期响应丢弃。
     const items: UnifiedEntry[] = entries.map((e) => ({
       name: e.name,
       isDir: e.isDir,
@@ -337,9 +349,10 @@ async function loadRemote(path: string) {
     remoteEntries.value = items;
     remotePath.value = path;
   } catch (e) {
+    if (seq !== remoteLoadSeq) return;
     ElMessage.error("读取远端目录失败: " + String(e));
   } finally {
-    remoteLoading.value = false;
+    if (seq === remoteLoadSeq) remoteLoading.value = false;
   }
 }
 
@@ -430,12 +443,58 @@ async function remoteRemove(entry: UnifiedEntry) {
 // ---------------------------------------------------------------------------
 // 上传 / 下载
 // ---------------------------------------------------------------------------
+/** 行内"上传"按钮：用 join 拼绝对路径（旧实现把 path 与 sep 函数对象直接
+ *  字符串拼接，路径必坏），完成后刷新远端列表。 */
+async function onRowUpload(e: UnifiedEntry) {
+  if (e.isDir) return;
+  const full = await join(localPath.value, e.name);
+  await uploadOne(full, e.name);
+  await refreshRemote();
+}
+
+// --- 覆盖保护（上传/下载前确认，避免静默覆盖同名文件造成数据丢失） ---
+
+async function confirmOverwrite(message: string): Promise<boolean> {
+  try {
+    await ElMessageBox.confirm(message, "覆盖确认", {
+      type: "warning",
+      confirmButtonText: "覆盖",
+      cancelButtonText: "取消",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 远端目标已存在同名文件时弹确认；不存在或 stat 失败放行。 */
+async function confirmRemoteOverwrite(remoteAbs: string, name: string): Promise<boolean> {
+  try {
+    await fileStat(backendId.value, remoteAbs);
+  } catch {
+    return true;
+  }
+  return confirmOverwrite(`远端已存在同名文件「${name}」，是否覆盖？`);
+}
+
+/** 本地目标已存在同名文件时弹确认。 */
+async function confirmLocalOverwrite(localAbs: string, name: string): Promise<boolean> {
+  try {
+    await fsStat(localAbs);
+  } catch {
+    return true; // 本地不存在，直接写。
+  }
+  return confirmOverwrite(`本地已存在同名文件「${name}」，是否覆盖？`);
+}
+
 async function uploadOne(localAbs: string, name: string) {
   if (!backendId.value) {
     ElMessage.warning("请先连接账号");
     return;
   }
   const remoteAbs = joinRemote(name);
+  // 覆盖保护：旧实现直接覆盖远端同名文件，可能丢失远端数据。
+  if (!(await confirmRemoteOverwrite(remoteAbs, name))) return;
   const taskId = crypto.randomUUID();
   transfer.add({
     id: taskId,
@@ -477,6 +536,8 @@ async function downloadOne(remoteName: string) {
     return;
   }
   const full = await join(savePath, remoteName);
+  // 覆盖保护：旧实现直接写盘覆盖本地同名文件，可能丢失本地数据。
+  if (!(await confirmLocalOverwrite(full, remoteName))) return;
   const taskId = crypto.randomUUID();
   transfer.add({
     id: taskId,
@@ -723,7 +784,7 @@ onBeforeUnmount(() => {
                   link
                   size="small"
                   type="primary"
-                  @click.stop="uploadOne(localPath + pathSep + e.name, e.name).then(refreshRemote)"
+                  @click.stop="onRowUpload(e)"
                 >
                   上传
                 </el-button>
@@ -937,7 +998,8 @@ onBeforeUnmount(() => {
   color: var(--el-text-color-secondary);
   position: sticky;
   top: 0;
-  background: var(--el-bg-color);
+  /* 与 SftpView 表头统一使用填充色，滚动时与行内容区分 */
+  background: var(--el-fill-color-light);
   z-index: 1;
 }
 .file-header .file-name,
@@ -1020,9 +1082,15 @@ onBeforeUnmount(() => {
   font-size: 12px;
 }
 .row-actions {
-  width: 140px;
-  text-align: right;
+  /* 与 SftpView 统一：悬停行时浮现操作按钮，平时隐藏节省空间 */
+  display: none;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
   flex-shrink: 0;
+}
+.file-row:hover .row-actions {
+  display: flex;
 }
 .empty-row {
   padding: 24px;

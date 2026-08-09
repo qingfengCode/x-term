@@ -50,6 +50,51 @@ pub fn format_query_result(qr: &QueryResult) -> String {
     if qr.rows.is_empty() {
         out.push_str("(无数据)\n");
     }
-    out.push_str(&format!("共 {} 行", qr.rows.len()));
+    if qr.truncated {
+        // 面向模型的截断提示：否则模型会把"仅前 limit 行"误当作完整结果。
+        out.push_str(&format!(
+            "显示前 {} 行（结果已截断：查询实际返回超过 {} 行；可调大 limit 参数重新查询）\n",
+            qr.rows.len(),
+            qr.rows.len()
+        ));
+    } else {
+        out.push_str(&format!("共 {} 行", qr.rows.len()));
+    }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 截断标记必须反映到格式化文本里（面向模型的提示），
+    /// 否则模型会把"仅前 limit 行"误当作完整结果。
+    #[test]
+    fn format_query_result_marks_truncation() {
+        let rows = vec![vec!["1".into(), "a".into()], vec!["2".into(), "b".into()]];
+        let qr = QueryResult {
+            columns: vec!["id".into(), "name".into()],
+            rows,
+            affected: 2,
+            truncated: true,
+        };
+        let out = format_query_result(&qr);
+        assert!(out.contains("已截断"), "截断提示缺失: {out}");
+        assert!(out.contains("limit"), "应引导调大 limit: {out}");
+        assert!(!out.contains("共 2 行"), "截断时不应显示误导性的完整行数: {out}");
+    }
+
+    /// 未截断时保持原有格式（不出现截断提示）。
+    #[test]
+    fn format_query_result_plain() {
+        let qr = QueryResult {
+            columns: vec!["id".into()],
+            rows: vec![vec!["1".into()]],
+            affected: 1,
+            truncated: false,
+        };
+        let out = format_query_result(&qr);
+        assert!(out.contains("共 1 行"));
+        assert!(!out.contains("已截断"));
+    }
 }

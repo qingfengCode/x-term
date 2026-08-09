@@ -20,3 +20,8 @@ export function forwardStart(ruleId: string): Promise<string> {
 export function forwardStop(ruleId: string): Promise<void> {
   return invoke<void>("forward_stop", { ruleId });
 }
+
+/** 当前正在运行的转发规则 id 列表（后端持有真实状态）。 */
+export function forwardListRunning(): Promise<string[]> {
+  return invoke<string[]>("forward_list_running");
+}

@@ -8,7 +8,7 @@ import { ElMessage, ElMessageBox, type FormInstance } from "element-plus";
 import { Plus, Delete, EditPen, Monitor, Connection, RefreshRight } from "@element-plus/icons-vue";
 import { useDesktopsStore } from "@/stores/desktops";
 import { remoteDesktopLaunch, type Desktop } from "@/api/remote_desktop";
-import { credentialSave, credentialGet } from "@/api/vault";
+import { credentialDelete, credentialSave, credentialGet } from "@/api/vault";
 
 defineOptions({ name: "RemoteDesktopView" });
 
@@ -68,11 +68,13 @@ async function submit() {
   const now = new Date().toISOString();
   const existed = store.desktops.find((d) => d.id === editingId.value);
 
-  // 密码处理：填了密码就加密存 vault，拿 credentialId 关联。
+  // 密码处理：编辑时留空表示不修改（保持原凭据关联）；填了密码则原地更新
+  // 原凭据（传 id 不产生孤儿凭据）或新建。
   let credentialId = existed?.credentialId ?? null;
   if (form.password.trim()) {
     try {
       credentialId = await credentialSave({
+        id: existed?.credentialId ?? undefined,
         name: `${form.name} 密码`,
         kind: "password",
         value: form.password,
@@ -138,6 +140,14 @@ async function remove(d: Desktop) {
       cancelButtonText: "取消",
     });
     await store.remove(d.id);
+    // 同步清理关联的 vault 凭据，避免孤儿凭据残留。
+    if (d.credentialId) {
+      try {
+        await credentialDelete(d.credentialId);
+      } catch {
+        /* 忽略删除失败 */
+      }
+    }
     ElMessage.success("已删除");
   } catch {
     /* 取消 */

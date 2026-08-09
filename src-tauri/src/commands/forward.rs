@@ -113,7 +113,9 @@ pub fn forward_delete_rule(id: String, state: State<'_, AppState>) -> AppResult<
     // 同步停止运行中的隧道。
     if let Some(tunnel) = state.tunnels.lock().remove(&id) {
         // 隧道停止是异步的；这里不 await，spawn 出去避免命令阻塞。
-        tokio::spawn(crate::ssh::tunnel::stop(tunnel));
+        // 注意：同步 Tauri 命令运行在主线程（无 tokio 运行时上下文），裸
+        // tokio::spawn 会 panic 导致程序崩溃；async_runtime::spawn 任意线程可用。
+        tauri::async_runtime::spawn(crate::ssh::tunnel::stop(tunnel));
     }
     Ok(())
 }
@@ -258,4 +260,13 @@ pub async fn forward_stop(rule_id: String, state: State<'_, AppState>) -> AppRes
         .remove(&rule_id)
         .ok_or_else(|| AppError::NotFound(format!("转发 {} 未在运行", rule_id)))?;
     crate::ssh::tunnel::stop(tunnel).await
+}
+
+/// 返回当前正在运行的转发规则 id 列表。
+///
+/// 运行状态由后端持有（[`AppState::tunnels`]），前端刷新页面/重新进入时调用
+/// 本命令同步真实状态，避免内存 Set 与实际不一致（如隧道异常退出后仍显示运行）。
+#[tauri::command]
+pub fn forward_list_running(state: State<'_, AppState>) -> AppResult<Vec<String>> {
+    Ok(state.tunnels.lock().keys().cloned().collect())
 }

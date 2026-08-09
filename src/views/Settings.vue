@@ -2,20 +2,26 @@
   Settings.vue — 应用设置视图
 
   两个 Tab：
-  1. 终端：主题 / 字体 / 字号 / 行高 / 滚屏 / 选中复制 / WebGL 渲染 / SSH 空闲断开时间
+  1. 终端：主题 / 字体 / 字号 / 行高 / 滚屏 / 选中复制 / 启用WebGL / SSH 空闲断开时间 / SSH 保活间隔 / SSH 连接超时
   2. AI 助手（BYOK 多模型）：管理 provider 列表、设置激活模型
 
   所有改动通过 settingsStore.save() 持久化；主题切换同时切换 document.documentElement 的 'dark' class。
 -->
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from "vue";
+import { computed, h, onMounted, reactive, ref, watch } from "vue";
+import { onBeforeRouteLeave } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
-import type { FormInstance, FormRules } from "element-plus";
-import { Delete, Plus, Refresh, Folder, Setting } from "@element-plus/icons-vue";
-import { open } from "@tauri-apps/plugin-dialog";
+import type { FormInstance, FormRules, TabsInstance } from "element-plus";
+import { Delete, Plus, Refresh, Folder, Setting, Download, Upload } from "@element-plus/icons-vue";
+import HelpTip from "@/components/HelpTip.vue";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { setWorkspaceDir } from "@/api/ai";
+import * as backupApi from "@/api/backup";
+import type { BackupInfo } from "@/api/backup";
 import { useSettingsStore } from "@/stores/settings";
 import { useUpdateStore } from "@/stores/update";
+import { useVaultStore } from "@/stores/vault";
+import { useMcpStore } from "@/stores/mcp";
 import { ProviderKind, PROVIDER_DEFAULTS } from "@/api/types";
 import {
   APP_SHORTCUT_METAS,
@@ -36,7 +42,13 @@ import type {
 
 const settings = useSettingsStore();
 const updater = useUpdateStore();
-const activeTab = ref<"terminal" | "shortcuts" | "appShortcuts" | "ai" | "about">("terminal");
+const vaultStore = useVaultStore();
+const mcpStore = useMcpStore();
+const activeTab = ref<
+  "terminal" | "shortcuts" | "appShortcuts" | "ai" | "security" | "dataMigration" | "about"
+>("terminal");
+/** Tab 容器实例（切换 Tab 时把内容区滚动回顶部）。 */
+const tabsRef = ref<TabsInstance | null>(null);
 
 // --- 关于 / 更新 -----------------------------------------------------------
 
@@ -68,9 +80,12 @@ async function confirmInstall() {
   void updater.install();
 }
 
-// 切到关于页时按需加载应用信息与更新源。
+// 切到关于页时按需加载应用信息与更新源；切到数据迁移页时刷新保险库状态。
 watch(activeTab, (tab) => {
   if (tab === "about") loadAbout();
+  if (tab === "dataMigration") void vaultStore.refresh();
+  // 切换 Tab 后回到内容区顶部，避免停留在上个 Tab 的滚动位置。
+  tabsRef.value?.$el.querySelector(".el-tabs__content")?.scrollTo(0, 0);
 });
 async function loadAbout() {
   await updater.loadInfo();
@@ -168,8 +183,26 @@ function resetAppShortcuts() {
 // 终端表单（与 store 解耦的本地副本，点"应用"才写回）
 const termForm = reactive<TerminalSettings>({ ...settings.terminal });
 
-// AI 激活模型（value 为 `${kind}:${model}` 字符串）
-const activeValue = ref<string>("");
+/** 终端字体预设（等宽字体，value 为完整 font-family 栈，label 为显示名）。 */
+const FONT_PRESETS: { label: string; value: string }[] = [
+  { label: "Consolas（推荐）", value: "Consolas, 'Cascadia Code', 'Courier New', monospace" },
+  { label: "Cascadia Code", value: "'Cascadia Code', Consolas, monospace" },
+  { label: "Courier New", value: "'Courier New', monospace" },
+  { label: "JetBrains Mono", value: "'JetBrains Mono', Consolas, monospace" },
+  { label: "Fira Code", value: "'Fira Code', Consolas, monospace" },
+  { label: "Source Code Pro", value: "'Source Code Pro', Consolas, monospace" },
+  { label: "Menlo", value: "Menlo, Consolas, monospace" },
+  { label: "Monaco", value: "Monaco, Consolas, monospace" },
+  { label: "DejaVu Sans Mono", value: "'DejaVu Sans Mono', Consolas, monospace" },
+];
+
+/** 下拉选项：预设列表 + 旧版输入的自定义字体（不在预设中时保留显示，避免选中态丢失）。 */
+const fontOptions = computed(() => {
+  if (!termForm.fontFamily || FONT_PRESETS.some((f) => f.value === termForm.fontFamily)) {
+    return FONT_PRESETS;
+  }
+  return [...FONT_PRESETS, { label: `自定义：${termForm.fontFamily}`, value: termForm.fontFamily }];
+});
 
 // 添加/编辑 provider 弹窗
 const providerDialogVisible = ref(false);
@@ -187,6 +220,7 @@ const providerForm = reactive<{
   temperature: number | null;
   connectTimeoutSecs: number;
   readTimeoutSecs: number;
+  multimodal: boolean;
 }>({
   kind: ProviderKind.OpenAi,
   baseUrl: defaultBaseUrl(ProviderKind.OpenAi),
@@ -198,6 +232,7 @@ const providerForm = reactive<{
   temperature: null,
   connectTimeoutSecs: PROVIDER_DEFAULTS.connectTimeoutSecs,
   readTimeoutSecs: PROVIDER_DEFAULTS.readTimeoutSecs,
+  multimodal: false,
 });
 
 const providerRules: FormRules = {
@@ -272,40 +307,6 @@ function onProviderKindChange(kind: ProviderKindType) {
   }
 }
 
-// provider 列表选项（用于激活模型 select）
-const activeOptions = computed(() =>
-  settings.aiProviders.map((p) => ({
-    value: `${p.kind}:${p.model}`,
-    label: `${kindLabel(p.kind)} / ${p.model}`,
-  })),
-);
-
-// 当前激活模型同步到 select
-watch(
-  () => [settings.aiActive, settings.aiProviders] as const,
-  ([active]) => {
-    if (!active) {
-      activeValue.value = "";
-      return;
-    }
-    const [kind, model] = active.split(":");
-    // 校验是否仍存在于列表中
-    const exists = settings.aiProviders.some((p) => p.kind === kind && p.model === model);
-    activeValue.value = exists ? active : "";
-  },
-  { immediate: true },
-);
-
-async function onActiveChange(val: string) {
-  settings.aiActive = val || null;
-  try {
-    await settings.save();
-    ElMessage.success("已切换激活模型");
-  } catch (e: any) {
-    ElMessage.error("保存失败：" + (e?.message ?? String(e)));
-  }
-}
-
 function openProviderDialog() {
   editingIndex.value = null;
   providerForm.kind = ProviderKind.OpenAi;
@@ -318,6 +319,7 @@ function openProviderDialog() {
   providerForm.temperature = null;
   providerForm.connectTimeoutSecs = PROVIDER_DEFAULTS.connectTimeoutSecs;
   providerForm.readTimeoutSecs = PROVIDER_DEFAULTS.readTimeoutSecs;
+  providerForm.multimodal = false;
   providerDialogVisible.value = true;
 }
 
@@ -334,6 +336,7 @@ function openEditProvider(p: ProviderConfig, index: number) {
   providerForm.temperature = p.temperature ?? null;
   providerForm.connectTimeoutSecs = p.connectTimeoutSecs ?? PROVIDER_DEFAULTS.connectTimeoutSecs;
   providerForm.readTimeoutSecs = p.readTimeoutSecs ?? PROVIDER_DEFAULTS.readTimeoutSecs;
+  providerForm.multimodal = p.multimodal ?? false;
   providerDialogVisible.value = true;
 }
 
@@ -355,6 +358,7 @@ async function submitProvider() {
     temperature: providerForm.temperature,
     connectTimeoutSecs: providerForm.connectTimeoutSecs,
     readTimeoutSecs: providerForm.readTimeoutSecs,
+    multimodal: providerForm.multimodal,
   };
   if (editingIndex.value !== null) {
     // 编辑模式：按下标覆盖。
@@ -420,7 +424,7 @@ async function setActive(p: ProviderConfig) {
   settings.aiActive = `${p.kind}:${p.model}`;
   try {
     await settings.save();
-    ElMessage.success("已设为激活");
+    ElMessage.success(`已设为默认模型：${kindLabel(p.kind)} / ${p.model}`);
   } catch (e: any) {
     ElMessage.error("保存失败：" + (e?.message ?? String(e)));
   }
@@ -439,6 +443,31 @@ function toggleDarkClass(theme: string) {
   if (theme === "dark") root.classList.add("dark");
   else root.classList.remove("dark");
 }
+
+// 主题是否已修改但未点"应用"（本地副本与已持久化的 store 值不一致）。
+// 主题选择会立即预览（全局切换 dark class），但只有点"应用"才写入
+// settings.json——若未应用就离开，下次进入设置页会被真实值覆盖，
+// 表现为"设置了浅色又变回深色"。故离开前提醒。
+const themePending = computed(() => termForm.theme !== settings.terminal.theme);
+
+// 离开设置页时拦截：存在未应用的主题变更则弹窗确认，防止用户以为
+// 预览即已保存。选择"放弃更改"时同时撤销预览残留，恢复为已保存主题，
+// 否则整个应用会停留在未保存的预览主题上，下次进入设置页再次"跳变"。
+onBeforeRouteLeave(() => {
+  if (!themePending.value) return true;
+  const pending = termForm.theme === "dark" ? "深色" : "浅色";
+  const saved = settings.terminal.theme === "dark" ? "深色" : "浅色";
+  return ElMessageBox.confirm(
+    `主题已切换为「${pending}」但尚未应用，离开后将恢复为「${saved}」。是否放弃更改？`,
+    "主题未应用",
+    { type: "warning", confirmButtonText: "放弃更改", cancelButtonText: "留在设置页" },
+  )
+    .then(() => {
+      toggleDarkClass(settings.terminal.theme);
+      return true;
+    })
+    .catch(() => false);
+});
 
 async function applyTerminal() {
   settings.setTerminal({ ...termForm });
@@ -460,6 +489,17 @@ function resetTerminal() {
 function addShortcut() {
   settings.addShortcut();
 }
+
+/** 快捷命令按分组聚合（空分组归「默认」），用于分组展示。 */
+const shortcutGroupsView = computed(() => {
+  const map = new Map<string, ShortcutCommand[]>();
+  for (const sc of settings.shortcuts) {
+    const g = sc.group?.trim() || "";
+    if (!map.has(g)) map.set(g, []);
+    map.get(g)!.push(sc);
+  }
+  return [...map.entries()].map(([group, items]) => ({ group, items }));
+});
 
 function removeShortcut(id: string) {
   settings.removeShortcut(id);
@@ -543,6 +583,160 @@ async function saveSshSwitches() {
   }
 }
 
+/** 安全开关（启用锁定）切换后立即保存。 */
+async function saveSecuritySwitches() {
+  try {
+    await settings.save();
+    ElMessage.success(
+      settings.vaultLockEnabled ? "已启用锁定功能" : "已关闭锁定功能（导航栏隐藏锁定按钮）",
+    );
+  } catch (e: unknown) {
+    ElMessage.error("保存失败：" + String(e));
+  }
+}
+
+// --- 数据迁移（加密导入/导出） --------------------------------------------
+const exportPwd = ref("");
+const exportPwdConfirm = ref("");
+const exporting = ref(false);
+const importPwd = ref("");
+const importMode = ref<"merge" | "overwrite">("merge");
+const importing = ref(false);
+
+/** 备份文件名日期戳（YYYYMMDD）。 */
+function backupDateStamp(): string {
+  return new Date().toISOString().slice(0, 10).replaceAll("-", "");
+}
+
+/** 把摘要条目数格式化为展示文本。 */
+function countsLines(c: BackupInfo["counts"]): string[] {
+  const items: [string, number][] = [
+    ["SSH/远程会话", c.sessions],
+    ["会话分组", c.groups],
+    ["凭据（密码/私钥）", c.credentials],
+    ["数据库连接", c.dbProfiles],
+    ["数据库分组", c.dbGroups],
+    ["端口转发规则", c.forwardRules],
+    ["桌面连接（RDP/VNC）", c.desktops],
+    ["TOTP 验证码", c.totpSecrets],
+    ["文件账号（S3）", c.fileAccounts],
+  ];
+  const lines = items
+    .filter(([, n]) => n > 0)
+    .map(([name, n]) => `· ${name}：${n} 条`);
+  if (c.hasSettings) lines.push("· 应用设置（含 AI 密钥）");
+  if (c.hasMcp) lines.push("· MCP 服务配置");
+  return lines.length > 0 ? lines : ["（空备份）"];
+}
+
+/** 导出：选保存位置 → 后端聚合数据 → 加密写文件。 */
+async function doExport() {
+  const pwd = exportPwd.value;
+  if (pwd.length < 6) {
+    ElMessage.warning("备份密码至少 6 位");
+    return;
+  }
+  if (pwd !== exportPwdConfirm.value) {
+    ElMessage.warning("两次输入的密码不一致");
+    return;
+  }
+  const picked = await save({
+    title: "导出加密备份",
+    defaultPath: `x-term-backup-${backupDateStamp()}.xtermbackup`,
+    filters: [{ name: "X-Term 加密备份", extensions: ["xtermbackup"] }],
+  });
+  if (typeof picked !== "string" || !picked) return; // 用户取消
+
+  exporting.value = true;
+  try {
+    const summary = await backupApi.backupExport(picked, pwd);
+    ElMessage.success(`已导出：${countsLines(summary.counts).join("、")}`);
+    if (summary.credentialsSkipped > 0 || summary.totpSkipped > 0) {
+      ElMessage.warning(
+        `保险库未解锁，${summary.credentialsSkipped} 条凭据、${summary.totpSkipped} 条 TOTP 未包含在备份中；解锁后重新导出即可完整备份`,
+      );
+    }
+    exportPwd.value = "";
+    exportPwdConfirm.value = "";
+  } catch (e: any) {
+    ElMessage.error("导出失败：" + (e?.message ?? String(e)));
+  } finally {
+    exporting.value = false;
+  }
+}
+
+/** 导入：选文件 → 解密预览（校验密码）→ 确认 → 写入。 */
+async function doImport() {
+  const pwd = importPwd.value;
+  if (!pwd) {
+    ElMessage.warning("请输入备份密码");
+    return;
+  }
+  const picked = await open({
+    title: "选择备份文件导入",
+    multiple: false,
+    filters: [{ name: "X-Term 加密备份", extensions: ["xtermbackup"] }],
+  });
+  if (typeof picked !== "string" || !picked) return; // 用户取消
+
+  // 先解密预览：校验密码 + 展示文件内容（不写入任何数据）。
+  let info: BackupInfo;
+  try {
+    info = await backupApi.backupInspect(picked, pwd);
+  } catch (e: any) {
+    ElMessage.error("无法读取备份文件：" + (e?.message ?? String(e)));
+    return;
+  }
+
+  const lines = [
+    `文件：${picked}`,
+    `创建时间：${info.createdAt ? new Date(info.createdAt).toLocaleString() : "—"}`,
+    ...countsLines(info.counts),
+  ];
+  if (info.hasCredentials || info.hasTotp) {
+    lines.push(
+      vaultStore.unlocked
+        ? "⚠ 包含凭据与 TOTP，将使用当前保险库重新加密后导入"
+        : "⚠ 包含凭据与 TOTP，导入前需先解锁（或创建）凭据保险库",
+    );
+  }
+  if (importMode.value === "overwrite") {
+    lines.push("⚠ 覆盖模式：将清空本机现有会话/凭据等全部数据后写入，且不可撤销！");
+  }
+
+  try {
+    await ElMessageBox.confirm(
+      h(
+        "div",
+        { style: "line-height:1.9" },
+        lines.map((l, i) => h("div", { key: i }, l)),
+      ),
+      `确认${importMode.value === "overwrite" ? "覆盖导入" : "合并导入"}？`,
+      {
+        type: importMode.value === "overwrite" ? "warning" : "info",
+        confirmButtonText: "开始导入",
+        cancelButtonText: "取消",
+      },
+    );
+  } catch {
+    return; // 用户取消
+  }
+
+  importing.value = true;
+  try {
+    const summary = await backupApi.backupImport(picked, pwd, importMode.value);
+    // 刷新本地状态：设置 + MCP 配置（会话/数据库等列表在各自页面下次进入时重新加载）。
+    await settings.load();
+    await mcpStore.loadAll();
+    ElMessage.success(`导入完成：${countsLines(summary.counts).join("、")}`);
+    importPwd.value = "";
+  } catch (e: any) {
+    ElMessage.error("导入失败：" + (e?.message ?? String(e)));
+  } finally {
+    importing.value = false;
+  }
+}
+
 /** 把 SSH 白名单 textarea 文本同步到 store（去空行/去空白）。 */
 async function saveWhitelist() {
   const list = whitelistText.value
@@ -600,6 +794,13 @@ function runModeDesc(mode: ToolRunMode, agent: "ssh" | "sql"): string {
   return map[agent][mode];
 }
 
+/** 运行模式 / SQL 模式当前值的说明（悬浮帮助，随选择动态变化）。 */
+const sshRunModeHint = computed(() => runModeDesc(settings.sshAgent.runMode, "ssh"));
+const sqlRunModeHint = computed(() => runModeDesc(settings.sqlAgent.runMode, "sql"));
+const sqlModeHint = computed(
+  () => SQL_MODE_OPTIONS.find((o) => o.value === settings.sqlAgent.sqlMode)?.desc ?? "",
+);
+
 // --- 本地文件读写：开关 + 工作目录 ----------------------------------------
 /** 文件读写开关切换后立即保存。 */
 async function saveFileAccessSwitch() {
@@ -656,87 +857,118 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
       <h2><el-icon><Setting /></el-icon> 设置</h2>
     </div>
 
-    <el-tabs v-model="activeTab" class="settings-tabs">
+    <el-tabs v-model="activeTab" ref="tabsRef" class="settings-tabs">
       <!-- ============ 终端 ============ -->
       <el-tab-pane label="终端" name="terminal">
-        <div class="form-card">
-          <el-form :model="termForm" label-width="140px" label-position="right">
-            <el-form-item label="主题">
-              <el-select v-model="termForm.theme" style="width: 220px">
-                <el-option label="深色 (dark)" value="dark" />
-                <el-option label="浅色 (light)" value="light" />
-              </el-select>
-            </el-form-item>
+        <div class="card-grid">
+          <div class="form-card">
+            <div class="card-title">外观</div>
+            <el-form :model="termForm" label-width="100px" label-position="right">
+              <el-form-item label="主题">
+                <el-select v-model="termForm.theme" style="width: 160px">
+                  <el-option label="深色 (dark)" value="dark" />
+                  <el-option label="浅色 (light)" value="light" />
+                </el-select>
+              </el-form-item>
 
-            <el-form-item label="字体">
-              <el-input
-                v-model="termForm.fontFamily"
-                placeholder="Consolas, 'Cascadia Code', monospace"
-                style="width: 360px"
-              />
-            </el-form-item>
+              <el-form-item label="字体">
+                <el-select v-model="termForm.fontFamily" style="width: 220px">
+                  <el-option v-for="f in fontOptions" :key="f.value" :label="f.label" :value="f.value" />
+                </el-select>
+              </el-form-item>
 
-            <el-form-item label="字号">
-              <el-input-number v-model="termForm.fontSize" :min="10" :max="24" controls-position="right" />
-            </el-form-item>
+              <el-form-item label="字号">
+                <el-input-number v-model="termForm.fontSize" :min="10" :max="24" controls-position="right" />
+              </el-form-item>
 
-            <el-form-item label="行高">
-              <el-input-number
-                v-model="termForm.lineHeight"
-                :min="1.0"
-                :max="2.0"
-                :step="0.1"
-                :precision="1"
-                controls-position="right"
-              />
-            </el-form-item>
+              <el-form-item label="行高">
+                <el-input-number
+                  v-model="termForm.lineHeight"
+                  :min="1.0"
+                  :max="2.0"
+                  :step="0.1"
+                  :precision="1"
+                  controls-position="right"
+                />
+              </el-form-item>
 
-            <el-form-item label="滚屏行数">
-              <el-input-number v-model="termForm.scrollback" :min="100" :max="100000" :step="1000" controls-position="right" />
-            </el-form-item>
+              <el-form-item label="滚屏行数">
+                <el-input-number v-model="termForm.scrollback" :min="100" :max="100000" :step="1000" controls-position="right" />
+              </el-form-item>
 
-            <el-form-item label="选中即复制">
-              <el-switch v-model="termForm.copyOnSelect" />
-            </el-form-item>
+              <el-form-item label="选中即复制">
+                <el-switch v-model="termForm.copyOnSelect" />
+              </el-form-item>
 
-            <el-form-item label="启用 WebGL 渲染">
-              <el-switch v-model="termForm.enableWebgl" />
-            </el-form-item>
+              <el-form-item label="启用WebGL">
+                <el-switch v-model="termForm.enableWebgl" />
+              </el-form-item>
+            </el-form>
+          </div>
 
-            <el-form-item label="SSH 空闲断开">
-              <el-input-number
-                v-model="termForm.sshIdleTimeoutMinutes"
-                :min="0"
-                :max="1440"
-                controls-position="right"
-              />
-              <span style="margin-left: 8px; color: var(--el-text-color-secondary); font-size: 13px">
-                分钟，0 表示永不自动断开
-              </span>
-            </el-form-item>
+          <div class="form-card">
+            <div class="card-title">连接</div>
+            <el-form :model="termForm" label-width="100px" label-position="right">
+              <el-form-item label="SSH 空闲断开">
+                <el-input-number
+                  v-model="termForm.sshIdleTimeoutMinutes"
+                  :min="0"
+                  :max="1440"
+                  controls-position="right"
+                />
+                <span class="unit-hint">分钟</span>
+                <HelpTip content="0 表示永不自动断开" />
+              </el-form-item>
 
-            <el-form-item>
-              <el-button type="primary" @click="applyTerminal">应用</el-button>
-              <el-button @click="resetTerminal">重置</el-button>
-            </el-form-item>
-          </el-form>
+              <el-form-item label="SSH 保活间隔">
+                <el-input-number
+                  v-model="termForm.sshKeepaliveSecs"
+                  :min="0"
+                  :max="3600"
+                  controls-position="right"
+                />
+                <span class="unit-hint">秒</span>
+                <HelpTip content="0 表示不发送保活包（建议保持默认 30）" />
+              </el-form-item>
+
+              <el-form-item label="SSH 连接超时">
+                <el-input-number
+                  v-model="termForm.sshConnectTimeoutSecs"
+                  :min="0"
+                  :max="600"
+                  controls-position="right"
+                />
+                <span class="unit-hint">秒</span>
+                <HelpTip content="0 表示永不超时" />
+              </el-form-item>
+            </el-form>
+          </div>
+        </div>
+        <div class="card-actions">
+          <el-button type="primary" @click="applyTerminal">应用</el-button>
+          <el-button @click="resetTerminal">重置</el-button>
         </div>
       </el-tab-pane>
 
       <!-- ============ 快捷命令 / 快捷键 ============ -->
-      <el-tab-pane label="快捷命令" name="shortcuts">
-        <div class="tab-section">
-          <div class="section-desc">
-            配置终端底部快捷命令栏与全局快捷键。点击按钮或按下快捷键即向当前活动终端发送命令。
-            <br />支持占位符：<code>{"{host}"}</code>、<code>{"{user}"}</code>、<code>{"{port}"}</code>（按当前会话替换）。
-          </div>
-
+      <el-tab-pane name="shortcuts">
+        <template #label>
+          快捷命令
+          <HelpTip :size="12">
+            <template #content>
+              配置终端底部快捷命令栏与全局快捷键。点击按钮或按下快捷键即向当前活动终端发送命令。
+              <br />支持占位符：<code>{"{host}"}</code>、<code>{"{user}"}</code>、<code>{"{port}"}</code>（按当前会话替换）。
+            </template>
+          </HelpTip>
+        </template>
           <div class="shortcut-list">
-            <div
-              v-for="sc in settings.shortcuts"
-              :key="sc.id"
-              class="shortcut-row"
-            >
+            <template v-for="gv in shortcutGroupsView" :key="gv.group || '__default__'">
+              <div class="shortcut-group-title">{{ gv.group || "默认" }}</div>
+              <div
+                v-for="sc in gv.items"
+                :key="sc.id"
+                class="shortcut-row"
+              >
               <el-input
                 v-model="sc.label"
                 placeholder="显示名称"
@@ -784,6 +1016,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
                 <el-icon><Delete /></el-icon>
               </el-button>
             </div>
+            </template>
             <div v-if="settings.shortcuts.length === 0" class="empty-tip">
               暂无快捷命令。
             </div>
@@ -795,17 +1028,19 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
               保存快捷命令
             </el-button>
           </div>
-        </div>
       </el-tab-pane>
 
-      <!-- ============ 快捷键（应用级） ============ -->
-      <el-tab-pane label="快捷键" name="appShortcuts">
-        <div class="tab-section">
-          <div class="section-desc">
-            自定义应用级快捷键。点击右侧输入框开始录制，按下组合键即可绑定；
-            <b>Esc</b> 取消录制，<b>Backspace</b> 清除当前绑定。冲突会高亮提示。
-          </div>
-
+      <!-- ============ 快捷命令 / 快捷键 ============ -->
+      <el-tab-pane name="appShortcuts">
+        <template #label>
+          快捷键
+          <HelpTip :size="12">
+            <template #content>
+              自定义应用级快捷键。点击右侧输入框开始录制，按下组合键即可绑定；
+              <b>Esc</b> 取消录制，<b>Backspace</b> 清除当前绑定。冲突会高亮提示。
+            </template>
+          </HelpTip>
+        </template>
           <div class="app-shortcut-list">
             <div
               v-for="row in appRows"
@@ -856,11 +1091,10 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
               保存快捷键
             </el-button>
           </div>
-        </div>
       </el-tab-pane>
 
       <!-- ============ AI 助手 ============ -->
-      <el-tab-pane label="AI 助手" name="ai">
+      <el-tab-pane label="AI 助手" name="ai" class="ai-pane">
         <el-alert
           class="ai-tip"
           type="warning"
@@ -869,31 +1103,19 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
           title="AI 数据会上传到所选模型服务，请勿输入敏感信息"
         />
 
-        <div class="form-card">
-          <el-form label-width="140px" label-position="right">
-            <el-form-item label="当前激活模型">
-              <el-select
-                v-model="activeValue"
-                placeholder="未选择"
-                style="width: 360px"
-                @change="onActiveChange"
-              >
-                <el-option
-                  v-for="opt in activeOptions"
-                  :key="opt.value"
-                  :label="opt.label"
-                  :value="opt.value"
-                />
-              </el-select>
-              <el-button class="ml" type="primary" plain @click="openProviderDialog">
-                添加 Provider
-              </el-button>
-            </el-form-item>
-          </el-form>
-        </div>
-
-        <div class="form-card no-pad">
-          <el-table :data="settings.aiProviders" empty-text="尚未添加任何 provider" stripe>
+        <div class="form-card no-pad span-full">
+          <div class="table-head">
+            <span class="table-title">模型列表</span>
+            <el-button size="small" type="primary" plain :icon="Plus" @click="openProviderDialog">
+              添加 Provider
+            </el-button>
+          </div>
+          <el-table
+            :data="settings.aiProviders"
+            empty-text="尚未添加任何 provider"
+            stripe
+            max-height="460"
+          >
             <el-table-column label="类型" width="160">
               <template #default="{ row }">{{ kindLabel(row.kind) }}</template>
             </el-table-column>
@@ -907,6 +1129,9 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
             <el-table-column label="模型" min-width="160">
               <template #default="{ row }">
                 <span class="mono">{{ row.model }}</span>
+                <el-tag v-if="row.multimodal" type="warning" size="small" effect="plain" class="mm-tag">
+                  多模态
+                </el-tag>
               </template>
             </el-table-column>
 
@@ -944,10 +1169,11 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
               <template #default="{ row, $index }">
                 <el-button
                   size="small"
+                  :type="settings.aiActive === `${row.kind}:${row.model}` ? 'success' : 'primary'"
                   :disabled="settings.aiActive === `${row.kind}:${row.model}`"
                   @click="setActive(row)"
                 >
-                  设为激活
+                  {{ settings.aiActive === `${row.kind}:${row.model}` ? "已激活" : "设为激活" }}
                 </el-button>
                 <el-button size="small" @click="openEditProvider(row, $index)">
                   编辑
@@ -962,15 +1188,15 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
 
         <!-- SSH 智能体配置 -->
         <div class="form-card">
-          <div class="card-title">SSH 智能体（终端命令执行）</div>
-          <div class="card-desc">
-            控制 AI 在 SSH 终端上执行命令的行为：运行模式、白名单、可视化。
+          <div class="card-title">
+            SSH 智能体（终端命令执行）
+            <HelpTip content="控制 AI 在 SSH 终端上执行命令的行为：运行模式、白名单、可视化。" />
           </div>
           <div class="switch-row">
             <div class="switch-label">
-              <div>运行模式</div>
-              <div class="switch-desc">
-                控制 AI 执行命令前是否需要你确认。
+              <div>
+                运行模式
+                <HelpTip :content="sshRunModeHint" />
               </div>
             </div>
             <el-select
@@ -986,23 +1212,21 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
               />
             </el-select>
           </div>
-          <div class="mode-desc">
-            {{ runModeDesc(settings.sshAgent.runMode, "ssh") }}
-          </div>
           <div class="switch-row">
             <div class="switch-label">
-              <div>终端可视化执行</div>
-              <div class="switch-desc">
-                开启后，AI 执行的命令会<strong>写入活动终端</strong>，命令和输出
-                实时显示在终端窗口（像 AI 在终端里敲命令）。关闭则走后台独立执行，
-                输出只在 AI 面板。
+              <div>
+                终端可视化执行
+                <HelpTip content="开启后，AI 执行的命令会写入活动终端，命令和输出实时显示在终端窗口（像 AI 在终端里敲命令）。关闭则走后台独立执行，输出只在 AI 面板。" />
               </div>
             </div>
             <el-switch v-model="settings.sshAgent.terminalVisualization" @change="saveSshSwitches" />
           </div>
-          <div class="card-title" style="margin-top: 16px; font-size: 13px">命令白名单</div>
-          <div class="card-desc">
-            允许 AI 在服务器上<strong>免确认</strong>执行的命令前缀（每行一条）。
+          <div class="card-title" style="margin-top: 16px; font-size: 13px">
+            命令白名单
+            <HelpTip content="允许 AI 在服务器上免确认执行的命令前缀（每行一条）。" />
+          </div>
+          <!-- 安全规则：保持直接展示，不收进 tooltip -->
+          <div class="card-desc warn">
             注意：含 shell 元字符（<code>; &amp; | &gt; &lt; ` $()</code>）的命令
             <strong>永不</strong>算白名单内——防止 <code>ls; rm -rf /</code> 绕过。
           </div>
@@ -1021,80 +1245,73 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
 
         <!-- SQL 智能体配置 -->
         <div class="form-card">
-          <div class="card-title">SQL 智能体（数据库语句执行）</div>
-          <div class="card-desc">
-            控制 AI 在 MySQL 上执行 SQL 的行为：执行模式与运行模式。
+          <div class="card-title">
+            SQL 智能体（数据库语句执行）
+            <HelpTip content="控制 AI 在 MySQL 上执行 SQL 的行为：执行模式与运行模式。" />
           </div>
-          <div class="switch-row">
-            <div class="switch-label">
-              <div>SQL 执行模式</div>
-              <div class="switch-desc">
-                限制 AI 可执行的 SQL 类型。模式越严格越安全。
+            <div class="switch-row">
+              <div class="switch-label">
+                <div>
+                  运行模式
+                  <HelpTip :content="sqlRunModeHint" />
+                </div>
               </div>
+              <el-select
+                v-model="settings.sqlAgent.runMode"
+                style="width: 140px"
+                @change="saveSqlSwitches"
+              >
+                <el-option
+                  v-for="opt in RUN_MODE_OPTIONS"
+                  :key="opt.value"
+                  :label="opt.label"
+                  :value="opt.value"
+                />
+              </el-select>
             </div>
-            <el-select
-              v-model="settings.sqlAgent.sqlMode"
-              style="width: 140px"
-              @change="saveSqlSwitches"
-            >
-              <el-option
-                v-for="opt in SQL_MODE_OPTIONS"
-                :key="opt.value"
-                :label="opt.label"
-                :value="opt.value"
-              />
-            </el-select>
-          </div>
-          <div class="mode-desc">
-            {{ SQL_MODE_OPTIONS.find((o) => o.value === settings.sqlAgent.sqlMode)?.desc }}
-          </div>
-          <div class="switch-row" style="margin-top: 12px">
-            <div class="switch-label">
-              <div>运行模式</div>
-              <div class="switch-desc">
-                控制 AI 执行 SQL 前是否需要你确认。
+            <div class="switch-row">
+              <div class="switch-label">
+                <div>
+                  终端可视化执行
+                  <HelpTip content="开启后，AI 执行的 SQL 及其结果回显到 SQL 控制台（命令行模式），就像你手动执行一样。关闭则结果只在 AI 面板。与终端助手的可视化独立设置。" />
+                </div>
               </div>
+              <el-switch v-model="settings.sqlAgent.terminalVisualization" @change="saveSqlSwitches" />
             </div>
-            <el-select
-              v-model="settings.sqlAgent.runMode"
-              style="width: 140px"
-              @change="saveSqlSwitches"
-            >
-              <el-option
-                v-for="opt in RUN_MODE_OPTIONS"
-                :key="opt.value"
-                :label="opt.label"
-                :value="opt.value"
-              />
-            </el-select>
-          </div>
-          <div class="mode-desc">
-            {{ runModeDesc(settings.sqlAgent.runMode, "sql") }}
-          </div>
-          <div class="switch-row" style="margin-top: 12px">
-            <div class="switch-label">
-              <div>终端可视化执行</div>
-              <div class="switch-desc">
-                开启后，AI 执行的 SQL 及其结果<strong>回显到 SQL 控制台</strong>（命令行模式），
-                就像你手动执行一样。关闭则结果只在 AI 面板。与终端助手的可视化独立设置。
+            <div class="switch-row">
+              <div class="switch-label">
+                <div>
+                  SQL 执行模式
+                  <HelpTip :content="sqlModeHint" />
+                </div>
               </div>
+              <el-select
+                v-model="settings.sqlAgent.sqlMode"
+                style="width: 140px"
+                @change="saveSqlSwitches"
+              >
+                <el-option
+                  v-for="opt in SQL_MODE_OPTIONS"
+                  :key="opt.value"
+                  :label="opt.label"
+                  :value="opt.value"
+                />
+              </el-select>
             </div>
-            <el-switch v-model="settings.sqlAgent.terminalVisualization" @change="saveSqlSwitches" />
-          </div>
         </div>
 
         <!-- 本地文件读写 -->
-        <div class="form-card">
-          <div class="card-title">本地文件读写</div>
-          <div class="card-desc">
-            开启后，AI 可在各助手的工作目录内<strong>自动读写文件</strong>（读取数据文件、
-            导出查询结果为 CSV/SQL 等）。AI 只能访问工作目录及子目录（沙箱），
-            写文件覆盖已有文件仍需人工确认。关闭时 AI 无法访问本地文件。
+        <div class="form-card span-full">
+          <div class="card-title">
+            本地文件读写
+            <HelpTip content="开启后，AI 可在各助手的工作目录内自动读写文件（读取数据文件、导出查询结果为 CSV/SQL 等）。AI 只能访问工作目录及子目录（沙箱），写文件覆盖已有文件仍需人工确认。关闭时 AI 无法访问本地文件。" />
           </div>
-          <div class="switch-row" style="margin-top: 12px">
+          <div class="switch-row">
             <div class="switch-label">
-              <div>启用本地文件读写</div>
-              <div class="switch-desc">关闭时 AI 行为与之前完全一致。</div>
+              <div>
+                启用本地文件读写
+                <HelpTip content="关闭时 AI 行为与之前完全一致。" />
+              </div>
             </div>
             <el-switch v-model="settings.fileAccess.enabled" @change="saveFileAccessSwitch" />
           </div>
@@ -1105,9 +1322,9 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
               class="workspace-row"
             >
               <div class="switch-label">
-                <div>{{ d === "ssh" ? "终端助手" : "数据库助手" }}工作目录</div>
-                <div class="switch-desc">
-                  AI 读写文件的根目录（可读写其子目录）。未设置时 AI 无法使用文件工具。
+                <div>
+                  {{ d === "ssh" ? "终端助手" : "数据库助手" }}工作目录
+                  <HelpTip content="AI 读写文件的根目录（可读写其子目录）。未设置时 AI 无法使用文件工具。" />
                 </div>
               </div>
               <div class="workspace-picker">
@@ -1119,7 +1336,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
                   :close-icon="Delete"
                   @close="clearWorkspaceDir(d)"
                 >
-                  {{ settings.fileAccess.workspaceDirs[d] ?? "未设置" }}
+                  <span class="path-text">{{ settings.fileAccess.workspaceDirs[d] ?? "未设置" }}</span>
                 </el-tag>
                 <el-button size="small" :icon="Folder" @click="pickWorkspaceDir(d)">
                   {{ settings.fileAccess.workspaceDirs[d] ? "更改" : "选择目录" }}
@@ -1170,9 +1387,18 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
               <el-input v-model="providerForm.model" placeholder="例如 gpt-4o-mini" />
             </el-form-item>
 
+            <el-form-item label="多模态">
+              <el-switch v-model="providerForm.multimodal" />
+              <span class="muted form-hint">开启后终端助手 / 数据库助手可附带图片提问</span>
+            </el-form-item>
+
             <el-divider content-position="left">模型参数</el-divider>
 
-            <el-form-item label="最大输出" prop="maxOutput">
+            <el-form-item prop="maxOutput">
+              <template #label>
+                最大输出
+                <HelpTip content="tokens（请求体 max_tokens）" />
+              </template>
               <el-input-number
                 v-model="providerForm.maxOutput"
                 :min="1"
@@ -1180,10 +1406,13 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
                 :step="1024"
                 style="width: 180px"
               />
-              <span class="muted form-hint">tokens（请求体 max_tokens）</span>
             </el-form-item>
 
-            <el-form-item label="上下文大小" prop="contextWindow">
+            <el-form-item prop="contextWindow">
+              <template #label>
+                上下文大小
+                <HelpTip content="tokens，超出部分的历史消息会被裁剪" />
+              </template>
               <el-input-number
                 v-model="providerForm.contextWindow"
                 :min="1"
@@ -1191,20 +1420,26 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
                 :step="4096"
                 style="width: 180px"
               />
-              <span class="muted form-hint">tokens，超出部分的历史消息会被裁剪</span>
             </el-form-item>
 
-            <el-form-item label="工具调用数" prop="maxToolCalls">
+            <el-form-item prop="maxToolCalls">
+              <template #label>
+                工具调用数
+                <HelpTip content="智能体模式单次对话的最大工具调用数" />
+              </template>
               <el-input-number
                 v-model="providerForm.maxToolCalls"
                 :min="1"
                 :max="1000"
                 style="width: 180px"
               />
-              <span class="muted form-hint">智能体模式单次对话的最大工具调用数</span>
             </el-form-item>
 
-            <el-form-item label="温度" prop="temperature">
+            <el-form-item prop="temperature">
+              <template #label>
+                温度
+                <HelpTip content="采样温度，留空表示不发送" />
+              </template>
               <el-input-number
                 v-model="providerForm.temperature"
                 :min="0"
@@ -1215,27 +1450,32 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
                 placeholder="留空由服务端默认"
                 style="width: 180px"
               />
-              <span class="muted form-hint">采样温度，留空表示不发送</span>
             </el-form-item>
 
-            <el-form-item label="建连超时" prop="connectTimeoutSecs">
+            <el-form-item prop="connectTimeoutSecs">
+              <template #label>
+                建连超时
+                <HelpTip content="秒，DNS 解析/建连最长等待" />
+              </template>
               <el-input-number
                 v-model="providerForm.connectTimeoutSecs"
                 :min="1"
                 :max="3600"
                 style="width: 180px"
               />
-              <span class="muted form-hint">秒，DNS 解析/建连最长等待</span>
             </el-form-item>
 
-            <el-form-item label="读取超时" prop="readTimeoutSecs">
+            <el-form-item prop="readTimeoutSecs">
+              <template #label>
+                读取超时
+                <HelpTip content="秒，流式响应间隔最长等待；长思考模型需调大" />
+              </template>
               <el-input-number
                 v-model="providerForm.readTimeoutSecs"
                 :min="1"
                 :max="3600"
                 style="width: 180px"
               />
-              <span class="muted form-hint">秒，流式响应间隔最长等待；长思考模型需调大</span>
             </el-form-item>
           </el-form>
 
@@ -1246,6 +1486,100 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
             </el-button>
           </template>
         </el-dialog>
+      </el-tab-pane>
+
+      <!-- ============ 安全 ============ -->
+      <el-tab-pane label="安全" name="security">
+        <div class="form-card">
+          <div class="card-title">
+            保险库与锁定
+            <HelpTip content="凭据保险库用主密码保护所有保存的密码与私钥，解锁状态保存在应用进程内。" />
+          </div>
+          <div class="switch-row">
+            <div class="switch-label">
+              <div>
+                启用锁定功能
+                <HelpTip content="开启后，左侧导航栏底部显示「锁定」按钮。点击锁定即清除内存中的主密钥，需重新输入主密码才能解锁。已建立的连接（终端 / SFTP / 隧道 / 数据库）不受影响，可继续使用。" />
+              </div>
+            </div>
+            <el-switch v-model="settings.vaultLockEnabled" @change="saveSecuritySwitches" />
+          </div>
+          <div class="mode-desc">
+            说明：解锁状态只保存在应用进程内存中——刷新 / 重开窗口<strong>不会</strong>
+            要求重新登录；<strong>重启应用</strong>或点击「锁定」后才需重新输入主密码。
+            关闭本开关仅隐藏锁定按钮，重启后仍需解锁（主密钥从不落盘）。
+          </div>
+        </div>
+      </el-tab-pane>
+
+      <!-- ============ 数据迁移 ============ -->
+      <el-tab-pane label="数据迁移" name="dataMigration">
+        <div class="card-grid">
+          <!-- 导出 -->
+          <div class="form-card">
+            <div class="card-title">
+              导出加密备份
+              <HelpTip content="将会话、数据库连接、凭据（密码/私钥）、TOTP、转发规则、桌面连接、文件账号、应用设置与 MCP 配置导出为加密备份文件（.xtermbackup）。文件使用独立的备份密码（Argon2id + AES-256-GCM）加密，可安全转移到其他机器。" />
+            </div>
+            <div class="backup-pwd-row">
+              <el-input
+                v-model="exportPwd"
+                type="password"
+                show-password
+                placeholder="备份密码（至少 6 位）"
+                @keyup.enter="doExport"
+              />
+              <el-input
+                v-model="exportPwdConfirm"
+                type="password"
+                show-password
+                placeholder="确认备份密码"
+                @keyup.enter="doExport"
+              />
+            </div>
+            <div v-if="!vaultStore.unlocked" class="mode-desc">
+              提示：当前<strong>未解锁保险库</strong>，凭据（密码/私钥）与 TOTP 将
+              <strong>不包含</strong>在备份中；如需完整备份，请先在「安全」页解锁保险库。
+            </div>
+            <div class="backup-actions">
+              <el-button type="primary" :loading="exporting" :icon="Download" @click="doExport">
+                导出到文件…
+              </el-button>
+            </div>
+          </div>
+
+          <!-- 导入 -->
+          <div class="form-card">
+            <div class="card-title">
+              从备份导入
+              <HelpTip content="选择之前导出的加密备份文件并输入对应的备份密码。合并导入按 id 覆盖同名条目、保留本机其他数据；覆盖导入会先清空本机相关数据再完整恢复（同一事务，失败自动回滚）。" />
+            </div>
+            <div class="backup-pwd-row">
+              <el-input
+                v-model="importPwd"
+                type="password"
+                show-password
+                placeholder="备份密码"
+                @keyup.enter="doImport"
+              />
+              <el-radio-group v-model="importMode" class="backup-mode">
+                <el-radio value="merge">合并导入</el-radio>
+                <el-radio value="overwrite">覆盖导入</el-radio>
+              </el-radio-group>
+            </div>
+            <div class="backup-actions">
+              <!-- 覆盖导入是危险操作，按钮随模式切换为红色提示 -->
+              <el-button
+                :type="importMode === 'overwrite' ? 'danger' : 'primary'"
+                :loading="importing"
+                :icon="Upload"
+                @click="doImport"
+              >
+                选择文件导入…
+              </el-button>
+            </div>
+          </div>
+        </div>
       </el-tab-pane>
 
       <!-- ============ 关于 ============ -->
@@ -1330,7 +1664,6 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
           <div class="form-card about-meta">
             <div class="about-card-title">技术信息</div>
             <div class="about-meta-grid">
-              <span class="k">Tauri</span><span class="v">v{{ updater.info?.tauriVersion ?? "—" }}</span>
               <span class="k">平台</span><span class="v">Windows x64</span>
               <span class="k">数据目录</span><span class="v">{{ updater.info?.dataDir ?? "—" }}</span>
             </div>
@@ -1362,13 +1695,12 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
   gap: 8px;
 }
 
+/* 顶部 Tab 导航 + 下方内容区滚动 */
 .settings-tabs {
   flex: 1;
   min-height: 0;
   display: flex;
-  flex-direction: column;
 }
-/* 让 el-tabs 内容区滚动（tab header 固定，内容超出时滚动） */
 .settings-tabs :deep(.el-tabs__header) {
   margin: 0;
   flex-shrink: 0;
@@ -1381,11 +1713,38 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
 }
 
 .form-card {
-  background: var(--el-bg-color);
-  border: 1px solid var(--el-border-color-light);
+  background: var(--el-bg-color-overlay);
+  border: 1px solid var(--el-border-color-lighter);
   border-radius: 8px;
-  padding: 24px;
+  padding: 20px;
   margin-bottom: 16px;
+}
+
+/* 多卡片网格布局（两列并排，窄屏回退单列）。AI 助手 Tab 复用同一网格。 */
+.card-grid,
+.ai-pane {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+  gap: 16px;
+}
+.card-grid {
+  margin-bottom: 16px;
+}
+.card-grid .form-card,
+.ai-pane .form-card {
+  margin-bottom: 0;
+}
+.card-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* AI 助手 Tab：SSH / SQL 配置卡片两列并排，其余横跨整行 */
+.ai-pane .ai-tip {
+  margin-bottom: 0;
+}
+.ai-pane .span-full {
+  grid-column: 1 / -1;
 }
 
 .form-card.no-pad {
@@ -1397,8 +1756,17 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
   margin-bottom: 16px;
 }
 
-.ml {
-  margin-left: 12px;
+/* 表格卡片头部（标题 + 操作按钮） */
+.table-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+}
+.table-title {
+  font-size: 14px;
+  font-weight: 600;
 }
 
 .mono {
@@ -1416,10 +1784,22 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
   color: var(--el-text-color-placeholder);
 }
 
-/* 表单输入框右侧的说明文字。 */
+/* 表单行内辅助说明（如多模态开关旁的解释文字）。 */
 .form-hint {
   margin-left: 10px;
   font-size: 12px;
+}
+
+/* 模型列表中的「多模态」标签。 */
+.mm-tag {
+  margin-left: 6px;
+}
+
+/* 终端表单：输入框后的单位文字。 */
+.unit-hint {
+  margin-left: 8px;
+  color: var(--el-text-color-secondary);
+  font-size: 13px;
 }
 
 .card-title {
@@ -1432,12 +1812,12 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
   line-height: 1.6;
   color: var(--el-text-color-secondary);
 }
-/* SQL 模式说明（选择框下方）。 */
+/* SQL 模式说明 / 安全提示等段落说明。 */
 .mode-desc {
-  font-size: 11px;
-  color: var(--el-text-color-placeholder);
-  margin: 4px 0 0 156px; /* 与 switch-label 右侧对齐 */
-  line-height: 1.5;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  margin: 8px 0 0;
+  line-height: 1.6;
 }
 .card-desc code {
   background: var(--el-fill-color-light);
@@ -1445,26 +1825,41 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
   border-radius: 3px;
   font-size: 11px;
 }
+/* 安全规则类说明：保持直接展示。 */
+.card-desc.warn {
+  color: var(--el-color-warning);
+}
+/* 数据迁移：密码输入行与操作按钮行。 */
+.backup-pwd-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 14px;
+}
+/* 密码框弹性均分宽度，卡片变窄时自动收缩 */
+.backup-pwd-row :deep(.el-input) {
+  min-width: 0;
+}
+.backup-mode {
+  flex-shrink: 0;
+}
+.backup-actions {
+  margin-top: 14px;
+}
 .switch-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 8px 0;
-  border-top: 1px solid var(--el-border-color-lighter);
+  padding: 12px 0;
 }
-.switch-row:first-of-type {
-  border-top: none;
+/* 分隔线只出现在相邻开关行之间（卡片标题后的首行无线） */
+.switch-row + .switch-row {
+  border-top: 1px solid var(--el-border-color-lighter);
 }
 .switch-label > div:first-child {
   font-size: 13px;
   font-weight: 500;
-}
-.switch-desc {
-  font-size: 12px;
-  line-height: 1.5;
-  color: var(--el-text-color-secondary);
-  margin-top: 2px;
 }
 
 /* 本地文件读写：工作目录选择行 */
@@ -1485,10 +1880,17 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
 }
 .workspace-path {
   max-width: 320px;
-  overflow: hidden;
-  text-overflow: ellipsis;
   font-family: "Consolas", "Cascadia Code", monospace;
   font-size: 12px;
+}
+/* el-tag 是 inline-flex，text-overflow 在它身上不生效；截断放到内部 span。
+   限宽 300px 为关闭按钮留空间。 */
+.workspace-path .path-text {
+  display: block;
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* --- 快捷命令 tab --- */
@@ -1497,6 +1899,16 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
   flex-direction: column;
   gap: 8px;
   margin: 12px 0;
+}
+.shortcut-group-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--el-text-color-secondary);
+  margin: 12px 0 2px;
+  padding-left: 2px;
+}
+.shortcut-group-title:first-child {
+  margin-top: 0;
 }
 .shortcut-row {
   display: flex;
@@ -1605,7 +2017,8 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
 
 /* --- 关于页 --- */
 .about-page {
-  max-width: 640px;
+  max-width: 720px;
+  margin: 0 auto;
 }
 .about-brand {
   display: flex;
@@ -1623,8 +2036,9 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
   justify-content: center;
   font-size: 34px;
   font-weight: 700;
-  color: #fff;
-  background: linear-gradient(135deg, var(--el-color-primary), var(--el-color-primary-light-3));
+  color: var(--el-color-white);
+  /* 终点用 dark-2：浅色主题下 light-3 接近白色，白字对比度不足 */
+  background: linear-gradient(135deg, var(--el-color-primary), var(--el-color-primary-dark-2));
   margin-bottom: 8px;
 }
 .about-name {

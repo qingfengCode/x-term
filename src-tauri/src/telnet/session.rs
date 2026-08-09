@@ -60,6 +60,23 @@ impl TelnetSession {
         }
     }
 
+    /// 取终端输出的完整快照（整个环形缓冲）。与 [`SshSession::full_snapshot`]
+    /// 对齐，供 AI 可视化命令的哨兵检测/截取使用。
+    pub fn full_snapshot(&self) -> String {
+        match self.output_buffer.lock() {
+            Ok(buf) => buf.snapshot(usize::MAX),
+            Err(_) => String::new(),
+        }
+    }
+
+    /// 累计写入字节数（不受环形截断影响），判断"输出是否仍在增长"用。
+    pub fn total_output_bytes(&self) -> usize {
+        match self.output_buffer.lock() {
+            Ok(buf) => buf.total_bytes(),
+            Err(_) => 0,
+        }
+    }
+
     /// 输出缓冲当前字节数（命令执行前基准）。
     pub fn output_offset(&self) -> usize {
         match self.output_buffer.lock() {
@@ -283,16 +300,33 @@ async fn send_naws(
 
 /// 带 stream 的 open（connect_session 调用）：连接 + 创建 session + spawn_reader。
 impl TelnetSession {
+    /// `connect_timeout_secs`：建连超时（复用设置里的 SSH 连接超时；0 = 永不超时）。
     pub async fn connect_and_spawn(
         host: &str,
         port: u16,
         session_config_id: String,
+        connect_timeout_secs: u32,
         app: AppHandle,
     ) -> AppResult<Self> {
         log::info!("[telnet] 连接 {}:{}...", host, port);
-        let stream = TcpStream::connect((host, port))
-            .await
-            .map_err(|e| AppError::Ssh(format!("Telnet 连接失败 {}: {}", host, e)))?;
+        // TcpStream::connect 本身无超时，目标不可达/防火墙丢包时可能挂数十秒，
+        // 且命令无取消路径——必须包一层超时（与 SSH 侧连接超时行为一致）。
+        let connect = TcpStream::connect((host, port));
+        let stream = match connect_timeout_secs {
+            // 0 = 永不超时。
+            0 => connect.await,
+            secs => {
+                tokio::time::timeout(std::time::Duration::from_secs(u64::from(secs)), connect)
+                    .await
+                    .map_err(|_| {
+                        AppError::Ssh(format!(
+                            "Telnet 连接超时（{} 秒，可在设置中调整）",
+                            secs
+                        ))
+                    })?
+            }
+        }
+        .map_err(|e| AppError::Ssh(format!("Telnet 连接失败 {}: {}", host, e)))?;
         let _ = stream.set_nodelay(true);
 
         let mut session = TelnetSession {

@@ -56,6 +56,10 @@ pub struct ChatMessage {
     /// 仅当 role=Tool 时存在（对应的 tool_call id）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// 用户消息附带的多模态图片。非空时具体厂商实现会把 content 序列化为
+    /// 「文本 + 图片块」数组（OpenAI image_url / Claude image 块）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<ImagePart>>,
 }
 
 impl ChatMessage {
@@ -66,8 +70,23 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: None,
             tool_call_id: None,
+            images: None,
         }
     }
+}
+
+/// 一张多模态图片（用户消息附带）。
+///
+/// 前端负责把图片文件读成 base64 后随消息传入；后端不做解码，仅按厂商协议
+/// 重新包装（OpenAI 拼 `data:{mime};base64,{data}` 的 image_url，Claude 拆成
+/// `source {type: base64, media_type, data}`）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImagePart {
+    /// MIME 类型，如 `image/png`、`image/jpeg`、`image/webp`。
+    pub mime_type: String,
+    /// 图片原始字节的 base64 编码（不含 `data:` URL 前缀）。
+    pub data_base64: String,
 }
 
 // ===========================================================================
@@ -205,6 +224,10 @@ pub struct ProviderConfig {
     /// 长思考模型的首 token 延迟可能达数分钟，按需调大。
     #[serde(default = "default_read_timeout_secs")]
     pub read_timeout_secs: u64,
+    /// 是否支持多模态（图片输入）。开启后终端助手 / 数据库助手允许附带图片，
+    /// 后端按厂商协议把图片块序列化进请求体。默认关闭。
+    #[serde(default)]
+    pub multimodal: bool,
 }
 
 fn default_max_output() -> u32 {

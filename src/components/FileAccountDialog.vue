@@ -251,7 +251,7 @@ async function submit() {
 }
 .warn-text {
   font-size: 12px;
-  color: #e6a23c;
+  color: var(--el-color-warning);
   line-height: 1.5;
   margin-top: 4px;
 }

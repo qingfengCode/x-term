@@ -47,6 +47,23 @@ const navItems = [
 ];
 const navFooterItems = [{ key: "settings", label: "设置", icon: "Setting" }];
 
+/** 是否显示锁定按钮：保险库已创建且已解锁，且设置中开启了锁定功能。 */
+const showLock = computed(() => vault.exists && vault.unlocked && settings.vaultLockEnabled);
+
+/**
+ * 锁定保险库：清除内存主密钥后跳到解锁页。
+ * 温和锁定——不断开已建立的连接（终端/SFTP/隧道/MySQL 继续工作），
+ * 解锁后重新进入主界面（MainLayout 重挂载，见 onMounted 的 gate 逻辑）。
+ */
+async function onLock() {
+  try {
+    await vault.lock();
+    router.replace("/unlock");
+  } catch (e) {
+    ElMessage.error("锁定失败：" + String(e));
+  }
+}
+
 const activeNav = computed(() => {
   if (
     route.name === "terminals" ||
@@ -70,11 +87,8 @@ function go(key: string) {
 }
 
 onMounted(async () => {
-  // 路由守卫：未解锁则跳到 /unlock。
-  if (!vault.unlocked) {
-    router.replace("/unlock");
-    return;
-  }
+  // vault 解锁门卫由 router 全局守卫负责（先于本组件挂载执行），
+  // 能挂载到这里说明已解锁，无需再判断/重定向。
 
   // 初始数据加载失败不应阻断事件订阅：否则 DB 出错时整个 AI/传输/MCP 事件
   // 链路全部失效（且错误无人捕获）。逐个容错，失败只记录。
@@ -197,6 +211,9 @@ onMounted(async () => {
 // focusSessions）在任何页面都生效。copy/paste/search 由终端组件自行处理
 // （这里不注册，避免与终端内焦点冲突）。
 function switchTab(delta: 1 | -1) {
+  // 与 newTab/closeTab 一致：仅终端页生效，避免在 SQL/设置等页面按快捷键
+  // 静默切换后台终端 tab。
+  if (activeNav.value !== "terminals") return;
   const tabs = terminalsStore.tabs;
   if (tabs.length === 0) return;
   const curIdx = tabs.findIndex((t) => t.instanceId === terminalsStore.activeId);
@@ -247,17 +264,23 @@ function startSidebarResize(e: MouseEvent) {
     const w = startW + (ev.clientX - startX);
     settings.setSidebarWidth(Math.max(180, Math.min(420, w)));
   };
-  const onUp = () => {
+  const cleanup = () => {
     document.removeEventListener("mousemove", onMove);
     document.removeEventListener("mouseup", onUp);
+    window.removeEventListener("blur", onBlur);
     document.body.style.cursor = "";
     document.body.style.userSelect = "";
     void settings.save().catch(() => {});
   };
+  const onUp = () => cleanup();
+  // 鼠标在窗口外释放（拖出窗口边缘 / Alt-Tab 切走）时 mouseup 不触发，
+  // 监听器与 col-resize 光标、userSelect:none 会永久残留——用 window blur 兜底清理。
+  const onBlur = () => cleanup();
   document.body.style.cursor = "col-resize";
   document.body.style.userSelect = "none";
   document.addEventListener("mousemove", onMove);
   document.addEventListener("mouseup", onUp);
+  window.addEventListener("blur", onBlur);
 }
 
 // Ctrl/Cmd + 1..9：切换到第 N 个终端 tab（动态数字快捷键，不纳入可配置列表，
@@ -294,7 +317,16 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onNumberKeydown));
           <span>{{ item.label }}</span>
         </div>
       </div>
-      <!-- 底部固定项（设置）：矮窗口也始终可见 -->
+      <!-- 底部固定项（设置/锁定）：矮窗口也始终可见 -->
+      <div
+        v-if="showLock"
+        class="nav-item nav-item-fixed"
+        title="锁定保险库（需重新输入主密码）"
+        @click="onLock"
+      >
+        <el-icon><component :is="'Lock'" /></el-icon>
+        <span>锁定</span>
+      </div>
       <div
         v-for="item in navFooterItems"
         :key="item.key"
@@ -388,7 +420,8 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onNumberKeydown));
 .nav-logo {
   font-size: 22px;
   font-weight: bold;
-  color: #2563eb;
+  /* 跟随主题主色，而非硬编码品牌蓝 */
+  color: var(--el-color-primary);
   margin: 4px 0 12px;
 }
 .nav-item {

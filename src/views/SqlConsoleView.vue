@@ -1,16 +1,19 @@
 <!--
-  SqlConsoleView.vue — MySQL SQL 控制台
+  SqlConsoleView.vue — MySQL SQL 控制台（多标签）
 
   功能：
-  - 选择 / 新建 / 编辑 / 删除 DB profile，连接 / 断开。
+  - 多标签页（参考终端）：每个标签 = 一个独立连接 + 绑定一个库（schema）。
+    标签标题 = 库名（未绑定库时为 profile 名），支持关闭/关闭其他/拖拽排序。
+  - 左侧表树：点实例节点 → 打开/激活该 profile 的标签；点库节点 → 打开/激活
+    该 (profile, 库) 的标签并自动 USE（之后 SQL 无需带库前缀）；点表节点 →
+    填入 `SELECT * FROM `表名` LIMIT 100;`（当前库表不带前缀）。
   - 只读 / 读写模式切换（默认只读，写操作需切到读写模式）。
-  - 左侧表列表：dbListTables，点击 → DESCRIBE 表结构 + 表名填入 SQL 编辑器。
-  - SQL 编辑器（textarea，Ctrl+Enter 执行）：执行 / 清空 / AI 优化 / AI 解释。
+  - SQL 编辑器（CodeMirror，Ctrl+Enter 执行）：执行 / 清空 / AI 优化 / AI 解释。
   - 结果区：动态列 el-table，显示行数、耗时、影响行数；出错显示 error。
-  - 订阅 db:query_result 事件，按 queryId 匹配当前等待的查询。
+  - 每个标签独立订阅 db:query_result 事件，按 queryId 匹配各自等待的查询。
 -->
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type Ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import {
   Refresh,
@@ -30,10 +33,10 @@ import {
   MoreFilled,
   EditPen,
   QuestionFilled,
+  Close,
 } from "@element-plus/icons-vue";
 import {
   dbDeleteProfile,
-  dbDisconnect,
   dbListDatabases,
   dbListProfiles,
   dbListTables,
@@ -47,9 +50,10 @@ import { listen } from "@tauri-apps/api/event";
 import DbProfileDialog from "@/components/DbProfileDialog.vue";
 import AiPanel from "@/components/AiPanel.vue";
 import { useAiDbStore } from "@/stores/ai";
-import { useDbStore } from "@/stores/db";
+import { useDbStore, type DbTab } from "@/stores/db";
 import { useSettingsStore } from "@/stores/settings";
 import { useCodeMirror } from "@/composables/useCodeMirror";
+import { stripLeadingComments, useSqlConsole } from "@/composables/useSqlConsole";
 
 // KeepAlive 按 name 匹配缓存本组件（保留 DB 助手面板状态）。
 defineOptions({ name: "SqlConsoleView" });
@@ -92,31 +96,14 @@ async function loadProfiles() {
     ]);
     // 同步树根：分组 + 实例层。
     treeData.value = rebuildInstanceNodes();
+    // 树重建后按活动标签重新对齐（展开实例 / 高亮当前库）。
+    syncTreeToActiveTab();
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     ElMessage.error("加载数据库连接失败：" + msg);
   } finally {
     loadingProfiles.value = false;
   }
-}
-
-// --- 连接状态 ---------------------------------------------------------------
-// connId 由全局 db store 维护，便于 AI 智能体面板读取活动连接（启用 SQL 工具集）。
-const connId = computed(() => db.activeConnId);
-const isConnected = computed(() => !!connId.value);
-
-const readOnly = ref(true); // 默认只读
-
-async function disconnect() {
-  if (!connId.value) return;
-  await db.disconnect();
-  ElMessage.success("已断开");
-  // 重置树（清除已加载的库/表子节点，保留实例层）。
-  treeData.value = rebuildInstanceNodes();
-  describeResult.value = null;
-  result.value = null;
-  // 断开后清除关联库（db.disconnect 已清空 conns，显式再置一次更稳妥）。
-  db.setActiveDatabase(null);
 }
 
 // --- DB 分组管理 ---------------------------------------------------------------
@@ -253,6 +240,8 @@ interface TreeNode {
   value: string;
   /** 表所属的库名（仅 table 节点用）。 */
   database?: string;
+  /** 库/表节点所属的 profile id（用于打开对应标签）。 */
+  profileId?: string;
   /** 是否已加载子节点（懒加载标记）。 */
   loaded?: boolean;
   /** 子节点。 */
@@ -266,6 +255,67 @@ interface TreeNode {
 /** 树根：分组 + 实例节点。 */
 const treeData = ref<TreeNode[]>([]);
 const treeRef = ref<any>(null);
+
+/** 树懒加载缓存：实例层子节点（库）按 profileId，库层子节点（表）按 profileId:库名。 */
+const treeCache = new Map<string, TreeNode[]>();
+function cachedOrLoad(key: string, loader: () => Promise<TreeNode[]>): Promise<TreeNode[]> {
+  const hit = treeCache.get(key);
+  if (hit) return Promise.resolve(hit);
+  return loader().then((nodes) => {
+    treeCache.set(key, nodes);
+    return nodes;
+  });
+}
+
+/**
+ * 连接拓扑变化时重建整树（`:key` 强制重挂载）+ 清掉对应 profile 的懒加载缓存。
+ *
+ * el-tree 节点一旦 loaded 就不再重新加载（resolve 空数组也会置 loaded）。
+ * 断线重连后服务器上的库/表可能已变化，不重建就会一直显示旧数据（展开后
+ * 点不存在的库报错）。只对「该 profile 连接数从 1+ 降到 0」触发（断开/全部
+ * 关闭标签）：正常开/关标签（1→2、2→1）不重建，避免打断用户展开状态。
+ * 0→1（首次连接/重连）不再重建——首次连接时该 profile 的树本就无数据可刷新，
+ * 断线重连的刷新已在 1→0 时完成（重建 + 清缓存）；再重建只会打断其他
+ * profile 的展开状态。
+ */
+const treeVersion = ref(0);
+let prevConnCounts = new Map<string, number>();
+let connCountsFirst = true;
+watch(
+  () => db.tabs.map((t) => ({ pid: t.profileId, conn: !!t.connId })),
+  (list) => {
+    const counts = new Map<string, number>();
+    for (const { pid, conn } of list) {
+      counts.set(pid, (counts.get(pid) ?? 0) + (conn ? 1 : 0));
+    }
+    if (connCountsFirst) {
+      // 首帧只建立基线（keepalive 下可能已有历史标签），不触发重建。
+      connCountsFirst = false;
+      prevConnCounts = counts;
+      return;
+    }
+    // 同时遍历旧/新两侧的 profile：标签被全部关闭时 pid 会从 counts 中消失，
+    // 只遍历 counts 会漏掉 1→0（缓存不失效、树不重建，残留的库/表节点之后
+    // 一点又触发 0→1 重建，打断操作）。
+    const pids = new Set<string>([...prevConnCounts.keys(), ...counts.keys()]);
+    let changed = false;
+    for (const pid of pids) {
+      const prev = prevConnCounts.get(pid) ?? 0;
+      const cnt = counts.get(pid) ?? 0;
+      if (prev > 0 && cnt === 0) {
+        changed = true;
+        // 该 profile 的库/表列表全部失效（重连后数据可能已变化）。
+        for (const key of [...treeCache.keys()]) {
+          if (key.startsWith(`dbs:${pid}`) || key.startsWith(`tables:${pid}:`)) {
+            treeCache.delete(key);
+          }
+        }
+      }
+    }
+    if (changed) treeVersion.value++;
+    prevConnCounts = counts;
+  },
+);
 
 /** 重建树根：分组节点 + 未分组实例节点。 */
 function rebuildInstanceNodes(): TreeNode[] {
@@ -319,78 +369,96 @@ function rebuildInstanceNodes(): TreeNode[] {
   return roots;
 }
 
-/** 懒加载子节点（el-tree 的 load 回调）。 */
-async function loadTreeNode(node: any, resolve: (children: TreeNode[]) => void) {
+/** 懒加载子节点（el-tree 的 load 回调）。
+ *
+ * 失败路径必须用第三个参数 `reject()`：它只结束 loading、不把节点标记为
+ * "已加载"，下次展开会重新 load。若用 `resolve([])`，el-tree 会把空结果
+ * 永久缓存（`loaded=true`），之后展开永远不再触发 load——表现为"展开没反应"。
+ */
+async function loadTreeNode(node: any, resolve: (children: TreeNode[]) => void, reject?: () => void) {
+  const fail = () => {
+    if (reject) reject();
+    else resolve([]);
+  };
   const data: TreeNode = node.data ?? node;
+  // 根节点：el-tree 在 lazy 模式下初始化/重挂载（:key 变化）时会调用根节点的
+  // load 回调（TreeStore.initialize 里 loadFn(this.root, ...)），根节点的 data
+  // 是 treeData 数组本身、没有 .type。必须直接 resolve 树根数据，否则根节点
+  // 被 resolve([]) 置空、整棵树显示 "No Data"（此前 :key 重挂载后必现）。
+  if (Array.isArray(data)) {
+    resolve(data as TreeNode[]);
+    return;
+  }
   if (data.type === "group") {
     // 分组节点的子节点（实例）已在 rebuildInstanceNodes 中静态构建。
     resolve(data.children ?? []);
     return;
   }
   if (data.type === "instance") {
-    // 展开实例 → 自动连接（若尚未连接该 profile）。
-    const profileId = data.value;
+    // 展开实例 → 打开/激活该 profile 的标签（无则连接），保证有可用连接列库。
+    const profile = profiles.value.find((p) => p.id === data.value);
+    if (!profile) {
+      fail();
+      return;
+    }
     try {
-      // 如果当前连接的不是这个 profile，先断开旧连接再连新的。
-      const currentConn = db.conns[0];
-      if (!currentConn || currentConn.profileId !== profileId) {
-        if (currentConn) {
-          await db.disconnect();
-        }
-        selectedProfileId.value = profileId;
-        const profile = profiles.value.find((p) => p.id === profileId);
-        const name = profile?.name ?? profileId;
-        await db.connect(profileId, name);
-        ElMessage.success(`已连接 ${name}`);
-        // 连接后聚焦编辑器。
-        await nextTick();
-        if (editorMode.value === "console") {
-          cliInputRef.value?.focus();
-        } else {
-          remountSqlEditor();
-        }
+      await openTabForProfile(profile);
+      const connId = db.activeConnId;
+      // 连接失败时 openTabForProfile 已吞掉错误并弹提示；此时活动标签可能仍是
+      // 别的 profile，不能拿它的连接来列库（否则张冠李戴）。
+      if (!connId || db.activeTab?.profileId !== profile.id) {
+        fail();
+        return;
       }
-      const dbs = await dbListDatabases(db.activeConnId!);
-      resolve(
-        dbs
+      const nodes = await cachedOrLoad(`dbs:${profile.id}`, async () => {
+        const dbs = await dbListDatabases(connId);
+        return dbs
           .filter((d) => !["information_schema", "performance_schema", "mysql", "sys"].includes(d))
           .map((d) => ({
             type: "database" as const,
-            key: `db-${data.value}-${d}`,
+            key: `db-${profile.id}-${d}`,
             label: d,
             value: d,
+            profileId: profile.id,
             isLeaf: false,
             children: [],
-          })),
-      );
+          }));
+      });
+      resolve(nodes);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       ElMessage.error("连接失败：" + msg);
-      db.clear();
-      resolve([]);
+      fail();
     }
     return;
   }
   if (data.type === "database") {
-    // 展开库 → 列出表。
-    if (!db.activeConnId) {
-      resolve([]);
+    // 展开库 → 列出表。不能用"活动标签的连接"：活动标签可能正连接中
+    // （connId 为 null，点库节点开标签时必现）或属于别的库；改用同 profile
+    // 任意已连接标签的连接——同一服务器的连接都能 SHOW TABLES FROM `库`。
+    const connId = await ensureProfileConn(data.profileId ?? "");
+    if (!connId) {
+      fail();
       return;
     }
     try {
-      const tables = await dbListTables(db.activeConnId, data.value);
-      resolve(
-        tables.map((t) => ({
+      const nodes = await cachedOrLoad(`tables:${data.profileId}:${data.value}`, async () => {
+        const tables = await dbListTables(connId, data.value);
+        return tables.map((t) => ({
           type: "table" as const,
-          key: `tbl-${data.value}-${t}`,
+          key: `tbl-${data.profileId}-${data.value}-${t}`,
           label: t,
           value: t,
           database: data.value,
+          profileId: data.profileId,
           isLeaf: true,
-        })),
-      );
-    } catch {
-      resolve([]);
+        }));
+      });
+      resolve(nodes);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      ElMessage.error(`加载表列表失败：${msg}`);
+      fail();
     }
     return;
   }
@@ -399,9 +467,14 @@ async function loadTreeNode(node: any, resolve: (children: TreeNode[]) => void) 
 
 /** 拖拽表节点：把表信息写入 dataTransfer，供 AI 面板/SQL 编辑器接收。 */
 function onTableDragStart(e: DragEvent, data: TreeNode) {
-  if (data.type !== "table" || !db.activeConnId) return;
+  if (data.type !== "table") return;
+  // 用「表所属 profile 的连接」而非活动标签连接：表可能属于另一台服务器
+  // （展开 A 实例后切到 B 标签再拖 A 的表），否则 AiPanel 会用当前活动连接
+  // 去查错服务器/错库。
+  const tab = db.tabs.find((t) => t.profileId === data.profileId && t.connId);
+  if (!tab?.connId) return;
   const payload: DraggedTable = {
-    connId: db.activeConnId,
+    connId: tab.connId,
     // 父节点是 database 节点；若拿不到库名则传 null（用默认库）。
     database: data.database ?? null,
     table: data.value,
@@ -415,41 +488,112 @@ function onTableDragStart(e: DragEvent, data: TreeNode) {
   if (e.dataTransfer) e.dataTransfer.effectAllowed = "copy";
 }
 
+/** 打开/激活某 profile 的标签（失败弹提示；返回是否成功，供调用方决定后续动作）。 */
+async function openTabForProfile(profile: DbProfile): Promise<boolean> {
+  try {
+    await db.openTab(profile, null);
+    await focusActiveInput();
+    return true;
+  } catch (e: unknown) {
+    ElMessage.error("连接失败：" + String(e));
+    return false;
+  }
+}
+
+/** 打开/激活某 (profile, 库) 的标签并自动 USE（失败弹提示；返回是否成功）。 */
+async function openTabForDatabase(profile: DbProfile, database: string): Promise<boolean> {
+  try {
+    await db.openTab(profile, database);
+    await focusActiveInput();
+    return true;
+  } catch (e: unknown) {
+    ElMessage.error("连接失败：" + String(e));
+    return false;
+  }
+}
+
+/**
+ * 找指定 profile 的可用连接 id：同 profile 已连接标签优先；没有则打开实例标签
+ * 等连接完成。树节点（库/表）可能属于非活动 profile——操作（列表/DESCRIBE/拖拽）
+ * 必须落在表自己的连接上，否则会用活动连接查错服务器/错库。
+ */
+async function ensureProfileConn(profileId: string): Promise<string | null> {
+  let tab = db.tabs.find((t) => t.profileId === profileId && t.connId);
+  if (!tab) {
+    const profile = profiles.value.find((p) => p.id === profileId);
+    if (!profile) return null;
+    await openTabForProfile(profile);
+    tab = db.tabs.find((t) => t.profileId === profileId && t.connId);
+  }
+  return tab?.connId ?? null;
+}
+
+/** 连接完成后聚焦输入框（仅命令行模式）。 */
+async function focusActiveInput() {
+  await nextTick();
+  const s = activeState.value;
+  if (s && s.editorMode.value === "console") s.cliInputRef.value?.focus();
+}
+
 /** 点击树节点。 */
 async function onTreeNodeClick(data: TreeNode) {
-  if (data.type === "group" || data.type === "instance") {
-    // 分组/实例：展开由 el-tree 的 expand-on-click-node 处理，此处不干预。
+  if (data.type === "group") {
+    return;
+  }
+  if (data.type === "instance") {
+    // 点实例：打开/激活该 profile 的标签（展开由 el-tree 处理）。
+    const profile = profiles.value.find((p) => p.id === data.value);
+    if (profile) await openTabForProfile(profile);
     return;
   }
   if (data.type === "database") {
-    // 点击库：仅展开/收起（不填 USE，避免与后续 SQL 拼成多语句导致语法错误）。
-    // 点表时已用完全限定名 `db`.`table`，无需 USE 切换当前库。
-    // 记录关联库，供 AI 助手显示上下文 / 注入 system prompt。
-    db.setActiveDatabase(data.value);
+    // 点库：打开/激活该库的标签并自动 USE——每个 SQL 执行界面绑定一个库，
+    // 之后该标签里的 SQL 无需带库前缀（如 `SELECT * FROM `表名``）。
+    const profile = profiles.value.find((p) => p.id === data.profileId);
+    if (!profile) return;
+    await openTabForDatabase(profile, data.value);
     return;
   }
   if (data.type === "table") {
-    // 点击表：填入 SELECT 模板 + 记录表名 + 预拉表结构（供补全，但不弹出对话框）。
-    // 同时把表所在库设为关联库（与点库行为一致）。
-    db.setActiveDatabase(data.database ?? null);
-    const db2 = data.database ?? "";
-    const qualified = db2 ? `\`${db2}\`.\`${data.value}\`` : `\`${data.value}\``;
-    const selectTpl = `SELECT * FROM ${qualified} LIMIT 100;`;
-    if (editorMode.value === "console") {
-      cliInput.value = selectTpl;
-      cliInputRef.value?.focus();
-    } else {
-      const v = getSqlView();
-      if (v) {
-        v.dispatch({ changes: { from: 0, to: v.state.doc.length, insert: selectTpl } });
-        v.focus();
+    // 点表：填入 SELECT 模板 + 记录表名 + 预拉表结构（供补全，但不弹对话框）。
+    // 与点库语义一致：先确保活动标签是「表所属 profile + 库」的标签。
+    // 注意不能只比库名——两台服务器都有同名库时，`sameDb` 会误判为同库，
+    // 无前缀模板填进另一台服务器的标签，执行时静默查到另一张同名表。
+    // 跨服务器（profileId 不同）时限定名也救不了，必须切到表所属标签。
+    const active = db.activeTab;
+    const dbName = data.database ?? "";
+    const profile = profiles.value.find((p) => p.id === data.profileId);
+    const sameTab =
+      !!dbName &&
+      !!active &&
+      active.profileId === data.profileId &&
+      active.database === dbName;
+    if (!sameTab && profile && dbName) {
+      // 切到表所属库的标签（连接成功时活动标签已切换、自动 USE）。
+      const ok = await openTabForDatabase(profile, dbName);
+      if (!ok) return; // 连接失败已弹提示；不填模板，避免执行落在错连接上
+    }
+    // 活动标签即表所属库标签（已自动 USE）→ 用不带前缀的表名。
+    const selectTpl = `SELECT * FROM \`${data.value}\` LIMIT 100;`;
+    const s = activeState.value;
+    if (s) {
+      if (s.editorMode.value === "console") {
+        s.cliInput.value = selectTpl;
+        s.cliInputRef.value?.focus();
       } else {
-        sqlText.value = selectTpl;
+        const v = getSqlView();
+        if (v) {
+          v.dispatch({ changes: { from: 0, to: v.state.doc.length, insert: selectTpl } });
+          v.focus();
+        } else {
+          s.sqlText.value = selectTpl;
+        }
       }
     }
-    selectedTable.value = data.value;
-    // 预拉表结构（不弹层）——composable 存到 describeResult，字段名写入树节点供补全。
-    const desc = await loadStructure(data.value);
+    // 预拉表结构（不弹层）——DESCRIBE 带库名限定（`db`.`table`），不依赖连接
+    // 当前库：同 profile 开了多个库标签时，连接当前库未必是表所在库。
+    const connId = db.activeTab?.connId ?? (await ensureProfileConn(data.profileId ?? ""));
+    const desc = connId && s ? await s.console.loadStructure(data.value, connId, dbName) : null;
     if (desc) {
       const cols = desc.rows.map((r) => r[0]).filter(Boolean);
       data.columns = cols;
@@ -458,13 +602,251 @@ async function onTreeNodeClick(data: TreeNode) {
   }
 }
 
-// selectedTable / describeResult / showStructure 由 useSqlConsole composable 提供（见下方）。
-// 历史抽屉（命令行模式下历史不再常驻侧栏，改为抽屉按需打开）。
-const historyDrawer = ref(false);
-// 表结构弹层（默认不展示，点顶部按钮或点表时弹出）。
-const structureVisible = ref(false);
-// 编辑模式：console=命令行模式（Enter 执行，结果累积）；code=代码模式（多行编辑器+结果区）。
-const editorMode = ref<"console" | "code">("console");
+/** 树与活动标签对齐：展开活动 profile 的实例节点、高亮当前库节点。 */
+function syncTreeToActiveTab() {
+  const tab = db.activeTab;
+  const tree = treeRef.value;
+  if (!tab || !tree) return;
+  const instKey = `inst-${tab.profileId}`;
+  const node = tree.store?.nodesMap?.[instKey];
+  if (node && !node.expanded) node.expand();
+  if (tab.database) {
+    tree.setCurrentKey(`db-${tab.profileId}-${tab.database}`);
+  } else {
+    tree.setCurrentKey(instKey);
+  }
+}
+
+// 切标签时：树对齐 + 重挂 CodeMirror（内容随活动标签变化）。
+watch(() => db.activeTabId, () => {
+  syncTreeToActiveTab();
+  remountSqlEditor();
+});
+// 活动标签的绑定库变化（点库/拖表/执行 USE）时同步树高亮。
+watch(() => db.activeDatabase, () => syncTreeToActiveTab());
+
+// --- 多标签：每个标签一个独立执行界面状态 --------------------------------------
+interface TabState {
+  tabId: string;
+  /** SQL 文本（代码模式 CodeMirror 内容）。 */
+  sqlText: Ref<string>;
+  /** 只读模式。 */
+  readOnly: Ref<boolean>;
+  /** console=命令行模式；code=代码模式。 */
+  editorMode: Ref<"console" | "code">;
+  /** 命令行模式输入框内容。 */
+  cliInput: Ref<string>;
+  cliInputRef: Ref<HTMLTextAreaElement | null>;
+  /** 表结构弹层。 */
+  structureVisible: Ref<boolean>;
+  /** 历史抽屉。 */
+  historyDrawer: Ref<boolean>;
+  /** 该标签的控制台实例（订阅 db:query_result，按 queryId 匹配）。 */
+  console: ReturnType<typeof useSqlConsole>;
+}
+
+const tabStates = new Map<string, TabState>();
+
+function confirmDangerous(kw: string, noWhere: boolean): Promise<boolean> {
+  return ElMessageBox.confirm(
+    `检测到危险操作：${kw}${noWhere ? "（DELETE 无 WHERE）" : ""}。确认继续吗？`,
+    "危险操作确认",
+    { type: "warning", confirmButtonText: "确认执行", cancelButtonText: "取消", confirmButtonClass: "el-button--danger" },
+  )
+    .then(() => true)
+    .catch(() => false);
+}
+
+/** 为标签创建独立状态（连接 id 随标签走，标签关闭时 destroy）。 */
+function createTabState(tabId: string): TabState {
+  const connIdRef = computed<string | null>(
+    () => db.tabs.find((t) => t.id === tabId)?.connId ?? null,
+  );
+  const sqlText = ref("");
+  const readOnly = ref(true); // 默认只读
+  const editorMode = ref<"console" | "code">("console");
+  const cliInput = ref("");
+  const cliInputRef = ref<HTMLTextAreaElement | null>(null);
+  const structureVisible = ref(false);
+  const historyDrawer = ref(false);
+  const console = useSqlConsole(connIdRef, sqlText, confirmDangerous);
+  void console.setup();
+  console.loadHistory();
+  return {
+    tabId,
+    sqlText,
+    readOnly,
+    editorMode,
+    cliInput,
+    cliInputRef,
+    structureVisible,
+    historyDrawer,
+    console,
+  };
+}
+
+// 标签增删时同步创建/销毁状态（keepalive 下的 SQL 页生命周期只跟组件走，
+// 因此标签状态必须随 db.tabs 增删管理，不能依赖组件卸载）。
+watch(
+  () => db.tabs.map((t) => t.id),
+  (ids) => {
+    const known = new Set(ids);
+    for (const id of ids) {
+      if (!tabStates.has(id)) tabStates.set(id, createTabState(id));
+    }
+    for (const [id, st] of [...tabStates]) {
+      if (!known.has(id)) {
+        st.console.destroy();
+        tabStates.delete(id);
+      }
+    }
+  },
+  { immediate: true },
+);
+
+/** 活动标签状态（仅活动标签的编辑区渲染，其余标签状态保留在内存）。 */
+const activeState = computed<TabState | null>(
+  () => (db.activeTabId ? tabStates.get(db.activeTabId) ?? null : null),
+);
+
+// 活动标签的派生可写别名（供 v-model 使用）。
+const readOnlyModel = computed({
+  get: () => activeState.value?.readOnly.value ?? true,
+  set: (v: boolean) => {
+    if (activeState.value) activeState.value.readOnly.value = v;
+  },
+});
+const editorModeModel = computed({
+  get: () => activeState.value?.editorMode.value ?? "console",
+  set: (v: "console" | "code") => {
+    if (activeState.value) activeState.value.editorMode.value = v;
+  },
+});
+const cliInputModel = computed({
+  get: () => activeState.value?.cliInput.value ?? "",
+  set: (v: string) => {
+    if (activeState.value) activeState.value.cliInput.value = v;
+  },
+});
+const historyDrawerModel = computed({
+  get: () => activeState.value?.historyDrawer.value ?? false,
+  set: (v: boolean) => {
+    if (activeState.value) activeState.value.historyDrawer.value = v;
+  },
+});
+const structureVisibleModel = computed({
+  get: () => activeState.value?.structureVisible.value ?? false,
+  set: (v: boolean) => {
+    if (activeState.value) activeState.value.structureVisible.value = v;
+  },
+});
+
+// 活动标签的派生只读值（模板直接消费）。
+const activeLastResult = computed(() => activeState.value?.console.lastResult.value ?? null);
+const activeExecuting = computed(() => activeState.value?.console.executing.value ?? false);
+const activeHistory = computed(() => activeState.value?.console.history.value ?? []);
+const activeSelectedTable = computed(
+  () => activeState.value?.console.selectedTable.value ?? null,
+);
+const activeDescribeResult = computed(
+  () => activeState.value?.console.describeResult.value ?? null,
+);
+const activeResultIsSelect = computed(() => {
+  const r = activeLastResult.value;
+  return !!r && r.columns.length > 0;
+});
+
+// --- 标签栏交互（参考终端 Workspace） ------------------------------------------
+const tabMenu = ref<{ x: number; y: number; tab: DbTab | null }>({ x: 0, y: 0, tab: null });
+function openTabMenu(tab: DbTab, e: MouseEvent) {
+  tabMenu.value = { x: e.clientX, y: e.clientY, tab };
+}
+function closeTabMenu() {
+  tabMenu.value.tab = null;
+}
+function onTabMenuCommand(cmd: string) {
+  const t = tabMenu.value.tab;
+  closeTabMenu();
+  if (!t) return;
+  switch (cmd) {
+    case "close":
+      void db.closeTab(t.id);
+      break;
+    case "closeOthers":
+      for (const x of [...db.tabs]) {
+        if (x.id !== t.id) void db.closeTab(x.id);
+      }
+      break;
+    case "closeAll":
+      for (const x of [...db.tabs]) void db.closeTab(x.id);
+      break;
+  }
+}
+
+/** 中键点击标签：关闭（并阻止中键自动滚动）。 */
+function onTabAuxClick(tab: DbTab, e: MouseEvent) {
+  if (e.button === 1) {
+    e.preventDefault();
+    if (tab.id) void db.closeTab(tab.id);
+  }
+}
+
+/** 标签区滚轮：纵向滚动转为横向滚动。 */
+function onTabsWheel(e: WheelEvent) {
+  const el = e.currentTarget as HTMLElement;
+  el.scrollLeft += e.deltaY;
+}
+
+/** 拖拽排序标签（HTML5 DnD，dragover 时按过半即换位）。 */
+const dragTabId = ref<string | null>(null);
+function onTabDragStart(e: DragEvent, id: string) {
+  dragTabId.value = id;
+  if (e.dataTransfer) {
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", id);
+  }
+}
+function onTabDragOver(e: DragEvent, targetId: string) {
+  const from = dragTabId.value;
+  if (!from || from === targetId) return;
+  e.preventDefault();
+  if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+  const el = e.currentTarget as HTMLElement;
+  const before = e.offsetX < el.clientWidth / 2;
+  db.moveTab(from, targetId, before);
+}
+function onTabDragEnd() {
+  dragTabId.value = null;
+}
+
+/** 标签标题：库名（未绑定库时为 profile 名）。 */
+function tabTitle(tab: DbTab) {
+  return tab.database ?? tab.profileName;
+}
+
+/** "+" 下拉：选 profile 开新标签 / 新建连接。 */
+async function onAddTabCommand(command: string | number | object) {
+  if (command === "__new_profile__") {
+    openCreateProfile();
+    return;
+  }
+  const profile = profiles.value.find((p) => p.id === String(command));
+  if (profile) await openTabForProfile(profile);
+}
+
+/** 工具栏"断开"：关闭当前标签。 */
+async function closeActiveTab() {
+  if (db.activeTabId) await db.closeTab(db.activeTabId);
+}
+
+// 当前活动标签的 profile 展示名。
+const activeProfileLabel = computed(() => {
+  const tab = db.activeTab;
+  if (!tab) return "";
+  const p = profiles.value.find((x) => x.id === tab.profileId);
+  return p ? `${p.name} (${p.host}:${p.port})` : tab.profileName;
+});
+
 // 左侧数据库树宽度（可拖拽调整）。
 const sidebarWidth = ref(200);
 function startResize(e: MouseEvent) {
@@ -475,26 +857,34 @@ function startResize(e: MouseEvent) {
     const w = startW + (ev.clientX - startX);
     sidebarWidth.value = Math.max(140, Math.min(480, w));
   };
-  const onUp = () => {
+  const cleanup = () => {
     document.removeEventListener("mousemove", onMove);
     document.removeEventListener("mouseup", onUp);
+    window.removeEventListener("blur", onBlur);
     document.body.style.cursor = "";
     document.body.style.userSelect = "";
   };
+  const onUp = () => cleanup();
+  // 鼠标在窗口外释放（拖出窗口边缘 / Alt-Tab 切走）时 mouseup 不触发，
+  // 监听器与 col-resize 光标、userSelect:none 会永久残留——用 window blur 兜底清理。
+  const onBlur = () => cleanup();
   document.body.style.cursor = "col-resize";
   document.body.style.userSelect = "none";
   document.addEventListener("mousemove", onMove);
   document.addEventListener("mouseup", onUp);
+  window.addEventListener("blur", onBlur);
 }
-// 当前选中 profile 名（控制台顶部显示）。
-const selectedProfileName = computed(() => {
-  const p = profiles.value.find((x) => x.id === selectedProfileId.value);
-  return p ? `${p.name} (${p.host}:${p.port})` : "";
-});
 
 // --- SQL 编辑器（CodeMirror）----------------------------------------------
-const sqlText = ref("");
 const sqlEditorRef = ref<HTMLElement | null>(null);
+// 共享一个 CodeMirror 实例：model 委托到活动标签的 sqlText（切标签时 remount）。
+const activeSqlText = computed({
+  get: () => activeState.value?.sqlText.value ?? "",
+  set: (v: string) => {
+    const s = activeState.value;
+    if (s) s.sqlText.value = v;
+  },
+});
 // 从已加载的树节点收集 表→字段 映射，供 CodeMirror SQL 自动补全（表名 + 字段名）。
 // 字段来自点表时预拉的 DESCRIBE；未点过的表字段为空（仅补表名）。
 const tableSchema = computed(() => {
@@ -510,7 +900,7 @@ const tableSchema = computed(() => {
 });
 const { mount: mountSqlEditor, remount: remountSqlEditor, getView: getSqlView } = useCodeMirror(
   sqlEditorRef,
-  sqlText,
+  activeSqlText,
   tableSchema,
   () => void execute(),
   isDark,
@@ -518,104 +908,81 @@ const { mount: mountSqlEditor, remount: remountSqlEditor, getView: getSqlView } 
 );
 
 // 模式切换时重新挂载 CodeMirror（容器 DOM 因 v-if 切换而变化，需 destroy 后重建）。
-watch(editorMode, () => {
+// 切标签的重挂由上方 activeTabId watcher 负责。
+watch(() => activeState.value?.editorMode.value, () => {
   remountSqlEditor();
 });
-
-/** 在编辑器末尾插入文本（用于点击表名快速插入查询模板）。 */
-function insertTextAtCursor(text: string) {
-  const v = getSqlView();
-  if (!v) {
-    sqlText.value += text;
-    return;
-  }
-  const docLen = v.state.doc.length;
-  v.dispatch({
-    changes: { from: docLen, insert: text },
-    selection: { anchor: docLen + text.length },
-  });
-  v.focus();
-}
 
 function clearSql() {
   const v = getSqlView();
   if (v) {
     v.dispatch({ changes: { from: 0, to: v.state.doc.length, insert: "" } });
   } else {
-    sqlText.value = "";
+    const s = activeState.value;
+    if (s) s.sqlText.value = "";
   }
 }
 
-// --- SQL 命令行控制台（逻辑抽到 useSqlConsole composable） ---
-import { useSqlConsole } from "@/composables/useSqlConsole";
+// --- 执行（按活动标签路由） -----------------------------------------------------
 
-const {
-  entries: consoleEntries,
-  scrollRef: consoleScrollRef,
-  bottomAnchorRef: consoleBottomAnchor,
-  activeSqlEl,
-  activeSqlId,
-  executing,
-  lastResult: result,
-  clear: clearConsole,
-  execute: runSql,
-  onInputKeydown,
-  setup: setupConsole,
-  destroy: destroyConsole,
-  history,
-  loadHistory,
-  useHistory: applyHistory,
-  historyOlder,
-  historyNewer,
-  clearHistory,
-  selectedTable,
-  describeResult,
-  loadStructure,
-  pushExternal,
-} = useSqlConsole(connId, sqlText, async (kw, noWhere) => {
-  try {
-    await ElMessageBox.confirm(
-      `检测到危险操作：${kw}${noWhere ? "（DELETE 无 WHERE）" : ""}。确认继续吗？`,
-      "危险操作确认",
-      { type: "warning", confirmButtonText: "确认执行", cancelButtonText: "取消", confirmButtonClass: "el-button--danger" },
-    );
-    return true;
-  } catch {
-    return false;
+/** USE 语句同步：后端已拦截更新 current_db，这里把标签绑定的库同步到前端状态。 */
+const USE_RE = /^\s*use\s+`?([A-Za-z0-9_]+)`?\s*;?\s*$/i;
+function maybeSyncUse(sql: string) {
+  // 与 composable execute 的提取逻辑一致：先剥行首注释（`-- 注释\nUSE x`），
+  // 再按分号切分，多语句里最后一个 USE 生效（`USE db; SELECT 1` 也会同步）。
+  const stmts = stripLeadingComments(sql)
+    .split(";")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  let useDb: string | null = null;
+  for (const stmt of stmts) {
+    const m = USE_RE.exec(stmt);
+    if (m) useDb = m[1];
   }
-});
+  if (useDb && db.activeTab) db.activeTab.database = useDb;
+}
 
 /** 适配视图：执行（带只读模式判定，代码模式从 CodeMirror 读 sqlText）。 */
 async function execute() {
-  await runSql(readOnly.value);
+  const s = activeState.value;
+  if (!s) return;
+  const sql = s.sqlText.value.trim();
+  const ok = await s.console.execute(s.readOnly.value);
+  if (ok && sql) maybeSyncUse(sql);
 }
 
 /**
  * SQL 回显行的 :ref 回调——仅捕获"上一条输入"（activeSqlId）对应的 DOM，
  * 供 composable 滚动逻辑作锚点（语句置顶 / 结果溢出判断）。卸载时以 null 调用则清空。
  */
-function bindSqlEntry(id: string, el: unknown) {
-  if (id !== activeSqlId.value) return;
-  activeSqlEl.value = (el as HTMLElement | null) ?? null;
+function bindSqlEntry(s: TabState | null, id: string, el: unknown) {
+  if (!s || id !== s.console.activeSqlId.value) return;
+  s.console.activeSqlEl.value = (el as HTMLElement | null) ?? null;
 }
 
-// --- 命令行模式专用输入（原生 textarea，非 CodeMirror） ---
-const cliInputRef = ref<HTMLTextAreaElement | null>(null);
-const cliInput = ref("");
+function bindScrollRef(s: TabState | null, el: unknown) {
+  if (s) s.console.scrollRef.value = (el as HTMLElement | null) ?? null;
+}
+
+function bindAnchorRef(s: TabState | null, el: unknown) {
+  if (s) s.console.bottomAnchorRef.value = (el as HTMLElement | null) ?? null;
+}
 
 /** 命令行回车：执行 cliInput 内容，成功后清空输入框（mysql CLI 风格）。 */
 async function onCliKeydown(e: KeyboardEvent) {
+  const s = activeState.value;
+  if (!s) return;
   // ↑ / ↓ 浏览历史命令（mysql CLI 风格）。
   if (e.key === "ArrowUp" || e.key === "ArrowDown") {
     if (e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) return; // 带修饰键交给默认行为
     const text =
-      e.key === "ArrowUp" ? historyOlder(cliInput.value) : historyNewer();
+      e.key === "ArrowUp" ? s.console.historyOlder(s.cliInput.value) : s.console.historyNewer();
     if (text === null) return; // 无可切换项（已到边界 / 未在浏览），保持默认光标移动
     e.preventDefault();
-    cliInput.value = text;
+    s.cliInput.value = text;
     // 光标移到末尾，方便继续编辑。
     nextTick(() => {
-      const el = cliInputRef.value;
+      const el = s.cliInputRef.value;
       if (el) {
         el.selectionStart = el.selectionEnd = el.value.length;
       }
@@ -626,22 +993,25 @@ async function onCliKeydown(e: KeyboardEvent) {
   if (e.key !== "Enter") return;
   if (e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) return; // Shift+Enter 换行
   e.preventDefault();
-  const sql = cliInput.value.trim();
-  if (!sql || executing.value) return;
-  const ok = await runSql(readOnly.value, sql);
+  const sql = s.cliInput.value.trim();
+  if (!sql || s.console.executing.value) return;
+  const ok = await s.console.execute(s.readOnly.value, sql);
   if (ok) {
-    cliInput.value = ""; // 清空输入框，等待下一条
+    if (sql) maybeSyncUse(sql);
+    s.cliInput.value = ""; // 清空输入框，等待下一条
     await nextTick();
-    cliInputRef.value?.focus();
+    s.cliInputRef.value?.focus();
   }
 }
 
 /** 适配视图：历史条目填入当前活动输入（命令行→cliInput，代码模式→CodeMirror）。 */
 function useHistoryItem(item: { sql: string; ts: number; elapsedMs?: number }) {
-  applyHistory(item);
-  if (editorMode.value === "console") {
-    cliInput.value = item.sql;
-    cliInputRef.value?.focus();
+  const s = activeState.value;
+  if (!s) return;
+  s.console.useHistory(item);
+  if (s.editorMode.value === "console") {
+    s.cliInput.value = item.sql;
+    s.cliInputRef.value?.focus();
   } else {
     const v = getSqlView();
     if (v) {
@@ -653,9 +1023,16 @@ function useHistoryItem(item: { sql: string; ts: number; elapsedMs?: number }) {
 
 /** 顶部表结构按钮：拉取结构（composable）+ 弹出展示。 */
 async function showStructure() {
-  if (!selectedTable.value) return;
-  await loadStructure(selectedTable.value);
-  structureVisible.value = true;
+  const s = activeState.value;
+  if (!s || !s.console.selectedTable.value) return;
+  // 表结构可能来自其他 profile 的连接（点表时按表所属连接拉取）；重新拉取时
+  // 沿用上次实际使用的连接与库名，避免用当前标签连接 DESCRIBE 错库。
+  await s.console.loadStructure(
+    s.console.selectedTable.value,
+    s.console.structureConnId.value ?? undefined,
+    s.console.structureDatabase.value ?? undefined,
+  );
+  s.structureVisible.value = true;
 }
 
 /** 导出当前结果为 CSV/JSON（复制到剪贴板）。 */
@@ -668,35 +1045,31 @@ async function copyToClipboard(text: string) {
   }
 }
 function exportCsv() {
-  if (!result.value || !result.value.columns.length) return;
-  const { columns, rows } = result.value;
+  const r = activeLastResult.value;
+  if (!r || !r.columns.length) return;
+  const { columns, rows } = r;
   const esc = (v: string) => {
     const s = v ?? "";
     return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
-  const lines = [columns.map(esc).join(","), ...rows.map((r) => r.map(esc).join(","))];
+  const lines = [columns.map(esc).join(","), ...rows.map((row) => row.map(esc).join(","))];
   void copyToClipboard(lines.join("\n"));
 }
 function exportJson() {
-  if (!result.value || !result.value.columns.length) return;
-  const { columns, rows } = result.value;
-  const objs = rows.map((r) => {
+  const r = activeLastResult.value;
+  if (!r || !r.columns.length) return;
+  const { columns, rows } = r;
+  const objs = rows.map((row) => {
     const o: Record<string, string> = {};
-    columns.forEach((c, i) => (o[c] = r[i] ?? ""));
+    columns.forEach((c, i) => (o[c] = row[i] ?? ""));
     return o;
   });
   void copyToClipboard(JSON.stringify(objs, null, 2));
 }
 
-// --- 结果展示 ---------------------------------------------------------------
-const resultIsSelect = computed(() => {
-  if (!result.value) return false;
-  return result.value.columns.length > 0;
-});
-
 // --- AI 集成 ----------------------------------------------------------------
 function requireSql(): string | null {
-  const sql = sqlText.value.trim();
+  const sql = activeState.value?.sqlText.value.trim() ?? "";
   if (!sql) {
     ElMessage.warning("请先输入 SQL");
     return null;
@@ -777,36 +1150,34 @@ async function deleteProfile() {
 }
 
 // --- AI SQL 终端可视化：监听 exec_sql 回显事件 ---
-// 仅命令行模式把 AI 执行的 SQL + 结构化结果回显进控制台输出流。
+// 仅命令行模式把 AI 执行的 SQL + 结构化结果回显进**活动标签**的输出流。
 // 后端在 sql_agent.terminal_visualization 开启时 emit；代码模式不回显。
 let unlistenSqlResult: (() => void) | null = null;
 
 // --- 生命周期 ---------------------------------------------------------------
 onMounted(async () => {
   await loadProfiles();
-  loadHistory();
-  // 订阅 db:query_result 事件（composable 内部处理）。
-  await setupConsole();
-  // 订阅 ai:sql_result（exec_sql 终端可视化回显）。
+  window.addEventListener("click", closeTabMenu);
+  // 订阅 ai:sql_result（exec_sql 终端可视化回显到活动标签）。
   unlistenSqlResult = await listen<AiSqlResultEvent>("ai:sql_result", (e) => {
     // 仅命令行模式回显（代码模式有自己的结果区，不混入输出流）。
-    if (editorMode.value !== "console") return;
-    pushExternal(e.payload);
+    const s = activeState.value;
+    if (s && s.editorMode.value === "console") s.console.pushExternal(e.payload);
   });
 });
 
 onBeforeUnmount(() => {
-  destroyConsole();
+  window.removeEventListener("click", closeTabMenu);
   if (unlistenSqlResult) {
     unlistenSqlResult();
     unlistenSqlResult = null;
   }
-  // 切换页面时主动断开连接，避免后端连接泄漏。
-  if (connId.value) {
-    void dbDisconnect(connId.value).catch(() => {
-      /* ignore */
-    });
-    db.clear();
+  // 销毁所有标签状态（反订阅事件）。
+  for (const st of tabStates.values()) st.console.destroy();
+  tabStates.clear();
+  // 关闭所有标签并断开后端连接，避免连接泄漏。
+  for (const t of [...db.tabs]) {
+    void db.closeTab(t.id);
   }
 });
 </script>
@@ -816,27 +1187,78 @@ onBeforeUnmount(() => {
     <!-- 顶部工具栏 -->
     <div class="toolbar">
       <div class="toolbar-left">
-        <el-button :icon="Plus" size="small" @click="openCreateProfile()" />
-
-        <el-divider direction="vertical" />
-
-        <template v-if="isConnected">
+        <template v-if="db.activeTab">
           <el-tag type="success" effect="dark" size="small" round>
-            {{ selectedProfileName }}
+            {{ activeProfileLabel }}
           </el-tag>
-          <el-button :icon="VideoPause" size="small" type="warning" plain @click="disconnect">
+          <el-tag v-if="db.activeDatabase" type="warning" effect="plain" size="small" round>
+            <el-icon><Coin /></el-icon>
+            {{ db.activeDatabase }}
+          </el-tag>
+          <el-button :icon="VideoPause" size="small" type="warning" plain @click="closeActiveTab">
             断开
           </el-button>
         </template>
-        <span v-else class="conn-hint">展开左侧实例以连接</span>
+        <span v-else class="conn-hint">展开左侧实例或点 + 新建标签</span>
       </div>
 
       <div class="toolbar-right">
         <span class="mode-label">模式</span>
-        <el-radio-group v-model="readOnly" size="small">
+        <el-radio-group v-model="readOnlyModel" size="small" :disabled="!db.activeTab">
           <el-radio-button :value="true">只读</el-radio-button>
           <el-radio-button :value="false">读写</el-radio-button>
         </el-radio-group>
+      </div>
+    </div>
+
+    <!-- DB 标签栏（参考终端多标签：标题=库名） -->
+    <div class="db-tabbar">
+      <div class="tabs-scroll" @wheel="onTabsWheel">
+        <div
+          v-for="(tab, i) in db.tabs"
+          :key="tab.id"
+          class="tab"
+          :class="{ active: tab.id === db.activeTabId, dragging: dragTabId === tab.id }"
+          draggable="true"
+          :title="tab.database ? `${tab.profileName} · ${tab.database}` : tab.profileName"
+          @click="db.setActive(tab.id)"
+          @auxclick="(e: MouseEvent) => onTabAuxClick(tab, e)"
+          @mousedown.middle.prevent
+          @contextmenu.prevent="(e: MouseEvent) => openTabMenu(tab, e)"
+          @dragstart="(e: DragEvent) => onTabDragStart(e, tab.id)"
+          @dragover="(e: DragEvent) => onTabDragOver(e, tab.id)"
+          @dragend="onTabDragEnd"
+        >
+          <span class="dot" :class="{ connecting: tab.connecting }" />
+          <span class="tab-idx" v-if="i < 9">{{ i + 1 }}</span>
+          <span class="title">{{ tabTitle(tab) }}</span>
+          <el-icon class="close" @click.stop="db.closeTab(tab.id)"><Close /></el-icon>
+        </div>
+        <el-dropdown trigger="click" @command="onAddTabCommand" class="tab-add-wrap">
+          <div class="tab-add" title="新建标签"><el-icon><Plus /></el-icon></div>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item v-for="p in profiles" :key="p.id" :command="p.id">
+                {{ p.name }}（{{ p.host }}:{{ p.port }}）
+              </el-dropdown-item>
+              <el-dropdown-item command="__new_profile__" :icon="Plus" divided>
+                新建连接…
+              </el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
+        <div v-if="db.tabs.length === 0" class="tab-hint">展开左侧实例或点 + 新建标签</div>
+      </div>
+      <!-- Tab 右键菜单（fixed 浮层） -->
+      <div
+        v-if="tabMenu.tab"
+        class="tab-menu"
+        :style="{ left: tabMenu.x + 'px', top: tabMenu.y + 'px' }"
+        @click.stop
+      >
+        <div class="tab-menu-item" @click="onTabMenuCommand('close')">关闭</div>
+        <div class="tab-menu-item" @click="onTabMenuCommand('closeOthers')">关闭其他</div>
+        <div class="tab-menu-item" @click="onTabMenuCommand('closeAll')">关闭全部</div>
       </div>
     </div>
 
@@ -847,6 +1269,9 @@ onBeforeUnmount(() => {
         <div class="list-header">
           <span>数据库</span>
           <div class="list-header-actions">
+            <el-tooltip content="新建连接" placement="bottom">
+              <el-button :icon="Plus" size="small" circle @click="openCreateProfile()" />
+            </el-tooltip>
             <el-tooltip content="新建分组" placement="bottom">
               <el-button :icon="FolderAdd" size="small" circle @click="createDbGroup" />
             </el-tooltip>
@@ -858,6 +1283,7 @@ onBeforeUnmount(() => {
         <div class="list-body tree-body">
           <el-tree
             ref="treeRef"
+            :key="treeVersion"
             :data="treeData"
             node-key="key"
             :props="{ label: 'label', children: 'children', isLeaf: 'isLeaf' }"
@@ -909,8 +1335,6 @@ onBeforeUnmount(() => {
           </el-tree>
           <div v-if="treeData.length === 0" class="empty-tip">未配置数据库实例</div>
         </div>
-
-        <!-- 查询历史 -->
       </aside>
 
       <!-- 拖拽分隔条 -->
@@ -919,18 +1343,22 @@ onBeforeUnmount(() => {
       <!-- 右侧：编辑器 + 结果 -->
       <section class="editor-area sql-console-area">
         <!-- 未连接提示 -->
-        <div v-if="!isConnected" class="editor-placeholder">
-          <el-empty description="展开左侧数据库实例以连接" :image-size="80" />
+        <div v-if="!activeState" class="editor-placeholder">
+          <el-empty description="展开左侧数据库实例，或点 + 新建标签" :image-size="80" />
         </div>
         <template v-else>
         <!-- 顶部小工具栏 -->
         <div class="console-toolbar">
           <span class="console-prompt">
             <el-icon><Connection /></el-icon>
-            {{ selectedProfileName }}
+            {{ activeProfileLabel }}
+            <template v-if="db.activeDatabase">
+              <el-icon class="prompt-db"><Coin /></el-icon>
+              <span class="prompt-db-text">{{ db.activeDatabase }}</span>
+            </template>
           </span>
           <!-- 模式切换：命令行 / 代码 -->
-          <el-radio-group v-model="editorMode" size="small">
+          <el-radio-group v-model="editorModeModel" size="small">
             <el-radio-button value="console">命令行</el-radio-button>
             <el-radio-button value="code">代码</el-radio-button>
           </el-radio-group>
@@ -939,34 +1367,34 @@ onBeforeUnmount(() => {
             size="small"
             link
             :icon="Coin"
-            :disabled="!selectedTable"
+            :disabled="!activeSelectedTable"
             @click="showStructure"
           >
-            表结构{{ selectedTable ? `: ${selectedTable}` : "" }}
+            表结构{{ activeSelectedTable ? `: ${activeSelectedTable}` : "" }}
           </el-button>
         </div>
 
         <!-- ============ 命令行模式（mysql CLI 风格：输入在结果流末尾） ============ -->
-        <template v-if="editorMode === 'console'">
+        <template v-if="activeState.editorMode.value === 'console'">
         <!-- 命令行模式辅助操作行（与代码模式位置一致：工作区上方） -->
         <div class="console-action-bar">
           <!-- 帮助：悬浮显示使用指南 -->
           <el-popover
             placement="bottom-start"
-            :width="340"
+            :width="380"
             trigger="hover"
           >
             <template #reference>
               <el-button :icon="QuestionFilled" size="small" link class="help-btn">帮助</el-button>
             </template>
             <div class="help-content">
-              <div class="help-title">命令行模式使用指南</div>
+              <div class="help-title">SQL 控制台使用指南</div>
               <ul class="help-list">
-                <li>输入 SQL 后按 <b>Enter</b> 执行，<b>Shift+Enter</b> 换行</li>
-                <li>执行后语句置顶、结果向下展开：输入框始终跟在结果后面（结果铺满时其尾部停在底边），更早的历史在上方可滚动回看</li>
+                <li>每个标签绑定一个库：点击左侧<b>库名</b>会打开/切换到该库的标签并自动 <b>USE</b>，之后 SQL 无需带库前缀（如 <b>SELECT * FROM `表名`</b>）</li>
+                <li>点击左侧<b>表名</b>：自动填入 SELECT 模板并加载表结构（当前库的表不带前缀）</li>
+                <li>输入 SQL 后按 <b>Enter</b> 执行，<b>Shift+Enter</b> 换行；执行后语句置顶、结果向下展开</li>
                 <li><b>↑ / ↓</b> 浏览历史命令（↑ 取上一条，↓ 回最新，可循环翻找）</li>
-                <li>点击左侧<b>表名</b>：自动填入 SELECT 模板并加载表结构</li>
-                <li>点击左侧<b>库名</b>：设为当前关联库（同步给 AI 助手上下文）</li>
+                <li>标签标题 = 库名；点 <b>+</b> 新建标签；右键标签可<b>关闭 / 关闭其他 / 关闭全部</b>，也可拖拽排序</li>
                 <li><b>表结构</b>：查看当前选中表的字段定义</li>
                 <li><b>清屏</b>：清空输出流；<b>AI 优化 / AI 解释</b>：把当前 SQL 发给右侧 AI 助手</li>
                 <li><b>历史</b>：打开查询历史抽屉，点击条目回填执行</li>
@@ -975,21 +1403,21 @@ onBeforeUnmount(() => {
               </ul>
             </div>
           </el-popover>
-          <el-button :icon="Delete" size="small" link @click="clearConsole">清屏</el-button>
+          <el-button :icon="Delete" size="small" link @click="activeState.console.clear()">清屏</el-button>
           <el-button :icon="MagicStick" size="small" link @click="aiOptimize">AI 优化</el-button>
           <el-button :icon="View" size="small" link @click="aiExplain">AI 解释</el-button>
-          <el-button :icon="Plus" size="small" link @click="historyDrawer = true">历史</el-button>
+          <el-button :icon="Plus" size="small" link @click="historyDrawerModel = true">历史</el-button>
         </div>
         <!-- 单一输出流（顶部输入式终端）：
              输入框常驻内容区顶部（始终可见）；历史输出在输入框上方（溢出内容区，
              靠负滚动 / 向上滚轮回看）；当前内容区始终展示最新一条输出。 -->
-        <div ref="consoleScrollRef" class="console-output">
-          <template v-for="e in consoleEntries" :key="e.id">
+        <div :ref="(el) => bindScrollRef(activeState, el)" class="console-output">
+          <template v-for="e in activeState.console.entries.value" :key="e.id">
             <!-- 执行的 SQL -->
             <div
               v-if="e.kind === 'sql'"
               class="entry entry-sql"
-              :ref="(el) => bindSqlEntry(e.id, el)"
+              :ref="(el) => bindSqlEntry(activeState, e.id, el)"
             >
               <span class="entry-prompt">mysql&gt;</span>
               <span class="entry-sql-text">{{ e.sql }}</span>
@@ -1022,11 +1450,11 @@ onBeforeUnmount(() => {
             <div v-else-if="e.kind === 'info'" class="entry entry-info">-- {{ e.text }}</div>
           </template>
           <!-- 输入框（mysql CLI 风格：常驻输出流末尾，新输出贴在它上方） -->
-          <div ref="consoleBottomAnchor" class="console-input-wrap">
+          <div :ref="(el) => bindAnchorRef(activeState, el)" class="console-input-wrap">
             <span class="input-prompt">mysql&gt;</span>
             <textarea
-              ref="cliInputRef"
-              v-model="cliInput"
+              :ref="(el) => { if (activeState) activeState.cliInputRef.value = (el as HTMLTextAreaElement | null) ?? null }"
+              v-model="cliInputModel"
               class="cli-input"
               rows="1"
               placeholder="输入 SQL，Enter 执行，Shift+Enter 换行，↑↓ 切换历史"
@@ -1040,39 +1468,39 @@ onBeforeUnmount(() => {
         <!-- ============ 代码模式（多行编辑器 + 结果区） ============ -->
         <template v-else>
           <div class="code-editor-toolbar">
-            <el-button type="primary" size="small" :icon="CaretRight" :loading="executing" @click="execute">
+            <el-button type="primary" size="small" :icon="CaretRight" :loading="activeExecuting" @click="execute">
               执行
             </el-button>
             <el-button size="small" :icon="ClearIcon" @click="clearSql">清空</el-button>
             <!-- 辅助操作：从顶部工具栏移到执行行右侧 -->
             <div class="code-toolbar-right">
-              <el-button :icon="Delete" size="small" link @click="clearConsole">清屏</el-button>
+              <el-button :icon="Delete" size="small" link @click="activeState.console.clear()">清屏</el-button>
               <el-button :icon="MagicStick" size="small" link @click="aiOptimize">AI 优化</el-button>
               <el-button :icon="View" size="small" link @click="aiExplain">AI 解释</el-button>
-              <el-button :icon="Plus" size="small" link @click="historyDrawer = true">历史</el-button>
+              <el-button :icon="Plus" size="small" link @click="historyDrawerModel = true">历史</el-button>
             </div>
           </div>
           <!-- 复用同一个 CodeMirror 实例：命令行/代码模式共享 sqlEditorRef。
-               注意：v-if 切换会销毁重建 DOM，CM 需重新挂载，由 connect 后的 mount 保证。 -->
-          <div v-if="editorMode === 'code'" ref="sqlEditorRef" class="code-editor" />
+               注意：v-if 切换会销毁重建 DOM，CM 需重新挂载，由 watch 后的 remount 保证。 -->
+          <div v-if="activeState.editorMode.value === 'code'" ref="sqlEditorRef" class="code-editor" />
           <div class="code-result">
             <div class="code-result-header">
-              <span class="result-meta" v-if="result && !result.error">
-                {{ resultIsSelect ? `${result.rows.length} 行` : `影响 ${result.affected} 行` }}
-                · {{ result.elapsedMs }} ms
+              <span class="result-meta" v-if="activeLastResult && !activeLastResult.error">
+                {{ activeResultIsSelect ? `${activeLastResult.rows.length} 行` : `影响 ${activeLastResult.affected} 行` }}
+                · {{ activeLastResult.elapsedMs }} ms
               </span>
-              <span class="result-meta error" v-else-if="result && result.error">错误</span>
-              <div v-if="result && resultIsSelect && !result.error" class="result-actions">
+              <span class="result-meta error" v-else-if="activeLastResult && activeLastResult.error">错误</span>
+              <div v-if="activeLastResult && activeResultIsSelect && !activeLastResult.error" class="result-actions">
                 <el-button size="small" link @click="exportCsv">复制 CSV</el-button>
                 <el-button size="small" link @click="exportJson">复制 JSON</el-button>
               </div>
             </div>
-            <div v-loading="executing" class="code-result-body">
-              <div v-if="!result" class="empty-tip">尚未执行查询</div>
-              <el-alert v-else-if="result.error" :title="result.error" type="error" show-icon :closable="false" />
+            <div v-loading="activeExecuting" class="code-result-body">
+              <div v-if="!activeLastResult" class="empty-tip">尚未执行查询</div>
+              <el-alert v-else-if="activeLastResult.error" :title="activeLastResult.error" type="error" show-icon :closable="false" />
               <el-table
-                v-else-if="resultIsSelect"
-                :data="result.rows"
+                v-else-if="activeResultIsSelect"
+                :data="activeLastResult.rows"
                 border
                 stripe
                 size="small"
@@ -1081,7 +1509,7 @@ onBeforeUnmount(() => {
               >
                 <el-table-column type="index" label="#" width="50" fixed />
                 <el-table-column
-                  v-for="(c, i) in result.columns"
+                  v-for="(c, i) in activeLastResult.columns"
                   :key="i"
                   :prop="String(i)"
                   :label="c"
@@ -1091,7 +1519,7 @@ onBeforeUnmount(() => {
               </el-table>
               <el-alert
                 v-else
-                :title="`执行成功，影响 ${result.affected} 行（${result.elapsedMs} ms）`"
+                :title="`执行成功，影响 ${activeLastResult.affected} 行（${activeLastResult.elapsedMs} ms）`"
                 type="success"
                 show-icon
                 :closable="false"
@@ -1113,42 +1541,42 @@ onBeforeUnmount(() => {
       @saved="onProfileSaved"
     />
 
-    <!-- 历史抽屉 -->
-    <el-drawer v-model="historyDrawer" title="查询历史" size="360px" direction="rtl">
+    <!-- 历史抽屉（活动标签） -->
+    <el-drawer v-model="historyDrawerModel" title="查询历史" size="360px" direction="rtl">
       <div class="history-drawer">
-        <el-button v-if="history.length" size="small" link type="danger" @click="clearHistory">
+        <el-button v-if="activeHistory.length" size="small" link type="danger" @click="activeState?.console.clearHistory()">
           清空历史
         </el-button>
         <div
-          v-for="(h, i) in history"
+          v-for="(h, i) in activeHistory"
           :key="i"
           class="history-item"
           :title="h.sql"
-          @click="useHistoryItem(h); historyDrawer = false"
+          @click="useHistoryItem(h); historyDrawerModel = false"
         >
           <span class="history-sql">{{ h.sql }}</span>
           <span v-if="h.elapsedMs" class="history-meta">{{ h.elapsedMs }}ms</span>
         </div>
-        <div v-if="history.length === 0" class="empty-tip">无历史</div>
+        <div v-if="activeHistory.length === 0" class="empty-tip">无历史</div>
       </div>
     </el-drawer>
 
     <!-- 表结构弹层（默认不展示，点顶部按钮或点表时弹出） -->
     <el-dialog
-      v-model="structureVisible"
-      :title="selectedTable ? `表结构: ${selectedTable}` : '表结构'"
+      v-model="structureVisibleModel"
+      :title="activeSelectedTable ? `表结构: ${activeSelectedTable}` : '表结构'"
       width="720px"
       append-to-body
     >
       <el-table
-        v-if="describeResult"
-        :data="describeResult.rows"
+        v-if="activeDescribeResult"
+        :data="activeDescribeResult.rows"
         size="small"
         border
         max-height="480"
       >
         <el-table-column
-          v-for="(c, i) in describeResult.columns"
+          v-for="(c, i) in activeDescribeResult.columns"
           :key="i"
           :prop="String(i)"
           :label="c"
@@ -1194,6 +1622,129 @@ onBeforeUnmount(() => {
   color: var(--el-text-color-secondary);
 }
 
+/* DB 标签栏（参考终端 Workspace 的 tab-bar） */
+.db-tabbar {
+  display: flex;
+  align-items: center;
+  height: 34px;
+  background: var(--el-bg-color-overlay);
+  border-bottom: 1px solid var(--el-border-color-lighter);
+  padding: 0 4px;
+  flex-shrink: 0;
+}
+.tabs-scroll {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+}
+.tabs-scroll::-webkit-scrollbar {
+  height: 0;
+}
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  margin-right: 2px;
+  border-radius: 4px 4px 0 0;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--el-text-color-regular);
+  max-width: 200px;
+  flex-shrink: 0;
+}
+.tab:hover {
+  background: var(--el-fill-color-light);
+}
+.tab.active {
+  background: var(--el-bg-color-page);
+  color: var(--el-color-primary);
+}
+.tab .title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tab .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--el-color-success);
+  flex-shrink: 0;
+}
+.tab .dot.connecting {
+  background: var(--el-color-warning);
+}
+.tab-idx {
+  font-size: 10px;
+  color: var(--el-text-color-placeholder);
+  margin-right: 2px;
+}
+.tab .close {
+  font-size: 12px;
+  padding: 2px;
+  border-radius: 2px;
+  color: var(--el-text-color-secondary);
+  flex-shrink: 0;
+}
+.tab .close:hover {
+  color: var(--el-color-danger);
+  background: var(--el-fill-color);
+}
+.tab.dragging {
+  opacity: 0.5;
+}
+.tab-add-wrap {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+}
+.tab-add {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+  cursor: pointer;
+  color: var(--el-text-color-secondary);
+  font-size: 14px;
+}
+.tab-add:hover {
+  color: var(--el-color-primary);
+  background: var(--el-fill-color);
+}
+.tab-hint {
+  font-size: 12px;
+  color: var(--el-text-color-placeholder);
+  margin-left: 8px;
+  white-space: nowrap;
+}
+/* Tab 右键菜单（fixed 浮层，与终端右键菜单同一套样式惯例） */
+.tab-menu {
+  position: fixed;
+  z-index: 3000;
+  background: var(--el-bg-color-overlay);
+  border: 1px solid var(--el-border-color);
+  border-radius: 6px;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.15);
+  padding: 4px;
+  min-width: 110px;
+}
+.tab-menu-item {
+  padding: 6px 12px;
+  font-size: 13px;
+  cursor: pointer;
+  border-radius: 4px;
+  color: var(--el-text-color-primary);
+}
+.tab-menu-item:hover {
+  background: var(--el-fill-color);
+  color: var(--el-color-primary);
+}
+
 /* 占位 */
 .placeholder {
   flex: 1;
@@ -1230,7 +1781,6 @@ onBeforeUnmount(() => {
 /* 左侧表列表（宽度由 sidebarWidth inline style 控制） */
 .table-list {
   flex-shrink: 0;
-  border-right: none;
   background: var(--el-bg-color-overlay);
   display: flex;
   flex-direction: column;
@@ -1396,6 +1946,17 @@ onBeforeUnmount(() => {
   font-weight: 500;
   color: var(--el-color-success);
   margin-right: auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.console-prompt .prompt-db,
+.console-prompt .prompt-db-text {
+  color: var(--el-color-warning);
+}
+.console-prompt .prompt-db {
+  margin-left: 4px;
 }
 /* 输出区 */
 .console-output {
@@ -1471,6 +2032,14 @@ onBeforeUnmount(() => {
   color: var(--el-color-danger);
   padding-left: 16px;
   white-space: pre-wrap;
+}
+/* 结果头部元信息（行数/耗时）；error 变体为执行失败时的状态提示。 */
+.result-meta {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+.result-meta.error {
+  color: var(--el-color-danger);
 }
 .entry-info {
   color: var(--el-text-color-secondary);

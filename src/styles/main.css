@@ -42,12 +42,8 @@ body,
   background: transparent;
 }
 
-/* xterm 容器，撑满父元素 */
-.xterm-pane {
-  width: 100%;
-  height: 100%;
-  background: #000;
-}
+/* xterm 容器：宽高由 TerminalPane.vue 的 scoped 规则提供，此处不设背景色，
+   避免浅色主题下终端首帧出现黑底黑边硬切（主题背景由 xterm 运行时内联）。 */
 .xterm-pane .xterm {
   padding: 4px;
 }

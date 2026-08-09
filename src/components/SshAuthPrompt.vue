@@ -10,11 +10,12 @@
  *   填入第一个空输入框（保险库未解锁时自动隐藏）；
  * - 后端等待超时 120s，前端设置 125s 兜底计时器自动取消，防止弹窗悬挂。
  */
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { ElMessage } from "element-plus";
 import { sshAuthRespond, type SshAuthChallengeEvent } from "@/api/session";
 import { totpGenerate, totpList, type TotpEntry } from "@/api/totp";
+import { useUiStore } from "@/stores/ui";
 
 /** 后端等待超时 120s，前端兜底略长，到点自动取消弹窗。 */
 const CHALLENGE_TIMEOUT_MS = 125_000;
@@ -30,11 +31,26 @@ interface QueuedChallenge {
 }
 
 const queue = ref<QueuedChallenge[]>([]);
-const submitting = ref(false);
+/** 提交/取消任一请求进行中（互斥：提交途中不允许取消，反之亦然）。 */
+const busy = ref(false);
 let unlisten: UnlistenFn | null = null;
 
 const current = computed(() => queue.value[0] ?? null);
 const visible = computed(() => queue.value.length > 0);
+/**
+ * 实际显示状态：与主机公钥确认弹窗互斥（见 stores/ui.ts）。对方可见时本弹窗
+ * 暂时隐藏，挑战留在队列中等待；队列不空即向后端保持挑战存活。
+ */
+const shown = computed(() => visible.value && !ui.hostKeyVisible);
+watch(
+  shown,
+  (v) => {
+    ui.sshAuthVisible = v;
+  },
+  { immediate: true }
+);
+
+const ui = useUiStore();
 
 // --- 事件监听 ---------------------------------------------------------------
 
@@ -47,6 +63,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   unlisten?.();
   for (const item of queue.value) window.clearTimeout(item.timer);
+  ui.sshAuthVisible = false;
 });
 
 async function enqueue(challenge: SshAuthChallengeEvent) {
@@ -57,21 +74,37 @@ async function enqueue(challenge: SshAuthChallengeEvent) {
   } catch {
     totpEntries = [];
   }
-  const timer = window.setTimeout(() => void cancelCurrent(), CHALLENGE_TIMEOUT_MS);
-  queue.value.push({
+  const item: QueuedChallenge = {
     challenge,
     values: challenge.prompts.map(() => ""),
-    timer,
+    timer: 0,
     totpEntries,
-  });
+  };
+  // 兜底计时器必须取消**自己**这条挑战：队尾的挑战若先超时，不能去取消
+  // 队首的（否则用户对 A 的输入会被 B 的超时抢跑）。
+  item.timer = window.setTimeout(() => void cancelItem(item), CHALLENGE_TIMEOUT_MS);
+  queue.value.push(item);
+}
+
+/** 兜底超时：按 item 引用取消指定的排队挑战并出队。 */
+async function cancelItem(item: QueuedChallenge) {
+  const idx = queue.value.indexOf(item);
+  if (idx < 0) return;
+  queue.value.splice(idx, 1);
+  window.clearTimeout(item.timer);
+  try {
+    await sshAuthRespond(item.challenge.challengeId, null);
+  } catch {
+    /* 挑战已关闭，忽略 */
+  }
 }
 
 // --- 提交 / 取消 ------------------------------------------------------------
 
 async function submit() {
   const item = current.value;
-  if (!item || submitting.value) return;
-  submitting.value = true;
+  if (!item || busy.value) return;
+  busy.value = true;
   try {
     window.clearTimeout(item.timer);
     await sshAuthRespond(item.challenge.challengeId, item.values);
@@ -81,19 +114,24 @@ async function submit() {
     ElMessage.error("提交验证码失败: " + String(e));
     queue.value.shift();
   } finally {
-    submitting.value = false;
+    busy.value = false;
   }
 }
 
 async function cancelCurrent() {
   const item = current.value;
-  if (!item) return;
-  window.clearTimeout(item.timer);
-  queue.value.shift();
+  // busy 守卫：提交进行中不响应取消；同时防止连点取消把队首之后
+  // 的排队挑战一并取消掉。
+  if (!item || busy.value) return;
+  busy.value = true;
   try {
+    window.clearTimeout(item.timer);
+    queue.value.shift();
     await sshAuthRespond(item.challenge.challengeId, null);
   } catch {
     /* 挑战已关闭，忽略 */
+  } finally {
+    busy.value = false;
   }
 }
 
@@ -129,7 +167,7 @@ function totpLabel(entry: TotpEntry): string {
 
 <template>
   <el-dialog
-    :model-value="visible"
+    :model-value="shown"
     :show-close="false"
     :close-on-click-modal="false"
     :close-on-press-escape="false"
@@ -184,8 +222,8 @@ function totpLabel(entry: TotpEntry): string {
     </template>
 
     <template #footer>
-      <el-button :disabled="submitting" @click="cancelCurrent">取消</el-button>
-      <el-button type="primary" :loading="submitting" @click="submit">
+      <el-button :disabled="busy" @click="cancelCurrent">取消</el-button>
+      <el-button type="primary" :loading="busy" @click="submit">
         提交
       </el-button>
     </template>

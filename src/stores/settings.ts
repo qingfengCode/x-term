@@ -39,6 +39,8 @@ const defaultTerminal: TerminalSettings = {
   copyOnSelect: true,
   enableWebgl: true,
   sshIdleTimeoutMinutes: 30,
+  sshKeepaliveSecs: 30,
+  sshConnectTimeoutSecs: 15,
 };
 
 export const useSettingsStore = defineStore("settings", () => {
@@ -57,17 +59,35 @@ export const useSettingsStore = defineStore("settings", () => {
   const shortcuts = ref<ShortcutCommand[]>([]);
   /** 快捷命令有序分组名列表。 */
   const shortcutGroups = ref<string[]>([]);
+  /** 快捷命令栏展开状态（多行换行显示），持久化。 */
+  const shortcutBarExpanded = ref(false);
   /** 应用级快捷键绑定（action -> 组合键）。 */
   const appShortcuts = ref<AppShortcuts>(defaultAppShortcuts());
   /** 会话侧栏宽度（px），拖拽调整后持久化。 */
   const sidebarWidth = ref(240);
   /** 最近成功连接的会话 id（最近的在前，最多 10 个）。 */
   const recentSessionIds = ref<string[]>([]);
+  /** 是否启用锁定功能（导航栏显示「锁定」按钮）。 */
+  const vaultLockEnabled = ref(true);
   const loaded = ref(false);
+
+  /** 主题缓存键：index.html 内联脚本在页面加载时读取，提前恢复 dark class，
+   *  消除刷新/启动时的白屏闪烁。仅持久化路径（load/setTerminal）写入——
+   *  设置页"预览"只切 class 不写 store，不会污染缓存，刷新后按磁盘真实主题恢复。 */
+  const THEME_CACHE_KEY = "xterm-theme";
+
+  function syncThemeCache() {
+    try {
+      localStorage.setItem(THEME_CACHE_KEY, terminal.value.theme);
+    } catch {
+      // localStorage 不可用（隐私模式等）不影响功能。
+    }
+  }
 
   async function load() {
     const s = await configApi.settingsLoad();
     terminal.value = { ...defaultTerminal, ...s.terminal };
+    syncThemeCache();
     // 旧配置缺模型参数字段时补默认值（后端 serde default 已兜底，这里防御旧前端缓存）。
     aiProviders.value = (s.ai.providers ?? []).map((p) => ({
       ...PROVIDER_DEFAULTS,
@@ -93,11 +113,14 @@ export const useSettingsStore = defineStore("settings", () => {
     skills.value = s.ai.skills ?? [];
     shortcuts.value = s.shortcuts?.commands ?? [];
     shortcutGroups.value = s.shortcuts?.groups ?? [];
+    shortcutBarExpanded.value = s.shortcuts?.expanded ?? false;
     appShortcuts.value = { ...defaultAppShortcuts(), ...(s.shortcuts?.app ?? {}) };
     // 旧配置文件没有这些字段（或后端默认 0）时回退默认值。
     sidebarWidth.value =
       typeof s.sidebarWidth === "number" && s.sidebarWidth >= 120 ? s.sidebarWidth : 240;
     recentSessionIds.value = s.recentSessionIds ?? [];
+    // 兼容旧配置文件无该字段（默认开启锁定功能）。
+    vaultLockEnabled.value = s.vaultLockEnabled ?? true;
     loaded.value = true;
   }
 
@@ -112,10 +135,16 @@ export const useSettingsStore = defineStore("settings", () => {
         fileAccess: fileAccess.value,
         skills: skills.value,
       },
-      shortcuts: { commands: shortcuts.value, groups: shortcutGroups.value, app: appShortcuts.value },
+      shortcuts: {
+        commands: shortcuts.value,
+        groups: shortcutGroups.value,
+        app: appShortcuts.value,
+        expanded: shortcutBarExpanded.value,
+      },
       firstRun: false,
       sidebarWidth: sidebarWidth.value,
       recentSessionIds: recentSessionIds.value,
+      vaultLockEnabled: vaultLockEnabled.value,
     };
     await configApi.settingsSave(s);
   }
@@ -137,6 +166,7 @@ export const useSettingsStore = defineStore("settings", () => {
 
   function setTerminal(patch: Partial<TerminalSettings>) {
     terminal.value = { ...terminal.value, ...patch };
+    syncThemeCache();
   }
 
   /** 设置会话侧栏宽度（调用方负责 save() 持久化）。 */
@@ -230,9 +260,11 @@ export const useSettingsStore = defineStore("settings", () => {
     skills,
     shortcuts,
     shortcutGroups,
+    shortcutBarExpanded,
     appShortcuts,
     sidebarWidth,
     recentSessionIds,
+    vaultLockEnabled,
     loaded,
     load,
     save,

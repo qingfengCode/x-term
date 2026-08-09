@@ -4,6 +4,19 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>X-Term</title>
+    <script>
+      // 刷新/启动时立即恢复主题：在 CSS 与 JS bundle 加载前同步执行，
+      // 避免深色主题下先渲染出浅色页面的白屏闪烁。
+      // 缓存由 stores/settings.ts 在 load/setTerminal 时写入（跟随磁盘持久化值），
+      // 设置页里的"预览"（只切 class 不写 store）不会污染缓存。
+      try {
+        if (localStorage.getItem("xterm-theme") === "dark") {
+          document.documentElement.classList.add("dark");
+        }
+      } catch (e) {
+        /* localStorage 不可用时忽略，App 加载后仍会按磁盘值校正 */
+      }
+    </script>
   </head>
   <body>
     <div id="app"></div>

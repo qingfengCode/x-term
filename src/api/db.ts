@@ -35,12 +35,23 @@ export function dbDisconnect(connId: string): Promise<void> {
   return invoke<void>("db_disconnect", { connId });
 }
 
+/** 切换连接的当前库（schema）。之后该连接上的查询自动带 USE，SQL 无需库前缀。 */
+export function dbUseDatabase(connId: string, database: string | null): Promise<void> {
+  return invoke<void>("db_use_database", { connId, database });
+}
+
 /**
  * 执行 SQL，结果通过 db:query_result 事件推送（含 queryId）。
  * 注意：本 invoke 会等到后端 SQL 执行完才 resolve；事件先于 invoke resolve 到达。
+ * @param readOnly 只读模式：后端强制校验（前端判定可被绕过，必须由后端兜底）。
  */
-export function dbExecSql(connId: string, sql: string, queryId: string): Promise<void> {
-  return invoke<void>("db_exec_sql", { connId, sql, queryId });
+export function dbExecSql(
+  connId: string,
+  sql: string,
+  queryId: string,
+  readOnly = false
+): Promise<void> {
+  return invoke<void>("db_exec_sql", { connId, sql, queryId, readOnly });
 }
 
 /** 列出表。database 省略时列当前库；指定时列该库（SHOW TABLES FROM <db>）。 */

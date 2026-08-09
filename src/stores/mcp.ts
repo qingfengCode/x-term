@@ -32,6 +32,9 @@ export const useMcpStore = defineStore("mcp", () => {
   /** 待确认的请求队列（按到达顺序）。 */
   const pendingApprovals = ref<McpApprovalRequest[]>([]);
 
+  /** 正在回结果（允许/拒绝）的请求 id，防止连点重复提交。 */
+  const respondingIds = ref<Set<string>>(new Set());
+
   /** 该 kind 的默认配置。 */
   function makeDefault(kind: McpKind): McpInstanceConfig {
     const port = kind === "ssh" ? 8765 : kind === "db" ? 8766 : 8767;
@@ -42,6 +45,7 @@ export const useMcpStore = defineStore("mcp", () => {
       token: undefined,
       resourceId: undefined,
       resourceMode: "bound",
+      boundSource: "config",
       boundDatabase: undefined,
       autoApprove: false,
       enableLog: true,
@@ -86,6 +90,17 @@ export const useMcpStore = defineStore("mcp", () => {
     const c = cfg ?? configOf(kind).value;
     await mcpApi.mcpSaveConfig(kind, c);
     configOf(kind).value = { ...c };
+  }
+
+  /**
+   * 运行中热切换绑定的资源（会话配置 / 终端标签页），立即生效并持久化。
+   * 服务未运行时仅保存配置（启动时生效）。
+   */
+  async function rebind(kind: McpKind, boundSource: "config" | "terminal", resourceId: string) {
+    await mcpApi.mcpRebind(kind, boundSource, resourceId);
+    const c = configOf(kind).value;
+    c.boundSource = boundSource;
+    c.resourceId = resourceId;
   }
 
   /** 拉取该 kind 的服务端状态。 */
@@ -137,12 +152,16 @@ export const useMcpStore = defineStore("mcp", () => {
   }
 
   /** 用户点"允许/拒绝"。向后端回结果并从队列移除。
-   *  即使后端返回错误（如请求已超时清理），仍从前端队列移除，避免卡片残留。 */
+   *  即使后端返回错误（如请求已超时清理），仍从前端队列移除，避免卡片残留。
+   *  in-flight 守卫：同一请求的重复点击（连点/双击）直接忽略。 */
   async function respond(requestId: string, approved: boolean) {
+    if (respondingIds.value.has(requestId)) return;
+    respondingIds.value.add(requestId);
     try {
       await mcpApi.mcpRespondApproval(requestId, approved);
-    } finally {
       pendingApprovals.value = pendingApprovals.value.filter((r) => r.requestId !== requestId);
+    } finally {
+      respondingIds.value.delete(requestId);
     }
   }
 
@@ -155,9 +174,11 @@ export const useMcpStore = defineStore("mcp", () => {
     fileStatus,
     loading,
     pendingApprovals,
+    respondingIds,
     loadAll,
     loadConfig,
     saveConfig,
+    rebind,
     refresh,
     start,
     stop,

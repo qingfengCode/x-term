@@ -9,6 +9,11 @@ export function sftpStat(sftpId: string, path: string): Promise<FileMeta> {
   return invoke<FileMeta>("sftp_stat", { sftpId, path });
 }
 
+/** 获取远程会话当前工作目录（绝对路径，后端用 REALPATH 解析 "."）。 */
+export function sftpPwd(sftpId: string): Promise<string> {
+  return invoke<string>("sftp_pwd", { sftpId });
+}
+
 export function sftpMkdir(sftpId: string, path: string): Promise<void> {
   return invoke<void>("sftp_mkdir", { sftpId, path });
 }

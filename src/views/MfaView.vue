@@ -25,6 +25,11 @@ const loading = ref(false);
 /** id -> 当前码（含周期起始时间戳，便于本地倒计时）。 */
 const codes = ref<Map<string, { code: string; codeTs: number; period: number }>>(new Map());
 
+/** 生成失败的条目重试冷却：失败后延迟再试，避免每秒 tick 无限重试风暴。 */
+const RETRY_BACKOFF_MS = 10_000;
+/** id -> 最近一次生成失败的时间戳（冷却期内不再调后端）。 */
+const failedAt = ref<Map<string, number>>(new Map());
+
 /** 当前 Unix 秒。 */
 const nowSec = ref(Math.floor(Date.now() / 1000));
 let tickTimer: ReturnType<typeof setInterval> | null = null;
@@ -44,11 +49,15 @@ async function load() {
   }
 }
 
-/** 为所有条目重新生成码（调后端）。 */
+/** 为所有条目重新生成码（调后端）。失败条目进入冷却，冷却期内跳过。 */
 async function refreshAllCodes() {
-  const next = new Map<string, { code: string; codeTs: number; period: number }>();
+  const now = Date.now();
+  const next = new Map(codes.value);
   await Promise.all(
     entries.value.map(async (e) => {
+      // 冷却中：跳过，避免失败条目每秒触发一次 IPC。
+      const lastFail = failedAt.value.get(e.id);
+      if (lastFail && now - lastFail < RETRY_BACKOFF_MS) return;
       try {
         const c = await totpApi.totpGenerate(e.id);
         next.set(e.id, {
@@ -56,8 +65,11 @@ async function refreshAllCodes() {
           codeTs: Math.floor(Date.now() / 1000),
           period: e.period,
         });
+        failedAt.value.delete(e.id);
       } catch {
-        /* 单条失败忽略 */
+        // 记下失败时间进入冷却；移除旧码，界面显示"------"等待重试。
+        failedAt.value.set(e.id, Date.now());
+        next.delete(e.id);
       }
     })
   );
@@ -151,6 +163,7 @@ async function removeEntry(e: TotpEntry) {
     await totpApi.totpDelete(e.id);
     entries.value = entries.value.filter((x) => x.id !== e.id);
     codes.value.delete(e.id);
+    failedAt.value.delete(e.id);
     ElMessage.success("已删除");
   } catch (err) {
     ElMessage.error("删除失败：" + String(err));

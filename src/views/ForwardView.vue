@@ -17,6 +17,7 @@ import { useSessionsStore } from "@/stores/sessions";
 import {
   forwardDeleteRule,
   forwardListRules,
+  forwardListRunning,
   forwardSaveRule,
   forwardStart,
   forwardStop,
@@ -26,7 +27,8 @@ import type { ForwardRule } from "@/api/types";
 const sessions = useSessionsStore();
 
 const rules = ref<ForwardRule[]>([]);
-// 当前在前端认为处于运行中的规则 id 集合（页面刷新后清空）
+// 运行中的规则 id 集合：以后端真实状态为准（页面刷新/重新进入后同步，隧道
+// 异常退出后由后端决定），不再依赖纯前端内存。
 const running = ref<Set<string>>(new Set());
 const loading = ref(false);
 // 正在发起启动/停止请求的规则 id（用于按钮 loading）
@@ -99,7 +101,12 @@ const formRules: FormRules = {
 async function loadRules() {
   loading.value = true;
   try {
-    rules.value = await forwardListRules();
+    const [list, runningIds] = await Promise.all([
+      forwardListRules(),
+      forwardListRunning().catch(() => [] as string[]),
+    ]);
+    rules.value = list;
+    running.value = new Set(runningIds);
   } catch (e: any) {
     ElMessage.error("加载转发规则失败：" + (e?.message ?? String(e)));
   } finally {
@@ -165,9 +172,21 @@ async function submitForm() {
   };
   try {
     await forwardSaveRule(rule);
-    ElMessage.success(dialogMode.value === "create" ? "已新建转发规则" : "已保存修改");
+    const wasRunning = running.value.has(rule.id);
     dialogVisible.value = false;
     await loadRules();
+    // autoStart 消费：保存后自动启动本规则（编辑运行中的规则时已在运行则跳过）。
+    if (rule.autoStart && !wasRunning && !running.value.has(rule.id)) {
+      try {
+        await forwardStart(rule.id);
+        running.value.add(rule.id);
+        ElMessage.success(`已保存并启动：${rule.name}`);
+      } catch (e: any) {
+        ElMessage.warning("规则已保存，但自动启动失败：" + (e?.message ?? String(e)));
+      }
+    } else {
+      ElMessage.success(dialogMode.value === "create" ? "已新建转发规则" : "已保存修改");
+    }
   } catch (e: any) {
     ElMessage.error("保存失败：" + (e?.message ?? String(e)));
   }
@@ -257,6 +276,7 @@ onMounted(async () => {
       :data="rules"
       empty-text="暂无转发规则，点击右上角“新建转发规则”创建"
       stripe
+      height="100%"
       class="rules-table"
     >
       <el-table-column label="名称" prop="name" min-width="140">
@@ -381,7 +401,7 @@ onMounted(async () => {
 
         <el-form-item label="自动启动">
           <el-switch v-model="form.autoStart" />
-          <span class="form-hint">建立 SSH 会话后自动开启本规则</span>
+          <span class="form-hint">保存后自动启动本规则（启动失败不影响保存）</span>
         </el-form-item>
       </el-form>
 

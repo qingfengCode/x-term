@@ -62,6 +62,15 @@ export const useSessionsStore = defineStore("sessions", () => {
 
   async function removeGroup(id: string) {
     await sessionApi.deleteGroup(id);
+    // 后端 delete_group 无级联，需清理悬空引用：
+    // - 组内会话的 groupId 置空（变"无分组"）；
+    // - 子分组的 parentId 置空（变根组）。
+    for (const s of sessions.value.filter((s) => s.groupId === id)) {
+      await saveSession({ ...s, groupId: null });
+    }
+    for (const g of groups.value.filter((g) => g.parentId === id)) {
+      await saveGroup({ ...g, parentId: null });
+    }
     groups.value = groups.value.filter((g) => g.id !== id);
   }
 

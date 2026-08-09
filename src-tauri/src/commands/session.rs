@@ -86,10 +86,15 @@ pub async fn connect_session(
     let instance_id = match session_config.protocol.as_str() {
         "telnet" => {
             // Telnet：纯 TCP，无 SSH 认证（用户名/密码在连接后交互输入）。
+            // 建连超时复用设置里的 SSH 连接超时（0 = 永不超时），默认 15s。
+            let timeout_secs = crate::config::settings_load_inner(&state)
+                .map(|s| s.terminal.ssh_connect_timeout_secs)
+                .unwrap_or(15);
             let telnet = crate::telnet::TelnetSession::connect_and_spawn(
                 &session_config.host,
                 session_config.port,
                 session_config.id.clone(),
+                timeout_secs,
                 app,
             )
             .await?;

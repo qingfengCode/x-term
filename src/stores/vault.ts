@@ -36,5 +36,11 @@ export const useVaultStore = defineStore("vault", () => {
     unlocked.value = true;
   }
 
-  return { exists, unlocked, loading, refresh, create, unlock };
+  /** 锁定保险库（温和锁定：后端不清除已建立的连接）。 */
+  async function lock() {
+    await vaultApi.vaultLock();
+    unlocked.value = false;
+  }
+
+  return { exists, unlocked, loading, refresh, create, unlock, lock };
 });

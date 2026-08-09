@@ -24,6 +24,12 @@ export function vaultUnlocked(): Promise<boolean> {
   return invoke<boolean>("vault_unlocked");
 }
 
+/** 锁定保险库：清除内存主密钥，之后需重新输入主密码解锁。
+ *  不断开已建立的连接（温和锁定）。 */
+export function vaultLock(): Promise<void> {
+  return invoke<void>("vault_lock");
+}
+
 export function credentialSave(input: CredentialInput): Promise<string> {
   return invoke<string>("credential_save", { input });
 }

@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, onBeforeUnmount, ref } from "vue";
+import { computed, onActivated, onBeforeUnmount, onDeactivated, ref } from "vue";
 import { useTerminalsStore, type TerminalTab } from "@/stores/terminals";
 import { useSettingsStore } from "@/stores/settings";
 import TerminalPane from "@/components/TerminalPane.vue";
 import AiPanel from "@/components/AiPanel.vue";
-import { Close, Delete, Top, Bottom, ZoomIn, ZoomOut, Refresh } from "@element-plus/icons-vue";
+import { Close, Delete, Top, Bottom, ZoomIn, ZoomOut, Refresh, Plus, ArrowDown, ArrowUp } from "@element-plus/icons-vue";
+import { ElMessage } from "element-plus";
 import { eventToCombo, isModifierOnly } from "@/utils/shortcut";
 import type { ShortcutCommand } from "@/api/types";
 
@@ -152,8 +153,73 @@ function runShortcut(sc: ShortcutCommand) {
   activePaneRef.value?.sendCommand(resolveCommand(sc.command));
 }
 
+// --- 快捷命令栏：展开/折叠（状态持久化） --------------------------------
+
+/** 展开状态来自设置（持久化，重启后保持）。 */
+const scExpanded = computed(() => settings.shortcutBarExpanded);
+
+function toggleScExpand() {
+  settings.shortcutBarExpanded = !settings.shortcutBarExpanded;
+  void settings.save();
+}
+
+// --- 快捷命令栏：在终端直接添加快捷命令 ----------------------------------
+
+/** 添加命令弹窗（位于分组标签行右侧的 + 按钮）。 */
+const addVisible = ref(false);
+const newScLabel = ref("");
+const newScCommand = ref("");
+const newScGroup = ref("");
+
+/** 尽力从终端当前行剥离 shell 提示符，得到用户输入的命令。 */
+function stripPrompt(line: string): string {
+  const s = line.replace(/\s+$/, "");
+  // 提示符常见形态：user@host:~$ / root@host:/opt# / [user@host ~]$ / C:\> / ❯ 等。
+  // 特征：提示符字符（$ # % > ❯ λ ➜）后跟空白，且其前含 @、:、]、~、/ 或形如盘符。
+  const matches = [...s.matchAll(/[#$%>❯λ➜]\s+/g)];
+  for (let i = matches.length - 1; i >= 0; i--) {
+    const m = matches[i];
+    const before = s.slice(0, m.index);
+    if (/[@:\]~/]/.test(before) || /^[A-Za-z]:\\?$/.test(before)) {
+      return s.slice(m.index! + m[0].length).trimStart();
+    }
+  }
+  return s;
+}
+
+/** 点击 +：预填当前终端输入的命令，打开添加弹窗。 */
+function openAddShortcut() {
+  const line = activePaneRef.value?.getCurrentLine() ?? "";
+  newScCommand.value = stripPrompt(line);
+  newScLabel.value = newScCommand.value.split(/\s+/)[0] || "新命令";
+  newScGroup.value = activeGroup.value === "__all__" ? "" : activeGroup.value;
+  addVisible.value = true;
+}
+
+/** 保存新快捷命令（写入设置持久化）。 */
+async function saveNewShortcut() {
+  const command = newScCommand.value.trim();
+  const label = newScLabel.value.trim();
+  if (!label && !command) {
+    ElMessage.warning("名称和命令不能同时为空");
+    return;
+  }
+  const finalLabel = label || command || "新命令";
+  const group = newScGroup.value.trim();
+  if (group && !settings.shortcutGroups.includes(group)) {
+    settings.addShortcutGroup(group);
+  }
+  const id = settings.addShortcut(group || undefined);
+  settings.updateShortcut(id, { label: finalLabel, command, shortcut: null });
+  addVisible.value = false;
+  await settings.save();
+  ElMessage.success(`已添加快捷命令「${finalLabel}」`);
+}
+
 /** 用于全局快捷键监听（自定义快捷命令）。 */
 function onGlobalKeydown(e: KeyboardEvent) {
+  // 长按连发（e.repeat）只响应首次按键，避免自定义命令被连续执行。
+  if (e.repeat) return;
   // Esc 关闭 tab 右键菜单。
   if (e.key === "Escape") {
     closeTabMenu();
@@ -173,11 +239,19 @@ function onGlobalKeydown(e: KeyboardEvent) {
   }
 }
 
-onMounted(() => {
+// 本组件被 KeepAlive 缓存（MainLayout），切到其他页面时不会卸载——若在
+// onMounted 里注册全局监听，切走后自定义命令快捷键仍会在后台终端执行命令、
+// 点击也会误关菜单。改为随页面激活/停用注册/注销。
+onActivated(() => {
   window.addEventListener("keydown", onGlobalKeydown);
   // 点击任意处关闭 tab 右键菜单。
   window.addEventListener("click", closeTabMenu);
 });
+onDeactivated(() => {
+  window.removeEventListener("keydown", onGlobalKeydown);
+  window.removeEventListener("click", closeTabMenu);
+});
+// 兜底：组件真正销毁（如应用退出）时确保清理。
 onBeforeUnmount(() => {
   window.removeEventListener("keydown", onGlobalKeydown);
   window.removeEventListener("click", closeTabMenu);
@@ -284,41 +358,103 @@ onBeforeUnmount(() => {
       <AiPanel domain="ssh" />
     </div>
     <!-- 终端底部快捷命令栏 -->
-    <div v-if="active && settings.shortcuts.length > 0" class="shortcut-bar">
-      <!-- 分组标签页（仅存在分组时显示） -->
-      <div v-if="hasGroups" class="sc-tabs">
-        <button
-          class="sc-tab"
-          :class="{ active: activeGroup === '__all__' }"
-          @click="activeGroup = '__all__'"
-        >
-          全部
-        </button>
-        <button
-          v-for="g in settings.shortcutGroups"
-          :key="g"
-          class="sc-tab"
-          :class="{ active: activeGroup === g }"
-          @click="activeGroup = g"
-        >
-          {{ g }}
-        </button>
-      </div>
-      <!-- 命令按钮区 -->
-      <div class="sc-buttons">
-        <el-tooltip
-          v-for="sc in visibleShortcuts"
-          :key="sc.id"
-          :content="sc.shortcut ? `${sc.command}  (${sc.shortcut})` : sc.command"
-          placement="top"
-          :show-after="400"
-        >
-          <button class="sc-btn" @click="runShortcut(sc)">
-            <span class="sc-label">{{ sc.label }}</span>
-            <span v-if="sc.shortcut" class="sc-key">{{ sc.shortcut }}</span>
+    <div v-if="active" class="shortcut-bar">
+      <!-- 分组标签行：分组在左，右侧为「添加快捷命令」按钮 -->
+      <div class="sc-tabs">
+        <template v-if="hasGroups">
+          <button
+            class="sc-tab"
+            :class="{ active: activeGroup === '__all__' }"
+            @click="activeGroup = '__all__'"
+          >
+            全部
           </button>
-        </el-tooltip>
-        <span v-if="visibleShortcuts.length === 0" class="sc-empty">该分组暂无命令</span>
+          <button
+            v-for="g in settings.shortcutGroups"
+            :key="g"
+            class="sc-tab"
+            :class="{ active: activeGroup === g }"
+            @click="activeGroup = g"
+          >
+            {{ g }}
+          </button>
+        </template>
+        <span class="sc-tabs-spacer" />
+        <!-- 添加命令弹窗：预填当前终端输入的命令 -->
+        <el-popover v-model:visible="addVisible" placement="top-start" :width="320" trigger="click">
+          <div class="sc-add-form">
+            <div class="sc-add-field">
+              <span class="sc-add-label">命令</span>
+              <el-input
+                v-model="newScCommand"
+                size="small"
+                placeholder="要发送的命令"
+                spellcheck="false"
+              />
+            </div>
+            <div class="sc-add-field">
+              <span class="sc-add-label">名称</span>
+              <el-input
+                v-model="newScLabel"
+                size="small"
+                placeholder="按钮显示名称（默认取命令首词）"
+              />
+            </div>
+            <div class="sc-add-field">
+              <span class="sc-add-label">分组</span>
+              <el-select
+                v-model="newScGroup"
+                size="small"
+                filterable
+                allow-create
+                default-first-option
+                clearable
+                placeholder="未分组"
+                style="flex: 1"
+              >
+                <el-option v-for="g in settings.shortcutGroups" :key="g" :label="g" :value="g" />
+              </el-select>
+            </div>
+            <div class="sc-add-actions">
+              <el-button size="small" @click="addVisible = false">取消</el-button>
+              <el-button size="small" type="primary" @click="saveNewShortcut">添加</el-button>
+            </div>
+          </div>
+          <template #reference>
+            <button class="sc-add" title="添加快捷命令">
+              <el-icon><Plus /></el-icon>
+            </button>
+          </template>
+        </el-popover>
+      </div>
+      <!-- 命令按钮行：折叠时超出宽度隐藏；展开时自动往下换行显示全部 -->
+      <div class="sc-row">
+        <div class="sc-buttons" :class="{ expanded: scExpanded }">
+          <el-tooltip
+            v-for="sc in visibleShortcuts"
+            :key="sc.id"
+            :content="sc.shortcut ? `${sc.command}  (${sc.shortcut})` : sc.command"
+            placement="top"
+            :show-after="400"
+          >
+            <button class="sc-btn" @click="runShortcut(sc)">
+              <span class="sc-label">{{ sc.label }}</span>
+              <span v-if="sc.shortcut" class="sc-key">{{ sc.shortcut }}</span>
+            </button>
+          </el-tooltip>
+          <span v-if="visibleShortcuts.length === 0" class="sc-empty">
+            {{ settings.shortcuts.length === 0 ? "暂无快捷命令，点击上方 + 添加" : "该分组暂无命令" }}
+          </span>
+        </div>
+        <button
+          v-if="settings.shortcuts.length > 0"
+          class="sc-toggle"
+          :title="scExpanded ? '收起（单行显示）' : '展开（多行换行）'"
+          @click="toggleScExpand"
+        >
+          <el-icon><component :is="scExpanded ? ArrowUp : ArrowDown" /></el-icon>
+          <span>{{ scExpanded ? "收起" : "展开" }}</span>
+        </button>
       </div>
     </div>
   </div>
@@ -400,13 +536,13 @@ onBeforeUnmount(() => {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: #22c55e;
+  background: var(--el-color-success);
 }
 .tab .dot.connecting {
-  background: #f59e0b;
+  background: var(--el-color-warning);
 }
 .tab .dot.dead {
-  background: #ef4444;
+  background: var(--el-color-danger);
 }
 /* 拖拽中的 tab 半透明提示 */
 .tab.dragging {
@@ -435,7 +571,9 @@ onBeforeUnmount(() => {
   border-radius: 6px;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
   padding: 4px 0;
-  z-index: 100;
+  /* 与 SqlConsoleView 同款菜单保持一致；高于 el-dialog 遮罩（2000+），
+     避免右键菜单打开时被弹窗遮罩盖住 */
+  z-index: 3000;
 }
 .tab-menu-item {
   padding: 6px 14px;
@@ -519,6 +657,32 @@ onBeforeUnmount(() => {
   gap: 2px;
   padding: 4px 10px 0;
   border-bottom: 1px solid var(--el-border-color-lighter);
+  flex-shrink: 0;
+}
+.sc-tabs-spacer {
+  flex: 1;
+}
+/* 「添加快捷命令」按钮（分组右侧） */
+.sc-add {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  margin-left: 6px;
+  border: 1px dashed var(--el-border-color);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--el-text-color-secondary);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.sc-add:hover {
+  border-color: var(--el-color-primary);
+  color: var(--el-color-primary);
+  background: var(--el-color-primary-light-9);
 }
 .sc-tab {
   padding: 3px 10px;
@@ -539,12 +703,47 @@ onBeforeUnmount(() => {
   border-bottom-color: var(--el-color-primary);
   font-weight: 500;
 }
+/* 命令按钮行：按钮区（可折叠/展开）+ 展开收起按钮 */
+.sc-row {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
 .sc-buttons {
   display: flex;
   align-items: center;
   gap: 6px;
   padding: 6px 10px;
-  overflow-x: auto;
+  flex: 1;
+  min-width: 0;
+  /* 折叠：单行，超出宽度直接隐藏（不出现滚动条） */
+  flex-wrap: nowrap;
+  overflow: hidden;
+}
+.sc-buttons.expanded {
+  /* 展开：自动往下换行显示全部命令 */
+  flex-wrap: wrap;
+  overflow: visible;
+}
+.sc-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0 8px 0 2px;
+  padding: 3px 8px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: all 0.15s;
+}
+.sc-toggle:hover {
+  color: var(--el-color-primary);
+  background: var(--el-fill-color);
 }
 .sc-empty {
   font-size: 12px;
@@ -581,5 +780,30 @@ onBeforeUnmount(() => {
   border-radius: 3px;
   background: var(--el-fill-color-dark);
   color: var(--el-text-color-secondary);
+}
+
+/* --- 添加命令弹窗 --- */
+.sc-add-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.sc-add-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.sc-add-label {
+  flex-shrink: 0;
+  width: 34px;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  text-align: right;
+}
+.sc-add-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 2px;
 }
 </style>

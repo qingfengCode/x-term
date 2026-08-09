@@ -81,6 +81,11 @@ pub async fn ai_chat(
         .ai
         .active_provider()
         .ok_or_else(|| AppError::InvalidInput("未配置 AI provider，请先在设置中添加".into()))?;
+    // 多模态兜底：非多模态模型不发送图片字段。前端发送时已按激活模型过滤，
+    // 但旧对话历史 / 其它调用方仍可能带图——文本模型（如 DeepSeek）遇到
+    // image_url / image 块会直接 400，这里在入口统一剥离，双保险。
+    let mut req = req;
+    filter_images_for_model(&mut req.messages, provider_cfg.multimodal);
     // 智能体循环轮数上限与上下文裁剪预算均来自模型配置（见设置页「模型参数」）。
     let max_tool_calls = provider_cfg.max_tool_calls.max(1);
     let context_budget = provider_cfg
@@ -378,6 +383,7 @@ async fn run_agent_loop(
             content: resp.message,
             tool_calls: Some(resp.tool_calls.clone()),
             tool_call_id: None,
+            images: None,
         });
 
         // 逐个工具调用：emit → 等待确认 → 执行 → emit 结果 → 回填进 messages。
@@ -415,6 +421,7 @@ async fn run_agent_loop(
                     content: msg,
                     tool_calls: None,
                     tool_call_id: Some(call.id.clone()),
+                    images: None,
                 });
                 continue;
             }
@@ -478,6 +485,7 @@ async fn run_agent_loop(
                         content: msg,
                         tool_calls: None,
                         tool_call_id: Some(call.id.clone()),
+                        images: None,
                     });
                     continue;
                 }
@@ -632,6 +640,7 @@ async fn run_agent_loop(
                 content: result.output.clone(),
                 tool_calls: None,
                 tool_call_id: Some(call.id.clone()),
+                images: None,
             });
         }
         // 继续下一轮：messages 已含完整的 [assistant(tool_calls), tool, tool, ...] 链。
@@ -660,6 +669,8 @@ async fn run_agent_loop(
 
 /// 单条消息除正文外的固定协议开销（role、分隔符等），估算时计入。
 const MESSAGE_OVERHEAD_TOKENS: usize = 8;
+/// 每张图片的 token 估算值（与分辨率相关，取主流视觉模型的中间值）。
+const IMAGE_TOKENS: usize = 1_000;
 
 /// 粗略估算一段文本的 token 数。
 ///
@@ -690,7 +701,14 @@ fn estimate_tokens(text: &str) -> usize {
 ///   带 tool_calls 的 assistant 消息之后，否则以 400 拒绝；
 /// - 至少保留最后一条非 system 消息（当前用户问题不能被裁掉）。
 fn trim_history_for_context(messages: &mut Vec<ChatMessage>, budget: usize) {
-    let tokens_of = |m: &ChatMessage| estimate_tokens(&m.content) + MESSAGE_OVERHEAD_TOKENS;
+    let tokens_of = |m: &ChatMessage| {
+        estimate_tokens(&m.content)
+            + MESSAGE_OVERHEAD_TOKENS
+            + m.images
+                .as_ref()
+                .map(|imgs| imgs.len() * IMAGE_TOKENS)
+                .unwrap_or(0)
+    };
     let mut total: usize = messages.iter().map(tokens_of).sum();
     let mut i = 0;
     while total > budget && i < messages.len() {
@@ -758,4 +776,57 @@ pub fn ai_save_conversations(
 ) -> AppResult<()> {
     let path = conversations_path(&domain)?;
     crate::storage::json_store::write_json(&path, &conversations)
+}
+
+/// 非多模态模型不发送图片字段：把 `messages` 里的图片全部剥离。
+///
+/// 多模态开关在模型配置上，普通模型（如 DeepSeek 等 OpenAI 兼容文本模型）
+/// 不识别 `image_url` / `image` 块，带上会直接 400。前端发送时已按激活模型
+/// 过滤，此函数在 `ai_chat` 入口兜底（旧对话历史或其它调用方仍可能带图）。
+fn filter_images_for_model(messages: &mut [ChatMessage], multimodal: bool) {
+    if !multimodal {
+        for m in messages {
+            m.images = None;
+        }
+    }
+}
+
+// ===========================================================================
+// 单元测试
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::provider::{ChatMessage, ImagePart, Role};
+
+    fn msg_with_image() -> ChatMessage {
+        ChatMessage {
+            role: Role::User,
+            content: "看图".into(),
+            tool_calls: None,
+            tool_call_id: None,
+            images: Some(vec![ImagePart {
+                mime_type: "image/png".into(),
+                data_base64: "AAAA".into(),
+            }]),
+        }
+    }
+
+    /// 非多模态模型：剥离所有消息的图片字段，文本内容不受影响。
+    #[test]
+    fn strips_images_for_non_multimodal() {
+        let mut messages = vec![msg_with_image(), ChatMessage::new(Role::User, "第二问")];
+        filter_images_for_model(&mut messages, false);
+        assert!(messages.iter().all(|m| m.images.is_none()));
+        assert_eq!(messages[0].content, "看图");
+    }
+
+    /// 多模态模型：图片字段原样保留。
+    #[test]
+    fn keeps_images_for_multimodal() {
+        let mut messages = vec![msg_with_image()];
+        filter_images_for_model(&mut messages, true);
+        assert!(messages[0].images.is_some());
+    }
 }

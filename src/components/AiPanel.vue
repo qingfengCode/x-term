@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
-import { Promotion, Delete, ChatDotRound, DArrowRight, Connection, Tools, ArrowDown, Plus, Close, CopyDocument, RefreshRight, VideoPause, Document, Loading, Download, MagicStick, Collection } from "@element-plus/icons-vue";
+import { Promotion, Delete, ChatDotRound, DArrowRight, Connection, Tools, ArrowDown, Plus, Close, CopyDocument, RefreshRight, VideoPause, Document, Loading, Download, MagicStick, Collection, Picture } from "@element-plus/icons-vue";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
-import { save } from "@tauri-apps/plugin-dialog";
-import { writeTextFile } from "@tauri-apps/plugin-fs";
+import { open, save } from "@tauri-apps/plugin-dialog";
+import { readFile, writeTextFile } from "@tauri-apps/plugin-fs";
 import { homeDir, join } from "@tauri-apps/api/path";
 import { useAiSshStore, useAiDbStore, type AiMessage } from "@/stores/ai";
 import { useSettingsStore } from "@/stores/settings";
@@ -14,6 +14,7 @@ import { useDbStore } from "@/stores/db";
 import { useUiStore } from "@/stores/ui";
 import { dbShowCreateTable, type DraggedTable } from "@/api/db";
 import type { ToolCallItem } from "@/stores/ai";
+import type { ImagePart } from "@/api/types";
 import SkillDialog from "@/components/SkillDialog.vue";
 import SkillManagerDialog from "@/components/SkillManagerDialog.vue";
 import type { SkillConfig } from "@/api/types";
@@ -208,9 +209,9 @@ const contextTip = computed(() => {
   } else {
     // db 域
     if (db.activeConnId) {
-      const c = db.conns.find((x) => x.id === db.activeConnId);
-      parts.push(`数据库: ${c?.name ?? db.activeConnId}`);
-      // 追加当前关联库（点库/表或拖表时设置）。
+      const tab = db.activeTab;
+      parts.push(`数据库: ${tab?.profileName ?? db.activeConnId}`);
+      // 追加当前绑定库（点库/表或拖表时设置）。
       if (db.activeDatabase) parts.push(`库: ${db.activeDatabase}`);
     }
   }
@@ -239,6 +240,169 @@ const configTip = computed(() => {
   if (!hasActive.value) return "未选择激活模型";
   return "";
 });
+
+// --- 多模态（图片输入） ---------------------------------------------------
+/** 当前激活模型（按 `${kind}:${model}` 匹配）。 */
+const activeProvider = computed(
+  () =>
+    settings.aiProviders.find((p) => `${p.kind}:${p.model}` === settings.aiActive) ?? null
+);
+/** 激活模型是否开启了多模态：开启后才显示图片上传入口。 */
+const multimodalEnabled = computed(() => activeProvider.value?.multimodal ?? false);
+
+/** 一张待发送的图片。 */
+interface AttachedImage {
+  id: string;
+  name: string;
+  mimeType: string;
+  dataBase64: string;
+}
+/** 待发送图片列表（发送后清空）。 */
+const attachedImages = ref<AttachedImage[]>([]);
+
+/** 激活模型切到非多模态：清空待发送图片（避免残留导致发送被拦）。 */
+watch(multimodalEnabled, (v) => {
+  if (!v && attachedImages.value.length > 0) {
+    attachedImages.value = [];
+    ElMessage.info("当前模型不支持多模态，已清空待发送图片");
+  }
+});
+/** 正在读取图片文件（弹窗选择 / 拖入 / 粘贴）。 */
+const imageReading = ref(false);
+/** 单次最多附带的图片数。 */
+const MAX_IMAGES = 4;
+/** 单张图片大小上限（10MB，防止请求体过大）。 */
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+
+/** 生成图片的 data URL（渲染预览用）。 */
+function imageDataUrl(img: Pick<ImagePart, "mimeType" | "dataBase64">): string {
+  return `data:${img.mimeType};base64,${img.dataBase64}`;
+}
+
+// --- 大图查看器（点击消息缩略图打开） -------------------------------------
+/** 查看器是否打开。 */
+const viewerVisible = ref(false);
+/** 查看器图片列表（同一消息的所有图，可左右切换）。 */
+const viewerUrls = ref<string[]>([]);
+/** 打开时定位到的图片下标。 */
+const viewerIndex = ref(0);
+
+/** 点击消息里的缩略图：用该消息的全部图片打开查看器，并定位到点击的这张。 */
+function previewImages(m: AiMessage, index: number) {
+  if (!m.images?.length) return;
+  viewerUrls.value = m.images.map(imageDataUrl);
+  viewerIndex.value = index;
+  viewerVisible.value = true;
+}
+
+/** Uint8Array → base64（分块拼接，避免栈溢出）。 */
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+/** 按文件名后缀推断 MIME 类型（取不到时默认 image/png）。 */
+function mimeFromName(name: string): string {
+  const ext = name.split(".").pop()?.toLowerCase() ?? "";
+  const map: Record<string, string> = {
+    png: "image/png",
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    gif: "image/gif",
+    webp: "image/webp",
+    bmp: "image/bmp",
+  };
+  return map[ext] ?? "image/png";
+}
+
+/** 校验并追加一张图片（大小/数量上限），返回是否成功。 */
+function addImage(img: Omit<AttachedImage, "id">): boolean {
+  if (attachedImages.value.length >= MAX_IMAGES) {
+    ElMessage.warning(`最多附带 ${MAX_IMAGES} 张图片`);
+    return false;
+  }
+  attachedImages.value.push({ ...img, id: `img-${Date.now()}-${Math.random().toString(36).slice(2, 6)}` });
+  return true;
+}
+
+/** 移除一张待发送图片。 */
+function removeImage(id: string) {
+  attachedImages.value = attachedImages.value.filter((i) => i.id !== id);
+}
+
+/** 图片选择按钮：弹系统文件对话框，读取并附加。 */
+async function pickImage() {
+  if (imageReading.value) return;
+  const selected = await open({
+    title: "选择图片",
+    multiple: true,
+    filters: [
+      { name: "图片", extensions: ["png", "jpg", "jpeg", "gif", "webp", "bmp"] },
+    ],
+  });
+  if (!selected) return;
+  const paths = Array.isArray(selected) ? selected : [selected];
+  imageReading.value = true;
+  try {
+    for (const p of paths) {
+      const bytes = await readFile(p);
+      if (bytes.byteLength > MAX_IMAGE_BYTES) {
+        ElMessage.warning(`${p.split(/[\\/]/).pop()} 超过 10MB，已跳过`);
+        continue;
+      }
+      const name = p.split(/[\\/]/).pop() ?? "image";
+      addImage({ name, mimeType: mimeFromName(name), dataBase64: bytesToBase64(bytes) });
+    }
+  } catch (e) {
+    ElMessage.error("读取图片失败：" + String(e));
+  } finally {
+    imageReading.value = false;
+  }
+}
+
+/** File（粘贴 / 拖入产生）→ 图片附加。 */
+async function attachFile(file: File) {
+  if (!file.type.startsWith("image/")) return;
+  if (file.size > MAX_IMAGE_BYTES) {
+    ElMessage.warning(`${file.name} 超过 10MB，已跳过`);
+    return;
+  }
+  try {
+    const dataUrl = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result as string);
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(file);
+    });
+    // data URL 形如 "data:image/png;base64,...."，拆成 mime + base64 两部分。
+    const comma = dataUrl.indexOf(",");
+    const mime = dataUrl.slice(5, comma).split(";")[0] || file.type || "image/png";
+    addImage({ name: file.name, mimeType: mime, dataBase64: dataUrl.slice(comma + 1) });
+  } catch {
+    ElMessage.error("读取图片失败：" + file.name);
+  }
+}
+
+/** 输入框粘贴：剪贴板含图片时附加（不拦截纯文本粘贴）。 */
+function onComposerPaste(e: ClipboardEvent) {
+  const items = e.clipboardData?.items ?? [];
+  const imageItem = Array.from(items).find((it) => it.type.startsWith("image/"));
+  const file = imageItem?.getAsFile();
+  if (file) {
+    e.preventDefault();
+    void attachFile(file);
+  }
+}
+
+/** 拖入文件（图片）：与拖表共用 drop 通道，互不干扰。 */
+function onComposerDropFiles(e: DragEvent) {
+  const files = Array.from(e.dataTransfer?.files ?? []);
+  for (const f of files) void attachFile(f);
+}
 
 // --- 输入 / 发送 ---------------------------------------------------------
 const inputText = ref("");
@@ -275,9 +439,10 @@ async function attachTable(payload: DraggedTable) {
     ElMessage.warning("只能拖入当前连接数据库的表");
     return;
   }
-  // 拖表也算选中该表所在库（与点表行为一致），让助手关联到正确库。
-  if (props.domain === "db" && payload.database) {
-    db.setActiveDatabase(payload.database);
+  // 拖表也算选中该表所在库（与点表行为一致）：把活动标签的绑定库切过去并自动
+  // USE，让助手关联到正确库（后端同步，后续 AI 执行的 SQL 落在这个库上）。
+  if (props.domain === "db" && payload.database && db.activeTabId) {
+    void db.useDatabase(db.activeTabId, payload.database).catch(() => {});
   }
   const qualified = payload.database
     ? `${payload.database}.${payload.table}`
@@ -332,10 +497,11 @@ async function attachTable(payload: DraggedTable) {
   }
 }
 
-/** composer 的 drop 处理。 */
+/** composer 的 drop 处理：拖表（附加表结构）或拖图片文件（多模态）。 */
 function onComposerDrop(e: DragEvent) {
   e.preventDefault();
   dragOver.value = false;
+  onComposerDropFiles(e);
   const raw = e.dataTransfer?.getData("application/x-xterm-table");
   if (!raw) return;
   try {
@@ -346,9 +512,13 @@ function onComposerDrop(e: DragEvent) {
   }
 }
 function onComposerDragOver(e: DragEvent) {
-  // 仅当携带表数据时才允许 drop（避免普通文本拖入干扰）。
-  const types = e.dataTransfer?.types ?? [];
-  if (Array.from(types).includes("application/x-xterm-table")) {
+  // 携带表数据（拖表附加）或图片文件（多模态）时才允许 drop。
+  const types = Array.from(e.dataTransfer?.types ?? []);
+  const hasTable = types.includes("application/x-xterm-table");
+  const hasImageFile = Array.from(e.dataTransfer?.files ?? []).some((f) =>
+    f.type.startsWith("image/")
+  );
+  if (hasTable || hasImageFile) {
     e.preventDefault();
     if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
     dragOver.value = true;
@@ -433,7 +603,16 @@ function onSwitchConversation(cid: string) {
 
 async function handleSend() {
   const text = inputText.value.trim();
-  if (!text || ai.sending || configBlocked.value) return;
+  // 图片模式下允许"只发图片不带文字"；但两者都空则不发。
+  const images = attachedImages.value.map(({ mimeType, dataBase64 }) => ({
+    mimeType,
+    dataBase64,
+  }));
+  if ((!text && images.length === 0) || ai.sending || configBlocked.value) return;
+  if (images.length > 0 && !multimodalEnabled.value) {
+    ElMessage.warning("当前模型未开启多模态，无法附带图片（可在设置中开启）");
+    return;
+  }
   inputText.value = "";
   recordHistory(text);
   if (mode.value === "agent") {
@@ -459,17 +638,18 @@ async function handleSend() {
       }
     } else {
       if (db.activeConnId) {
-        const c = db.conns.find((x) => x.id === db.activeConnId);
-        const name = c?.name ?? "未命名";
+        const tab = db.activeTab;
+        const name = tab?.profileName ?? "未命名";
         ctxParts.push(
           `当前活动 MySQL 连接：dbConnId="${db.activeConnId}"（${name}）。调用 exec_sql / list_db_tables / describe_table 时直接用这个 dbConnId。`
         );
         activeDb = db.activeConnId;
-        // 注入当前关联库（点库/表或拖表时设置），让 AI 默认在该库 schema 下操作。
+        // 注入当前绑定库（点库/表或拖表时设置），让 AI 默认在该库 schema 下操作。
         if (db.activeDatabase) {
           ctxParts.push(
-            `当前关联的库（schema）为 "${db.activeDatabase}"。执行 SQL 时请默认针对该库的表；` +
-              `用 database.table 限定名引用表（如 \`${db.activeDatabase}\`.\`表名\`）以避免库歧义。`
+            `当前库（schema）为 "${db.activeDatabase}"，该连接已自动 USE 此库。` +
+              `执行 SQL 时直接引用表名（如 \`表名\`）即可，不要加库前缀；` +
+              `确需跨库时才用 \`${db.activeDatabase}\`.\`表名\` 限定。`
           );
         }
       } else {
@@ -502,19 +682,21 @@ async function handleSend() {
       activeTerminalId: activeTerminal,
       activeDbConnId: activeDb,
       domain: props.domain,
+      images,
     });
   } else {
     let prompt = SYSTEM_PROMPTS[mode.value];
     const ddlSection = buildAttachedDdlSection();
     if (ddlSection) prompt += ddlSection;
     prompt += buildSkillsSection();
-    await ai.send(text, prompt);
+    await ai.send(text, prompt, { images });
   }
   // 发送后强制跟随滚动到底部（用户主动发送，应看到自己的消息与回复开始；
   // 若此刻正在上翻浏览，也以发送为准回到最新位置）。
   void scrollToBottom();
-  // 发送后清空附加表（下次提问重新拖）。
+  // 发送后清空附加表与图片（下次提问重新拖/选）。
   clearAttachedTables();
+  attachedImages.value = [];
 }
 
 /** 拼接附加表的 DDL 段落（用于注入 system prompt）。无附加表返回空串。 */
@@ -545,7 +727,8 @@ const skillManagerVisible = ref(false);
 /** 把当前会话总结成 skill：把对话文本喂给 AI，让它生成结构化标题+内容，用户编辑后保存。 */
 async function handleSummarizeSkill() {
   const conv = ai.activeConversation;
-  if (!conv || conv.messages.length === 0 || summarizing.value) return;
+  // 流式中不允许总结：send 会静默跳过，且读到的 lastMsg 是半截内容。
+  if (!conv || conv.messages.length === 0 || summarizing.value || conv.sending) return;
 
   // 复用 handleExport 的渲染逻辑，把会话拼成纯文本。
   const transcript = conv.messages
@@ -577,7 +760,10 @@ async function handleSummarizeSkill() {
     // 等待本次请求的流式完成。必须用捕获的 conv（send 时活跃的会话）判断
     // sending，而不能用 ai.activeConversation——等待期间用户切走对话会让
     // activeConversation 变成别的会话，读取它的 sending/lastMsg 都会错。
-    const rid = ai.activeRequestId;
+    // 同理 rid 要读 conv.activeRequestId（send 同步把它写在本会话上），
+    // 读全局 ai.activeRequestId 会拿到别的会话的 id 或 null：
+    // null 时跳过轮询，把仍在流式中的半截消息当成总结结果。
+    const rid = conv.activeRequestId;
     if (rid) {
       const waitDone = async () => {
         for (let i = 0; i < 600; i++) {
@@ -1098,7 +1284,22 @@ function renderMarkdown(text: string): string {
               <span v-if="m.streaming && m.content" class="cursor" />
               <div v-if="m.error" class="error-text">⚠ {{ m.error }}</div>
             </template>
-            <template v-else>{{ m.content }}</template>
+            <!-- 用户消息：图片（多模态）+ 文本。
+                 图片限制最大宽高、按原比例完整展示（不裁剪），点击打开查看器看大图。 -->
+            <template v-else>
+              <div v-if="m.images && m.images.length" class="msg-images">
+                <img
+                  v-for="(img, i) in m.images"
+                  :key="i"
+                  :src="imageDataUrl(img)"
+                  class="msg-img"
+                  alt="图片"
+                  title="点击查看大图"
+                  @click="previewImages(m, i)"
+                />
+              </div>
+              <template v-if="m.content">{{ m.content }}</template>
+            </template>
           </div>
         </div>
       </el-scrollbar>
@@ -1152,7 +1353,38 @@ function renderMarkdown(text: string): string {
             清空
           </el-button>
         </div>
+        <!-- 已附加的图片（多模态模型下显示，会随问题一起发给 AI） -->
+        <div v-if="attachedImages.length > 0" class="attached-images">
+          <span class="attached-label">
+            <el-icon><Picture /></el-icon>
+            图片:
+          </span>
+          <div v-for="img in attachedImages" :key="img.id" class="attached-img-item">
+            <img :src="imageDataUrl(img)" class="attached-img-thumb" alt="预览" />
+            <el-icon class="attached-img-remove" @click="removeImage(img.id)"><Close /></el-icon>
+            <span class="attached-img-name">{{ img.name }}</span>
+          </div>
+          <el-button
+            link
+            size="small"
+            class="attached-clear"
+            @click="attachedImages = []"
+          >
+            清空
+          </el-button>
+        </div>
         <div class="composer-row">
+          <!-- 图片上传入口：仅激活模型开启多模态时显示 -->
+          <el-button
+            v-if="multimodalEnabled"
+            link
+            :icon="Picture"
+            class="attach-img-btn"
+            :disabled="ai.sending || configBlocked"
+            :loading="imageReading"
+            title="附带图片（也可直接粘贴或拖入）"
+            @click="pickImage"
+          />
           <div class="input-wrap">
             <el-input
               ref="inputRef"
@@ -1168,18 +1400,21 @@ function renderMarkdown(text: string): string {
                   ? '粘贴报错信息...'
                   : mode === 'explain'
                   ? '粘贴命令输出...'
+                  : multimodalEnabled
+                  ? '输入问题，Enter 发送，Shift+Enter 换行（可粘贴/拖入图片）'
                   : '输入问题，Enter 发送，Shift+Enter 换行'
               "
               :disabled="configBlocked"
               resize="none"
               @keydown="onKeydown"
+              @paste="onComposerPaste"
             />
             <!-- 发送 / 终止：输入框内右下角悬浮图标，发送中变为红色终止图标 -->
             <el-button
               v-if="!ai.sending"
               link
               :icon="Promotion"
-              :disabled="!inputText.trim() || configBlocked"
+              :disabled="(!inputText.trim() && attachedImages.length === 0) || configBlocked"
               class="send-inner-btn"
               title="发送 (Enter)"
               @click="handleSend"
@@ -1207,6 +1442,15 @@ function renderMarkdown(text: string): string {
     <SkillManagerDialog
       v-model:visible="skillManagerVisible"
       :domain="domain"
+    />
+    <!-- 大图查看器：点击消息缩略图打开（teleported 到 body，缩放/旋转/翻页/滚轮） -->
+    <el-image-viewer
+      v-if="viewerVisible"
+      :url-list="viewerUrls"
+      :initial-index="viewerIndex"
+      hide-on-click-modal
+      teleported
+      @close="viewerVisible = false"
     />
   </div>
 </template>
@@ -1462,9 +1706,10 @@ function renderMarkdown(text: string): string {
   color: var(--el-text-color-primary);
   border-bottom-left-radius: 2px;
 }
-.bubble-error {
-  background: var(--el-color-danger-light-9) !important;
-  color: var(--el-color-danger) !important;
+/* 特异性高于 .msg-user .bubble / .msg-ai .bubble，无需 !important */
+.msg .bubble.bubble-error {
+  background: var(--el-color-danger-light-9);
+  color: var(--el-color-danger);
   border: 1px solid var(--el-color-danger-light-5);
 }
 .error-text {
@@ -1653,6 +1898,88 @@ function renderMarkdown(text: string): string {
 .attached-clear {
   margin-left: auto;
   font-size: 11px;
+}
+/* 已附加的图片条（多模态）：缩略图 + 文件名 + 移除角标。 */
+.attached-images {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+  padding: 6px;
+  background: var(--el-fill-color-light);
+  border-radius: 4px;
+  font-size: 12px;
+}
+.attached-img-item {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px;
+  background: var(--el-bg-color);
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 4px;
+}
+.attached-img-thumb {
+  width: 36px;
+  height: 36px;
+  object-fit: cover;
+  border-radius: 3px;
+  display: block;
+}
+.attached-img-remove {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  font-size: 12px;
+  padding: 2px;
+  border-radius: 50%;
+  background: var(--el-color-danger);
+  color: #fff;
+  cursor: pointer;
+}
+.attached-img-name {
+  max-width: 90px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--el-text-color-secondary);
+  font-size: 11px;
+}
+/* 输入框左侧的图片上传按钮。 */
+.attach-img-btn {
+  font-size: 17px;
+  color: var(--el-color-primary);
+  padding: 6px;
+  margin-bottom: 2px;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+.attach-img-btn:hover:not(:disabled) {
+  background: var(--el-fill-color-light);
+}
+/* 用户消息中的图片：限制最大宽高（宽 220 / 高 160），按原比例完整展示、
+   不裁剪也不留白；点击缩略图打开查看器看原图。 */
+.msg-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.msg-img {
+  max-width: 220px;
+  max-height: 160px;
+  width: auto;
+  height: auto;
+  border-radius: 6px;
+  cursor: zoom-in;
+  display: block;
+  transition: transform 0.15s, box-shadow 0.15s;
+}
+.msg-img:hover {
+  transform: scale(1.03);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
 }
 /* 输入框上方工具栏：模式选择在左，智能体上下文（已附加终端）在右 */
 .composer-toolbar {

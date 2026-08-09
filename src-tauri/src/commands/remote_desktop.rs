@@ -40,6 +40,13 @@ pub fn remote_desktop_launch(
 
 /// Windows RDP：生成临时 .rdp 文件并用 mstsc 打开。
 fn launch_rdp(addr: &str, username: Option<&str>, password: Option<&str>) -> AppResult<String> {
+    // .rdp 是每行 "key:s:value" 的文本格式，值里带换行会注入伪造配置行
+    // （如 redirectclipboard、full address 覆盖），必须拒绝。
+    validate_rdp_field(addr, "主机")?;
+    if let Some(u) = username {
+        validate_rdp_field(u, "用户名")?;
+    }
+
     // 构建 .rdp 文件内容。
     let mut rdp = String::new();
     rdp.push_str("full address:s:");
@@ -49,8 +56,13 @@ fn launch_rdp(addr: &str, username: Option<&str>, password: Option<&str>) -> App
     if let Some(u) = username {
         rdp.push_str(&format!("username:s:{}\n", u));
     }
-    // RDP 文件不直接存密码（安全考虑），用户在 mstsc 弹窗输入。
-    // 如需自动填充，可用 cmdkey 预存凭据，但此处保持简单。
+    // 密码不写入 .rdp 文件（明文落盘不安全）；Windows 下用 cmdkey 预存到
+    // 凭据管理器（系统加密存储），mstsc 连接时自动使用。
+    #[cfg(target_os = "windows")]
+    if let (Some(u), Some(p)) = (username, password) {
+        store_rdp_credential(addr, u, p)?;
+    }
+    #[cfg(not(target_os = "windows"))]
     let _ = password;
 
     // 写入临时文件。
@@ -91,6 +103,31 @@ fn launch_rdp(addr: &str, username: Option<&str>, password: Option<&str>) -> App
     }
 
     Ok(format!("已启动 RDP 客户端连接 {}", addr))
+}
+
+/// 校验 .rdp 文件字段不包含换行符（防止注入伪造配置行）。
+fn validate_rdp_field(field: &str, name: &str) -> AppResult<()> {
+    if field.contains(['\r', '\n']) {
+        return Err(AppError::InvalidInput(format!("{name} 不能包含换行符")));
+    }
+    Ok(())
+}
+
+/// Windows：用 cmdkey 预存 RDP 凭据，mstsc 连接时自动使用。
+#[cfg(target_os = "windows")]
+fn store_rdp_credential(addr: &str, username: &str, password: &str) -> AppResult<()> {
+    let status = Command::new("cmdkey")
+        .arg(format!("/generic:TERMSRV/{addr}"))
+        .arg(format!("/user:{username}"))
+        .arg(format!("/pass:{password}"))
+        .status()
+        .map_err(|e| AppError::Ssh(format!("cmdkey 预存凭据失败: {e}")))?;
+    if !status.success() {
+        return Err(AppError::Ssh(
+            "cmdkey 预存凭据失败（Windows 凭据管理器不可用）".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// VNC：尝试常见 VNC 客户端。

@@ -219,6 +219,9 @@ pub struct AiSqlResultEvent {
     pub rows: Vec<Vec<String>>,
     /// 非查询语句的影响行数（SELECT 为行数）。
     pub affected: u64,
+    /// 结果是否被 limit 截断（查询实际返回超过 limit 行）。
+    #[serde(default)]
+    pub truncated: bool,
     /// 执行耗时（毫秒）。
     pub elapsed_ms: u64,
     /// 执行错误信息（成功为 None）。
@@ -235,6 +238,9 @@ pub struct DbQueryResultEvent {
     pub rows: Vec<Vec<String>>,
     /// 非 SELECT 语句的影响行数（SELECT 为 0）。
     pub affected: u64,
+    /// 结果是否被 limit 截断（查询实际返回超过 limit 行）。
+    #[serde(default)]
+    pub truncated: bool,
     pub error: Option<String>,
     pub elapsed_ms: u64,
 }

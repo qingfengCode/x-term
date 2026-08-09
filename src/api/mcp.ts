@@ -12,6 +12,14 @@ import { invoke } from "@tauri-apps/api/core";
 /** MCP 实例种类。 */
 export type McpKind = "ssh" | "db" | "file";
 
+/**
+ * MCP 绑定来源（仅 bound 模式有效）。
+ * - "config"（默认）：绑定会话配置，执行时新建短连接。
+ * - "terminal"：绑定已打开的终端标签页，命令写入该终端 PTY 执行
+ *   （支持 A→B→C 跳板嵌套场景）。仅 SSH kind 支持。
+ */
+export type McpBoundSource = "config" | "terminal";
+
 /** 单个 MCP 实例的配置（持久化在 mcp.json，每个 kind 一份）。 */
 export interface McpInstanceConfig {
   /** 是否启用（记录意图；实际启停以 mcpStart/mcpStop 为准）。 */
@@ -22,7 +30,10 @@ export interface McpInstanceConfig {
   port: number;
   /** Bearer token（未生成则 undefined）。 */
   token?: string;
-  /** 绑定的资源 id：SSH 会话 id（ssh）或 DB profile id（db）。仅 bound 模式必填。 */
+  /**
+   * 绑定的资源 id：SSH 会话 id / DB profile id（boundSource="config"）或
+   * 终端实例 id（boundSource="terminal"）。仅 bound 模式必填。
+   */
   resourceId?: string;
   /**
    * 资源模式："bound"（绑定本地资源，默认）| "client"（客户端直连，免绑定实例）。
@@ -30,6 +41,11 @@ export interface McpInstanceConfig {
    * 凭据仅本次调用有效、不存储不落日志。
    */
   resourceMode: "bound" | "client";
+  /**
+   * 绑定来源（仅 bound 模式）："config"（会话配置，默认）| "terminal"（终端标签页）。
+   * terminal 来源下命令写入该终端 PTY 执行，支持 A→B→C 跳板嵌套。
+   */
+  boundSource: McpBoundSource;
   /** 绑定的具体数据库名（仅 db kind）。设置后 exec_sql 只针对该库。 */
   boundDatabase?: string;
   /** 自动放行：开启后 exec_ssh/exec_sql 跳过人工确认直接执行。默认 false。 */
@@ -72,6 +88,22 @@ export function mcpSaveConfig(kind: McpKind, config: McpInstanceConfig): Promise
 /** 读取指定 kind 的配置。 */
 export function mcpLoadConfig(kind: McpKind): Promise<McpInstanceConfig> {
   return invoke<McpInstanceConfig>("mcp_load_config", { kind });
+}
+
+/**
+ * 运行中热切换绑定的资源（会话配置 / 终端标签页），立即生效无需重启。
+ *
+ * - `boundSource`："config"（会话配置）| "terminal"（终端标签页，仅 ssh kind）。
+ * - `resourceId`：会话配置 id 或终端实例 id。
+ *
+ * 同时持久化到 mcp.json。服务未运行时只保存配置（启动时生效）。
+ */
+export function mcpRebind(
+  kind: McpKind,
+  boundSource: McpBoundSource,
+  resourceId: string,
+): Promise<void> {
+  return invoke<void>("mcp_rebind", { kind, boundSource, resourceId });
 }
 
 /** 为指定 kind 生成随机 token（写入 mcp.json）并返回。 */

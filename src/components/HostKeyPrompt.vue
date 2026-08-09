@@ -11,7 +11,7 @@
  * 多个确认（如快速连多个会话）按到达顺序排队串行处理。后端等待超时 120s，
  * 前端设置 125s 兜底计时器自动拒绝，防止弹窗悬挂。
  */
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { ElMessage } from "element-plus";
 import {
@@ -19,6 +19,7 @@ import {
   type HostKeyDecision,
   type SshHostKeyEvent,
 } from "@/api/session";
+import { useUiStore } from "@/stores/ui";
 
 /** 后端等待超时 120s，前端兜底略长，到点自动拒绝。 */
 const CHALLENGE_TIMEOUT_MS = 125_000;
@@ -33,8 +34,22 @@ const queue = ref<QueuedChallenge[]>([]);
 const submitting = ref(false);
 let unlisten: UnlistenFn | null = null;
 
+const ui = useUiStore();
+
 const current = computed(() => queue.value[0] ?? null);
 const visible = computed(() => queue.value.length > 0);
+/**
+ * 实际显示状态：与 SSH 认证挑战弹窗互斥（见 stores/ui.ts）。对方可见时本弹窗
+ * 暂时隐藏，确认项留在队列中等待。
+ */
+const shown = computed(() => visible.value && !ui.sshAuthVisible);
+watch(
+  shown,
+  (v) => {
+    ui.hostKeyVisible = v;
+  },
+  { immediate: true }
+);
 
 onMounted(async () => {
   unlisten = await listen<SshHostKeyEvent>("ssh:host_key_challenge", (e) => {
@@ -45,6 +60,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   unlisten?.();
   for (const item of queue.value) window.clearTimeout(item.timer);
+  ui.hostKeyVisible = false;
 });
 
 function enqueue(challenge: SshHostKeyEvent) {
@@ -92,7 +108,7 @@ async function respondCurrent(decision: HostKeyDecision) {
 
 <template>
   <el-dialog
-    :model-value="visible"
+    :model-value="shown"
     :show-close="false"
     :close-on-click-modal="false"
     :close-on-press-escape="false"

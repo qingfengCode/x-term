@@ -96,6 +96,29 @@ const supportsKeyAuth = computed(() => form.protocol === "ssh");
 const isEdit = computed(() => !!props.session);
 const title = computed(() => (isEdit.value ? "编辑会话" : "新建会话"));
 
+/** 由会话数据反推 UI 认证方式（与 resetFromProps 中的推断保持一致）。 */
+function inferFormAuth(s: Session): FormAuth {
+  if (s.authType === AuthType.Password) return "password";
+  return s.keyPath ? "keyFile" : "keyText";
+}
+
+/** 编辑时用户是否切换了认证方式（切换后必须提供新凭据，不能再"留空不变"）。 */
+const authChanged = computed(() => {
+  if (!props.session) return false;
+  return inferFormAuth(props.session) !== form.auth;
+});
+
+/** 原认证方式对应的凭据 id（按类型归属，避免跨类型复用 credentialId）。
+ *  编辑时用于原地更新（传 id upsert）或清理。 */
+const origPasswordId = computed(() => {
+  const s = props.session;
+  return s && s.authType === AuthType.Password ? s.credentialId : null;
+});
+const origKeyId = computed(() => {
+  const s = props.session;
+  return s && s.authType === AuthType.PrivateKey ? s.credentialId : null;
+});
+
 const rules: FormRules<FormState> = {
   name: [{ required: true, message: "请输入名称", trigger: "blur" }],
   host: [{ required: true, message: "请输入主机", trigger: "blur" }],
@@ -104,8 +127,12 @@ const rules: FormRules<FormState> = {
   password: [
     {
       validator: (_r, _v, cb) => {
-        if (form.auth === "password" && !form.password && !isEdit.value) {
-          cb(new Error("请输入密码"));
+        if (
+          form.auth === "password" &&
+          !form.password &&
+          (!isEdit.value || authChanged.value)
+        ) {
+          cb(new Error(authChanged.value ? "切换认证方式后请填写新密码" : "请输入密码"));
         } else {
           cb();
         }
@@ -116,8 +143,12 @@ const rules: FormRules<FormState> = {
   keyText: [
     {
       validator: (_r, _v, cb) => {
-        if (form.auth === "keyText" && !form.keyText.trim() && !isEdit.value) {
-          cb(new Error("请粘贴私钥内容"));
+        if (
+          form.auth === "keyText" &&
+          !form.keyText.trim() &&
+          (!isEdit.value || authChanged.value)
+        ) {
+          cb(new Error(authChanged.value ? "切换认证方式后请粘贴新的私钥内容" : "请粘贴私钥内容"));
         } else {
           cb();
         }
@@ -128,8 +159,12 @@ const rules: FormRules<FormState> = {
   keyPath: [
     {
       validator: (_r, _v, cb) => {
-        if (form.auth === "keyFile" && !form.keyPath && !isEdit.value) {
-          cb(new Error("请选择私钥文件"));
+        if (
+          form.auth === "keyFile" &&
+          !form.keyPath &&
+          (!isEdit.value || authChanged.value)
+        ) {
+          cb(new Error(authChanged.value ? "切换认证方式后请选择私钥文件" : "请选择私钥文件"));
         } else {
           cb();
         }
@@ -214,6 +249,16 @@ function mapAuthType(a: FormAuth): AuthType {
   return a === "password" ? AuthType.Password : AuthType.PrivateKey;
 }
 
+/** 删除旧凭据（切换认证方式后不再使用；删除失败不阻塞保存）。 */
+async function deleteCredentialQuiet(id: string | null) {
+  if (!id) return;
+  try {
+    await credentialDelete(id);
+  } catch {
+    /* 忽略删除失败，避免遗留凭据时阻塞保存 */
+  }
+}
+
 function close() {
   emit("update:visible", false);
 }
@@ -233,34 +278,39 @@ async function handleSave() {
     let keyPath: string | null = null;
 
     if (form.auth === "password") {
-      // 仅在输入了新密码时更新凭据；编辑时留空表示不变。
       if (form.password) {
+        // 填了新密码 → 原地更新原密码凭据（传 id 不产生孤儿）；若原先是密钥
+        // 认证（切换到密码），新建后清掉遗留的密钥凭据。
         credentialId = await credentialSave({
+          id: origPasswordId.value ?? undefined,
           name: `${form.name} · password`,
           kind: KIND_PASSWORD,
           value: form.password,
         });
+        await deleteCredentialQuiet(origKeyId.value);
+      } else {
+        // 编辑留空表示不修改（切换认证方式后留空已被表单校验拦截）。
+        credentialId = origPasswordId.value;
       }
     } else if (form.auth === "keyText") {
       if (form.keyText.trim()) {
+        // 同上：原地更新原密钥凭据；从密码切换到文本密钥时清掉密码凭据。
         credentialId = await credentialSave({
+          id: origKeyId.value ?? undefined,
           name: `${form.name} · private_key`,
           kind: KIND_PRIVATE_KEY_TEXT,
           value: form.keyText,
           passphrase: form.passphrase || undefined,
         });
+        await deleteCredentialQuiet(origPasswordId.value);
+      } else {
+        credentialId = origKeyId.value;
       }
     } else if (form.auth === "keyFile") {
       keyPath = form.keyPath || null;
-      // 切换到文件方式时，旧文本凭据不再使用——删除以避免遗留。
-      if (existed?.credentialId) {
-        try {
-          await credentialDelete(existed.credentialId);
-        } catch {
-          /* 忽略删除失败 */
-        }
-        credentialId = null;
-      }
+      // 文件密钥不关联 vault 凭据：清掉原密码/文本密钥凭据，避免遗留。
+      await deleteCredentialQuiet(origPasswordId.value ?? origKeyId.value);
+      credentialId = null;
     }
 
     const session: Session = {
@@ -376,14 +426,6 @@ async function handleSave() {
             </template>
           </el-input>
         </el-form-item>
-        <el-form-item label="口令">
-          <el-input
-            v-model="form.passphrase"
-            type="password"
-            show-password
-            placeholder="可选"
-          />
-        </el-form-item>
       </template>
 
       <template v-else>
@@ -392,7 +434,7 @@ async function handleSave() {
             v-model="form.keyText"
             type="textarea"
             :rows="5"
-            placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;..."
+            :placeholder="isEdit && !authChanged ? '留空表示不修改' : '-----BEGIN OPENSSH PRIVATE KEY-----\n...'"
           />
         </el-form-item>
         <el-form-item label="口令">
@@ -400,7 +442,7 @@ async function handleSave() {
             v-model="form.passphrase"
             type="password"
             show-password
-            placeholder="可选"
+            placeholder="私钥加密时所需口令（仅在粘贴新私钥时生效）"
           />
         </el-form-item>
       </template>

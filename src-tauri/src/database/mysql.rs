@@ -19,7 +19,7 @@ use sqlx::mysql::types::MySqlTime;
 use sqlx::mysql::{MySqlPoolOptions, MySqlRow};
 use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use sqlx::types::{Decimal, JsonValue};
-use sqlx::{Column, MySqlPool, Row};
+use sqlx::{Column, Connection, MySqlPool, Row};
 use std::sync::Arc;
 use tokio::io::copy_bidirectional;
 use tokio::net::TcpListener;
@@ -68,36 +68,157 @@ pub fn qualify_table_identifier(table: &str) -> AppResult<String> {
     })
 }
 
+/// 校验库名是否可安全拼进 `` USE `db` ``。
+///
+/// 规则与 [`qualify_table_identifier`] 一致：非空且仅含 `[A-Za-z0-9_]`，
+/// 禁止空白、分号、反引号、注释符等，防止 USE 拼接被注入。
+pub fn validate_database_identifier(db: &str) -> AppResult<()> {
+    if db.is_empty() || !db.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(AppError::InvalidInput(format!("非法库名: {db}")));
+    }
+    Ok(())
+}
+
+/// 识别 `USE <库名>` 语句（库名允许反引号包裹），返回目标库名。
+///
+/// - `None`：不是 USE 语句（交给正常执行流程）；
+/// - `Some(None)`：`USE` 后没有库名（语法错误，由上层报错）；
+/// - `Some(Some(db))`：切换目标库。
+///
+/// `USE` 不能走 prepared statement 协议（MySQL 1295），且 pool 语义下裸 USE
+/// 只对单条连接生效——因此所有执行入口（控制台 / AI 工具）都应拦截 USE 并
+/// 更新连接的 current_db，而不是把语句发给 MySQL。
+pub fn parse_use_statement(sql: &str) -> Option<Option<String>> {
+    // 剥掉行首注释（-- / # / /* */），防 `-- 注释\nUSE x` 绕过关键字识别。
+    let mut t = sql.trim_start();
+    loop {
+        if let Some(rest) = t.strip_prefix("--") {
+            t = rest
+                .split_once('\n')
+                .map(|(_, after)| after)
+                .unwrap_or("")
+                .trim_start();
+        } else if let Some(rest) = t.strip_prefix('#') {
+            t = rest
+                .split_once('\n')
+                .map(|(_, after)| after)
+                .unwrap_or("")
+                .trim_start();
+        } else if let Some(rest) = t.strip_prefix("/*") {
+            match rest.find("*/") {
+                Some(end) => t = rest[end + 2..].trim_start(),
+                None => return None, // 未闭合块注释：不算 USE
+            }
+        } else {
+            break;
+        }
+    }
+    // 首个关键字必须是 USE。
+    let (kw, rest) = match t.split_once(char::is_whitespace) {
+        Some((k, r)) => (k, r.trim_start()),
+        None => (t, ""),
+    };
+    if !kw.eq_ignore_ascii_case("USE") {
+        return None;
+    }
+    // 库名 token：到空白或分号为止，去掉可能包裹的反引号。
+    let mut end = 0;
+    for (i, c) in rest.char_indices() {
+        if c.is_whitespace() || c == ';' {
+            end = i;
+            break;
+        }
+        end = i + c.len_utf8();
+    }
+    let name = rest[..end].trim_matches('`').to_string();
+    if name.is_empty() {
+        return Some(None); // `USE` 后没有库名：语法错误，由上层报错
+    }
+    // 尾部只允许空 / 分号 / 注释（`USE db;` / `USE db -- 说明` / `USE db /* 说明 */`）。
+    // `USE db; SELECT 1` 这类多语句不是纯 USE——必须返回 None 交给正常执行
+    // 流程（sqlx 会报多语句语法错误），否则后面的语句被本层静默吞掉，
+    // 用户既看不到结果也看不到报错。
+    let tail = rest[end..].trim_start();
+    if !tail.is_empty() && !is_use_tail_ok(tail) {
+        return None;
+    }
+    Some(Some(name))
+}
+
+/// USE 语句尾部的合法性：分号（后面可再有注释）或直接是注释（`--` / `#` / `/* */`）。
+fn is_use_tail_ok(tail: &str) -> bool {
+    let mut t = tail.trim_start();
+    if let Some(rest) = t.strip_prefix(';') {
+        t = rest.trim_start();
+    }
+    if t.is_empty() {
+        return true;
+    }
+    t.starts_with("--") || t.starts_with('#') || t.starts_with("/*")
+}
+
 // ===========================================================================
 // 数据结构
 // ===========================================================================
 
 /// 一条已建立的 MySQL 连接（实际是一个 pool）。
 ///
+/// `current_db` 是连接的"当前库"（schema）：pool 的每条连接在查询前都会先
+/// 执行 `USE \`current_db\``，因此对 pool 语义稳定（与连接复用无关）。
 /// `_tunnel_handle` 在直连时为 `None`；SSH 隧道模式下保存本地 listener 的
 /// accept 循环任务句柄，[`MySqlConn::close`] 时 abort 以释放端口与 SSH channel。
 pub struct MySqlConn {
     pub pool: MySqlPool,
     /// SSH 隧道模式下保存 accept 循环句柄；drop 时 abort。
     _tunnel_handle: Option<tokio::task::JoinHandle<()>>,
+    /// 当前库（schema）。由 `db_use_database` / `USE` 语句更新。
+    current_db: parking_lot::Mutex<Option<String>>,
 }
 
 impl MySqlConn {
+    /// 当前库（schema）。
+    pub fn current_db(&self) -> Option<String> {
+        self.current_db.lock().clone()
+    }
+
+    /// 设置当前库（schema）。None 表示清除（回落到连接 URL 里的默认库）。
+    pub fn set_current_db(&self, db: Option<String>) {
+        *self.current_db.lock() = db;
+    }
+
     /// 执行一条 SQL，返回 [`QueryResult`]。
+    ///
+    /// `db` 为连接的当前库（schema）：非空时先在同一连接上执行 `USE \`db\``，
+    /// 再执行用户 SQL——pool 连接复用导致裸 `USE` 只对单条连接生效，因此每次
+    /// 查询都携带 USE，只要与查询落在同一个 checkout 上，语义就稳定。
     ///
     /// 对于返回结果集的语句（SELECT/SHOW/EXPLAIN/DESC/WITH 等）走 `fetch_all`，
     /// 仅保留前 `limit` 行；其余语句走 `execute` 取影响行数。
-    pub async fn execute(&self, sql: &str, limit: u32) -> AppResult<QueryResult> {
+    pub async fn execute(&self, sql: &str, limit: u32, db: Option<&str>) -> AppResult<QueryResult> {
+        // 取一条连接；USE 与查询必须在同一连接上执行。
+        let mut conn = self.pool.acquire().await?;
+        if let Some(db) = db {
+            validate_database_identifier(db)?;
+            // `USE` 不支持 prepared statement 协议（MySQL 1295 HY000 "This command
+            // is not supported in the prepared statement protocol yet"），必须走文本
+            // 协议（COM_QUERY）：raw_sql 的 arguments 为 None，sqlx 即用文本协议；
+            // sqlx::query 即使不带参数也会走 COM_STMT_PREPARE，USE 必然报 1295。
+            let use_sql = format!("USE `{}`", db);
+            sqlx::Executor::execute(&mut *conn, sqlx::raw_sql(&use_sql))
+                .await
+                .map_err(|e| AppError::Storage(format!("切换到库 `{db}` 失败: {e}")))?;
+        }
         if is_query_stmt(sql) {
             // 流式逐行读取，而不是 fetch_all：fetch_all 会把整个结果集一次性
             // 读进内存，超大表（百万行+）直接 OOM。这里只保留前 limit 行后
-            // 提前 break——sqlx 在连接复用时（wait_until_ready）会把未读完的
-            // 剩余结果集排空，无协议残留风险。
+            // 提前 break，再用 flush 把连接上未读完的剩余结果集排空，保证
+            // 连接回池后无协议残留（sqlx 不会自动排空，见 pool release 路径）。
             use futures::TryStreamExt;
-            let mut stream = sqlx::query(sql).fetch(&self.pool);
+            let mut stream = sqlx::query(sql).fetch(&mut *conn);
             let mut columns: Vec<String> = Vec::new();
             let mut out_rows: Vec<Vec<String>> = Vec::with_capacity(limit as usize);
             let mut seen: u64 = 0;
+            let mut truncated = false;
             while let Some(row) = stream.try_next().await? {
                 seen += 1;
                 // 列名：从第一行取；若 0 行则无法拿到列（MySQL 在 0 行时
@@ -110,7 +231,8 @@ impl MySqlConn {
                         .collect();
                 }
                 if seen > limit as u64 {
-                    // 超过 limit 上限：停止读取（不占内存，连接由 sqlx 自动排空）。
+                    // 超过 limit 上限：停止读取（不占内存）。
+                    truncated = true;
                     break;
                 }
                 let mut vals: Vec<String> = Vec::with_capacity(row.columns().len());
@@ -119,27 +241,37 @@ impl MySqlConn {
                 }
                 out_rows.push(vals);
             }
+            if truncated {
+                // 流提前结束会释放对连接的借用；drop 后连接上仍有未读行，
+                // 用 flush 排空剩余结果集、状态复位后再回池。
+                drop(stream);
+                conn.flush().await?;
+            }
+            // 只统计实际返回的行数（截断后即 limit 行）。无法得知全量行数
+            // ——截断与否由 truncated 标记表达，避免"显示 100 行却报 101 行"。
+            let affected = out_rows.len() as u64;
             Ok(QueryResult {
                 columns,
                 rows: out_rows,
-                // 只统计已读取的行（limit 截断后）。无法得知全量行数——
-                // 截断语义下如实汇报读取量。
-                affected: seen,
+                affected,
+                truncated,
             })
         } else {
-            let res = sqlx::query(sql).execute(&self.pool).await?;
+            let res = sqlx::query(sql).execute(&mut *conn).await?;
             Ok(QueryResult {
                 columns: Vec::new(),
                 rows: Vec::new(),
                 affected: res.rows_affected(),
+                truncated: false,
             })
         }
     }
 
     /// 关闭连接：先关闭 pool，再 abort 隧道 accept 循环（如有）。
-    pub async fn close(self) {
+    /// 取 `&self` 即可（pool.close / handle.abort 都是 &self），支持 Arc 共享调用。
+    pub async fn close(&self) {
         self.pool.close().await;
-        if let Some(h) = self._tunnel_handle {
+        if let Some(h) = &self._tunnel_handle {
             h.abort();
         }
     }
@@ -152,8 +284,13 @@ pub struct QueryResult {
     pub columns: Vec<String>,
     /// 每行每列的值已 `to_string`；BLOB 等无法 decode 为 String 的列填 `"<binary>"`。
     pub rows: Vec<Vec<String>>,
-    /// 非 SELECT 语句的影响行数（SELECT 为行数）。
+    /// 非 SELECT 语句的影响行数（SELECT 为返回的行数）。
     pub affected: u64,
+    /// 结果是否被 limit 截断（查询实际返回超过 limit 行时置 true）。
+    ///
+    /// `serde(default)` 保证旧前端/旧数据缺字段也能解析。
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 // ===========================================================================
@@ -176,6 +313,7 @@ pub async fn connect_direct(
     Ok(MySqlConn {
         pool,
         _tunnel_handle: None,
+        current_db: parking_lot::Mutex::new(database.map(|s| s.to_string())),
     })
 }
 
@@ -285,6 +423,7 @@ pub async fn connect_via_ssh(
     Ok(MySqlConn {
         pool,
         _tunnel_handle: Some(tunnel_handle),
+        current_db: parking_lot::Mutex::new(mysql_db.map(|s| s.to_string())),
     })
 }
 

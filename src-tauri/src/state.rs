@@ -39,6 +39,22 @@ impl TerminalSession {
             TerminalSession::Telnet(s) => s.write(data),
         }
     }
+
+    /// 带写完成确认的写入（背压用）。
+    ///
+    /// SSH 会话返回 reader 的写确认 receiver；Telnet 写是同步的，
+    /// 直接返回已完成的 receiver。见 [`SshSession::write_with_ack`]。
+    pub fn write_with_ack(&self, data: Vec<u8>) -> AppResult<tokio::sync::oneshot::Receiver<()>> {
+        match self {
+            TerminalSession::Ssh(s) => s.write_with_ack(data),
+            TerminalSession::Telnet(s) => {
+                s.write(data)?;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = tx.send(());
+                Ok(rx)
+            }
+        }
+    }
     pub fn resize(&self, cols: u32, rows: u32) -> AppResult<()> {
         match self {
             TerminalSession::Ssh(s) => s.resize(cols, rows),
@@ -49,6 +65,20 @@ impl TerminalSession {
         match self {
             TerminalSession::Ssh(s) => s.snapshot(max_bytes),
             TerminalSession::Telnet(s) => s.snapshot(max_bytes),
+        }
+    }
+    /// 取终端输出的完整快照（整个环形缓冲），供 AI 可视化命令哨兵检测/截取。
+    pub fn full_snapshot(&self) -> String {
+        match self {
+            TerminalSession::Ssh(s) => s.full_snapshot(),
+            TerminalSession::Telnet(s) => s.full_snapshot(),
+        }
+    }
+    /// 累计写入字节数（不受环形截断影响），判断"输出是否仍在增长"用。
+    pub fn total_output_bytes(&self) -> usize {
+        match self {
+            TerminalSession::Ssh(s) => s.total_output_bytes(),
+            TerminalSession::Telnet(s) => s.total_output_bytes(),
         }
     }
     pub fn output_offset(&self) -> usize {
@@ -113,8 +143,14 @@ pub struct AppState {
     pub file_backends:
         Arc<Mutex<HashMap<String, (String, std::sync::Arc<dyn crate::file_backend::FileBackend>)>>>,
 
-    /// 已建立的 MySQL 业务连接：connId -> MySqlConn。
-    pub mysql_conns: Arc<Mutex<HashMap<String, crate::database::mysql::MySqlConn>>>,
+    /// 已建立的 MySQL 业务连接：connId -> Arc<MySqlConn>。
+    ///
+    /// 用 `Arc` 而非裸值：命令按需 `get().cloned()` 出句柄后释放锁再跨 await 使用，
+    /// 多个命令可并发操作同一连接（过去 remove/insert 模式在并发下会 NotFound 竞争，
+    /// 导致前端展开库/执行 SQL 偶发失败）。
+    pub mysql_conns: Arc<
+        Mutex<HashMap<String, std::sync::Arc<crate::database::mysql::MySqlConn>>>,
+    >,
 
     /// 待确认执行的 AI 工具调用：toolCallId -> (requestId, oneshot 发送端)。
     ///
@@ -168,6 +204,12 @@ pub struct AppState {
     /// [`crate::mcp::approval`]。
     pub approval_registry: Arc<crate::mcp::approval::ApprovalRegistry>,
 
+    /// 正被 MCP「终端绑定」执行占用的终端实例 id（并发保护）。
+    ///
+    /// 同一终端标签页同一时刻只允许一个 MCP 工具调用写入 PTY：多个并发写会
+    /// 导致输出交叉、哨兵检测互相干扰。执行结束（含超时/出错）后移除。
+    pub mcp_terminal_busy: Arc<tokio::sync::Mutex<HashMap<String, ()>>>,
+
     /// settings.json 的路径（缓存的快捷访问）。
     pub settings_path: Arc<PathBuf>,
 }
@@ -195,6 +237,7 @@ impl AppState {
             pending_host_keys: Arc::new(Mutex::new(HashMap::new())),
             app,
             approval_registry: Arc::new(crate::mcp::approval::ApprovalRegistry::new()),
+            mcp_terminal_busy: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             settings_path: Arc::new(settings_path),
         }
     }

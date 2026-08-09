@@ -9,11 +9,14 @@ use tauri::State;
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 
-/// 向指定终端实例写入数据（前端键盘输入）。
+/// 向指定终端实例写入数据（前端键盘输入 / ZMODEM 协议字节）。
 ///
 /// `data` 是 base64 编码的字节流（与输出方向保持一致，便于传输二进制控制字符）。
+///
+/// 异步 + 写确认：等待 reader 把字节真正写入 SSH channel 后才返回，
+/// 为 ZMODEM 大文件上传提供背压（防止无界输入队列堆积整个文件）。
 #[tauri::command]
-pub fn terminal_write(
+pub async fn terminal_write(
     instance_id: String,
     data: String,
     state: State<'_, AppState>,
@@ -22,11 +25,18 @@ pub fn terminal_write(
         .decode(data.as_bytes())
         .map_err(|e| AppError::InvalidInput(format!("base64 解码失败: {}", e)))?;
 
-    let terminals = state.terminals.lock();
-    let session = terminals
-        .get(&instance_id)
-        .ok_or_else(|| AppError::NotFound(format!("终端 {} 不存在", instance_id)))?;
-    session.write(bytes)
+    // 短临界区：只取出 ack receiver 即释放锁，再在锁外等待写完成。
+    let ack_rx = {
+        let terminals = state.terminals.lock();
+        let session = terminals
+            .get(&instance_id)
+            .ok_or_else(|| AppError::NotFound(format!("终端 {} 不存在", instance_id)))?;
+        session.write_with_ack(bytes)?
+    };
+
+    ack_rx
+        .await
+        .map_err(|_| AppError::Ssh("终端 reader 已退出".into()))
 }
 
 /// 调整指定终端实例的窗口大小。

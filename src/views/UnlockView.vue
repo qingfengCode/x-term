@@ -13,6 +13,11 @@ const submitting = ref(false);
 
 onMounted(async () => {
   await vault.refresh();
+  // 刷新页面时后端进程仍存活、保险库仍解锁（只要没点过「锁定」），
+  // 此时不应停留在解锁页要求重新输入主密码，直接回主界面。
+  if (vault.unlocked) {
+    router.replace("/");
+  }
 });
 
 async function submit() {

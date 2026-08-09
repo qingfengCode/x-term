@@ -25,18 +25,21 @@
 import { computed, onMounted, ref } from "vue";
 import { ElMessage } from "element-plus";
 import { VideoPlay, VideoPause, Refresh, CopyDocument, Key } from "@element-plus/icons-vue";
+import HelpTip from "@/components/HelpTip.vue";
 import { useMcpStore } from "@/stores/mcp";
 import { useSessionsStore } from "@/stores/sessions";
+import { useTerminalsStore } from "@/stores/terminals";
 import { dbListProfiles, dbConnect, dbListDatabases, dbDisconnect } from "@/api/db";
 import { fileAccountList } from "@/api/fileBackend";
 import type { FileAccount } from "@/api/fileBackend";
-import type { McpKind } from "@/api/mcp";
+import type { McpBoundSource, McpKind } from "@/api/mcp";
 import type { DbProfile, Session } from "@/api/types";
 
 const props = defineProps<{ kind: McpKind }>();
 
 const mcp = useMcpStore();
 const sessions = useSessionsStore();
+const terminalsStore = useTerminalsStore();
 
 /** 该 kind 的可用资源列表（ssh→SSH 会话；db→DB profile；file→S3 文件账号）。 */
 const sshSessions = ref<Session[]>([]);
@@ -51,7 +54,7 @@ const isSsh = computed(() => props.kind === "ssh");
 const isFile = computed(() => props.kind === "file");
 /** kind 中文标题。 */
 const title = computed(() => (isSsh.value ? "SSH MCP" : isFile.value ? "File MCP" : "DB MCP"));
-/** 该 kind 对外暴露的工具说明（按资源模式分支）。 */
+/** 该 kind 对外暴露的工具说明（按资源模式/绑定来源分支）。 */
 const toolHint = computed(() => {
   if (isFile.value) {
     return "对外暴露 list_files(path) / upload_file(localPath, remotePath) / download_file(remotePath, localPath)，\
@@ -61,6 +64,10 @@ const toolHint = computed(() => {
     return isSsh.value
       ? "对外暴露 exec_ssh(host/port/username/password/command)：目标服务器由调用方在参数中指定，免绑定本地实例。"
       : "对外暴露 exec_sql(host/port/username/password/database/sql)：目标数据库由调用方在参数中指定，免绑定本地实例。";
+  }
+  if (terminalBound.value) {
+    return "对外暴露 exec_ssh(command)：命令写入下方绑定的终端标签页执行（支持 A→B→C 跳板嵌套，\
+命令在终端当前所在的远端主机上执行，用户可实时看到执行过程）。";
   }
   return isSsh.value
     ? "对外暴露 exec_ssh(command)，目标服务器即下方绑定的 SSH 会话。"
@@ -82,9 +89,71 @@ const loading = computed(() => mcp.loading[props.kind]);
 /** 客户端直连模式（免绑定实例）：目标与账密由调用方在工具参数中传入。File 不支持。 */
 const clientMode = computed(() => !isFile.value && config.value.resourceMode === "client");
 
+/** 绑定来源（兼容旧配置无该字段的情况）。 */
+const boundSource = computed<McpBoundSource>(
+  () => config.value.boundSource ?? "config",
+);
+
+/**
+ * 模式 / 绑定方式（三选一，下拉框展示用）：
+ * - "config"：会话配置绑定（bound + boundSource=config）
+ * - "terminal"：终端标签页绑定（bound + boundSource=terminal）
+ * - "client"：客户端直连（resourceMode=client，免绑定）
+ */
+const mode = computed<"config" | "terminal" | "client">(() => {
+  if (config.value.resourceMode === "client") return "client";
+  return boundSource.value === "terminal" ? "terminal" : "config";
+});
+
+/** 终端标签页绑定模式（SSH kind + bound 模式 + 来源为 terminal）。 */
+const terminalBound = computed(
+  () => isSsh.value && !clientMode.value && boundSource.value === "terminal",
+);
+
+/** 模式 / 绑定方式的说明（悬浮帮助）。 */
+const modeHint = computed(() => {
+  if (terminalBound.value) {
+    return "命令将写入所选终端执行：终端当前在哪个远端主机（含 A→B→C 跳板嵌套）\
+命令就在哪个主机上执行。执行期间请勿手动操作该终端；终端关闭后绑定失效，需重新选择。";
+  }
+  if (clientMode.value) {
+    return "调用方在工具参数中传 host/port/username/password，凭据仅本次调用有效，\
+不存储不落日志。适用于调用方自带账密表的巡检场景。";
+  }
+  return "命令通过新建短连接执行，不打扰终端；但只能到达本机直接连到的服务器，\
+无法执行到跳板后的主机（如 A→B→C 中的 C）。需要时切换为「终端标签页」。";
+});
+
+/** 自动放行开关的说明（悬浮帮助）。 */
+const autoApproveHint =
+  "开启后，外部客户端的 exec_ssh / exec_sql 请求不再弹出确认框，直接执行。\
+适用于你信任的客户端场景；关闭则每次执行都需要你在 X-Term 中手动确认。";
+
+/** 记录执行日志开关的说明（悬浮帮助）。 */
+const logHint =
+  "开启后，每次启动服务会生成一个文本日志文件（位于应用数据目录 mcp-logs/），\
+记录每次工具调用的时间、命令/SQL、结果与耗时。重启服务后生效。";
+
+/** 已打开的终端标签页（含断开的，断开的禁选；连接中的无 instanceId 不列出）。 */
+const terminalOptions = computed(() =>
+  terminalsStore.tabs
+    .filter((t) => t.instanceId)
+    .map((t) => ({
+      instanceId: t.instanceId,
+      session: t.session,
+      disconnected: t.disconnected,
+      connecting: t.connecting,
+    })),
+);
+
 /** 该 kind 是否有可用资源可选。 */
 const hasResources = computed(() => {
-  if (isSsh.value) return sshSessions.value.length > 0;
+  if (isSsh.value) {
+    // 终端绑定模式：有已打开的终端即可；否则看会话配置。
+    return terminalBound.value
+      ? terminalOptions.value.some((t) => t.instanceId && !t.disconnected)
+      : sshSessions.value.length > 0;
+  }
   if (isFile.value) return fileAccounts.value.length > 0;
   return dbProfiles.value.length > 0;
 });
@@ -93,6 +162,11 @@ const hasResources = computed(() => {
 const boundResourceName = computed(() => {
   const id = config.value.resourceId;
   if (!id) return "";
+  if (isSsh.value && terminalBound.value) {
+    const t = terminalsStore.tabs.find((tab) => tab.instanceId === id);
+    if (!t) return "(终端已关闭)";
+    return `终端 · ${t.session.name} (${t.session.host}:${t.session.port})`;
+  }
   if (isSsh.value) {
     return sshSessions.value.find((s) => s.id === id)?.name ?? "(会话已删除)";
   }
@@ -158,25 +232,61 @@ async function loadResources() {
   }
 }
 
-/** DB MCP：选择 profile 后临时连接获取数据库列表。 */
+/** DB MCP：选择 profile 后临时连接获取数据库列表。
+ *  快速切换 profile 时用序号丢弃过期响应，避免先发起的慢请求覆盖新选择的结果。 */
+let dbListSeq = 0;
 async function loadDatabases(profileId: string) {
+  const seq = ++dbListSeq;
   if (!profileId) {
-    databases.value = [];
+    if (seq === dbListSeq) databases.value = [];
     return;
   }
   loadingDbs.value = true;
   try {
     const connId = await dbConnect(profileId);
     try {
-      databases.value = await dbListDatabases(connId);
+      const dbs = await dbListDatabases(connId);
+      if (seq === dbListSeq) databases.value = dbs;
     } finally {
       await dbDisconnect(connId).catch(() => {});
     }
   } catch {
+    if (seq !== dbListSeq) return;
     // 连接失败（服务不可达等）：清空列表，用户可手动输入。
     databases.value = [];
   } finally {
-    loadingDbs.value = false;
+    if (seq === dbListSeq) loadingDbs.value = false;
+  }
+}
+
+/**
+ * 模式 / 绑定方式切换（下拉框）。
+ *
+ * 组合映射：
+ * - config  → resourceMode="bound" + boundSource="config"
+ * - terminal→ resourceMode="bound" + boundSource="terminal"
+ * - client  → resourceMode="client"（忽略绑定）
+ *
+ * 规则：
+ * - config ↔ terminal 的 id 空间不同，清空 resourceId 重选；
+ *   运行中走热切换（`mcp_rebind`）即时生效。
+ * - 涉及 client 的切换不能热切换（后端 resource_mode 启动时固化），提示重启。
+ */
+async function onModeChange(value: string | number | boolean) {
+  const next = value === "client" ? "client" : value === "terminal" ? "terminal" : "config";
+  if (next === mode.value) return;
+  const prev = mode.value;
+  config.value.resourceMode = next === "client" ? "client" : "bound";
+  config.value.boundSource = next === "terminal" ? "terminal" : "config";
+  if (prev !== "client" && next !== "client") {
+    // 会话配置 ↔ 终端标签页：resourceId 属于不同 id 空间，清空重选。
+    config.value.resourceId = undefined;
+  }
+  if (next === "client" || prev === "client") {
+    // 涉及客户端直连：需重启生效。
+    await saveConfigAndMaybeWarn();
+  } else {
+    await saveConfigAndMaybeWarn({ hotRebind: true });
   }
 }
 
@@ -186,18 +296,40 @@ async function onResourceChange() {
   if (props.kind === "db" && config.value.resourceId) {
     await loadDatabases(config.value.resourceId);
   }
-  await saveConfigAndMaybeWarn();
+  await saveConfigAndMaybeWarn({ hotRebind: true });
 }
 
-/** 绑定/地址/端口改动后保存配置。运行中则提示重启。 */
-async function saveConfigAndMaybeWarn() {
+/**
+ * 绑定/地址/端口改动后保存配置。
+ *
+ * `hotRebind`：绑定类改动在服务运行中尝试热切换（`mcp_rebind`，立即生效无需重启）；
+ * 未传则按原有行为提示"需重启生效"。
+ *
+ * @returns 是否保存成功（false 时调用方应中止后续依赖新配置的操作，如启动）。
+ */
+async function saveConfigAndMaybeWarn(opts?: { hotRebind?: boolean }): Promise<boolean> {
   try {
     await mcp.saveConfig(props.kind);
-    if (needsRestart.value) {
-      ElMessage.warning("配置已保存，需重启该 MCP 服务才能生效。");
+    if (!needsRestart.value) return true;
+    if (opts?.hotRebind) {
+      if (!config.value.resourceId) {
+        // 切换绑定类型后尚未选择新资源：运行中的绑定保持旧值，重选后即时生效。
+        ElMessage.info("已保存。请选择新的绑定资源，选择后将即时生效。");
+        return true;
+      }
+      try {
+        await mcp.rebind(props.kind, boundSource.value, config.value.resourceId);
+        ElMessage.success("绑定已即时生效");
+      } catch (e) {
+        ElMessage.warning("热切换失败，重启服务后生效：" + String(e));
+      }
+      return true;
     }
+    ElMessage.warning("配置已保存，需重启该 MCP 服务才能生效。");
+    return true;
   } catch (e) {
     ElMessage.error("保存配置失败：" + String(e));
+    return false;
   }
 }
 
@@ -213,16 +345,25 @@ async function saveAutoApprove() {
 
 async function start() {
   if (!clientMode.value && !config.value.resourceId) {
-    const resName = isSsh.value ? "SSH 会话" : isFile.value ? "S3 文件账号" : "数据库连接";
-    ElMessage.warning(`请先选择一个${resName}，或开启「客户端直连模式」`);
+    const resName = terminalBound.value
+      ? "终端标签页"
+      : isSsh.value
+        ? "SSH 会话"
+        : isFile.value
+          ? "S3 文件账号"
+          : "数据库连接";
+    ElMessage.warning(`请先选择一个${resName}，或选择「客户端直连」模式`);
     return;
   }
   if (!config.value.token) {
     ElMessage.warning("请先生成 token 再启动");
     return;
   }
-  // 先把当前 host/port/resourceId/resourceMode 落盘，再用配置启动。
-  await saveConfigAndMaybeWarn();
+  // 先把当前 host/port/resourceId/resourceMode/boundSource 落盘，再用配置启动。
+  // 保存失败必须中止启动：否则后端用内存里的旧配置启动，UI 却按新配置展示，
+  // 前后端不一致。
+  const saved = await saveConfigAndMaybeWarn();
+  if (!saved) return;
   try {
     const s = await mcp.start(props.kind);
     ElMessage.success(`${title.value} 已启动：${s.host}:${s.port}`);
@@ -271,24 +412,29 @@ onMounted(async () => {
 <template>
   <div class="instance-panel">
     <div class="form-card">
-      <div class="card-title">{{ title }}</div>
-      <div class="card-desc">{{ toolHint }}</div>
+      <div class="card-title">
+        {{ title }}
+        <HelpTip :content="toolHint" />
+      </div>
 
-      <!-- 资源模式开关：绑定模式 / 客户端直连模式（File kind 仅支持 bound，隐藏开关） -->
-      <div v-if="!isFile" class="mode-row">
-        <div class="switch-label">
-          <div>客户端直连模式（免绑定实例）</div>
-          <div class="switch-desc">
-            开启后无需绑定本地资源，调用方在工具参数中传入目标服务器与账密
-            （host/port/username/password）。适用于调用方自带服务器账密表的巡检场景。
-          </div>
-        </div>
-        <el-switch
-          v-model="config.resourceMode"
-          active-value="client"
-          inactive-value="bound"
-          @change="saveConfigAndMaybeWarn"
-        />
+      <!-- 模式 / 绑定方式（SSH 三选一、DB 二选一；File 仅支持绑定模式，隐藏） -->
+      <div v-if="!isFile" class="field-row">
+        <label class="field-label">
+          模式 / 绑定方式
+          <HelpTip :content="modeHint" />
+        </label>
+        <el-select :model-value="mode" class="field-control" @change="onModeChange">
+          <el-option
+            v-if="isSsh"
+            value="terminal"
+            label="终端标签页（命令写入终端执行）"
+          />
+          <el-option
+            value="config"
+            :label="isSsh ? '会话配置（新建连接执行）' : '会话配置（绑定数据库连接）'"
+          />
+          <el-option value="client" label="客户端直连（免绑定，调用方传账密）" />
+        </el-select>
       </div>
 
       <!-- 直连模式安全提示 -->
@@ -297,7 +443,7 @@ onMounted(async () => {
         type="warning"
         :closable="false"
         show-icon
-        class="mt8"
+        class="alert-gap"
       >
         <div class="client-mode-alert">
           <div>调用方需在工具参数中传 <code>host</code> / <code>port</code> /
@@ -310,18 +456,29 @@ onMounted(async () => {
       <!-- 绑定资源（仅绑定模式） -->
       <div v-if="!clientMode" class="field-row">
         <label class="field-label">
-          绑定{{ isSsh ? "SSH 会话" : isFile ? "S3 文件账号" : "数据库连接" }}
+          绑定{{ terminalBound ? "终端标签页" : isSsh ? "SSH 会话" : isFile ? "S3 文件账号" : "数据库连接" }}
           <span class="required">*</span>
         </label>
         <el-select
           v-model="config.resourceId"
-          :placeholder="`选择一个${isSsh ? 'SSH 会话' : isFile ? 'S3 文件账号' : '数据库连接'}`"
+          :placeholder="`选择${terminalBound ? '一个已打开的终端标签页' : isSsh ? '一个 SSH 会话' : isFile ? '一个 S3 文件账号' : '一个数据库连接'}`"
           filterable
           class="field-control"
           :disabled="!hasResources"
           @change="onResourceChange"
         >
-          <template v-if="isSsh">
+          <template v-if="isSsh && terminalBound">
+            <el-option-group label="已打开的终端（在线）">
+              <el-option
+                v-for="t in terminalOptions"
+                :key="t.instanceId"
+                :label="`${t.session.name} (${t.session.host}:${t.session.port})`"
+                :value="t.instanceId"
+                :disabled="t.disconnected || t.connecting"
+              />
+            </el-option-group>
+          </template>
+          <template v-else-if="isSsh">
             <el-option
               v-for="s in sshSessions"
               :key="s.id"
@@ -350,7 +507,10 @@ onMounted(async () => {
 
       <!-- DB MCP：绑定具体数据库（仅 db kind + 绑定模式） -->
       <div v-if="kind === 'db' && !clientMode" class="field-row">
-        <label class="field-label">绑定数据库（可选）</label>
+        <label class="field-label">
+          绑定数据库（可选）
+          <HelpTip content="选择后，exec_sql 将只在该库上执行（外部 AI 工具描述中会注明库名）。若连接不可达，可手动输入库名。" />
+        </label>
         <el-select
           v-model="config.boundDatabase"
           placeholder="不选则使用连接默认库；可选择或手动输入"
@@ -364,24 +524,27 @@ onMounted(async () => {
         >
           <el-option v-for="db in databases" :key="db" :label="db" :value="db" />
         </el-select>
-        <div class="hint-text">
-          选择后，exec_sql 将只在该库上执行（外部 AI 工具描述中会注明库名）。
-          若连接不可达，可手动输入库名。
-        </div>
       </div>
       <el-alert
         v-if="!clientMode && !hasResources"
         type="warning"
         :closable="false"
         show-icon
-        class="mt8"
-        :title="`暂无可用${isSsh ? 'SSH 会话' : isFile ? 'S3 文件账号' : '数据库连接'}，请先在对应页面创建${isFile ? '' : '，或开启「客户端直连模式」'}`"
+        class="alert-gap"
+        :title="
+          terminalBound
+            ? '暂无已打开的 SSH 终端，请先在终端页打开一个终端（可嵌套登录后绑定该终端）'
+            : `暂无可用${isSsh ? 'SSH 会话' : isFile ? 'S3 文件账号' : '数据库连接'}，请先在对应页面创建${isFile ? '' : '，或选择「客户端直连」模式'}`
+        "
       />
 
       <!-- 监听地址 + 端口 -->
       <div class="addr-row">
         <div class="field-row flex1">
-          <label class="field-label">监听地址</label>
+          <label class="field-label">
+            监听地址
+            <HelpTip content="默认 0.0.0.0（对局域网开放）；仅本机使用可填 127.0.0.1。" />
+          </label>
           <el-input v-model="config.host" placeholder="0.0.0.0" class="field-control" @change="saveConfigAndMaybeWarn" />
         </div>
         <div class="field-row port-field">
@@ -396,11 +559,9 @@ onMounted(async () => {
           />
         </div>
       </div>
-      <div class="hint-text">
-        默认 <code>0.0.0.0</code>（对局域网开放）；仅本机使用可填 <code>127.0.0.1</code>。
-        <strong v-if="config.host === '0.0.0.0'" class="warn-inline">
-          ⚠ 对局域网开放，务必保管好 token。
-        </strong>
+      <!-- 安全警告：保持直接展示，不收进 tooltip -->
+      <div v-if="config.host === '0.0.0.0'" class="hint-text warn-inline">
+        ⚠ 当前监听 0.0.0.0：对局域网开放，务必保管好 token。
       </div>
     </div>
 
@@ -456,10 +617,9 @@ onMounted(async () => {
       <!-- 自动放行开关 -->
       <div class="switch-row">
         <div class="switch-label">
-          <div>自动放行（免确认）</div>
-          <div class="switch-desc">
-            开启后，外部客户端的 exec_ssh / exec_sql 请求<strong>不再弹出确认框</strong>，直接执行。
-            适用于你信任的客户端场景。关闭则每次执行都需要你在 X-Term 中手动确认。
+          <div>
+            自动放行（免确认）
+            <HelpTip :content="autoApproveHint" />
           </div>
         </div>
         <el-switch v-model="config.autoApprove" @change="saveAutoApprove" />
@@ -468,11 +628,9 @@ onMounted(async () => {
       <!-- 执行日志开关 -->
       <div class="switch-row">
         <div class="switch-label">
-          <div>记录执行日志</div>
-          <div class="switch-desc">
-            开启后，每次启动服务会生成一个文本日志文件（位于应用数据目录
-            <code>mcp-logs/</code>），记录每次工具调用的时间、命令/SQL、结果与耗时。
-            重启服务后生效。
+          <div>
+            记录执行日志
+            <HelpTip :content="logHint" />
           </div>
         </div>
         <el-switch v-model="config.enableLog" @change="saveConfigAndMaybeWarn" />
@@ -484,11 +642,13 @@ onMounted(async () => {
       <div class="card-title">
         <el-icon><Key /></el-icon>
         访问令牌 (Token)
-      </div>
-      <div class="card-desc">
-        外部客户端请求时需在 Header 携带
-        <code>Authorization: Bearer &lt;token&gt;</code>，或在 URL 加 <code>?token=&lt;token&gt;</code>。
-        <strong>请妥善保管 token</strong>：任何持有 token 的客户端均可调用本服务执行操作。
+        <HelpTip>
+          <template #content>
+            外部客户端请求时需在 Header 携带
+            <code>Authorization: Bearer &lt;token&gt;</code>，或在 URL 加
+            <code>?token=&lt;token&gt;</code>。
+          </template>
+        </HelpTip>
       </div>
       <div class="token-row">
         <el-input :model-value="config.token ?? ''" placeholder="点击生成 token" readonly class="token-input">
@@ -499,14 +659,15 @@ onMounted(async () => {
         </el-button>
         <el-button v-if="config.token" :icon="CopyDocument" @click="copy(config.token, '已复制 token')">复制</el-button>
       </div>
+      <!-- 安全警告：保持直接展示，不收进 tooltip -->
+      <div class="token-warn">⚠ 妥善保管 token：任何持有该 token 的客户端均可调用本服务执行操作。</div>
     </div>
 
     <!-- 客户端配置示例 -->
     <div class="form-card">
-      <div class="card-title">客户端配置示例</div>
-      <div class="card-desc">
-        将以下配置加入 Claude Desktop 的 <code>claude_desktop_config.json</code>（或 Cursor 的 MCP 设置）。
-        需先启动服务并生成 token。
+      <div class="card-title">
+        客户端配置示例
+        <HelpTip content="将以下配置加入 Claude Desktop 的 claude_desktop_config.json（或 Cursor 的 MCP 设置）。需先启动服务并生成 token。" />
       </div>
       <div v-if="!status.running || !config.token" class="config-empty">
         <el-alert type="info" :closable="false" show-icon>
@@ -552,18 +713,6 @@ onMounted(async () => {
 .card-title-row .card-title {
   margin-bottom: 0;
 }
-.card-desc {
-  font-size: 12px;
-  color: var(--el-text-color-secondary);
-  line-height: 1.6;
-  margin-bottom: 14px;
-}
-.card-desc code {
-  background: var(--el-fill-color-light);
-  padding: 1px 4px;
-  border-radius: 3px;
-  font-size: 11px;
-}
 
 .field-row {
   display: flex;
@@ -592,13 +741,6 @@ onMounted(async () => {
 .port-field {
   max-width: 160px;
 }
-.mode-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  margin-bottom: 14px;
-}
 .client-mode-alert {
   font-size: 12px;
   line-height: 1.8;
@@ -614,15 +756,11 @@ onMounted(async () => {
   margin-top: -6px;
   margin-bottom: 4px;
 }
-.hint-text code {
-  background: var(--el-fill-color-light);
-  padding: 1px 4px;
-  border-radius: 3px;
-}
 .warn-inline {
   color: var(--el-color-danger);
 }
-.mt8 {
+/* el-alert 与上方字段行间距：负上边距抵消 .field-row 的 margin-bottom，得到紧凑的 10px 间隙 */
+.alert-gap {
   margin-top: -4px;
   margin-bottom: 14px;
 }
@@ -662,6 +800,12 @@ onMounted(async () => {
 .token-input {
   flex: 1;
 }
+.token-warn {
+  margin-top: 10px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--el-color-danger);
+}
 
 .config-empty {
   margin-top: 4px;
@@ -690,11 +834,5 @@ onMounted(async () => {
   font-size: 13px;
   font-weight: 500;
   color: var(--el-text-color-primary);
-}
-.switch-desc {
-  font-size: 12px;
-  color: var(--el-text-color-secondary);
-  margin-top: 4px;
-  line-height: 1.5;
 }
 </style>

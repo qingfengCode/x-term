@@ -2,7 +2,8 @@ import { defineStore } from "pinia";
 import { computed, ref } from "vue";
 import * as aiApi from "@/api/ai";
 import * as dbApi from "@/api/db";
-import type { ChatMessage, ChatRole, ToolCall, ToolResult } from "@/api/types";
+import { useSettingsStore } from "@/stores/settings";
+import type { ChatMessage, ChatRole, ImagePart, ToolCall, ToolResult } from "@/api/types";
 
 /**
  * AI 对话状态。
@@ -51,6 +52,8 @@ export interface AiMessage {
   role: ChatRole;
   content: string;
   toolCallId?: string;
+  /** 用户消息附带的多模态图片（展示用 data URL 由组件端拼接）。 */
+  images?: ImagePart[];
   /** 是否正在流式接收中。 */
   streaming: boolean;
   error?: string;
@@ -215,6 +218,13 @@ const makeAiStore = (id: string) =>
     persist();
   }
 
+  /** 当前激活模型是否开启了多模态（决定历史消息里的图片是否随请求发送）。 */
+  function activeModelMultimodal(): boolean {
+    const s = useSettingsStore();
+    const p = s.aiProviders.find((x) => `${x.kind}:${x.model}` === s.aiActive);
+    return p?.multimodal ?? false;
+  }
+
   /**
    * 发送一条用户消息并启动 AI 流式回复。
    * @param userText 用户输入
@@ -223,6 +233,7 @@ const makeAiStore = (id: string) =>
    * @param opts.activeTerminalId 当前活动终端（agent 模式上下文）
    * @param opts.activeDbConnId 当前活动 MySQL 连接
    * @param opts.domain 请求所属助手域（"ssh" | "db"），文件工具据此取工作目录
+   * @param opts.images 附带的多模态图片（仅多模态模型下使用）
    */
   async function send(
     userText: string,
@@ -232,6 +243,7 @@ const makeAiStore = (id: string) =>
       activeTerminalId?: string;
       activeDbConnId?: string;
       domain?: string;
+      images?: ImagePart[];
     }
   ) {
     ensureConversation();
@@ -244,6 +256,7 @@ const makeAiStore = (id: string) =>
       role: "user",
       content: userText,
       streaming: false,
+      images: opts?.images?.length ? opts.images : undefined,
     };
     conv.messages.push(userMsg);
     // 用首条用户消息作为对话标题（取前 20 字）。
@@ -266,11 +279,15 @@ const makeAiStore = (id: string) =>
 
     const history: ChatMessage[] = [];
     if (systemPrompt) history.push({ role: "system", content: systemPrompt });
+    // 图片随请求发送的前置条件：当前激活模型开启了多模态。切到普通模型后，
+    // 历史消息里已带过的图片不再重发（文本模型收到图片块会 400），仅保留展示。
+    const withImages = activeModelMultimodal();
     for (const m of conv.messages) {
       if (m.id === assistantMsg.id) break;
       history.push({
         role: m.role,
         content: m.content,
+        images: withImages && m.images?.length ? m.images : undefined,
         toolCalls: m.toolCalls?.map((t) => ({
           id: t.toolCallId,
           name: t.name,
@@ -324,20 +341,25 @@ const makeAiStore = (id: string) =>
     return m && m.role === "assistant" ? m : null;
   }
 
+  /** 往助手消息追加一段文本：content 与 parts 双写保持同步（模板只渲染 parts）。 */
+  function appendTextPart(m: AiMessage, text: string) {
+    m.content += text;
+    const parts = (m.parts ??= []);
+    const last = parts[parts.length - 1];
+    if (last && last.kind === "text") {
+      last.text += text;
+    } else {
+      parts.push({ kind: "text", text });
+    }
+  }
+
   function onChunk(requestId: string, delta: string) {
     const conv = convForRequest(requestId);
     if (!conv) return;
     const m = lastAssistant(conv);
     if (!m) return;
-    m.content += delta;
-    // 同步追加进有序 parts：若末尾是文本段就续上，否则新建一段（与上一个工具调用分隔）。
-    const parts = (m.parts ??= []);
-    const last = parts[parts.length - 1];
-    if (last && last.kind === "text") {
-      last.text += delta;
-    } else {
-      parts.push({ kind: "text", text: delta });
-    }
+    // 追加进有序 parts：若末尾是文本段就续上，否则新建一段（与上一个工具调用分隔）。
+    appendTextPart(m, delta);
   }
 
   function onDone(requestId: string) {
@@ -372,11 +394,14 @@ const makeAiStore = (id: string) =>
     const m = lastAssistant(conv);
     if (m) {
       m.streaming = false;
-      // 若助手消息已有部分内容，保留并追加终止标记；否则置一个提示。
+      // 终止标记必须写入 parts（content 与 parts 双写同步）：模板只渲染
+      // parts，旧实现只改 content 导致标记永远不显示；若停止时还没有任何
+      // 文本，整个气泡会渲染为空。
+      const marker = "_（已终止）_";
       if (m.content.trim()) {
-        m.content += "\n\n_（已终止）_";
+        appendTextPart(m, "\n\n" + marker);
       } else if (!m.error) {
-        m.content = "_（已终止）_";
+        appendTextPart(m, marker);
       }
     }
     // 取消该会话所有待确认的工具调用卡片（pending → rejected）。
@@ -582,11 +607,14 @@ const makeAiStore = (id: string) =>
       }
     }
     if (userIdx < 0) return;
-    const userText = conv.messages[userIdx].content;
+    const userMsg = conv.messages[userIdx];
     // 删掉该 user 消息及之后的所有消息。
     conv.messages.splice(userIdx);
-    // 重新发送。
-    await send(userText, systemPrompt, opts);
+    // 重新发送（原用户消息若带图片，一并重发）。
+    await send(userMsg.content, systemPrompt, {
+      ...opts,
+      images: userMsg.images,
+    });
   }
 
   return {

@@ -44,7 +44,8 @@ pub struct McpInstanceConfig {
     /// Bearer token（未生成则为 None；启动时必须存在）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
-    /// 绑定的资源 id：SSH 会话 id（ssh）或 DB profile id（db）。仅 `resource_mode == "bound"`
+    /// 绑定的资源 id：SSH 会话 id / DB profile id（bound_source="config"）或
+    /// 终端实例 id（bound_source="terminal"）。仅 `resource_mode == "bound"`
     /// 时必填；`"client"` 模式下忽略。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_id: Option<String>,
@@ -56,6 +57,11 @@ pub struct McpInstanceConfig {
     ///   凭据即用即弃、不存储不落日志。适合调用方自带账密表的巡检场景。
     #[serde(default = "default_resource_mode")]
     pub resource_mode: String,
+    /// 绑定来源（仅 bound 模式有效）："config"（绑定会话配置，默认；执行时新建
+    /// 短连接）| "terminal"（绑定已打开的终端标签页，命令写入该终端 PTY 执行，
+    /// 支持 A→B→C 跳板嵌套场景）。仅 SSH kind 支持 terminal 来源。
+    #[serde(default = "default_bound_source")]
+    pub bound_source: String,
     /// 绑定的具体数据库名（仅 db kind 有效）。设置后 exec_sql 只针对该库操作。
     /// 为空则使用 profile 的 default_database。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -81,6 +87,11 @@ fn default_resource_mode() -> String {
     "bound".into()
 }
 
+/// 默认绑定来源：会话配置（向后兼容；老 mcp.json 无此字段即视为 config）。
+fn default_bound_source() -> String {
+    "config".into()
+}
+
 /// 规范化资源模式：仅 `"client"` 视为直连模式，其余一律按 `"bound"` 处理
 /// （防配置文件被手动改坏导致意外直连）。
 pub(crate) fn normalize_resource_mode(m: &str) -> String {
@@ -88,6 +99,15 @@ pub(crate) fn normalize_resource_mode(m: &str) -> String {
         "client".into()
     } else {
         "bound".into()
+    }
+}
+
+/// 规范化绑定来源：仅 `"terminal"` 视为终端标签页绑定，其余一律按 `"config"` 处理。
+pub(crate) fn normalize_bound_source(s: &str) -> String {
+    if s == "terminal" {
+        "terminal".into()
+    } else {
+        "config".into()
     }
 }
 
@@ -110,6 +130,7 @@ impl McpInstanceConfig {
             token: None,
             resource_id: None,
             resource_mode: default_resource_mode(),
+            bound_source: default_bound_source(),
             bound_database: None,
             auto_approve: false,
             enable_log: true,
@@ -220,8 +241,35 @@ pub async fn mcp_start(
         ))
     })?;
     // bound 模式要求绑定资源；client 模式（客户端直连）不要求。
+    let bound_source = normalize_bound_source(&cfg.bound_source);
+    // 终端标签页绑定仅 SSH kind 支持；其它 kind 强制回退会话配置绑定。
+    let bound_source = match (bound_source.as_str(), kind) {
+        ("terminal", McpKind::Ssh) => "terminal",
+        ("terminal", _) => {
+            log::warn!(
+                "[mcp] {} 不支持终端标签页绑定，已回退为会话配置绑定",
+                kind.label()
+            );
+            "config"
+        }
+        _ => "config",
+    };
     let bound_resource_id = if resource_mode == "client" {
         None
+    } else if bound_source == "terminal" {
+        // 终端标签页绑定：校验终端存在且为 SSH 终端（启动时校验，避免每次调用都报错）。
+        let id = cfg.resource_id.ok_or_else(|| {
+            AppError::Config(
+                "SSH MCP 未绑定终端标签页：请先在 MCP 页面选择一个已打开的终端标签页".into(),
+            )
+        })?;
+        if !crate::mcp::exec::ssh_terminal_exists(state.inner(), &id) {
+            return Err(AppError::Config(format!(
+                "绑定的终端标签页不存在或已断开（终端可能已关闭），请重新绑定（当前 id: {}）",
+                id
+            )));
+        }
+        Some(id)
     } else {
         Some(cfg.resource_id.ok_or_else(|| {
             AppError::Config(format!(
@@ -244,6 +292,7 @@ pub async fn mcp_start(
         port,
         token,
         bound_resource_id,
+        bound_source.to_string(),
         cfg.bound_database,
         resource_mode,
         cfg.auto_approve,
@@ -286,6 +335,56 @@ pub fn mcp_save_config(
 #[tauri::command]
 pub fn mcp_load_config(kind: String, state: State<'_, AppState>) -> AppResult<McpInstanceConfig> {
     Ok(instance_config(state.inner(), McpKind::parse(&kind)))
+}
+
+/// 运行中热切换绑定的资源（会话配置 / 终端标签页），立即生效无需重启。
+///
+/// - `bound_source`："config"（会话配置）| "terminal"（终端标签页，仅 SSH kind）。
+/// - `resource_id`：会话配置 id 或终端实例 id。
+///
+/// 同时把新绑定持久化到 mcp.json（与 `mcp_save_config` 各自独立，二者都会落盘）。
+/// 服务未运行时只保存配置（启动时生效）。
+#[tauri::command]
+pub async fn mcp_rebind(
+    kind: String,
+    bound_source: String,
+    resource_id: String,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    let kind = McpKind::parse(&kind);
+    let bound_source = normalize_bound_source(&bound_source);
+
+    // 终端标签页绑定仅 SSH kind 支持。
+    if bound_source == "terminal" && kind != McpKind::Ssh {
+        return Err(AppError::InvalidInput(format!(
+            "{} 不支持终端标签页绑定，请绑定{}",
+            kind.label(),
+            match kind {
+                McpKind::Ssh => "SSH 会话",
+                McpKind::Db => "数据库连接",
+                McpKind::File => "S3 文件账号",
+            }
+        )));
+    }
+    // 终端绑定要求终端当前存在且为 SSH 终端。
+    if bound_source == "terminal" && !crate::mcp::exec::ssh_terminal_exists(state.inner(), &resource_id)
+    {
+        return Err(AppError::NotFound(format!(
+            "终端标签页不存在或已断开（终端可能已关闭），请重新选择"
+        )));
+    }
+
+    // 热切换运行中的实例（未运行时仅提示，不视为错误——配置已保存，启动时生效）。
+    match crate::mcp::server::rebind_mcp(kind, &bound_source, &resource_id) {
+        Ok(()) => {}
+        Err(e) => log::info!("[mcp] {} 热切换跳过：{}", kind.label(), e),
+    }
+
+    // 持久化配置。
+    let mut cfg = instance_config(state.inner(), kind);
+    cfg.bound_source = bound_source;
+    cfg.resource_id = Some(resource_id);
+    set_instance_config(state.inner(), kind, cfg)
 }
 
 /// 为指定 kind 生成随机 token（uuid 去横线），写入配置文件并返回。

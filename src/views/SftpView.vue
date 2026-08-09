@@ -35,6 +35,8 @@ import { useTransferStore } from "@/stores/transfer";
 import type { Session, FileEntry } from "@/api/types";
 import {
   sftpList,
+  sftpStat,
+  sftpPwd,
   sftpMkdir,
   sftpRename,
   sftpRemove,
@@ -81,10 +83,16 @@ const localEntries = ref<UnifiedEntry[]>([]);
 const localLoading = ref(false);
 const selectedLocal = ref<UnifiedEntry | null>(null);
 
+// 加载竞态防护：每次加载取递增序号，响应返回时若序号已过期（期间又发起了
+// 新加载）则丢弃结果，避免先发的慢请求覆盖新导航的列表/loading 状态。
+let localLoadSeq = 0;
+
 async function loadLocal(path: string) {
+  const seq = ++localLoadSeq;
   localLoading.value = true;
   try {
     const raw = await readDir(path);
+    if (seq !== localLoadSeq) return; // 过期响应：期间已发起新加载，丢弃。
     const items: UnifiedEntry[] = [];
     for (const e of raw) {
       // 跳过 . / .. 等系统条目，readDir 已不含，但兼容过滤。
@@ -106,14 +114,16 @@ async function loadLocal(path: string) {
         modified,
       });
     }
+    if (seq !== localLoadSeq) return;
     sortEntries(items);
     localEntries.value = items;
     localPath.value = path;
     selectedLocal.value = null;
   } catch (e) {
+    if (seq !== localLoadSeq) return;
     ElMessage.error("读取本地目录失败: " + String(e));
   } finally {
-    localLoading.value = false;
+    if (seq === localLoadSeq) localLoading.value = false;
   }
 }
 
@@ -175,20 +185,25 @@ function fromFileEntry(e: FileEntry): UnifiedEntry {
   return { name: e.name, isDir: e.isDir, size: e.size, modified: e.modified };
 }
 
+let remoteLoadSeq = 0;
+
 async function loadRemote(path: string) {
   if (!sftpId.value) return;
+  const seq = ++remoteLoadSeq;
   remoteLoading.value = true;
   try {
     const list = await sftpList(sftpId.value, path);
+    if (seq !== remoteLoadSeq) return; // 过期响应丢弃（快速双击/刷新并发时）。
     const items = list.map(fromFileEntry);
     sortEntries(items);
     remoteEntries.value = items;
     remotePath.value = path;
     selectedRemote.value = null;
   } catch (e) {
+    if (seq !== remoteLoadSeq) return;
     ElMessage.error("读取远程目录失败: " + String(e));
   } finally {
-    remoteLoading.value = false;
+    if (seq === remoteLoadSeq) remoteLoading.value = false;
   }
 }
 
@@ -211,8 +226,12 @@ function remoteEnter(entry: UnifiedEntry) {
 
 function remoteGoUp() {
   if (!remotePath.value) return;
+  const p = remotePath.value;
+  // 相对路径（pwd 解析失败的回退场景）：无法可靠计算父目录，保持不动
+  // （旧实现会把 "." 的父目录误算成根目录，从家目录"向上"直接跳到 /）。
+  if (!p.startsWith("/") && !p.startsWith("\\")) return;
   const sep = "/";
-  const parts = remotePath.value.split(sep).filter(Boolean);
+  const parts = p.split(sep).filter(Boolean);
   if (parts.length <= 1) {
     loadRemote(sep);
     return;
@@ -395,8 +414,16 @@ async function connectSftp() {
     sftpId.value = id;
     msg.close();
     ElMessage.success("SFTP 连接已建立");
-    // 默认进入远程家目录（后端通常以 . 表示家目录，列表里能拿到绝对路径）。
-    await loadRemote(".");
+    // 用 REALPATH 解析会话家目录的绝对路径，之后统一用绝对路径导航。
+    // 旧实现直接 loadRemote(".") 会留下相对路径，remoteGoUp 会错误地跳到
+    // 根目录、面包屑也会把 "." 拼成 "/./..."，与双击进入的目录不一致。
+    try {
+      const cwd = await sftpPwd(id);
+      await loadRemote(cwd || "/");
+    } catch {
+      // pwd 失败（老服务器不支持 REALPATH 等）回退到相对 "."，功能不阻断。
+      await loadRemote(".");
+    }
   } catch (e) {
     msg.close();
     ElMessage.error("SFTP 连接失败: " + String(e));
@@ -498,8 +525,45 @@ async function uploadSelected() {
   await uploadOne(full, localFile.name);
 }
 
+// --- 覆盖保护（上传/下载前确认，避免静默覆盖同名文件造成数据丢失） ---
+
+async function confirmOverwrite(message: string): Promise<boolean> {
+  try {
+    await ElMessageBox.confirm(message, "覆盖确认", {
+      type: "warning",
+      confirmButtonText: "覆盖",
+      cancelButtonText: "取消",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 远程目标已存在同名文件时弹确认；不存在或 stat 失败放行（stat 失败由传输命令自身报错）。 */
+async function confirmRemoteOverwrite(remoteAbs: string, name: string): Promise<boolean> {
+  try {
+    await sftpStat(sftpId.value, remoteAbs);
+  } catch {
+    return true;
+  }
+  return confirmOverwrite(`远程已存在同名文件「${name}」，是否覆盖？`);
+}
+
+/** 本地目标已存在同名文件时弹确认。 */
+async function confirmLocalOverwrite(localAbs: string, name: string): Promise<boolean> {
+  try {
+    await fsStat(localAbs);
+  } catch {
+    return true; // 本地不存在，直接写。
+  }
+  return confirmOverwrite(`本地已存在同名文件「${name}」，是否覆盖？`);
+}
+
 async function uploadOne(localAbs: string, name: string) {
   const remoteAbs = joinRemote(name);
+  // 覆盖保护：旧实现直接覆盖远程同名文件，可能丢失远端数据。
+  if (!(await confirmRemoteOverwrite(remoteAbs, name))) return;
   const taskId = crypto.randomUUID();
   transfer.add({
     id: taskId,
@@ -623,6 +687,8 @@ async function downloadSelected() {
 // 下载单个远程文件到本地当前目录（拖拽用，无需弹框）。
 async function downloadOne(remoteAbs: string, name: string) {
   const localAbs = await joinLocal(name);
+  // 覆盖保护：旧实现直接写盘覆盖本地同名文件，可能丢失本地数据。
+  if (!(await confirmLocalOverwrite(localAbs, name))) return;
   const taskId = crypto.randomUUID();
   transfer.add({
     id: taskId,

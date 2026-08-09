@@ -7,6 +7,7 @@
 //! - 注册所有命令。
 
 pub mod ai;
+pub mod backup;
 pub mod commands;
 pub mod config;
 pub mod database;

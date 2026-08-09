@@ -48,6 +48,8 @@ pub struct OutputRing {
     cap: usize,
     /// 当前缓冲。
     buf: VecDeque<u8>,
+    /// 累计写入字节数（不受环形截断影响，用于判断"终端输出是否仍在增长"）。
+    total: usize,
 }
 
 impl OutputRing {
@@ -55,6 +57,7 @@ impl OutputRing {
         Self {
             cap: cap_bytes,
             buf: VecDeque::with_capacity(cap_bytes),
+            total: 0,
         }
     }
 
@@ -66,11 +69,20 @@ impl OutputRing {
             }
             self.buf.push_back(b);
         }
+        self.total += data.len();
     }
 
     /// 当前缓冲字节数（用于记录"命令执行前"的基准位置）。
     pub fn len(&self) -> usize {
         self.buf.len()
+    }
+
+    /// 累计写入的字节数（含已被环形截断丢弃的头部）。
+    ///
+    /// 与 [`Self::len`] 的区别：缓冲写满后 `len` 恒等于容量，无法反映持续
+    /// 到来的新输出；`total` 单调递增，适合做"输出是否还在增长"的检测。
+    pub fn total_bytes(&self) -> usize {
+        self.total
     }
 
     /// 取最近 `max_bytes` 字节的快照（UTF-8 lossy 转 String）。
@@ -225,7 +237,15 @@ fn fetch_enc_data(conn: &DbConn, id: &str) -> AppResult<String> {
 /// 前端 → reader 任务 的输入指令。
 enum InputMsg {
     /// 写入一段字节数据到远程 shell。
-    Write(Vec<u8>),
+    ///
+    /// `ack` 存在时，reader 在字节被真正写入 SSH channel 后 send 通知；
+    /// 命令层（`terminal_write`）等待该信号实现背压——ZMODEM 大文件上传时
+    /// 逐块等待写完成，避免无界 mpsc 队列把整个文件堆进内存。键盘输入等
+    /// 常规路径不传 ack，行为与原来一致。
+    Write {
+        buf: Vec<u8>,
+        ack: Option<oneshot::Sender<()>>,
+    },
     /// 调整终端窗口大小。
     Resize { cols: u32, rows: u32 },
     /// 关闭会话。reader 收到后退出循环并关闭 channel。
@@ -259,8 +279,12 @@ pub struct SshSession {
     pub output_buffer: SharedOutputRing,
 }
 
-/// 输出缓冲容量（字节），约 64KiB，可保留数百行终端输出。
-const OUTPUT_BUFFER_CAP: usize = 64 * 1024;
+/// 输出缓冲容量（字节），约 256 KiB，可保留数千行终端输出。
+///
+/// 容量大小直接影响可视化模式命令输出的可捕获范围：输出超过该容量后，
+/// 命令回显行与输出开头会被滚出缓冲，AI 只能拿到尾部（见 `ai::tools` 的
+/// `exec_ssh_visual`）。256 KiB 对绝大多数命令输出绰绰有余。
+pub const OUTPUT_BUFFER_CAP: usize = 256 * 1024;
 
 impl SshSession {
     /// 打开一个新的交互式终端会话。
@@ -330,6 +354,29 @@ impl SshSession {
         }
     }
 
+    /// 取终端输出的完整快照（整个环形缓冲）。
+    ///
+    /// 供可视化命令的哨兵检测/输出截取使用——那里需要"命令回显行 + 全部输出 +
+    /// 哨兵输出行"完整落在快照内，不能用限长窗口，否则输出稍大就会被截没。
+    pub fn full_snapshot(&self) -> String {
+        match self.output_buffer.lock() {
+            Ok(buf) => buf.snapshot(usize::MAX),
+            Err(_) => String::new(),
+        }
+    }
+
+    /// 返回环形缓冲累计写入的字节数（不受环形截断影响）。
+    ///
+    /// 与 [`Self::output_offset`] 的区别：缓冲写满后 `output_offset` 恒等于
+    /// 容量、无法反映新输出；本值单调递增，用于判断"终端输出是否仍在增长"
+    /// （可视化命令的静默完成检测）。
+    pub fn total_output_bytes(&self) -> usize {
+        match self.output_buffer.lock() {
+            Ok(buf) => buf.total_bytes(),
+            Err(_) => 0,
+        }
+    }
+
     /// 返回输出环形缓冲的当前字节数（用于记录命令执行前的基准位置，
     /// 配合 [`Self::snapshot_after`] 截取命令执行期间产生的新输出）。
     pub fn output_offset(&self) -> usize {
@@ -348,8 +395,28 @@ impl SshSession {
             .input_tx
             .as_ref()
             .ok_or_else(|| AppError::Ssh("终端会话尚未启动 reader 或已关闭".into()))?;
-        tx.send(InputMsg::Write(data))
+        tx.send(InputMsg::Write { buf: data, ack: None })
             .map_err(|_| AppError::Ssh("终端 reader 已退出".into()))
+    }
+
+    /// 带写完成确认的写入（背压用）。
+    ///
+    /// 返回的 oneshot receiver 在 reader 把字节写入 SSH channel 后收到信号；
+    /// 调用方 await 它即获得真实背压。ZMODEM 上传时用此接口逐块发送，
+    /// 避免无界输入通道堆积整个文件。
+    pub fn write_with_ack(&self, data: Vec<u8>) -> AppResult<oneshot::Receiver<()>> {
+        let tx = self
+            .input_tx
+            .as_ref()
+            .ok_or_else(|| AppError::Ssh("终端会话尚未启动 reader 或已关闭".into()))?
+            .clone();
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(InputMsg::Write {
+            buf: data,
+            ack: Some(ack_tx),
+        })
+        .map_err(|_| AppError::Ssh("终端 reader 已退出".into()))?;
+        Ok(ack_rx)
     }
 
     /// 通知远程终端窗口大小变化。
@@ -439,8 +506,14 @@ impl SshSession {
                     // 前端 → 远程：输入。
                     inp = input_rx.recv() => {
                         match inp {
-                            Some(InputMsg::Write(buf)) => {
-                                if channel.data(&buf[..]).await.is_err() {
+                            Some(InputMsg::Write { buf, ack }) => {
+                                let result = channel.data(&buf[..]).await;
+                                // 无论成败都回 ack，避免命令层无限等待；
+                                // 失败时连接即将关闭，由 TERMINAL_CLOSED 事件兜底。
+                                if let Some(ack) = ack {
+                                    let _ = ack.send(());
+                                }
+                                if result.is_err() {
                                     break;
                                 }
                             }

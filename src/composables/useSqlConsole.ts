@@ -14,7 +14,7 @@
 
 import { nextTick, ref, type Ref } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { dbExecSql, dbDescribeTable } from "@/api/db";
+import { dbExecSql, dbDescribeTable, dbUseDatabase } from "@/api/db";
 import type { DbQueryResultEvent, QueryResult } from "@/api/types";
 
 // ---------------------------------------------------------------------------
@@ -58,13 +58,21 @@ const WRITE_KEYWORDS = new Set([
 const DANGEROUS_KEYWORDS = new Set(["DROP", "TRUNCATE"]);
 
 /**
+ * 单条 USE 语句（库名允许反引号，可带尾分号/尾注释）。
+ * 与后端 parse_use_statement 语义一致：只有「纯 USE 语句」才会被后端拦截；
+ * `USE db; SELECT ...` 这类多语句后端不拦截，因此前端必须先把 USE 提取出来
+ * 单独切库，再执行剩余语句。
+ */
+const USE_STMT_RE = /^\s*use\s+`?([A-Za-z0-9_]+)`?\s*(;|--.*|#.*|\/\*[\s\S]*\*\/)?$/i;
+
+/**
  * 去掉 SQL 开头的注释（`--` 行注释 / `#` 行注释 / `斜杠星号` 块注释，可连续多层）。
  *
  * 不做注释剥离时，`-- 注释\nDROP TABLE users` 的首个关键字是 `--`，
  * 既不在 WRITE_KEYWORDS 里也不在 DANGEROUS_KEYWORDS 里——只读模式的写保护
  * 与危险确认都会被整段绕过（与后端 tools.rs 的 strip_sql_comments 对应）。
  */
-function stripLeadingComments(sql: string): string {
+export function stripLeadingComments(sql: string): string {
   let s = sql;
   for (;;) {
     const t = s.trimStart();
@@ -83,7 +91,27 @@ function stripLeadingComments(sql: string): string {
 }
 
 function firstKeyword(sql: string): string {
-  return (stripLeadingComments(sql).trimStart().split(/\s+/)[0] || "").toUpperCase();
+  const clean = stripLeadingComments(sql);
+  const firstStmt = clean.split(";")[0]?.trim() ?? "";
+  const tokens = firstStmt.split(/\s+/);
+  const first = tokens[0]?.toUpperCase() ?? "";
+  // WITH 引导的 CTE：取括号外第一个主语句关键字（与后端 sql_first_keyword
+  // 一致），防止 `WITH cte AS (...) DELETE ...` 绕过只读/危险判定。
+  if (first !== "WITH") return first;
+  let depth = 0;
+  for (let i = 1; i < tokens.length; i++) {
+    depth += (tokens[i].match(/\(/g)?.length ?? 0) - (tokens[i].match(/\)/g)?.length ?? 0);
+    if (depth !== 0) continue;
+    const up = tokens[i].toUpperCase();
+    if (
+      ["SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "REPLACE", "DROP", "TRUNCATE", "CREATE", "ALTER", "CALL"].includes(
+        up
+      )
+    ) {
+      return up;
+    }
+  }
+  return "WITH";
 }
 function isDeleteWithoutWhere(sql: string): boolean {
   return /^\s*DELETE\s+FROM\s+\S+\s*(;|$)/i.test(stripLeadingComments(sql));
@@ -211,12 +239,19 @@ export function useSqlConsole(
     lastResult.value = null;
     activeSqlEl.value = null;
     activeSqlId.value = null;
+    // 清屏时若仍有在途查询，同步重置单槽状态：后续结果事件因 queryId 不匹配
+    // 被丢弃，不会作为"孤儿条目"乱序插入，也不会让下次执行被误拦。
+    executing.value = false;
+    pendingQueryId.value = null;
+    pendingEntryId.value = null;
   }
 
   // --- 执行调度 + 事件路由 ---
   const pendingQueryId = ref<string | null>(null);
   const pendingEntryId = ref<string | null>(null);
   let unlistenFn: UnlistenFn | null = null;
+  // 标签在 setup() 的 listen 完成前被关闭时置位，防止 listen 完成后泄漏订阅。
+  let destroyed = false;
 
   function genId(prefix: string) {
     return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
@@ -235,51 +270,82 @@ export function useSqlConsole(
     if (!connIdRef.value) return false;
     const sqlRaw = (sqlOverride ?? sqlTextRef.value).trim();
     if (!sqlRaw) return false;
-    // 先剥离开头注释再按分号切分：注释内的分号（如 `-- a;b\nDROP TABLE x`）
-    // 若直接切分会把 `b\nDROP TABLE x` 当成最后一条语句，绕过关键字判定。
-    const stmts = stripLeadingComments(sqlRaw)
-      .split(";")
-      .map((s) => s.trim())
-      .filter((s) => s.length > 0);
-    // 编辑器可能含多条语句（分号分隔）；只执行最后一条非空语句，避免多语句语法错误。
-    const sql = stmts.length > 0 ? stmts[stmts.length - 1] : sqlRaw;
+    // 互斥守卫：同步检查并置位。旧实现在 await 切库/危险确认之后才检查
+    // executing，快速连按 Enter 会并发通过守卫，单槽 pendingQueryId/
+    // pendingEntryId 被覆盖，前一次查询的结果事件因 queryId 不匹配被丢弃、
+    // entry 永久停在 running。故守卫必须放在任何 await 之前。
     if (executing.value) return false;
-
-    const kw = firstKeyword(sql);
-    // 只读模式保护。
-    if (readOnly && WRITE_KEYWORDS.has(kw)) return false;
-    // 危险 SQL 二次确认。
-    const dangerous = DANGEROUS_KEYWORDS.has(kw) || isDeleteWithoutWhere(sql);
-    if (dangerous) {
-      const ok = await confirmDangerous(kw, isDeleteWithoutWhere(sql));
-      if (!ok) return false;
-    }
-
-    const queryId = genId("q");
-    const entryId = genId("e");
-    pendingQueryId.value = queryId;
     executing.value = true;
-
-    // 推入 running entry。pendingEntryId 必须在 await 之前设置——
-    // 后端 emit 的事件会在 invoke resolve 之前到达 onQueryResult。
-    pushEntry({ id: entryId, kind: "sql", sql, status: "running" });
-    // "上一条输入"置顶，当前查询从顶端开始（mysql CLI 风格）。
-    activeSqlId.value = entryId;
-    scrollSqlToTop();
-    pendingEntryId.value = entryId;
-    lastExecutedSql.value = sql;
-
     try {
-      await dbExecSql(connIdRef.value, sql, queryId);
-      // 结果已在 onQueryResult 里回填（事件先于 invoke resolve 到达）。
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
-      replaceEntry(entryId, { id: entryId, kind: "error", sql, message: msg });
+      // 先剥离开头注释再按分号切分：注释内的分号（如 `-- a;b\nDROP TABLE x`）
+      // 若直接切分会把 `b\nDROP TABLE x` 当成最后一条语句，绕过关键字判定。
+      const stmts = stripLeadingComments(sqlRaw)
+        .split(";")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0);
+      // mysql CLI 习惯：`USE db; SELECT ...` 会整条粘贴进来。前端按分号切分只
+      // 执行最后一条，中间的 USE 会被丢掉——先提取其中所有 USE（最后一条生效）
+      // 单独切库，再执行最后一条语句，保证查询落在目标库上（后端只拦截纯 USE
+      // 语句，多语句里的 USE 不会在后端生效）。
+      let lastUseDb: string | null = null;
+      for (const stmt of stmts) {
+        const m = USE_STMT_RE.exec(stmt);
+        if (m) lastUseDb = m[1];
+      }
+      if (lastUseDb) {
+        try {
+          await dbUseDatabase(connIdRef.value, lastUseDb);
+        } catch (e: unknown) {
+          // 切库失败：不执行后续语句，直接回显错误（与执行路径的报错形态一致）。
+          const msg = e instanceof Error ? e.message : String(e);
+          const errId = genId("e");
+          pushEntry({ id: errId, kind: "sql", sql: sqlRaw, status: "error" });
+          insertAfter(errId, { id: genId("e"), kind: "error", sql: sqlRaw, message: msg });
+          return false;
+        }
+      }
+      // 编辑器可能含多条语句（分号分隔）；只执行最后一条非空语句，避免多语句语法错误。
+      const sql = stmts.length > 0 ? stmts[stmts.length - 1] : sqlRaw;
+
+      const kw = firstKeyword(sql);
+      // 只读模式保护（前端快速拒绝；后端 db_exec_sql 已按 read_only 参数强制校验）。
+      if (readOnly && WRITE_KEYWORDS.has(kw)) return false;
+      // 危险 SQL 二次确认。
+      const dangerous = DANGEROUS_KEYWORDS.has(kw) || isDeleteWithoutWhere(sql);
+      if (dangerous) {
+        const ok = await confirmDangerous(kw, isDeleteWithoutWhere(sql));
+        if (!ok) return false;
+      }
+
+      const queryId = genId("q");
+      const entryId = genId("e");
+      pendingQueryId.value = queryId;
+
+      // 推入 running entry。pendingEntryId 必须在 await 之前设置——
+      // 后端 emit 的事件会在 invoke resolve 之前到达 onQueryResult。
+      pushEntry({ id: entryId, kind: "sql", sql, status: "running" });
+      // "上一条输入"置顶，当前查询从顶端开始（mysql CLI 风格）。
+      activeSqlId.value = entryId;
+      scrollSqlToTop();
+      pendingEntryId.value = entryId;
+      lastExecutedSql.value = sql;
+
+      try {
+        await dbExecSql(connIdRef.value, sql, queryId, readOnly);
+        // 结果已在 onQueryResult 里回填（事件先于 invoke resolve 到达）。
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        replaceEntry(entryId, { id: entryId, kind: "error", sql, message: msg });
+        pendingQueryId.value = null;
+        pendingEntryId.value = null;
+      }
+      return true;
+    } finally {
+      // 兜底复位：正常路径下结果事件先于 invoke resolve 到达、已在
+      // onQueryResult 复位 executing；被拦截的提前 return 在这里复位。
+      // （重复置 false 无害。）
       executing.value = false;
-      pendingQueryId.value = null;
-      pendingEntryId.value = null;
     }
-    return true;
   }
 
   function replaceEntry(id: string, e: ConsoleEntry) {
@@ -352,11 +418,19 @@ export function useSqlConsole(
 
   /** 订阅 db:query_result 事件（视图在 onMounted 调用，onBeforeUnmount 调 destroy）。 */
   async function setup() {
-    unlistenFn = await listen<DbQueryResultEvent>("db:query_result", (e) => {
+    const fn = await listen<DbQueryResultEvent>("db:query_result", (e) => {
+      if (destroyed) return;
       onQueryResult(e.payload);
     });
+    if (destroyed) {
+      // 订阅完成前标签已销毁：立刻反订阅，避免泄漏。
+      fn();
+    } else {
+      unlistenFn = fn;
+    }
   }
   function destroy() {
+    destroyed = true;
     if (unlistenFn) {
       unlistenFn();
       unlistenFn = null;
@@ -498,14 +572,32 @@ export function useSqlConsole(
   // --- 表结构（点表/按钮触发，预拉供补全 + 弹层展示） ---
   const selectedTable = ref<string | null>(null);
   const describeResult = ref<QueryResult | null>(null);
+  /** 最近一次拉取表结构实际使用的连接（点表时表可能属于其他 profile 的连接）。 */
+  const structureConnId = ref<string | null>(null);
+  /** 最近一次拉取表结构的库名（`db.table` 限定 DESCRIBE 时用）。 */
+  const structureDatabase = ref<string | null>(null);
 
-  /** 拉取表结构（不弹层，供补全 + describeResult）。 */
-  async function loadStructure(table: string) {
-    if (!connIdRef.value) return null;
+  /**
+   * 拉取表结构（不弹层，供补全 + describeResult）。
+   *
+   * @param connIdOverride 可选：覆盖本标签连接——树里点到的表可能属于
+   * 另一台服务器（展开 A 实例后切到 B 标签再点 A 的表），DESCRIBE 必须
+   * 落在表自己的连接上，否则会拿错库/错服务器的结构。
+   * @param database 可选：表所在库——DESCRIBE 用 `db`.`table` 限定名。
+   * 同 profile 开多个库标签时，连接当前库未必是表所在库（找连接时只保证
+   * 同 profile、不保证同库），不限定会 DESCRIBE 错库。
+   */
+  async function loadStructure(table: string, connIdOverride?: string, database?: string) {
+    const connId = connIdOverride ?? connIdRef.value;
+    if (!connId) return null;
     try {
-      const desc = await dbDescribeTable(connIdRef.value, table);
+      // 限定名由后端 qualify_table_identifier 校验并反引号拼接。
+      const qualified = database ? `${database}.${table}` : table;
+      const desc = await dbDescribeTable(connId, qualified);
       describeResult.value = desc;
       selectedTable.value = table;
+      structureConnId.value = connId;
+      structureDatabase.value = database ?? null;
       return desc;
     } catch {
       describeResult.value = null;
@@ -540,6 +632,8 @@ export function useSqlConsole(
     // 表结构
     selectedTable,
     describeResult,
+    structureConnId,
+    structureDatabase,
     loadStructure,
   };
 }

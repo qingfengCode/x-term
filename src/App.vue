@@ -1,19 +1,32 @@
 <script setup lang="ts">
-import { onMounted } from "vue";
+import { onMounted, watch } from "vue";
 import { useSettingsStore } from "@/stores/settings";
-import { useVaultStore } from "@/stores/vault";
 import SshAuthPrompt from "@/components/SshAuthPrompt.vue";
 import HostKeyPrompt from "@/components/HostKeyPrompt.vue";
 
 const settings = useSettingsStore();
-const vault = useVaultStore();
+
+/** 应用主题到 documentElement（dark class 驱动 Element Plus 深色变量）。 */
+function applyTheme(theme: string) {
+  document.documentElement.classList.toggle("dark", theme === "dark");
+}
+
+// store 主题变化（设置页点"应用"、load 校正等）全局同步，单一事实源。
+watch(
+  () => settings.terminal.theme,
+  (t) => applyTheme(t),
+);
 
 onMounted(async () => {
-  await settings.load();
-  // 应用主题。
-  document.documentElement.classList.toggle("dark", settings.terminal.theme === "dark");
-  // 检查保险库状态（首次启动需要创建，否则需要解锁）。
-  await vault.refresh();
+  try {
+    await settings.load();
+  } catch (e) {
+    // 加载失败不阻断主题应用：按默认（dark）继续，避免页面停留在浅色。
+    // （index.html 内联脚本已按上次主题缓存提前恢复，这里再做磁盘值校正。）
+    console.error("加载设置失败:", e);
+  }
+  applyTheme(settings.terminal.theme);
+  // vault 解锁门卫由 router 全局守卫负责（先于组件挂载执行），这里不再重复刷新。
 });
 </script>
 

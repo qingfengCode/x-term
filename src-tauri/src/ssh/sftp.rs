@@ -101,6 +101,18 @@ impl SftpSession {
         })
     }
 
+    /// 获取远程当前工作目录（绝对路径）。
+    ///
+    /// SFTP 会话初始 cwd 是登录用户家目录，但该路径可能是相对的（"."）。
+    /// 通过 SSH_FXP_REALPATH 解析成绝对路径，供前端在连接后统一用绝对路径
+    /// 导航（面包屑 / 上级目录计算依赖绝对路径）。
+    pub async fn cwd(&self) -> AppResult<String> {
+        self.channel
+            .canonicalize(".")
+            .await
+            .map_err(|e| AppError::Ssh(format!("解析当前目录失败: {}", e)))
+    }
+
     /// 下载远程文件到本地路径，逐块写盘并回调进度。
     ///
     /// `progress(transferred, total)`：`total` 来自远程文件元信息；若获取失败

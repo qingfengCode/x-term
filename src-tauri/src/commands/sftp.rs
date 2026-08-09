@@ -52,6 +52,22 @@ pub async fn sftp_stat(
     sftp.stat(&path).await
 }
 
+/// 获取远程会话的当前工作目录（绝对路径）。
+///
+/// SFTP 会话初始 cwd 是登录用户家目录，但路径可能只是相对的（"."）。
+/// 通过 SSH_FXP_REALPATH 解析成绝对路径，前端在连接后据此统一用绝对路径
+/// 导航（面包屑 / 上级目录计算依赖绝对路径）。
+#[tauri::command]
+pub async fn sftp_pwd(sftp_id: String, state: State<'_, AppState>) -> AppResult<String> {
+    let sftp = state
+        .sftp_sessions
+        .lock()
+        .get(&sftp_id)
+        .map(|(s, _)| s.clone());
+    let sftp = sftp.ok_or_else(|| AppError::NotFound(format!("SFTP 会话 {} 不存在", sftp_id)))?;
+    sftp.cwd().await
+}
+
 /// 创建远程目录。
 #[tauri::command]
 pub async fn sftp_mkdir(
