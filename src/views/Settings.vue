@@ -1666,6 +1666,17 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
             <div class="about-meta-grid">
               <span class="k">平台</span><span class="v">Windows x64</span>
               <span class="k">数据目录</span><span class="v">{{ updater.info?.dataDir ?? "—" }}</span>
+              <span class="k">项目地址</span>
+              <span class="v">
+                <a
+                  class="about-link"
+                  href="https://github.com/qingfengCode/x-term"
+                  target="_blank"
+                  rel="noopener"
+                >
+                  https://github.com/qingfengCode/x-term
+                </a>
+              </span>
             </div>
           </div>
         </div>
@@ -2115,5 +2126,12 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
 .about-meta-grid .v {
   color: var(--el-text-color-primary);
   word-break: break-all;
+}
+.about-link {
+  color: var(--el-color-primary);
+  text-decoration: none;
+}
+.about-link:hover {
+  text-decoration: underline;
 }
 </style>
