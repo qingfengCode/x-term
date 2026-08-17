@@ -26,8 +26,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use tauri::{AppHandle, State};
 
-use crate::ai::provider::{build_provider, ChatMessage, Role};
-use crate::ai::tools::{self, ToolApproval, ToolResult};
+use crate::ai::provider::{build_provider, ChatMessage, ChatWithToolsResult, LlmProvider, Role};
+use crate::ai::tools::{
+    self, DesktopToolOutcome, ToolApproval, ToolDef, ToolResult,
+};
 use crate::config::{
     settings_load_inner, FileAccessSettings, SqlAgentSettings, SshAgentSettings, RUN_MODE_AUTO,
     RUN_MODE_WHITELIST,
@@ -59,6 +61,12 @@ pub struct AiChatRequest {
     /// 当前活动 MySQL 连接 id（保留字段）。
     #[serde(default)]
     pub active_db_conn_id: Option<String>,
+    /// 当前活动内嵌 RDP 会话的桥接实例 id（桌面助手用，启用 desktop_* 工具）。
+    ///
+    /// 桌面工具要求激活模型为多模态（否则模型看不懂截图），`ai_chat` 入口会
+    /// 对非多模态模型强制置空本字段，从而不下发桌面工具。
+    #[serde(default)]
+    pub active_desktop_id: Option<String>,
     /// 请求所属助手域："ssh"（终端助手）| "db"（数据库助手）。
     /// 文件工具（read_file / write_file / list_files）据此取对应工作目录。
     #[serde(default)]
@@ -86,6 +94,11 @@ pub async fn ai_chat(
     // image_url / image 块会直接 400，这里在入口统一剥离，双保险。
     let mut req = req;
     filter_images_for_model(&mut req.messages, provider_cfg.multimodal);
+    // 桌面工具依赖多模态视觉：非多模态模型收到截图会 400，入口直接门控——
+    // 不传 active_desktop_id 即不下发 desktop_* 工具（前端系统提示会告知用户）。
+    if !provider_cfg.multimodal {
+        req.active_desktop_id = None;
+    }
     // 智能体循环轮数上限与上下文裁剪预算均来自模型配置（见设置页「模型参数」）。
     let max_tool_calls = provider_cfg.max_tool_calls.max(1);
     let context_budget = provider_cfg
@@ -165,6 +178,41 @@ pub async fn ai_cancel_tool(tool_call_id: String, state: State<'_, AppState>) ->
     Ok(())
 }
 
+/// 桌面工具（desktop_*）的前端「批准/拒绝 + 执行结果」一体回执。
+///
+/// RDP 会话（IronRDP WASM）活在前端，桌面工具的确认与执行都在前端完成：
+/// - 用户拒绝：`approved=false`（其余字段被忽略）；
+/// - 用户批准：前端先在 RDP 会话上执行，再把结果随 `ok`/`output` 回传；
+///   `desktop_screenshot` 额外附带 `image_mime` + `image_base64`（PNG），
+///   编排层把它作为图片消息回填给多模态模型。
+#[tauri::command]
+pub async fn ai_desktop_tool_respond(
+    tool_call_id: String,
+    approved: bool,
+    ok: bool,
+    output: String,
+    image_mime: Option<String>,
+    image_base64: Option<String>,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    let outcome = DesktopToolOutcome {
+        approved,
+        ok,
+        output,
+        image: match (image_mime, image_base64) {
+            (Some(mime), Some(data)) if approved => Some(crate::ai::provider::ImagePart {
+                mime_type: mime,
+                data_base64: data,
+            }),
+            _ => None,
+        },
+    };
+    if let Some((_, tx)) = state.pending_desktop_calls.lock().remove(&tool_call_id) {
+        let _ = tx.send(outcome);
+    }
+    Ok(())
+}
+
 /// 终止正在进行的 AI 请求（前端"终止"按钮触发）。
 ///
 /// 取出 requestId 对应的后台任务 JoinHandle 调 `abort()`，整个 future 树
@@ -172,8 +220,9 @@ pub async fn ai_cancel_tool(tool_call_id: String, state: State<'_, AppState>) ->
 /// await 点被取消。abort 后 spawn 的 future 不会再执行收尾代码，因此本命令
 /// 同时负责清理：
 /// - `pending_ai_tasks`：移除自身（abort 不会走任务内的 cleanup）；
-/// - `pending_tool_calls`：给**属于本请求**的阻塞中工具确认发拒绝信号
-///   （按 toolCallId → requestId 映射过滤，不误伤其他并发会话的确认项）。
+/// - `pending_tool_calls` / `pending_desktop_calls`：给**属于本请求**的阻塞中工具
+///   确认/前端执行等待发拒绝信号（按 toolCallId → requestId 映射过滤，
+///   不误伤其他并发会话的确认项）。
 ///
 /// 注意：abort 不会发射任何 AI 事件，前端需在调用本命令后自行把 sending 置 false
 /// （前端也会订阅 ai:stopped 事件作为统一收尾信号）。
@@ -207,6 +256,32 @@ pub async fn ai_stop(
     }
     for tx in pending {
         let _ = tx.send(crate::ai::tools::ToolApproval { approved: false });
+    }
+    // 2.5 桌面工具（desktop_*）的前端执行等待同样按 requestId 清理：
+    //     发送「拒绝」回执，让编排循环以拒绝结果收尾而不是挂到超时。
+    let desktop_ids: Vec<String> = {
+        let map = state.pending_desktop_calls.lock();
+        map.iter()
+            .filter(|(_, (req_id, _))| req_id == &request_id)
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    let mut desktop_pending = Vec::new();
+    {
+        let mut map = state.pending_desktop_calls.lock();
+        for id in &desktop_ids {
+            if let Some((_, tx)) = map.remove(id) {
+                desktop_pending.push(tx);
+            }
+        }
+    }
+    for tx in desktop_pending {
+        let _ = tx.send(DesktopToolOutcome {
+            approved: false,
+            ok: false,
+            output: "请求已终止".into(),
+            image: None,
+        });
     }
     // 3. 发射 ai:stopped 事件，前端据此统一收尾（标记 sending=false 等）。
     events::emit(
@@ -320,14 +395,18 @@ async fn run_agent_loop(
 ) -> AppResult<()> {
     // agent_mode 决定是否传入工具集。false 时 tools 为空，等同普通对话。
     // 工具集按活动上下文裁剪（块A）：有活动终端→SSH 工具；有活动 DB 连接→SQL 工具；
-    // 设置页开启「本地文件读写」→ 追加文件工具（read_file/write_file/list_files）。
+    // 有活动内嵌 RDP 会话→桌面工具（多模态门控在 ai_chat 入口完成）；
+    // 设置页开启「本地文件读写」→ 对 ssh/db 域追加文件工具（read_file/write_file/
+    // list_files；桌面助手不暴露文件工具，保持工具集按域硬隔离）。
+    let req_domain = req.domain.clone().unwrap_or_default();
     let mut tools = Vec::new();
     if req.agent_mode {
         tools.extend(tools::tools_for_context(
             req.active_terminal_id.as_deref(),
             req.active_db_conn_id.as_deref(),
+            req.active_desktop_id.as_deref(),
         ));
-        if file_cfg.enabled {
+        if file_cfg.enabled && (req_domain == "ssh" || req_domain == "db") {
             tools.extend(tools::file_tools());
         }
     }
@@ -343,24 +422,27 @@ async fn run_agent_loop(
     };
     let allowed = tools::allowed_tool_names(&tools);
     let mut messages = req.messages.clone();
+    // context_budget 在上下文超限降级重试中会被下调（降至 2/3），因此这里取可变副本。
+    let mut context_budget = context_budget;
     let mut tool_results: Vec<(String, ToolResult)> = Vec::new();
     let request_id = req.request_id.clone();
     let mut last_text = String::new();
 
     for _iter in 0..max_tool_calls {
-        // 上下文裁剪：估算 tokens 超出预算时丢弃最旧的历史（保留 system 与最近消息），
-        // 避免长对话超出模型上下文窗口。裁剪只影响本轮发送，不影响 messages 本身。
-        let mut round_messages = messages.clone();
-        trim_history_for_context(&mut round_messages, context_budget);
-        let resp = provider
-            .chat_with_tools(
-                round_messages,
-                tools.clone(),
-                tool_results.clone(),
-                request_id.clone(),
-                app.clone(),
-            )
-            .await?;
+        // 调用 chat_with_tools，带有限重试（429/5xx/建连失败指数退避；上下文超限
+        // 400 降级：预算降至 2/3 + 摘要化旧轮次工具结果），见
+        // [`chat_with_tools_with_retry`]。裁剪只影响本轮发送，不影响 messages 本身
+        // （降级重试会把摘要化直接写入 messages，那是刻意为之）。
+        let resp = chat_with_tools_with_retry(
+            provider.as_ref(),
+            &mut messages,
+            &tools,
+            &tool_results,
+            &request_id,
+            app,
+            &mut context_budget,
+        )
+        .await?;
 
         last_text = resp.message.clone();
 
@@ -415,10 +497,11 @@ async fn run_agent_loop(
                         output: msg.clone(),
                     },
                 ));
-                // 同样把结果作为 role=tool 消息追加进 messages。
+                // 同样把结果作为 role=tool 消息追加进 messages（压缩后再入上下文，
+                // 完整内容已通过 ai:tool_result 事件原样推给前端）。
                 messages.push(ChatMessage {
                     role: crate::ai::provider::Role::Tool,
-                    content: msg,
+                    content: compress_tool_output_for_context(&msg),
                     tool_calls: None,
                     tool_call_id: Some(call.id.clone()),
                     images: None,
@@ -447,6 +530,8 @@ async fn run_agent_loop(
                 "read_file" | "write_file" | "list_files"
             ) {
                 "file"
+            } else if tools::is_desktop_tool(&call.name) {
+                "desktop"
             } else {
                 "other"
             };
@@ -482,7 +567,7 @@ async fn run_agent_loop(
                     ));
                     messages.push(ChatMessage {
                         role: crate::ai::provider::Role::Tool,
-                        content: msg,
+                        content: compress_tool_output_for_context(&msg),
                         tool_calls: None,
                         tool_call_id: Some(call.id.clone()),
                         images: None,
@@ -537,6 +622,9 @@ async fn run_agent_loop(
                     // 写文件若覆盖已有文件（dangerous）仍走确认，其余自动执行。
                     (false, call.name != "write_file" || !dangerous)
                 }
+                // 桌面工具：截图是纯读取且无副作用（前端收到即自动截图回传）；
+                // 点击/输入可能对远端造成副作用，一律人工确认。
+                "desktop" => (false, call.name == "desktop_screenshot"),
                 _ => (false, true),
             };
             events::emit(
@@ -551,6 +639,13 @@ async fn run_agent_loop(
                     dangerous,
                     whitelisted,
                     auto_approved: auto_run,
+                    // 桌面工具：把请求发起时的活动桌面 id 带给前端执行器（防 agent
+                    // 循环期间用户切换标签导致操作落到错误桌面）。
+                    desktop_id: if domain == "desktop" {
+                        req.active_desktop_id.clone()
+                    } else {
+                        None
+                    },
                 },
             );
 
@@ -564,7 +659,62 @@ async fn run_agent_loop(
                 _ => false,
             };
 
-            let result = if auto_run {
+            // 桌面工具（desktop_screenshot）成功回传的截图图片：协议规定 role=tool
+            // 消息不能携带图片，需要以紧随其后的 user 消息图片块回填给模型。
+            let mut screenshot_image: Option<crate::ai::provider::ImagePart> = None;
+
+            let result = if domain == "desktop" {
+                // 桌面工具的执行体在**前端**（IronRDP WASM 会话，后端桥接只透传字节）。
+                // 无论 auto_run（截图自动放行）与否，后端都必须登记 oneshot 等待前端
+                // 「批准 + 执行」一体回执：auto_approved 只决定前端是否弹出确认卡片，
+                // 不影响这里的等待机制。
+                let (tx, rx) = tokio::sync::oneshot::channel::<DesktopToolOutcome>();
+                state
+                    .pending_desktop_calls
+                    .lock()
+                    .insert(call.id.clone(), (request_id.clone(), tx));
+
+                let outcome = tokio::time::timeout(APPROVAL_TIMEOUT, rx).await;
+                state.pending_desktop_calls.lock().remove(&call.id);
+
+                match outcome {
+                    Ok(Ok(out)) if out.approved => {
+                        screenshot_image = out.image;
+                        let r = ToolResult {
+                            ok: out.ok,
+                            output: out.output,
+                        };
+                        events::emit(
+                            app,
+                            AI_TOOL_RESULT,
+                            AiToolResultEvent {
+                                request_id: request_id.clone(),
+                                tool_call_id: call.id.clone(),
+                                ok: r.ok,
+                                output: r.output.clone(),
+                            },
+                        );
+                        r
+                    }
+                    _ => {
+                        // 用户拒绝 / 前端未回执（会话关闭等）/ 确认超时。
+                        events::emit(
+                            app,
+                            AI_TOOL_RESULT,
+                            AiToolResultEvent {
+                                request_id: request_id.clone(),
+                                tool_call_id: call.id.clone(),
+                                ok: false,
+                                output: "用户拒绝了该操作或确认超时".into(),
+                            },
+                        );
+                        ToolResult {
+                            ok: false,
+                            output: "用户拒绝了该操作或确认超时".into(),
+                        }
+                    }
+                }
+            } else if auto_run {
                 // 自动放行：不等待人工确认，直接执行。
                 let r =
                     tools::execute_tool(app, &state, call, &allowed, visualization, file_domain)
@@ -635,14 +785,33 @@ async fn run_agent_loop(
             };
             tool_results.push((call.id.clone(), result.clone()));
             // 把工具结果作为 role=tool 消息追加进 messages（紧跟 assistant(tool_calls)）。
+            // 入上下文前压缩到 8 KiB：完整内容已通过 ai:tool_result 事件推给前端展示，
+            // 模型只需要足够理解结果的头部，全量原文每轮重发会让成本复利放大。
             messages.push(ChatMessage {
                 role: crate::ai::provider::Role::Tool,
-                content: result.output.clone(),
+                content: compress_tool_output_for_context(&result.output),
                 tool_calls: None,
                 tool_call_id: Some(call.id.clone()),
                 images: None,
             });
+            // 截图回填：role=tool 消息不允许携带图片（OpenAI image_url / Claude
+            // image 块只能出现在 user 消息里），因此把 desktop_screenshot 捕获的
+            // 截图作为紧随其后的 user 消息图片块交给多模态模型查看。
+            if let Some(img) = screenshot_image {
+                messages.push(ChatMessage {
+                    role: Role::User,
+                    content: "（这是刚才 desktop_screenshot 工具捕获的 RDP 桌面截图，\
+请据此分析当前界面并继续下一步操作。）"
+                        .into(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    images: Some(vec![img]),
+                });
+            }
         }
+        // 早于最近 KEEP_FULL_TOOL_ROUNDS 轮的工具结果替换为一行摘要，从根源上
+        // 削减「历史工具输出每轮全量重推」的上下文体积（对下一轮及后续都生效）。
+        summarize_old_tool_rounds(&mut messages, KEEP_FULL_TOOL_ROUNDS);
         // 继续下一轮：messages 已含完整的 [assistant(tool_calls), tool, tool, ...] 链。
     }
 
@@ -661,6 +830,202 @@ async fn run_agent_loop(
         },
     );
     Ok(())
+}
+
+// ===========================================================================
+// LLM 调用重试
+// ===========================================================================
+
+/// 单次 `chat_with_tools` 失败的重试类别。
+enum ChatErrorKind {
+    /// 可重试：429 / 5xx 或建连失败（请求未发出/未收到响应头）。
+    /// 流式传输中途失败**不**在此列——部分 chunk 已推给前端，重试会重复文本。
+    Retryable,
+    /// 上下文超限（400 且响应体含上下文相关关键词）：降级重试一次。
+    ContextTooLong,
+    /// 不可重试：立即终止。
+    Fatal,
+}
+
+/// 按 provider 的错误文案分类（AppError::Ai 只有字符串，没有结构化状态码，
+/// 只能按已知格式匹配）。
+fn classify_chat_error(msg: &str) -> ChatErrorKind {
+    let lower = msg.to_ascii_lowercase();
+    // HTTP 429 / 5xx（openai 系 "LLM 返回错误状态 {status}: ..."，
+    // claude 系 "Claude 返回错误状态 {status}: ..."）。
+    if lower.contains("错误状态 429") || lower.contains("错误状态 5") {
+        return ChatErrorKind::Retryable;
+    }
+    // 400 + 上下文关键词 → 上下文超限（OpenAI "maximum context length"、
+    // Claude "prompt is too long"、DeepSeek "超出长度" 等文案都覆盖）。
+    if lower.contains("错误状态 400") && is_context_error_body(&lower) {
+        return ChatErrorKind::ContextTooLong;
+    }
+    // 建连失败（预流式）：DNS/连接/超时等，重试通常有效。
+    if lower.contains("连接 llm 服务失败") || lower.contains("连接 claude 服务失败") {
+        return ChatErrorKind::Retryable;
+    }
+    ChatErrorKind::Fatal
+}
+
+/// 400 响应体是否指向上下文超限（关键词小写匹配，宁宽勿漏：误判最多导致
+/// 一次无害的降级重试）。
+fn is_context_error_body(lower_body: &str) -> bool {
+    const KEYWORDS: [&str; 9] = [
+        "context",
+        "too long",
+        "too large",
+        "maximum",
+        "length",
+        "tokens",
+        "输入",
+        "长度",
+        "超限",
+    ];
+    KEYWORDS.iter().any(|k| lower_body.contains(k))
+}
+
+/// 调用一次 `chat_with_tools`，带有限重试：
+/// - 429/5xx/建连失败：最多再试 2 次，指数退避（1.5s → 3s）；
+/// - 上下文超限 400：预算降至 2/3 并把早于最近一轮的工具结果摘要化（就地修改
+///   `messages`，对后续所有轮次生效——这是裁剪保护下限之外唯一能真正缩容的手段），
+///   然后重试一次；
+/// - 其它错误：直接返回。
+///
+/// 重试中途不发射 `ai:error`：`chat_with_tools` 本身不再 emit（见 provider 文档），
+/// 最终失败由 `ai_chat` 的任务收尾统一发射一次。否则前端收到中间错误会立刻置为
+/// 终态（删除 requestToCid），重试成功后的 chunk/done 将无处路由、回复凭空消失。
+async fn chat_with_tools_with_retry(
+    provider: &dyn LlmProvider,
+    messages: &mut Vec<ChatMessage>,
+    tools: &[ToolDef],
+    tool_results: &[(String, ToolResult)],
+    request_id: &str,
+    app: &AppHandle,
+    context_budget: &mut usize,
+) -> AppResult<ChatWithToolsResult> {
+    /// 最大尝试次数（首次 + 2 次重试）。
+    const MAX_ATTEMPTS: usize = 3;
+    /// 重试退避基数（1.5s、3s，最多重试 2 次）。
+    const BACKOFF_BASE_MS: u64 = 1500;
+
+    let mut degraded = false;
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
+        let mut round = messages.clone();
+        trim_history_for_context(&mut round, *context_budget);
+        match provider
+            .chat_with_tools(
+                round,
+                tools.to_vec(),
+                tool_results.to_vec(),
+                request_id.to_string(),
+                app.clone(),
+            )
+            .await
+        {
+            Ok(resp) => return Ok(resp),
+            Err(e) => {
+                let msg = e.to_string();
+                match classify_chat_error(&msg) {
+                    ChatErrorKind::Retryable if attempt < MAX_ATTEMPTS => {
+                        let delay = Duration::from_millis(BACKOFF_BASE_MS << (attempt - 1));
+                        log::warn!(
+                            "[ai:{request_id}] 第 {attempt} 次调用失败，{delay:?} 后重试: {msg}"
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+                    ChatErrorKind::ContextTooLong if !degraded => {
+                        degraded = true;
+                        *context_budget = context_budget.saturating_mul(2) / 3;
+                        summarize_old_tool_rounds(messages, 1);
+                        log::warn!(
+                            "[ai:{request_id}] 上下文超限（{msg}），预算降至 {} 并摘要化旧轮次工具结果后重试",
+                            context_budget
+                        );
+                    }
+                    _ => return Err(e),
+                }
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// 工具结果上下文压缩
+// ===========================================================================
+
+/// 单条工具结果进入模型上下文的最大字节数（8 KiB ≈ 2k tokens）。
+/// 完整内容仍通过 `ai:tool_result` 事件原样推给前端展示，这里只压缩进入
+/// 上下文的副本——否则每条 16 KiB 原文 × 每轮全量重发 × max_tool_calls=200
+/// 会让 token 成本复利放大。
+const TOOL_OUTPUT_CONTEXT_CAP_BYTES: usize = 8 * 1024;
+
+/// 最近多少轮工具调用的结果保留全文；更早轮次的结果替换为一行摘要。
+const KEEP_FULL_TOOL_ROUNDS: usize = 5;
+
+/// 旧轮次工具结果被摘要化后的占位前缀（幂等判断用）。
+const TOOL_SUMMARY_PREFIX: &str = "[早前轮次工具结果已省略";
+
+/// 工具结果入上下文前的截断：超过 [`TOOL_OUTPUT_CONTEXT_CAP_BYTES`] 时只保留
+/// 头部并附截断说明（按 UTF-8 字符边界切分，避免截出乱码）。
+fn compress_tool_output_for_context(output: &str) -> String {
+    if output.len() <= TOOL_OUTPUT_CONTEXT_CAP_BYTES {
+        return output.to_string();
+    }
+    let mut cut = TOOL_OUTPUT_CONTEXT_CAP_BYTES;
+    while !output.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!(
+        "{}\n…[输出过长已截断：原文 {} 字节，完整内容见对话界面的工具卡片]",
+        &output[..cut],
+        output.len()
+    )
+}
+
+/// 把早于最近 `keep_rounds` 轮的工具结果替换为一行摘要（就地修改）。
+///
+/// 从末尾往前数 assistant(tool_calls) 消息作为「轮次」：每遇一组，其后所属的
+/// tool 消息若所在轮次早于保留范围，内容换成 `[早前轮次工具结果已省略：<工具名>，
+/// 原文 N 字节]`。摘要带工具名，帮助模型理解被省略的上下文。幂等：已摘要化的
+/// 内容（前缀匹配）不会重复处理。
+fn summarize_old_tool_rounds(messages: &mut [ChatMessage], keep_rounds: usize) {
+    // 先收集 tool_call_id → 工具名。
+    let mut names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for m in messages.iter() {
+        if let Some(tcs) = &m.tool_calls {
+            for tc in tcs {
+                names.insert(tc.id.clone(), tc.name.clone());
+            }
+        }
+    }
+    let mut round = 0usize;
+    for m in messages.iter_mut().rev() {
+        if m.role == Role::Assistant && m.tool_calls.is_some() {
+            round += 1;
+            continue;
+        }
+        if m.role != Role::Tool {
+            continue;
+        }
+        if round < keep_rounds || m.content.starts_with(TOOL_SUMMARY_PREFIX) {
+            continue;
+        }
+        let name = m
+            .tool_call_id
+            .as_deref()
+            .and_then(|id| names.get(id))
+            .map(String::as_str)
+            .unwrap_or("");
+        let bytes = m.content.len();
+        m.content = if name.is_empty() {
+            format!("{TOOL_SUMMARY_PREFIX}（原文 {bytes} 字节）")
+        } else {
+            format!("{TOOL_SUMMARY_PREFIX}：{name}，原文 {bytes} 字节")
+        };
+    }
 }
 
 // ===========================================================================
@@ -699,10 +1064,24 @@ fn estimate_tokens(text: &str) -> usize {
 /// - 丢弃带 `tool_calls` 的 assistant 消息时，连带其后连续的 tool 结果消息一起丢弃，
 ///   否则会残留"孤儿 tool 消息"——OpenAI/Anthropic 协议要求 tool 消息必须跟在
 ///   带 tool_calls 的 assistant 消息之后，否则以 400 拒绝；
+/// - 紧跟 assistant(tool_calls) 组之前的 user 消息不可单独丢弃：若丢，裁剪后首条
+///   非 system 消息会变成 assistant(tool_calls)——协议同样以 400 拒绝，对话永久失败；
 /// - 至少保留最后一条非 system 消息（当前用户问题不能被裁掉）。
 fn trim_history_for_context(messages: &mut Vec<ChatMessage>, budget: usize) {
     let tokens_of = |m: &ChatMessage| {
+        // tool_calls 的序列化 JSON（工具名 + 参数）同样占上下文，必须计入预算，
+        // 否则参数很长的调用会让估算严重偏低、超限 400。
+        let tool_calls_chars: usize = m
+            .tool_calls
+            .as_ref()
+            .map(|tcs| {
+                serde_json::to_string(tcs)
+                    .map(|s| s.len())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
         estimate_tokens(&m.content)
+            + tool_calls_chars / 4
             + MESSAGE_OVERHEAD_TOKENS
             + m.images
                 .as_ref()
@@ -713,6 +1092,16 @@ fn trim_history_for_context(messages: &mut Vec<ChatMessage>, budget: usize) {
     let mut i = 0;
     while total > budget && i < messages.len() {
         if messages[i].role == Role::System {
+            i += 1;
+            continue;
+        }
+        // 保护：紧跟 assistant(tool_calls) 组之前的 user 消息与组视为不可分割，
+        // 整体跳过（组本身在下一轮迭代按「连带 tool 结果」规则整组丢弃）。
+        if messages[i].role == Role::User
+            && i + 1 < messages.len()
+            && messages[i + 1].role == Role::Assistant
+            && messages[i + 1].tool_calls.is_some()
+        {
             i += 1;
             continue;
         }
@@ -799,6 +1188,7 @@ fn filter_images_for_model(messages: &mut [ChatMessage], multimodal: bool) {
 mod tests {
     use super::*;
     use crate::ai::provider::{ChatMessage, ImagePart, Role};
+    use crate::ai::tools::ToolCall;
 
     fn msg_with_image() -> ChatMessage {
         ChatMessage {
@@ -810,6 +1200,34 @@ mod tests {
                 mime_type: "image/png".into(),
                 data_base64: "AAAA".into(),
             }]),
+        }
+    }
+
+    fn tool_msg(id: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: Role::Tool,
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: Some(id.into()),
+            images: None,
+        }
+    }
+
+    fn assistant_tool_calls(ids: &[&str]) -> ChatMessage {
+        ChatMessage {
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls: Some(
+                ids.iter()
+                    .map(|id| ToolCall {
+                        id: id.to_string(),
+                        name: "exec_ssh".into(),
+                        arguments: serde_json::json!({}),
+                    })
+                    .collect(),
+            ),
+            tool_call_id: None,
+            images: None,
         }
     }
 
@@ -828,5 +1246,131 @@ mod tests {
         let mut messages = vec![msg_with_image()];
         filter_images_for_model(&mut messages, true);
         assert!(messages[0].images.is_some());
+    }
+
+    /// 短输出原样保留；超长输出截断并附说明。
+    #[test]
+    fn compress_short_and_truncate_long_tool_output() {
+        let short = "free -h 输出很短".to_string();
+        assert_eq!(compress_tool_output_for_context(&short), short);
+
+        let long = "x".repeat(TOOL_OUTPUT_CONTEXT_CAP_BYTES * 2);
+        let compressed = compress_tool_output_for_context(&long);
+        assert!(compressed.contains("已截断"));
+        assert!(compressed.contains(&format!("原文 {} 字节", long.len())));
+        assert!(compressed.len() < long.len());
+    }
+
+    /// 截断点落在多字节字符中间时向前退到字符边界，不产生乱码（越界 panic 即失败）。
+    #[test]
+    fn compress_cuts_at_char_boundary() {
+        // "汉" 占 3 字节：CAP-1 个 'a' 后接 "汉"，截断点 CAP 落在字符中间。
+        let mut out = "a".repeat(TOOL_OUTPUT_CONTEXT_CAP_BYTES - 1);
+        out.push('汉');
+        out.push_str("剩余内容");
+        let compressed = compress_tool_output_for_context(&out);
+        // 截断后内容为纯 ASCII 头部 + 说明（"汉" 被整体切掉，未产生半个字符）。
+        assert!(!compressed.contains('汉'));
+        assert!(compressed.contains("已截断"));
+    }
+
+    /// 保留最近 N 轮全文，更早轮次替换为一行摘要；幂等。
+    #[test]
+    fn summarize_old_tool_rounds_keeps_recent_and_idempotent() {
+        let mut msgs = vec![
+            ChatMessage::new(Role::User, "问1"),
+            assistant_tool_calls(&["c1"]),
+            tool_msg("c1", "第一轮输出"),
+            ChatMessage::new(Role::User, "问2"),
+            assistant_tool_calls(&["c2"]),
+            tool_msg("c2", "第二轮输出"),
+            ChatMessage::new(Role::User, "问3"),
+            assistant_tool_calls(&["c3"]),
+            tool_msg("c3", "第三轮输出"),
+        ];
+        summarize_old_tool_rounds(&mut msgs, 2);
+        // 第 1 轮（早于保留范围）摘要化并带工具名；第 2、3 轮保留全文。
+        assert!(msgs[2].content.starts_with(TOOL_SUMMARY_PREFIX));
+        assert!(msgs[2].content.contains("exec_ssh"));
+        assert_eq!(msgs[5].content, "第二轮输出");
+        assert_eq!(msgs[8].content, "第三轮输出");
+        // 幂等：重复执行不改变已摘要化的内容。
+        let once = msgs[2].content.clone();
+        summarize_old_tool_rounds(&mut msgs, 2);
+        assert_eq!(msgs[2].content, once);
+    }
+
+    /// 边界回归：末尾就是 tool 组时，预算再小也不能把组前的 user 裁掉——
+    /// 否则首条非 system 消息变成 assistant(tool_calls)，协议直接 400。
+    #[test]
+    fn trim_keeps_user_before_trailing_tool_group() {
+        let mut msgs = vec![
+            ChatMessage::new(Role::User, "问"),
+            assistant_tool_calls(&["c1"]),
+            tool_msg("c1", "输出"),
+        ];
+        trim_history_for_context(&mut msgs, 1);
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].role, Role::User);
+    }
+
+    /// tool_calls 的序列化参数计入预算；裁剪后不残留孤儿 tool 消息、首条为 user。
+    #[test]
+    fn trim_counts_tool_calls_and_drops_group_as_whole() {
+        // 仅按正文估算总 tokens ≈ 38 < 60（不裁）；计入 tool_calls（约 +60）后超预算。
+        let big_args = serde_json::json!({ "command": "x".repeat(200) });
+        let mut msgs = vec![
+            ChatMessage::new(Role::User, "问"),
+            ChatMessage {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_calls: Some(vec![ToolCall {
+                    id: "c1".into(),
+                    name: "exec_ssh".into(),
+                    arguments: big_args,
+                }]),
+                tool_call_id: None,
+                images: None,
+            },
+            tool_msg("c1", "输出"),
+            ChatMessage::new(Role::User, "第二问"),
+        ];
+        trim_history_for_context(&mut msgs, 60);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, Role::User);
+        assert_eq!(msgs[1].content, "第二问");
+    }
+
+    /// 错误分类：429/5xx/建连失败可重试；400 + 上下文关键词触发降级；流中途失败不可重试。
+    #[test]
+    fn classify_chat_errors() {
+        assert!(matches!(
+            classify_chat_error("LLM 返回错误状态 429 Too Many Requests: ..."),
+            ChatErrorKind::Retryable
+        ));
+        assert!(matches!(
+            classify_chat_error("Claude 返回错误状态 503 Service Unavailable: ..."),
+            ChatErrorKind::Retryable
+        ));
+        assert!(matches!(
+            classify_chat_error("连接 LLM 服务失败: dns error"),
+            ChatErrorKind::Retryable
+        ));
+        assert!(matches!(
+            classify_chat_error("Claude 返回错误状态 400 Bad Request: {\"message\":\"prompt is too long\"}"),
+            ChatErrorKind::ContextTooLong
+        ));
+        assert!(matches!(
+            classify_chat_error("LLM 返回错误状态 400 Bad Request: maximum context length exceeded"),
+            ChatErrorKind::ContextTooLong
+        ));
+        assert!(matches!(
+            classify_chat_error("读取流式响应失败: connection reset"),
+            ChatErrorKind::Fatal
+        ));
+        assert!(matches!(
+            classify_chat_error("LLM 返回错误状态 401 Unauthorized: ..."),
+            ChatErrorKind::Fatal
+        ));
     }
 }

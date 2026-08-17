@@ -14,7 +14,9 @@ pub mod database;
 pub mod error;
 pub mod events;
 pub mod file_backend;
+pub mod local;
 pub mod mcp;
+pub mod rdp;
 pub mod ssh;
 pub mod state;
 pub mod storage;
@@ -22,6 +24,7 @@ pub mod telnet;
 pub mod totp;
 pub mod updater;
 pub mod utils;
+pub mod vnc;
 
 use state::AppState;
 use storage::db;
@@ -30,14 +33,30 @@ use tauri::Manager;
 
 /// 启动 Tauri 应用。
 pub fn run() {
-    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .try_init();
-
+    // 日志统一由 tauri-plugin-log 管理（stdout + 应用日志目录），并承接前端
+    // attachConsole 转发的 webview console 输出。注意：不能再额外初始化
+    // env_logger 等全局 logger，否则插件初始化会 panic（logger 已存在）。
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_os::init())
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                // 开发态全量 Debug 便于排障；发布态只留 Info（桥接生命周期/错误）。
+                .level(if cfg!(debug_assertions) {
+                    log::LevelFilter::Debug
+                } else {
+                    log::LevelFilter::Info
+                })
+                .targets([
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
+                        file_name: Some("x-term.log".into()),
+                    }),
+                ])
+                .build(),
+        )
         .setup(|app| {
             // 1. 数据目录。
             let data_dir = json_store::app_data_dir()?;

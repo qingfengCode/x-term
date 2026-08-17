@@ -11,14 +11,18 @@ pub mod config;
 pub mod db;
 pub mod file_backend;
 pub mod forward;
+pub mod local;
 pub mod mcp;
+pub mod rdp;
 pub mod remote_desktop;
 pub mod session;
 pub mod sftp;
+pub mod ssh_key;
 pub mod terminal;
 pub mod totp;
 pub mod update;
 pub mod vault;
+pub mod vnc;
 
 /// 把所有命令注册到给定的 [`tauri::Builder`] 上，返回 builder 自身以便链式调用。
 pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
@@ -34,6 +38,17 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
         crate::commands::vault::credential_rename,
         crate::commands::vault::credential_get,
         crate::commands::vault::credential_delete,
+        // ssh key（密钥对生成）
+        crate::commands::ssh_key::ssh_key_generate,
+        // local terminal（本机 shell 标签页）
+        crate::commands::local::connect_local_terminal,
+        crate::commands::local::local_terminal_shells,
+        // vnc（内嵌 VNC 查看器的 WS↔TCP 桥接）
+        crate::commands::vnc::vnc_bridge_start,
+        crate::commands::vnc::vnc_bridge_stop,
+        // rdp（内嵌 RDP 客户端的迷你网关桥接）
+        crate::commands::rdp::rdp_bridge_start,
+        crate::commands::rdp::rdp_bridge_stop,
         // session
         crate::commands::session::list_sessions,
         crate::commands::session::get_session,
@@ -43,6 +58,7 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
         crate::commands::session::save_group,
         crate::commands::session::delete_group,
         crate::commands::session::connect_session,
+        crate::commands::session::connect_session_with_manual_auth,
         crate::commands::session::disconnect_session,
         crate::commands::session::open_sftp_for_session,
         crate::commands::session::ssh_auth_respond,
@@ -85,10 +101,15 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
         crate::commands::remote_desktop::desktop_list,
         crate::commands::remote_desktop::desktop_save,
         crate::commands::remote_desktop::desktop_delete,
+        crate::commands::remote_desktop::desktop_save_size,
+        crate::commands::remote_desktop::desktop_group_list,
+        crate::commands::remote_desktop::desktop_group_save,
+        crate::commands::remote_desktop::desktop_group_delete,
         // ai
         crate::commands::ai::ai_chat,
         crate::commands::ai::ai_execute_tool,
         crate::commands::ai::ai_cancel_tool,
+        crate::commands::ai::ai_desktop_tool_respond,
         crate::commands::ai::ai_stop,
         crate::commands::ai::ai_add_to_whitelist,
         crate::commands::ai::set_workspace_dir,

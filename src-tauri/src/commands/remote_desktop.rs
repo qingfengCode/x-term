@@ -113,18 +113,75 @@ fn validate_rdp_field(field: &str, name: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// Windows：用 cmdkey 预存 RDP 凭据，mstsc 连接时自动使用。
+/// Windows：向凭据管理器预存 RDP 凭据，mstsc 连接时自动使用。
+///
+/// 直接调用 CredWriteW 而非 `cmdkey /pass:...` 子进程——后者会把密码明文放进
+/// 进程命令行，本机任意进程可通过进程枚举（WMI Win32_Process CommandLine）、
+/// 事件日志或崩溃转储读到。
 #[cfg(target_os = "windows")]
 fn store_rdp_credential(addr: &str, username: &str, password: &str) -> AppResult<()> {
-    let status = Command::new("cmdkey")
-        .arg(format!("/generic:TERMSRV/{addr}"))
-        .arg(format!("/user:{username}"))
-        .arg(format!("/pass:{password}"))
-        .status()
-        .map_err(|e| AppError::Ssh(format!("cmdkey 预存凭据失败: {e}")))?;
-    if !status.success() {
+    use std::ffi::c_void;
+
+    const CRED_TYPE_GENERIC: u32 = 1;
+    const CRED_PERSIST_LOCAL_MACHINE: u32 = 2;
+
+    #[repr(C)]
+    struct FILETIME {
+        dw_low_date_time: u32,
+        dw_high_date_time: u32,
+    }
+
+    #[repr(C)]
+    struct CREDENTIALW {
+        flags: u32,
+        type_: u32,
+        target_name: *mut u16,
+        comment: *mut u16,
+        last_written: FILETIME,
+        credential_blob_size: u32,
+        credential_blob: *mut u8,
+        persist: u32,
+        attribute_count: u32,
+        attributes: *mut c_void,
+        target_alias: *mut u16,
+        username: *mut u16,
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn CredWriteW(credential: *const CREDENTIALW, flags: u32) -> i32;
+    }
+
+    let target = format!("TERMSRV/{addr}");
+    let mut target_utf16: Vec<u16> = target.encode_utf16().collect();
+    target_utf16.push(0);
+    let mut user_utf16: Vec<u16> = username.encode_utf16().collect();
+    user_utf16.push(0);
+    // 密码以 UTF-16 字节写入 blob（与 cmdkey 行为一致），仅在非空时写入。
+    let mut pass_utf16: Vec<u16> = password.encode_utf16().collect();
+    pass_utf16.push(0);
+
+    let cred = CREDENTIALW {
+        flags: 0,
+        type_: CRED_TYPE_GENERIC,
+        target_name: target_utf16.as_mut_ptr(),
+        comment: std::ptr::null_mut(),
+        last_written: FILETIME {
+            dw_low_date_time: 0,
+            dw_high_date_time: 0,
+        },
+        credential_blob_size: (pass_utf16.len() * 2) as u32,
+        credential_blob: pass_utf16.as_mut_ptr().cast::<u8>(),
+        persist: CRED_PERSIST_LOCAL_MACHINE,
+        attribute_count: 0,
+        attributes: std::ptr::null_mut(),
+        target_alias: std::ptr::null_mut(),
+        username: user_utf16.as_mut_ptr(),
+    };
+
+    if unsafe { CredWriteW(&cred, 0) } == 0 {
         return Err(AppError::Ssh(
-            "cmdkey 预存凭据失败（Windows 凭据管理器不可用）".into(),
+            "预存 RDP 凭据失败（Windows 凭据管理器不可用）".into(),
         ));
     }
     Ok(())
@@ -175,7 +232,7 @@ fn launch_vnc(addr: &str) -> AppResult<String> {
 // 桌面会话 CRUD（独立于终端 sessions）
 // ---------------------------------------------------------------------------
 
-use crate::storage::desktops_repo::Desktop;
+use crate::storage::desktops_repo::{Desktop, DesktopGroup};
 
 #[tauri::command]
 pub fn desktop_list(state: State<'_, AppState>) -> AppResult<Vec<Desktop>> {
@@ -193,4 +250,33 @@ pub fn desktop_save(desktop: Desktop, state: State<'_, AppState>) -> AppResult<(
 pub fn desktop_delete(id: String, state: State<'_, AppState>) -> AppResult<()> {
     let conn = state.conn()?;
     crate::storage::desktops_repo::delete_desktop(&conn, &id)
+}
+
+/// 记录断开时最后一次使用的 RDP 分辨率（"宽x高"），重连时恢复。
+#[tauri::command]
+pub fn desktop_save_size(
+    id: String,
+    size: Option<String>,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    let conn = state.conn()?;
+    crate::storage::desktops_repo::update_desktop_size(&conn, &id, size.as_deref())
+}
+
+#[tauri::command]
+pub fn desktop_group_list(state: State<'_, AppState>) -> AppResult<Vec<DesktopGroup>> {
+    let conn = state.conn()?;
+    crate::storage::desktops_repo::list_desktop_groups(&conn)
+}
+
+#[tauri::command]
+pub fn desktop_group_save(group: DesktopGroup, state: State<'_, AppState>) -> AppResult<()> {
+    let conn = state.conn()?;
+    crate::storage::desktops_repo::upsert_desktop_group(&conn, &group)
+}
+
+#[tauri::command]
+pub fn desktop_group_delete(id: String, state: State<'_, AppState>) -> AppResult<()> {
+    let conn = state.conn()?;
+    crate::storage::desktops_repo::delete_desktop_group(&conn, &id)
 }

@@ -3,7 +3,8 @@
 use tauri::State;
 
 use crate::error::{AppError, AppResult};
-use crate::ssh::session::{resolve_credential, SshSession};
+use crate::ssh::client::{AuthMethod, PasswordAuth};
+use crate::ssh::session::{resolve_credential, ResolvedCredential, SshSession};
 use crate::state::AppState;
 use crate::storage::sessions_repo::{Group, Session};
 
@@ -61,6 +62,39 @@ pub fn delete_session(id: String, state: State<'_, AppState>) -> AppResult<()> {
 // 连接管理
 // ---------------------------------------------------------------------------
 
+/// 从保险库解析会话凭据（vault 未解锁时返回 Auth 错误）。
+///
+/// 把 vault 引用 clone 出来，避免 RwLockReadGuard 跨 await（非 Send）。
+fn resolve_session_credential(
+    session_config: &Session,
+    state: &AppState,
+) -> AppResult<ResolvedCredential> {
+    let vault_guard = state.vault_read()?;
+    let vault = vault_guard
+        .as_ref()
+        .ok_or_else(|| AppError::Auth("保险库未解锁".into()))?
+        .clone();
+    drop(vault_guard);
+    let conn = state.conn()?;
+    resolve_credential(session_config, &vault, &conn)
+}
+
+/// 打开一个 SSH 终端会话：连接+认证 → PTY → shell → 注册到 state，返回实例 id。
+async fn open_ssh_terminal(
+    session_config: &Session,
+    resolved: ResolvedCredential,
+    state: &AppState,
+) -> AppResult<String> {
+    let mut ssh = SshSession::open(session_config, resolved, state.clone()).await?;
+    ssh.spawn_reader()?;
+    let id = ssh.id.clone();
+    state
+        .terminals
+        .lock()
+        .insert(id.clone(), crate::state::TerminalSession::Ssh(ssh));
+    Ok(id)
+}
+
 /// 连接一个会话配置，打开交互式终端，返回终端实例 id（前端 tab 标识）。
 ///
 /// 流程：
@@ -107,31 +141,63 @@ pub async fn connect_session(
         }
         _ => {
             // 默认 SSH（含未知协议回退）。
-            // 解析凭据。把 vault clone 出来，避免 RwLockReadGuard 跨 await（非 Send）。
-            let resolved = {
-                let vault_guard = state.vault_read()?;
-                let vault = vault_guard
-                    .as_ref()
-                    .ok_or_else(|| AppError::Auth("保险库未解锁".into()))?
-                    .clone();
-                drop(vault_guard);
-                let conn = state.conn()?;
-                resolve_credential(&session_config, &vault, &conn)?
-            };
-            // 打开 SSH 会话。
-            let mut ssh =
-                SshSession::open(&session_config, resolved, state.inner().clone()).await?;
-            ssh.spawn_reader()?;
-            let id = ssh.id.clone();
-            state
-                .terminals
-                .lock()
-                .insert(id.clone(), crate::state::TerminalSession::Ssh(ssh));
-            id
+            let resolved = resolve_session_credential(&session_config, state.inner())?;
+            open_ssh_terminal(&session_config, resolved, state.inner()).await?
         }
     };
 
     Ok(instance_id)
+}
+
+/// 认证失败后，用手动输入的密码/验证码重试连接（`connect_session` 的手动认证版）。
+///
+/// 与 [`connect_session`] 的区别：
+/// - `password` 非空时，忽略会话配置的认证方式（私钥会话也回退），改用该
+///   密码认证；
+/// - `otp` 为二次认证验证码（口令码/动态口令等），keyboard-interactive 流程
+///   自动预填首个验证码提示，其余提示仍弹窗请用户输入；
+/// - 两者均可为空：密码为空回退使用会话配置已保存的凭据，验证码为空则不预填。
+///
+/// 仅支持 SSH 协议；Telnet 等协议直接回退 [`connect_session`] 原流程。
+#[tauri::command]
+pub async fn connect_session_with_manual_auth(
+    session_config_id: String,
+    password: Option<String>,
+    otp: Option<String>,
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> AppResult<String> {
+    let session_config = {
+        let conn = state.conn()?;
+        crate::storage::sessions_repo::get_session(&conn, &session_config_id)?
+            .ok_or_else(|| AppError::NotFound(format!("会话 {} 不存在", session_config_id)))?
+    };
+
+    if session_config.protocol.as_str() != "ssh" {
+        // 非 SSH 协议无手动认证概念，回退普通连接流程。
+        return connect_session(session_config_id, state, app).await;
+    }
+
+    let mut resolved = resolve_session_credential(&session_config, state.inner())?;
+    let manual_password = password.filter(|p| !p.trim().is_empty());
+    let otp = otp.filter(|c| !c.trim().is_empty());
+    // 手动密码优先：提供则一律改用密码认证（私钥会话也回退），验证码一并预填。
+    if let Some(pw) = manual_password {
+        resolved.auth_method = AuthMethod::Password(PasswordAuth { password: pw, otp });
+    } else if let AuthMethod::Password(pa) = &mut resolved.auth_method {
+        // 未提供密码但原本是密码认证：沿用已保存密码，仅附加验证码。
+        pa.otp = otp;
+    } else if otp.is_some() {
+        // 私钥会话 + 只提供了验证码：私钥大概率仍会失败，改走密码认证让
+        // keyboard-interactive 弹窗收集密码（验证码已预填）。
+        resolved.auth_method = AuthMethod::Password(PasswordAuth {
+            password: String::new(),
+            otp,
+        });
+    }
+    // 私钥会话 + 均未提供：保持原认证方式重试。
+
+    open_ssh_terminal(&session_config, resolved, state.inner()).await
 }
 
 /// 断开一个终端实例。
@@ -148,6 +214,10 @@ pub async fn disconnect_session(instance_id: String, state: State<'_, AppState>)
             // TelnetSession drop 时 reader_handle 被 abort（JoinHandle abort 在 Drop）。
             // 这里直接 drop 即可，连接断开后 reader 任务自然结束。
             Ok(())
+        }
+        crate::state::TerminalSession::Local(mut local) => {
+            // kill 子进程 + abort reader（Drop 亦兜底），本地 shell 直接关闭。
+            local.close()
         }
     }
 }
@@ -167,16 +237,7 @@ pub async fn open_sftp_for_session(
             .ok_or_else(|| AppError::NotFound(format!("会话 {} 不存在", session_config_id)))?
     };
 
-    let resolved = {
-        let vault_guard = state.vault_read()?;
-        let vault = vault_guard
-            .as_ref()
-            .ok_or_else(|| AppError::Auth("保险库未解锁".into()))?
-            .clone();
-        drop(vault_guard);
-        let conn = state.conn()?;
-        resolve_credential(&session_config, &vault, &conn)?
-    };
+    let resolved = resolve_session_credential(&session_config, state.inner())?;
 
     // 直接连接并认证，不经过 SshSession::open（避免触发 PTY/shell）。
     let handle = crate::ssh::client::connect_direct(

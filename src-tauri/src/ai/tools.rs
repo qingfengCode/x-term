@@ -18,6 +18,9 @@
 //! - `describe_table`：描述表结构。
 //! - `read_file` / `write_file` / `list_files`：本地文件读写（设置页开启"本地文件
 //!   读写"后才下发）。只能在各助手工作目录（沙箱）内操作，详见 [`file_tools`]。
+//! - `desktop_screenshot` / `desktop_click` / `desktop_type` / `desktop_key`：操作
+//!   内嵌 RDP 远程桌面（多模态模型 + 活动 RDP 会话时启用）。执行体在**前端**
+//!   （IronRDP WASM 会话），后端只负责下发与等待回执，详见 [`desktop_tools`]。
 //!
 //! # 执行流程
 //!
@@ -45,6 +48,7 @@ use serde_json::{json, Value};
 use tauri::AppHandle;
 use tokio::time::timeout;
 
+use crate::ai::provider::ImagePart;
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 use crate::utils::{format_query_result, strip_ansi};
@@ -99,6 +103,22 @@ impl ToolResult {
 /// 用户对工具调用的确认/拒绝（前端通过命令发回）。
 pub struct ToolApproval {
     pub approved: bool,
+}
+
+/// 桌面工具（desktop_*）的前端执行回执（通过 `ai_desktop_tool_respond` 命令发回）。
+///
+/// RDP 会话（IronRDP WASM）活在前端，桌面工具的后端侧无法执行——编排层 emit
+/// `ai:tool_call` 后阻塞在 [`crate::state::AppState::pending_desktop_calls`]，
+/// 等待前端「批准 + 执行」一体回执：
+/// - `approved=false`：用户拒绝（或请求被终止）；
+/// - `approved=true`：`ok` / `output` 为执行结果；`image` 仅 `desktop_screenshot`
+///   附带（mime + base64），编排层把它作为图片消息回填给模型（role=tool 消息
+///   不允许携带图片，需追加一条带图的 user 消息）。
+pub struct DesktopToolOutcome {
+    pub approved: bool,
+    pub ok: bool,
+    pub output: String,
+    pub image: Option<ImagePart>,
 }
 
 // ===========================================================================
@@ -239,6 +259,106 @@ table 可用 `database.table` 限定名（推荐，尤其当连接未指定默�
     ]
 }
 
+/// RDP 桌面上下文工具集（有活动内嵌 RDP 会话且激活模型为多模态时启用）。
+///
+/// - `desktop_screenshot`：截取当前 RDP 桌面整屏画面（PNG），作为**图片**回传给
+///   模型（多模态视觉）。坐标与截图共用同一像素坐标系。
+/// - `desktop_click`：在截图坐标系的 (x, y) 像素位置点击（左/右/中键，可双击）。
+/// - `desktop_type`：把文本输入到远端当前焦点处（Unicode 通道，不支持组合键）。
+/// - `desktop_key`：按下一个键（DOM `KeyboardEvent.code`），可带修饰键组合。
+///
+/// 与 exec_ssh 等后端工具不同：这些工具的执行体在**前端**（IronRDP WASM 会话），
+/// 后端只负责 emit `ai:tool_call` 并等待前端通过 `ai_desktop_tool_respond` 回传
+/// 结果（见 [`crate::commands::ai::run_agent_loop`]），因此 `execute_tool` 不会
+/// 分派到它们。
+pub fn desktop_tools() -> Vec<ToolDef> {
+    vec![
+        ToolDef {
+            name: "desktop_screenshot".into(),
+            description: "截取当前活动 RDP 远程桌面的整屏画面（PNG 图片，会直接展示给你）。\
+坐标与截图使用同一像素坐标系。执行任何点击/输入前都应先截图了解当前界面，\
+操作完成后再截图确认结果。"
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        },
+        ToolDef {
+            name: "desktop_click".into(),
+            description: "在远端桌面截图的像素坐标系中，点击 (x, y) 位置。\
+button 可选 left（默认）/right/middle；double=true 时双击。\
+点击前先 desktop_screenshot 确认坐标，点击后用 desktop_screenshot 确认效果。"
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "x": {
+                        "type": "integer",
+                        "description": "截图坐标系中的横坐标（像素，从 0 开始）"
+                    },
+                    "y": {
+                        "type": "integer",
+                        "description": "截图坐标系中的纵坐标（像素，从 0 开始）"
+                    },
+                    "button": {
+                        "type": "string",
+                        "enum": ["left", "right", "middle"],
+                        "description": "鼠标按键，默认 left"
+                    },
+                    "double": {
+                        "type": "boolean",
+                        "description": "是否双击，默认 false"
+                    }
+                },
+                "required": ["x", "y"]
+            }),
+        },
+        ToolDef {
+            name: "desktop_type".into(),
+            description: "把文本输入到远端桌面当前焦点位置（如输入框、编辑器、终端），\
+通过 Unicode 输入通道发送，等价于用户在远端键入。不支持快捷键/组合键（如 Ctrl+C），\
+组合键请用 desktop_key。输入前请确认焦点在目标输入框上。"
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "要输入的完整文本（单次调用上限 2000 字符）"
+                    }
+                },
+                "required": ["text"]
+            }),
+        },
+        ToolDef {
+            name: "desktop_key".into(),
+            description: "向远端桌面发送一次按键。code 使用 DOM KeyboardEvent.code 值\
+（如 \"Enter\"、\"Escape\"、\"Tab\"、\"Backspace\"、\"F5\"、\"KeyA\"、\"ArrowDown\"）；\
+modifiers 为可选修饰键 code 列表（如 [\"ControlLeft\",\"ShiftLeft\",\"AltLeft\"]），\
+按下主键后按相反顺序释放。适合快捷键组合、回车确认、方向键等 desktop_type 覆盖不了的输入。"
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "主键的 KeyboardEvent.code（如 Enter / Escape / F5 / KeyA）"
+                    },
+                    "modifiers": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "可选修饰键 code 列表，如 [\"ControlLeft\"]"
+                    }
+                },
+                "required": ["code"]
+            }),
+        },
+    ]
+}
+
+
 /// 本地文件读写工具集（设置页开启"本地文件读写"后才由编排层下发）。
 ///
 /// 两个助手域（终端助手 / 数据库助手）共用同一组工具定义；执行时按请求所属的
@@ -319,14 +439,18 @@ pub fn all_tools() -> Vec<ToolDef> {
 ///
 /// - 提供活动终端 → 启用 SSH 工具；
 /// - 提供活动 MySQL 连接 → 启用 SQL 工具；
-/// - 两者皆无 → 返回空（agent 模式下模型只能纯文本对话，前端系统提示会告知
+/// - 提供活动内嵌 RDP 会话 → 启用桌面工具（调用方还需保证激活模型为多模态，
+///   否则模型看不懂截图——见 [`crate::commands::ai::ai_chat`] 的门控）；
+/// - 皆无 → 返回空（agent 模式下模型只能纯文本对话，前端系统提示会告知
 ///   "未检测到可用上下文"）。
 ///
-/// `active_terminal_id` / `active_db_conn_id` 只要**非空字符串**即视为有该上下文
-/// （具体值是否有效由执行期 `execute_tool` 自然校验——找不到对应实例会返回错误）。
+/// `active_terminal_id` / `active_db_conn_id` / `active_desktop_id` 只要**非空字符串**
+/// 即视为有该上下文（具体值是否有效由执行期自然校验——SSH/SQL 工具找不到对应实例
+/// 会返回错误；桌面工具由前端执行，找不到 RDP 控制句柄同样回填错误）。
 pub fn tools_for_context(
     active_terminal_id: Option<&str>,
     active_db_conn_id: Option<&str>,
+    active_desktop_id: Option<&str>,
 ) -> Vec<ToolDef> {
     let mut tools: Vec<ToolDef> = Vec::new();
     if active_terminal_id.map(|s| !s.is_empty()).unwrap_or(false) {
@@ -335,7 +459,20 @@ pub fn tools_for_context(
     if active_db_conn_id.map(|s| !s.is_empty()).unwrap_or(false) {
         tools.extend(sql_tools());
     }
+    if active_desktop_id.map(|s| !s.is_empty()).unwrap_or(false) {
+        tools.extend(desktop_tools());
+    }
     tools
+}
+
+/// 判断一个工具是否为桌面工具（RDP 控制，执行体在前端）。
+///
+/// 编排层据此把执行路径从「后端 `execute_tool`」切换到「emit + 等待前端回执」。
+pub fn is_desktop_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "desktop_screenshot" | "desktop_click" | "desktop_type" | "desktop_key"
+    )
 }
 
 /// 从一组工具定义中提取名称集合，用于执行期校验模型是否幻觉调用了未 advertised 的工具。
@@ -381,6 +518,11 @@ pub async fn execute_tool(
         "read_file" => read_file(state, &call.arguments, file_domain),
         "write_file" => write_file(state, &call.arguments, file_domain),
         "list_files" => list_files(state, &call.arguments, file_domain),
+        // 桌面工具的执行体在**前端**（IronRDP WASM 会话）：编排层不应把它们
+        // 送到这里，若到达说明路由有误，给出明确错误而不是静默失败。
+        name if is_desktop_tool(name) => ToolResult::err(format!(
+            "工具 `{name}` 应由前端 RDP 会话执行，后端无法直接执行（执行路由异常）"
+        )),
         other => ToolResult::err(format!("未知工具: {other}")),
     }
 }
@@ -546,27 +688,50 @@ async fn exec_ssh(state: &AppState, args: &Value, visualization: bool) -> ToolRe
     }
 }
 
-/// 可视化模式执行 SSH 命令：写入活动终端 PTY + 哨兵检测完成 + 截取新输出。
+/// 可视化模式执行 SSH 命令：写入活动终端 PTY + 哨兵检测完成 + 按偏移取新增输出。
 ///
 /// 流程：
 /// 1. 生成唯一哨兵标记，把命令包装为 `<cmd>; echo <SENTINEL>` 写入 PTY
-///    （终端里用户能看到 AI 实际敲的命令和输出）。
+///    （终端里用户能看到 AI 实际敲的命令和输出）；写入前在同一把锁内记录
+///    累计输出字节数作为基准。
 /// 2. 轮询终端输出环形缓冲（**全量**，非限长窗口），直到命令执行完毕：
 ///    - 哨兵出现 ≥2 次（命令回显行 + echo 实际输出行）即完成——常规 shell；
-///    - 仅出现 1 次（无回显 shell / 回显行已滚出环形缓冲）时，以"缓冲停止
-///      增长"作为完成信号；
+///    - 仅出现 1 次（无回显 shell / 长命令折行拆断回显行内的哨兵 / 回显行
+///      已滚出环形缓冲）时，以"缓冲停止增长"作为完成信号；
 ///    - 最长等待 30 秒，超时返回已收集输出 + 引导。
-/// 3. 截取"回显行之后、哨兵输出行之前"的新增输出，去 ANSI 后按 16 KiB
-///    上限截断（超出附截断提示）。
+/// 3. 用 [`crate::state::TerminalSession::snapshot_after`] 取"基准之后"的输出
+///    窗口（只含本次命令的新增输出，不受缓冲中历史内容与折行影响），清理
+///    命令回显与哨兵行，去 ANSI 后按 16 KiB 上限截断（超出附截断提示）。
 ///
 /// 注意：**不能**以哨兵首次出现作为完成信号——命令回显行（PTY 回显
 /// `cmd; echo SENTINEL`）在写入瞬间就会出现，此时命令可能仍在执行；
 /// 若在此时返回，AI 拿到的会是空/部分输出（"终端有输出但 AI 分析不到"
 /// 的主要根因）。
 async fn exec_ssh_visual(state: &AppState, session_id: &str, command: &str) -> ToolResult {
+    // 占用该终端：与 MCP 的 exec_ssh_terminal 共用同一把 busy 锁（try 获取，忙时
+    // 立即返回引导、不排队等待）。没有这把锁时，两个并发 AI 会话在同一终端上
+    // 执行会互相污染：A 写入的哨兵/回显混进 B 的 snapshot_after 窗口，A 的输出
+    // 可能回填给 B，命令输出张冠李戴。
+    {
+        let mut busy = state.mcp_terminal_busy.lock().await;
+        if busy.insert(session_id.to_string(), ()).is_some() {
+            return ToolResult::err(
+                "该终端正有另一个命令（AI 助手或 MCP 调用）在执行，请稍后再试",
+            );
+        }
+    }
+    let result = exec_ssh_visual_unlocked(state, session_id, command).await;
+    // 无论成功/超时/出错都释放占用（unlocked 体内所有路径都返回）。
+    state.mcp_terminal_busy.lock().await.remove(session_id);
+    result
+}
+
+/// [`exec_ssh_visual`] 的执行主体（调用方已持有该终端的 busy 占用）。
+async fn exec_ssh_visual_unlocked(state: &AppState, session_id: &str, command: &str) -> ToolResult {
     use rand::Rng;
 
-    // 生成唯一哨兵（避免与正常输出撞车）。
+    // 生成唯一哨兵（避免与正常输出撞车）。哨兵只用于完成检测；内容提取
+    // 走"写入点偏移"窗口，不依赖哨兵行在快照中的位置。
     let nonce: u64 = rand::thread_rng().gen();
     let sentinel = format!("__XTERM_DONE_{nonce:x}__");
 
@@ -576,25 +741,28 @@ async fn exec_ssh_visual(state: &AppState, session_id: &str, command: &str) -> T
     let cmd = command.trim_end_matches(['\n', '\r']);
     let wrapped = format!("{cmd}; echo {sentinel}\n");
 
-    // 写入 PTY（mpsc send，非阻塞）。
-    {
+    // 写入 PTY 前记录累计字节基准（同一把锁内先记基准再写，保证命令回显
+    // 与输出都落在基准之后的窗口里）。
+    let base = {
         let terminals = state.terminals.lock();
         match terminals.get(session_id) {
             Some(ssh) => {
+                let base = ssh.total_output_bytes();
                 if let Err(e) = ssh.write(wrapped.into_bytes()) {
                     return ToolResult::err(format!("写入终端失败: {e}"));
                 }
+                base
             }
             None => return ToolResult::err(format!("终端会话 {session_id} 不存在")),
         }
-    }
+    };
 
     // 轮询等待命令执行完毕（最长 30 秒）。
     // 完成信号：
     // - 哨兵出现 ≥2 次：命令回显行与 echo 输出行都已出现，命令已结束；
-    // - 哨兵只出现 1 次且**不在回显行**（无回显 shell、或回显行已滚出环形
-    //   缓冲），且输出停止增长一段时间：echo 输出行即唯一哨兵，输出停止
-    //   即视为结束；
+    // - 哨兵只出现 1 次且**不在回显行**（无回显 shell、长命令折行拆断回显
+    //   行内的哨兵、或回显行已滚出环形缓冲），且输出停止增长一段时间：
+    //   echo 输出行即唯一哨兵，输出停止即视为结束；
     // - 其它情况继续等待。哨兵在回显行里的特征：PTY 回显的是包装后的
     //   `cmd; echo SENTINEL`，整行包含 `echo <SENTINEL>`；真正的 echo 输出行
     //   则只是哨兵本身，二者由此区分。
@@ -639,22 +807,41 @@ async fn exec_ssh_visual(state: &AppState, session_id: &str, command: &str) -> T
         last_total = total;
 
         if std::time::Instant::now() >= deadline {
-            // 超时：返回目前已收集到的输出（可能命令还在跑或卡住等输入）。
-            let partial = extract_new_output(&snapshot, "");
-            let cleaned = strip_ansi(&partial);
-            return ToolResult::ok(format!(
+            // 超时：返回基准之后已收集的输出（可能命令还在跑或卡住等输入）。
+            let (window, overflow) = {
+                let terminals = state.terminals.lock();
+                match terminals.get(session_id) {
+                    Some(ssh) => ssh.snapshot_after(base),
+                    None => return ToolResult::err("终端会话已断开"),
+                }
+            };
+            let cleaned = strip_ansi(&window);
+            let mut result = format!(
                 "命令已写入终端执行，但 30 秒内未检测到执行完成（命令可能仍在运行、\
                  等待输入，或终端当前不在 shell 提示符）。\n目前捕获到的输出：\n{}\n\
                  （如需终端当前完整输出，可调用 terminal_snapshot）",
                 truncate_output(&cleaned, MAX_EXEC_OUTPUT_BYTES)
-            ));
+            );
+            if overflow {
+                result.push_str(&output_overflow_note());
+            }
+            return ToolResult::ok(result);
         }
     }
 
-    // 截取回显行之后、echo 输出行之前的新增输出，去 ANSI 后截断（附提示）。
-    let new_output = extract_new_output(&snapshot, &sentinel);
-    let cleaned = strip_ansi(&new_output);
-    let result = truncate_output(&cleaned, MAX_EXEC_OUTPUT_BYTES);
+    // 取"写入点之后"的输出窗口，清掉命令回显与哨兵行，去 ANSI 后截断（附提示）。
+    let (window, overflow) = {
+        let terminals = state.terminals.lock();
+        match terminals.get(session_id) {
+            Some(ssh) => ssh.snapshot_after(base),
+            None => return ToolResult::err("终端会话已断开"),
+        }
+    };
+    let cleaned = clean_window(&strip_ansi(&window), cmd, &sentinel);
+    let mut result = truncate_output(&cleaned, MAX_EXEC_OUTPUT_BYTES);
+    if overflow {
+        result.push_str(&output_overflow_note());
+    }
     ToolResult::ok(result)
 }
 
@@ -663,8 +850,8 @@ async fn exec_ssh_visual(state: &AppState, session_id: &str, command: &str) -> T
 /// 命令写入 PTY 的瞬间，shell 会把包装后的 `cmd; echo SENTINEL` 回显成一行
 /// 输出（该行含 `echo <SENTINEL>` 标记）；而 echo 的实际输出行（哨兵本身）
 /// 只在命令执行完毕后出现。据此区分"命令还在跑"与"命令已结束"，
-/// 避免把回显行误当作完成信号。
-fn sentinel_in_echo_line(snapshot: &str, sentinel: &str, echo_marker: &str) -> bool {
+/// 避免把回显行误当作完成信号。`mcp::exec` 的终端绑定执行复用此函数。
+pub fn sentinel_in_echo_line(snapshot: &str, sentinel: &str, echo_marker: &str) -> bool {
     let Some(pos) = snapshot.find(sentinel) else {
         return false;
     };
@@ -676,56 +863,63 @@ fn sentinel_in_echo_line(snapshot: &str, sentinel: &str, echo_marker: &str) -> b
     snapshot[line_start..line_end].contains(echo_marker)
 }
 
-/// 从快照中提取"命令执行期间的新增输出"。
+/// 清理命令执行窗口：去掉末尾哨兵行（含其后的提示符）与开头的命令回显。
 ///
-/// `sentinel` 为空表示超时路径（返回快照全量）。
+/// [`crate::state::TerminalSession::snapshot_after`] 返回的窗口从"命令写入点"
+/// 开始，结构为：
+/// `[命令回显(可能折行)] [命令输出] [哨兵输出行] [下一个提示符]`
 ///
-/// 哨兵会出现在两处：**命令回显行**（PTY 回显 `cmd; echo SENTINEL`，第一次出现）
-/// 和 **echo 命令的实际输出行**（最后一次出现）。正常返回第一个含哨兵行之后、
-/// 最后一个含哨兵行之前的内容；若输出末尾没有换行（printf/echo -n/进度条），
-/// 哨兵会与最后一行输出粘在同一行，剥离行内哨兵后再并入。
-///
-/// 只有一处哨兵时（无回显 shell、或命令输出过大导致回显行已滚出环形缓冲），
-/// 取哨兵行**之前**的内容——调用方只在命令完成后才调用本函数，此时输出都在
-/// 哨兵行之前（或与行内哨兵粘在一起）。
-fn extract_new_output(snapshot: &str, sentinel: &str) -> String {
-    if sentinel.is_empty() {
-        return snapshot.to_string();
-    }
-    let lines: Vec<&str> = snapshot.split_inclusive('\n').collect();
-    let mut first: Option<usize> = None;
-    let mut last: Option<usize> = None;
-    for (i, line) in lines.iter().enumerate() {
-        if line.contains(sentinel) {
-            if first.is_none() {
-                first = Some(i);
+/// - 在最后一个含完整哨兵的位置截断：去掉哨兵行与提示符；若输出无尾随换行
+///   （printf/echo -n/进度条），哨兵与输出粘在同一行，截到哨兵之前可保住
+///   粘在行内的输出。
+/// - 开头回显按"写入原文（跳过折行产生的 CR/LF）"做字符级前缀匹配，匹配
+///   成功则整块移除；不匹配（无回显 shell、heredoc 等特殊回显）则保留原样。
+pub fn clean_window(window: &str, cmd: &str, sentinel: &str) -> String {
+    // 1. 在最后一个完整哨兵处截断（哨兵之后只有提示符，一并去掉）。
+    let mut text = match window.rfind(sentinel) {
+        Some(pos) => window[..pos].to_string(),
+        None => window.to_string(),
+    };
+    // 2. 回显剥离：把写入原文（cmd; echo SENTINEL）与窗口开头逐字符比对，
+    //    折行产生的 CR/LF 跳过；整条比对完即回显块结束，剩余部分为命令输出。
+    let expect: Vec<char> = format!("{cmd}; echo {sentinel}").chars().collect();
+    let chars: Vec<char> = text.chars().collect();
+    let mut idx = 0;
+    let mut i = 0;
+    while i < chars.len() && idx < expect.len() {
+        // 期望串里的换行按"回显里的真实换行"处理，直接跨过（多行命令）。
+        if expect[idx] == '\r' || expect[idx] == '\n' {
+            idx += 1;
+            continue;
+        }
+        match chars[i] {
+            // 窗口里的 CR/LF 可能是折行产生，也可能是回显里的真实换行，跳过。
+            '\r' | '\n' => i += 1,
+            c if c == expect[idx] => {
+                idx += 1;
+                i += 1;
             }
-            last = Some(i);
+            // 回显不匹配（无回显 shell / 特殊回显）：放弃剥离，返回去尾后的窗口。
+            _ => return text,
         }
     }
-    match (first, last) {
-        (Some(f), Some(l)) => {
-            let mut out = String::new();
-            if l > f {
-                // 常规路径：回显行与哨兵输出行都在，取两者之间的内容。
-                out.push_str(&lines[f + 1..l].concat());
-                // 输出末尾无换行时哨兵与最后一行输出粘在同一行，剥离后并入。
-                if let Some(p) = lines[l].find(sentinel) {
-                    out.push_str(&lines[l][..p]);
-                }
-            } else {
-                // 只有一处哨兵：输出在哨兵行之前（回显行滚出缓冲/无回显 shell），
-                // 或与该行内哨兵粘在一起（printf/echo -n 无换行输出）。
-                out.push_str(&lines[..f].concat());
-                if let Some(p) = lines[f].find(sentinel) {
-                    out.push_str(&lines[f][..p]);
-                }
-            }
-            out
+    if idx == expect.len() {
+        // 回显块末尾即写入命令结尾的换行，一并跳过。
+        while i < chars.len() && (chars[i] == '\r' || chars[i] == '\n') {
+            i += 1;
         }
-        // 快照里找不到哨兵：返回全量（调用方按超时/部分输出处理）。
-        _ => snapshot.to_string(),
+        text = chars[i..].iter().collect();
     }
+    text
+}
+
+/// 输出超过环形缓冲容量时的提示（附给模型，避免把残缺窗口当完整结果）。
+pub fn output_overflow_note() -> String {
+    format!(
+        "\n[提示：本次输出超过终端环形缓冲容量（{} 字节），窗口开头部分已丢失；\
+         如需完整内容可拆分命令或调用 terminal_snapshot]",
+        crate::ssh::session::OUTPUT_BUFFER_CAP
+    )
 }
 
 /// 截断输出到指定字节数，超出则保留开头，并附**面向模型**的截断提示。
@@ -1134,6 +1328,8 @@ fn list_files(state: &AppState, args: &Value, domain: &str) -> ToolResult {
 /// 危险命令正则集合（exec_ssh 用）。
 ///
 /// 命中任一即视为危险操作；前端会红色高亮 + 二次确认。
+/// 覆盖：rm -rf /、mkfs、dd 写块设备、shutdown/reboot、fork bomb、
+/// chmod -R 777 /、`sed -i`（静默改写文件）等。
 static DANGEROUS_CMD_REGEXES: Lazy<Vec<Regex>> = Lazy::new(|| {
     [
         r"(?i)rm\s+-[a-z]*r[a-z]*f[a-z]*\s+/(?:\s|$|\*)",
@@ -1146,6 +1342,9 @@ static DANGEROUS_CMD_REGEXES: Lazy<Vec<Regex>> = Lazy::new(|| {
         r":\(\)\s*\{", // fork bomb :(){:|:&};:
         r"(?i)>\s*/dev/(?:sd|nvme|hd|vd|xvd)",
         r"(?i)chmod\s+-R\s+777\s+/(?:\s|$)",
+        // sed -i 静默改写文件（-i、-ri、-i.bak 等组合 flag 均命中）。
+        // 默认白名单已不含 sed，此正则兜底拦截用户自行加入白名单的场景。
+        r"(?i)\bsed\s+-[a-z.]*i[a-z.]*(?:\s|$)",
     ]
     .iter()
     .map(|p| Regex::new(p).unwrap_or_else(|e| panic!("无效正则 {p}: {e}")))
@@ -1162,7 +1361,7 @@ static DELETE_NO_WHERE_RE: Lazy<Regex> = Lazy::new(|| {
 /// 判断一个工具调用是否危险。
 ///
 /// - exec_ssh：command 命中危险命令模式（rm -rf /、mkfs、dd 写块设备、
-///   shutdown/reboot、fork bomb、chmod -R 777 / 等）。
+///   shutdown/reboot、fork bomb、chmod -R 777 /、`sed -i` 等）。
 /// - exec_sql：有效关键字为 DROP/TRUNCATE，或 DELETE 无 WHERE 子句
 ///   （含 `WITH ... DELETE` 形式，见 [`sql_first_keyword`]）。
 /// - write_file：目标文件已存在（覆盖已有数据）→ 危险。
@@ -1460,6 +1659,47 @@ pub fn describe_call(name: &str, arguments: &Value) -> String {
                 .unwrap_or("工作目录");
             format!("列出目录: {p}")
         }
+        "desktop_screenshot" => "截取 RDP 桌面画面".into(),
+        "desktop_click" => {
+            let x = arguments.get("x").and_then(Value::as_i64).unwrap_or(-1);
+            let y = arguments.get("y").and_then(Value::as_i64).unwrap_or(-1);
+            let button = arguments
+                .get("button")
+                .and_then(Value::as_str)
+                .unwrap_or("left");
+            let double = arguments.get("double").and_then(Value::as_bool).unwrap_or(false);
+            format!(
+                "点击桌面 ({x}, {y}){}{}",
+                if button != "left" {
+                    format!("，{button} 键")
+                } else {
+                    String::new()
+                },
+                if double { "（双击）" } else { "" }
+            )
+        }
+        "desktop_type" => {
+            let text = arguments.get("text").and_then(Value::as_str).unwrap_or("");
+            let preview: String = text.chars().take(40).collect();
+            if text.chars().count() > 40 {
+                format!("输入文本: {preview}...")
+            } else {
+                format!("输入文本: {preview}")
+            }
+        }
+        "desktop_key" => {
+            let code = arguments.get("code").and_then(Value::as_str).unwrap_or("?");
+            let mods: Vec<&str> = arguments
+                .get("modifiers")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            if mods.is_empty() {
+                format!("按键: {code}")
+            } else {
+                format!("按键: {} + {}", mods.join("+"), code)
+            }
+        }
         other => format!("执行工具: {other}"),
     }
 }
@@ -1513,37 +1753,56 @@ mod tests {
         assert!(!is_whitelisted("systemctl status", &wl_prefix));
     }
 
-    /// 常规提取：回显行与哨兵输出行都在，返回两者之间的内容。
+    /// `sed -i` 静默改写文件，必须被 is_dangerous 标记（前缀白名单无法区分
+    /// 只读 sed 与改文件的 sed -i，由危险正则兜底拦截）。
     #[test]
-    fn extract_output_normal() {
-        let snap = "$ ls; echo __DONE__\nfile1\nfile2\n__DONE__\nuser@host:~$ ";
-        assert_eq!(extract_new_output(snap, "__DONE__"), "file1\nfile2\n");
+    fn dangerous_detects_sed_inplace() {
+        let arg = |cmd: &str| serde_json::json!({ "command": cmd });
+        assert!(is_dangerous("exec_ssh", &arg("sed -i 's/a/b/' /etc/hosts"), None));
+        assert!(is_dangerous("exec_ssh", &arg("sed -ri 's/a/b/g' app.conf"), None));
+        assert!(is_dangerous("exec_ssh", &arg("sed -i.bak 's/a/b/' notes.txt"), None));
+        // 只读 sed（无 -i）不危险。
+        assert!(!is_dangerous("exec_ssh", &arg("sed -n '1,5p' log.txt"), None));
+        assert!(!is_dangerous("exec_ssh", &arg("sed 's/a/b/' log.txt"), None));
+    }
+
+    /// 常规窗口：去掉命令回显、哨兵行与随后的提示符，只留命令输出。
+    #[test]
+    fn clean_window_normal() {
+        let win = "ls; echo __DONE__\nfile1\nfile2\n__DONE__\nuser@host:~$ ";
+        assert_eq!(clean_window(win, "ls", "__DONE__"), "file1\nfile2\n");
     }
 
     /// 输出末尾无换行（printf/echo -n）：哨兵与最后一行输出粘在同一行，
-    /// 提取时应剥离行内哨兵。
+    /// 清理时截到哨兵之前，保住粘在行内的输出。
     #[test]
-    fn extract_output_glued_sentinel() {
-        let snap = "$ printf abc; echo __DONE__\nabc__DONE__\nuser@host:~$ ";
-        assert_eq!(extract_new_output(snap, "__DONE__"), "abc");
+    fn clean_window_glued_sentinel() {
+        let win = "printf abc; echo __DONE__\nabc__DONE__\nuser@host:~$ ";
+        assert_eq!(clean_window(win, "printf abc", "__DONE__"), "abc");
     }
 
-    /// 只有一处哨兵（回显行滚出环形缓冲 / 无回显 shell）：输出在哨兵行之前。
+    /// 长命令折行把回显行里的哨兵拆成两行：快照里只有哨兵输出行一处完整
+    /// 哨兵，清理应剥离折行回显、去掉哨兵行与提示符，只留输出（回归：
+    /// 折行导致的历史输出污染 bug）。
     #[test]
-    fn extract_output_single_occurrence() {
-        // 输出过大，回显行已被滚掉，只剩哨兵输出行 + 提示符。
-        let snap = "tail-of-output\n__DONE__\nuser@host:~$ ";
-        assert_eq!(extract_new_output(snap, "__DONE__"), "tail-of-output\n");
+    fn clean_window_wrapped_echo() {
+        let sentinel = "__XTERM_DONE_eec0e70d3a3acc51__";
+        let cmd = "free -h && echo '---'";
+        let win = format!(
+            "{cmd}; echo __XTERM_DONE_eec0e70d3a\n3acc51__\n              total        used\nMem:            15G\n{sentinel}\n[root@ai158 ~]# "
+        );
+        let out = clean_window(&win, cmd, sentinel);
+        assert_eq!(out.trim(), "total        used\nMem:            15G");
+    }
+
+    /// 无回显 shell（回显不匹配）：放弃剥离回显，但仍去掉哨兵行与提示符。
+    #[test]
+    fn clean_window_no_echo_shell() {
+        let win = "tail-of-output\n__DONE__\nuser@host:~$ ";
+        assert_eq!(clean_window(win, "cat x", "__DONE__"), "tail-of-output\n");
         // 无回显 shell 且输出末尾无换行：输出与哨兵同处一行。
         let glued = "abc__DONE__\n";
-        assert_eq!(extract_new_output(glued, "__DONE__"), "abc");
-    }
-
-    /// 超时路径：sentinel 为空返回快照全量。
-    #[test]
-    fn extract_output_timeout() {
-        let snap = "partial output";
-        assert_eq!(extract_new_output(snap, ""), snap);
+        assert_eq!(clean_window(glued, "printf abc", "__DONE__"), "abc");
     }
 
     /// 回显行判定：含 `echo <SENTINEL>` 的行是命令回显（命令可能仍在执行），

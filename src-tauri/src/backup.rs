@@ -41,6 +41,15 @@ const KDF_M: u32 = 19456;
 const KDF_T: u32 = 2;
 const KDF_P: u32 = 1;
 
+/// 解密时接受的 KDF 参数上限。
+///
+/// 解密参数来自备份文件（攻击者可控）：不做上限的话，构造 m=数 GiB 的恶意
+/// `.xtermbackup` 文件即可让应用在密码校验前分配数 GB 内存 → OOM/崩溃
+/// （本地 DoS）。上限远高于正常导出值（m=19456, t=2, p=1），合法备份不受影响。
+const KDF_M_MAX: u32 = 1024 * 1024; // 1 GiB
+const KDF_T_MAX: u32 = 10;
+const KDF_P_MAX: u32 = 4;
+
 // ===========================================================================
 // 加密文件结构
 // ===========================================================================
@@ -114,7 +123,7 @@ pub struct BackupPayload {
 }
 
 /// 明文凭据（`credentials` 表解密后的内容）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlainCredential {
     pub id: String,
@@ -129,8 +138,22 @@ pub struct PlainCredential {
     pub passphrase: Option<String>,
 }
 
+// 手写 Debug：`value` / `passphrase` 是明文机密，派生实现会原样打进日志，这里脱敏。
+impl std::fmt::Debug for PlainCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlainCredential")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("created_at", &self.created_at)
+            .field("value", &"***")
+            .field("passphrase", &self.passphrase.as_ref().map(|_| "***"))
+            .finish()
+    }
+}
+
 /// 明文 TOTP 配置（`totp_secrets` 表解密后的内容）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlainTotp {
     pub id: String,
@@ -143,6 +166,23 @@ pub struct PlainTotp {
     pub created_at: String,
     /// 明文 secret（base32 或原始字符串，与 totp_add 输入一致）。
     pub secret: String,
+}
+
+// 手写 Debug：`secret` 是明文机密，脱敏展示。
+impl std::fmt::Debug for PlainTotp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlainTotp")
+            .field("id", &self.id)
+            .field("issuer", &self.issuer)
+            .field("account", &self.account)
+            .field("algorithm", &self.algorithm)
+            .field("digits", &self.digits)
+            .field("period", &self.period)
+            .field("sort_order", &self.sort_order)
+            .field("created_at", &self.created_at)
+            .field("secret", &"***")
+            .finish()
+    }
 }
 
 // ===========================================================================
@@ -211,6 +251,20 @@ pub fn decrypt_full(content: &str, password: &str) -> AppResult<(BackupFile, Bac
         return Err(AppError::InvalidInput(format!(
             "备份文件版本 {} 高于当前支持的版本 {}，请升级应用后再导入",
             file.version, BACKUP_VERSION
+        )));
+    }
+    // KDF 参数校验（见 KDF_*_MAX 说明）：防止恶意文件用超大内存参数在密码
+    // 校验前触发数 GB 内存分配导致 OOM；算法字段也校验，防算法混淆。
+    if file.kdf.algorithm != "argon2id" {
+        return Err(AppError::InvalidInput(format!(
+            "不支持的备份 KDF 算法: {}（仅支持 argon2id）",
+            file.kdf.algorithm
+        )));
+    }
+    if file.kdf.m > KDF_M_MAX || file.kdf.t > KDF_T_MAX || file.kdf.p > KDF_P_MAX {
+        return Err(AppError::InvalidInput(format!(
+            "备份文件 KDF 参数超出安全上限（m={}, t={}, p={}；上限 m≤{} KiB, t≤{}, p≤{}）",
+            file.kdf.m, file.kdf.t, file.kdf.p, KDF_M_MAX, KDF_T_MAX, KDF_P_MAX
         )));
     }
 

@@ -27,6 +27,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { homeDir, join, dirname, basename } from "@tauri-apps/api/path";
 
 import { useTransferStore } from "@/stores/transfer";
+import { formatSize } from "@/utils/format";
 import type { FileEntry } from "@/api/types";
 import {
   fileAccountList,
@@ -245,6 +246,8 @@ async function loadLocal(path: string) {
     sortEntries(items);
     localEntries.value = items;
     localPath.value = path;
+    // 目录切换/刷新后清空选中：残留高亮可能指向已不存在的同名文件。
+    selectedLocal.value = null;
   } catch (e) {
     if (seq !== localLoadSeq) return;
     ElMessage.error("读取本地目录失败: " + String(e));
@@ -348,6 +351,8 @@ async function loadRemote(path: string) {
     sortEntries(items);
     remoteEntries.value = items;
     remotePath.value = path;
+    // 目录切换/刷新后清空选中：残留高亮可能指向已不存在的同名文件。
+    selectedRemote.value = null;
   } catch (e) {
     if (seq !== remoteLoadSeq) return;
     ElMessage.error("读取远端目录失败: " + String(e));
@@ -587,15 +592,8 @@ async function pickAndUpload() {
 // 工具
 // ---------------------------------------------------------------------------
 function humanSize(n: number): string {
-  if (!n) return "-";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let i = 0;
-  let v = n;
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  return `${v.toFixed(v >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
+  if (!n || n <= 0) return "-";
+  return formatSize(n);
 }
 
 function formatTime(s: string | null): string {
@@ -614,6 +612,8 @@ let transferDoneUnlisten: UnlistenFn | null = null;
 let dragDropUnlisten: UnlistenFn | null = null;
 /** 原生文件拖入远端面板时的高亮状态。 */
 const dragOver = ref(false);
+// 组件销毁标志：监听注册未 resolve 前组件可能已卸载，resolve 后据此立即反订阅。
+let unmounted = false;
 
 onMounted(async () => {
   await loadAccounts();
@@ -625,18 +625,26 @@ onMounted(async () => {
     // 忽略。
   }
   // 传输完成事件：按方向刷新对应面板（上传→刷远端，下载→刷本地）。
-  transferDoneUnlisten = await listen<{ taskId: string }>("transfer:done", (e) => {
-    const task = transfer.tasks.find((t) => t.id === e.payload.taskId);
-    if (task) {
-      transfer.update(e.payload.taskId, { status: "done", transferred: task.total || 0 });
-      if (task.direction === "upload") refreshRemote();
-      else refreshLocal();
-    }
-  });
+  try {
+    const fn = await listen<{ taskId: string }>("transfer:done", (e) => {
+      if (unmounted) return;
+      const task = transfer.tasks.find((t) => t.id === e.payload.taskId);
+      if (task) {
+        transfer.update(e.payload.taskId, { status: "done", transferred: task.total || 0 });
+        if (task.direction === "upload") refreshRemote();
+        else refreshLocal();
+      }
+    });
+    if (unmounted) fn();
+    else transferDoneUnlisten = fn;
+  } catch (e) {
+    console.error("传输完成事件订阅失败:", e);
+  }
   // 原生文件拖拽上传（Tauri onDragDropEvent 拿 OS 文件真实路径）。
   try {
     const { getCurrentWebview } = await import("@tauri-apps/api/webview");
-    dragDropUnlisten = await getCurrentWebview().onDragDropEvent((event) => {
+    const fn = await getCurrentWebview().onDragDropEvent((event) => {
+      if (unmounted) return;
       if (event.payload.type === "enter" || event.payload.type === "over") {
         dragOver.value = true;
       } else {
@@ -650,12 +658,15 @@ onMounted(async () => {
         }
       }
     });
+    if (unmounted) fn();
+    else dragDropUnlisten = fn;
   } catch {
     // 非 Tauri 环境忽略。
   }
 });
 
 onBeforeUnmount(() => {
+  unmounted = true;
   if (transferDoneUnlisten) transferDoneUnlisten();
   if (dragDropUnlisten) dragDropUnlisten();
   // 离开页面时断开连接。
@@ -763,8 +774,8 @@ onBeforeUnmount(() => {
               <span class="row-actions"></span>
             </div>
             <div
-              v-for="(e, idx) in sortedLocal"
-              :key="'l-' + idx"
+              v-for="e in sortedLocal"
+              :key="'l-' + e.name"
               class="file-row"
               :class="{ selected: selectedLocal?.name === e.name }"
               :draggable="!e.isDir"
@@ -853,8 +864,8 @@ onBeforeUnmount(() => {
               <span class="row-actions"></span>
             </div>
             <div
-              v-for="(e, idx) in sortedRemote"
-              :key="'r-' + idx"
+              v-for="e in sortedRemote"
+              :key="'r-' + e.name"
               class="file-row"
               :class="{ selected: selectedRemote?.name === e.name }"
               @click="selectedRemote = e"

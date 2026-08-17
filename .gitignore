@@ -111,3 +111,5 @@ scripts/
 *.swp
 *~
 review.md
+# ---- rustfmt 检查残留（临时输出）----
+src-tauri/fmt*.txt

@@ -9,6 +9,12 @@ use tauri::State;
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 
+/// 等待一次终端写入 ack 的最长等待时间。
+///
+/// reader 侧退出（会话关闭）或底层连接卡死时 ack 可能永远不来，ZMODEM 上传
+/// 等背压路径会永久挂起；超时兜底并给出明确错误。
+const TERMINAL_WRITE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// 向指定终端实例写入数据（前端键盘输入 / ZMODEM 协议字节）。
 ///
 /// `data` 是 base64 编码的字节流（与输出方向保持一致，便于传输二进制控制字符）。
@@ -34,9 +40,14 @@ pub async fn terminal_write(
         session.write_with_ack(bytes)?
     };
 
-    ack_rx
-        .await
-        .map_err(|_| AppError::Ssh("终端 reader 已退出".into()))
+    match tokio::time::timeout(TERMINAL_WRITE_ACK_TIMEOUT, ack_rx).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(AppError::Ssh("终端 reader 已退出".into())),
+        Err(_) => Err(AppError::Ssh(format!(
+            "写入终端超时（{} 秒），连接可能已卡死",
+            TERMINAL_WRITE_ACK_TIMEOUT.as_secs()
+        ))),
+    }
 }
 
 /// 调整指定终端实例的窗口大小。
@@ -70,6 +81,7 @@ pub fn terminal_snapshot(
     let snap = match session {
         crate::state::TerminalSession::Ssh(s) => s.snapshot(max_bytes),
         crate::state::TerminalSession::Telnet(s) => s.snapshot(max_bytes),
+        crate::state::TerminalSession::Local(s) => s.snapshot(max_bytes),
     };
     Ok(snap)
 }

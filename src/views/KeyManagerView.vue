@@ -5,15 +5,27 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
-import { Plus, Delete, View, EditPen, Key, Lock } from "@element-plus/icons-vue";
+import {
+  Plus,
+  Delete,
+  View,
+  EditPen,
+  Key,
+  Lock,
+  MagicStick,
+  CopyDocument,
+} from "@element-plus/icons-vue";
 import {
   credentialList,
   credentialSave,
   credentialGet,
   credentialDelete,
   credentialRename,
+  sshKeyGenerate,
   type CredentialView,
   type CredentialInput,
+  type SshKeyGenerateInput,
+  type GeneratedKeyInfo,
 } from "@/api/vault";
 
 defineOptions({ name: "KeyManagerView" });
@@ -101,19 +113,24 @@ function escapeHtml(s: string): string {
 }
 
 async function rename(c: CredentialView) {
+  let value: string;
   try {
-    const { value } = await ElMessageBox.prompt("新名称", "重命名", {
+    ({ value } = await ElMessageBox.prompt("新名称", "重命名", {
       inputValue: c.name,
       confirmButtonText: "确定",
       cancelButtonText: "取消",
-    });
-    if (value && value !== c.name) {
-      await credentialRename(c.id, value);
-      ElMessage.success("已重命名");
-      await load();
-    }
+    }));
   } catch {
-    /* 取消 */
+    return; // 用户取消
+  }
+  if (!value || value === c.name) return;
+  try {
+    await credentialRename(c.id, value);
+    ElMessage.success("已重命名");
+    await load();
+  } catch (e: unknown) {
+    // API 失败与用户取消分开处理：失败必须有提示，不能被"取消"分支吞掉。
+    ElMessage.error("重命名失败：" + String(e));
   }
 }
 
@@ -124,11 +141,15 @@ async function remove(c: CredentialView) {
       confirmButtonText: "删除",
       cancelButtonText: "取消",
     });
+  } catch {
+    return; // 用户取消
+  }
+  try {
     await credentialDelete(c.id);
     ElMessage.success("已删除");
     await load();
-  } catch {
-    /* 取消 */
+  } catch (e: unknown) {
+    ElMessage.error("删除失败：" + String(e));
   }
 }
 
@@ -138,6 +159,59 @@ function kindLabel(kind: string): string {
   return kind;
 }
 
+// 生成密钥对对话框
+const genVisible = ref(false);
+const generating = ref(false);
+const genForm = ref<{
+  name: string;
+  algorithm: "ed25519" | "rsa";
+  bits: number;
+  passphrase: string;
+}>({ name: "", algorithm: "ed25519", bits: 3072, passphrase: "" });
+
+// 生成结果（只含公钥，私钥已入保险库）
+const genResult = ref<GeneratedKeyInfo | null>(null);
+const resultVisible = ref(false);
+
+function openGen() {
+  genForm.value = { name: "", algorithm: "ed25519", bits: 3072, passphrase: "" };
+  genVisible.value = true;
+}
+
+async function submitGen() {
+  if (!genForm.value.name.trim()) {
+    ElMessage.warning("请输入名称");
+    return;
+  }
+  generating.value = true;
+  try {
+    const input: SshKeyGenerateInput = {
+      name: genForm.value.name.trim(),
+      algorithm: genForm.value.algorithm,
+      bits: genForm.value.algorithm === "rsa" ? genForm.value.bits : undefined,
+      passphrase: genForm.value.passphrase || undefined,
+    };
+    genResult.value = await sshKeyGenerate(input);
+    genVisible.value = false;
+    resultVisible.value = true;
+    await load();
+  } catch (e: unknown) {
+    ElMessage.error("生成失败：" + String(e));
+  } finally {
+    generating.value = false;
+  }
+}
+
+async function copyPublicKey() {
+  if (!genResult.value) return;
+  try {
+    await navigator.clipboard.writeText(genResult.value.publicKey);
+    ElMessage.success("公钥已复制");
+  } catch {
+    ElMessage.error("复制失败，请手动复制");
+  }
+}
+
 onMounted(load);
 </script>
 
@@ -145,7 +219,10 @@ onMounted(load);
   <div class="key-manager">
     <div class="header">
       <h2><el-icon><Key /></el-icon> 密钥管理</h2>
-      <el-button type="primary" :icon="Plus" @click="openAdd">添加凭据</el-button>
+      <div class="header-actions">
+        <el-button type="primary" :icon="MagicStick" @click="openGen">生成密钥对</el-button>
+        <el-button type="primary" :icon="Plus" @click="openAdd">添加凭据</el-button>
+      </div>
     </div>
     <div class="hint">
       所有凭据（密码、私钥）经主密码派生密钥 AES-256-GCM 加密后存储，运行时解密。
@@ -216,6 +293,74 @@ onMounted(load);
         <el-button type="primary" @click="submit">保存</el-button>
       </template>
     </el-dialog>
+
+    <!-- 生成密钥对对话框 -->
+    <el-dialog v-model="genVisible" title="生成密钥对" width="560px">
+      <el-form label-width="90px">
+        <el-form-item label="名称">
+          <el-input v-model="genForm.name" placeholder="如：gitlab 部署密钥（同时用作公钥注释）" />
+        </el-form-item>
+        <el-form-item label="算法">
+          <el-radio-group v-model="genForm.algorithm">
+            <el-radio value="ed25519">ED25519（推荐）</el-radio>
+            <el-radio value="rsa">RSA</el-radio>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item v-if="genForm.algorithm === 'rsa'" label="位数">
+          <el-radio-group v-model="genForm.bits">
+            <el-radio-button :value="2048">2048</el-radio-button>
+            <el-radio-button :value="3072">3072</el-radio-button>
+            <el-radio-button :value="4096">4096</el-radio-button>
+          </el-radio-group>
+          <div class="gen-hint">RSA 生成需要数秒，请耐心等待</div>
+        </el-form-item>
+        <el-form-item label="私钥口令">
+          <el-input
+            v-model="genForm.passphrase"
+            type="password"
+            show-password
+            placeholder="留空则私钥不加密（可选）"
+          />
+          <div class="gen-hint">设置口令后，使用该私钥连接时需输入相同口令</div>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button :disabled="generating" @click="genVisible = false">取消</el-button>
+        <el-button type="primary" :loading="generating" @click="submitGen">生成并保存</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 生成结果对话框（只展示公钥，私钥已入库） -->
+    <el-dialog v-model="resultVisible" title="密钥对生成成功" width="640px">
+      <el-alert
+        type="success"
+        :closable="false"
+        show-icon
+        title="私钥已加密存入凭据保险库"
+        description="私钥未在界面展示，可在列表中点击「查看」解密查看。"
+      />
+      <div v-if="genResult" class="gen-result">
+        <div class="gen-result-label">公钥</div>
+        <div class="gen-result-pub">
+          <el-input
+            v-model="genResult.publicKey"
+            type="textarea"
+            readonly
+            :autosize="{ minRows: 2, maxRows: 6 }"
+          />
+          <el-button :icon="CopyDocument" @click="copyPublicKey">复制公钥</el-button>
+        </div>
+        <div class="gen-result-label">指纹</div>
+        <div class="gen-result-fp">{{ genResult.fingerprint }}</div>
+        <div class="gen-result-tip">
+          将公钥追加到目标服务器 <code>~/.ssh/authorized_keys</code>
+          后，即可在会话配置中使用该私钥免密登录。
+        </div>
+      </div>
+      <template #footer>
+        <el-button type="primary" @click="resultVisible = false">完成</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -249,5 +394,50 @@ onMounted(load);
 .kind-icon {
   margin-right: 4px;
   vertical-align: middle;
+}
+.header-actions {
+  display: flex;
+  gap: 8px;
+}
+.gen-hint {
+  width: 100%;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  line-height: 1.5;
+  margin-top: 4px;
+}
+.gen-result {
+  margin-top: 16px;
+}
+.gen-result-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--el-text-color-primary);
+  margin-bottom: 6px;
+}
+.gen-result-pub {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+.gen-result-pub .el-textarea {
+  flex: 1;
+}
+.gen-result-fp {
+  font-family: Consolas, Monaco, monospace;
+  font-size: 13px;
+  color: var(--el-text-color-primary);
+  margin-bottom: 12px;
+}
+.gen-result-tip {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  line-height: 1.6;
+}
+.gen-result-tip code {
+  background: var(--el-fill-color-light);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-family: Consolas, Monaco, monospace;
 }
 </style>

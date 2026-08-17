@@ -57,3 +57,27 @@ export function credentialList(): Promise<CredentialView[]> {
 export function credentialRename(id: string, name: string): Promise<void> {
   return invoke<void>("credential_rename", { id, name });
 }
+
+// ---------------------------------------------------------------------------
+// SSH 密钥对生成
+// ---------------------------------------------------------------------------
+
+/** 密钥对生成请求。 */
+export interface SshKeyGenerateInput {
+  name: string; // 凭据名称（同时用作公钥注释）
+  algorithm: "ed25519" | "rsa";
+  bits?: number; // 仅 RSA 有效：2048 / 3072 / 4096，默认 3072
+  passphrase?: string; // 可选：私钥口令
+}
+
+/** 生成结果（不含私钥明文，私钥已加密存入保险库）。 */
+export interface GeneratedKeyInfo {
+  id: string; // 凭据 id
+  publicKey: string; // "ssh-ed25519 AAAA... <名称>"
+  fingerprint: string; // "SHA256:xxx"
+}
+
+/** 生成 SSH 密钥对并存入凭据保险库。 */
+export function sshKeyGenerate(input: SshKeyGenerateInput): Promise<GeneratedKeyInfo> {
+  return invoke<GeneratedKeyInfo>("ssh_key_generate", { input });
+}

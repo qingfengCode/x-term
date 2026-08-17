@@ -6,8 +6,7 @@ export enum AuthType {
 }
 
 /** 会话协议。 */
-export type Protocol = "ssh" | "telnet" | "rdp" | "vnc";
-
+export type Protocol = "ssh" | "telnet" | "rdp" | "vnc" | "local";
 export interface Session {
   id: string;
   name: string;
@@ -124,6 +123,41 @@ export interface TerminalSettings {
   sshKeepaliveSecs: number;
   /** SSH 连接超时时间（秒），0 = 永不超时。 */
   sshConnectTimeoutSecs: number;
+  /** 本地终端默认 Shell："cmd" | "powershell" | "git-bash"。 */
+  localShell: string;
+  /** 桌面客户端选择（VNC / RDP 各自独立：程序内嵌或系统客户端）。 */
+  desktopClients: DesktopClients;
+  /** 内嵌 RDP 是否校验服务器证书（严格模式，系统信任根；默认 false 与官方一致）。 */
+  rdpVerifyCert: boolean;
+}
+
+/** 桌面客户端模式："app" 程序内嵌 / "system" 系统客户端。 */
+export type DesktopClientMode = "app" | "system";
+
+/** 桌面客户端模式选项（设置页下拉用，与后端 config.rs 常量保持一致）。 */
+export const DESKTOP_CLIENT_MODE_OPTIONS: {
+  value: DesktopClientMode;
+  label: string;
+  desc: string;
+}[] = [
+  {
+    value: "app",
+    label: "程序内嵌",
+    desc: "在终端页标签页内打开，无需安装客户端",
+  },
+  {
+    value: "system",
+    label: "系统客户端",
+    desc: "RDP 用 mstsc，VNC 用 vncviewer",
+  },
+];
+
+/** 桌面客户端选择（VNC / RDP 各自独立）。 */
+export interface DesktopClients {
+  /** VNC 客户端模式："app"（程序内嵌 noVNC）| "system"（系统 vncviewer）。 */
+  vnc: DesktopClientMode;
+  /** RDP 客户端模式："app"（程序内嵌 IronRDP）| "system"（系统 mstsc）。 */
+  rdp: DesktopClientMode;
 }
 
 /** 工具运行模式（SSH / SQL 智能体各自独立设置）。 */
@@ -186,8 +220,8 @@ export interface SkillConfig {
   title: string;
   /** skill 内容（直接作为系统提示词片段注入）。 */
   content: string;
-  /** 所属助手域："ssh" | "db"。 */
-  domain: "ssh" | "db";
+  /** 所属助手域："ssh"（终端）| "db"（数据库）| "desktop"（桌面）。 */
+  domain: "ssh" | "db" | "desktop";
   enabled: boolean;
 }
 

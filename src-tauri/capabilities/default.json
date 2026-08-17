@@ -16,6 +16,7 @@
     "fs:allow-read-file",
     "fs:allow-write-file",
     "os:default",
+    "log:default",
     "fs:read-all",
     "fs:write-all",
     {

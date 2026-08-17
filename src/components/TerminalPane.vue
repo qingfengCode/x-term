@@ -11,6 +11,7 @@ import * as terminalApi from "@/api/terminal";
 import { useSettingsStore } from "@/stores/settings";
 import { matchesCombo } from "@/utils/shortcut";
 import { base64ToBytes, bytesToBase64 } from "@/utils/binary";
+import { formatSize } from "@/utils/format";
 import { useZmodemTransfer } from "@/composables/useZmodemTransfer";
 import "@xterm/xterm/css/xterm.css";
 
@@ -24,6 +25,19 @@ let fitAddon: FitAddon | null = null;
 let searchAddon: SearchAddon | null = null;
 let unlistens: UnlistenFn[] = [];
 let resizeObs: ResizeObserver | null = null;
+// 组件销毁标志：listen 未 resolve 前组件可能已卸载，resolve 后据此立即反订阅。
+let unmounted = false;
+
+/** 注册事件监听：resolve 前已卸载则立刻反订阅，避免监听器泄漏到卸载之后。 */
+const track = async (un: Promise<UnlistenFn>) => {
+  try {
+    const fn = await un;
+    if (unmounted) fn();
+    else unlistens.push(fn);
+  } catch (e) {
+    console.error("事件订阅失败:", e);
+  }
+};
 
 // --- 右键菜单 ---
 const menuVisible = ref(false);
@@ -59,17 +73,6 @@ const zmodemSizeText = computed(() => {
   if (!p) return "";
   return p.total > 0 ? `${formatSize(p.transferred)} / ${formatSize(p.total)}` : formatSize(p.transferred);
 });
-function formatSize(n: number): string {
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let v = n;
-  let i = 0;
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${units[i]}`;
-}
-
 function buildOptions() {
   const t = settings.terminal;
   return {
@@ -136,21 +139,25 @@ onMounted(async () => {
   // 监听后端推送的终端数据：按 instanceId 过滤。
   // 字节先经过 ZMODEM Sentry（检测起始序列 / 路由协议字节），
   // 非传输数据由 Sentry 转回终端写入。
-  const un1 = await listen<{ sessionId: string; data: string }>("terminal:data", (e) => {
-    if (e.payload.sessionId !== props.instanceId) return;
-    const bytes = base64ToBytes(e.payload.data);
-    zmodemFeed(bytes);
-  });
-  unlistens.push(un1);
+  await track(
+    listen<{ sessionId: string; data: string }>("terminal:data", (e) => {
+      if (unmounted) return;
+      if (e.payload.sessionId !== props.instanceId) return;
+      const bytes = base64ToBytes(e.payload.data);
+      zmodemFeed(bytes);
+    }),
+  );
 
   // 连接断开：终端提示 + 通知父组件（显示重连按钮）。
-  const un2 = await listen<{ sessionId: string }>("terminal:closed", (e) => {
-    if (e.payload.sessionId !== props.instanceId) return;
-    zmodemReset();
-    term?.write("\r\n\x1b[31m[连接已断开]\x1b[0m\r\n");
-    emit("closed");
-  });
-  unlistens.push(un2);
+  await track(
+    listen<{ sessionId: string }>("terminal:closed", (e) => {
+      if (unmounted) return;
+      if (e.payload.sessionId !== props.instanceId) return;
+      zmodemReset();
+      term?.write("\r\n\x1b[31m[连接已断开]\x1b[0m\r\n");
+      emit("closed");
+    }),
+  );
 
   // 用户键盘输入 → 后端。ZMODEM 传输期间屏蔽，避免干扰协议。
   term.onData((data) => {
@@ -161,13 +168,13 @@ onMounted(async () => {
     });
   });
 
-  // copyOnSelect：选中即复制（修死设置 bug）。读 settings.terminal.copyOnSelect。
-  if (settings.terminal.copyOnSelect) {
-    term.onSelectionChange(() => {
-      const sel = term?.getSelection();
-      if (sel) void copyText(sel);
-    });
-  }
+  // copyOnSelect：选中即复制。回调内实时读设置值（而非挂载时读一次），
+  // 设置页切换"选中即复制"对已打开的终端立即生效，无需重挂载。
+  term.onSelectionChange(() => {
+    if (!settings.terminal.copyOnSelect) return;
+    const sel = term?.getSelection();
+    if (sel) void copyText(sel);
+  });
 
   // 尺寸变化：浏览器 resize + 容器变化。
   term.onResize(({ cols, rows }) => {
@@ -275,6 +282,7 @@ watch(
 );
 
 onBeforeUnmount(() => {
+  unmounted = true;
   for (const u of unlistens) u();
   unlistens = [];
   resizeObs?.disconnect();
@@ -399,14 +407,15 @@ defineExpose({
         v-model="searchKeyword"
         class="term-search-input"
         placeholder="搜索..."
+        aria-label="终端内搜索"
         spellcheck="false"
         @keydown.enter.prevent="runSearch('next')"
         @keydown.esc.prevent="closeSearch"
       />
-      <button class="term-search-btn" title="上一个" @click="runSearch('prev')">↑</button>
-      <button class="term-search-btn" title="下一个" @click="runSearch('next')">↓</button>
-      <span class="term-search-info">{{ searchMatchInfo }}</span>
-      <button class="term-search-close" title="关闭 (Esc)" @click="closeSearch">×</button>
+      <button class="term-search-btn" title="上一个" aria-label="上一个匹配" @click="runSearch('prev')">↑</button>
+      <button class="term-search-btn" title="下一个" aria-label="下一个匹配" @click="runSearch('next')">↓</button>
+      <span class="term-search-info" aria-live="polite">{{ searchMatchInfo }}</span>
+      <button class="term-search-close" title="关闭 (Esc)" aria-label="关闭搜索" @click="closeSearch">×</button>
     </div>
 
     <!-- 右键菜单 -->
@@ -515,7 +524,8 @@ defineExpose({
   border-radius: 6px;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
   padding: 4px 0;
-  z-index: 100;
+  /* 与共享 TabBar 菜单统一层级（避免被后开的浮层/菜单遮挡）。 */
+  z-index: 3000;
 }
 .term-menu-item {
   padding: 6px 14px;

@@ -1,12 +1,14 @@
 <script setup lang="ts">
-import { computed, onActivated, onBeforeUnmount, onDeactivated, ref } from "vue";
+import { computed, onActivated, onBeforeUnmount, onDeactivated, reactive, ref } from "vue";
 import { useTerminalsStore, type TerminalTab } from "@/stores/terminals";
 import { useSettingsStore } from "@/stores/settings";
 import TerminalPane from "@/components/TerminalPane.vue";
 import AiPanel from "@/components/AiPanel.vue";
-import { Close, Delete, Top, Bottom, ZoomIn, ZoomOut, Refresh, Plus, ArrowDown, ArrowUp } from "@element-plus/icons-vue";
+import TabBar, { type TabBarItem } from "@/components/TabBar.vue";
+import { Delete, Top, Bottom, ZoomIn, ZoomOut, Refresh, Plus, ArrowDown, ArrowUp, Monitor, Key } from "@element-plus/icons-vue";
 import { ElMessage } from "element-plus";
 import { eventToCombo, isModifierOnly } from "@/utils/shortcut";
+import { isAuthError } from "@/utils/error";
 import type { ShortcutCommand } from "@/api/types";
 
 // KeepAlive 按 name 匹配缓存本组件（保留终端助手面板状态）。
@@ -19,12 +21,59 @@ const active = computed(() =>
   terminals.tabs.find((t) => t.instanceId === terminals.activeId)
 );
 
-// 当前活动 pane 的组件引用（用于调 clear/focus）。
-const activePaneRef = ref<InstanceType<typeof TerminalPane> | null>(null);
+// 各 tab 的 TerminalPane 引用（按 instanceId 索引）。
+// reactive Map 保证增删触发 activePaneRef 重新求值。
+const paneRefs = reactive(new Map<string, InstanceType<typeof TerminalPane>>());
 
-async function closeTab(instanceId: string, e?: Event) {
-  e?.stopPropagation();
-  await terminals.close(instanceId);
+/** 当前活动 tab 的 pane 引用（工具动作作用于它；vnc tab 时为 undefined）。 */
+const activePaneRef = computed(() => {
+  const id = terminals.activeId;
+  return id ? paneRefs.get(id) : undefined;
+});
+
+/** TerminalPane 挂载/卸载时的 ref 回调：登记或移除 pane 引用。 */
+function onPaneRef(tab: TerminalTab, el: unknown) {
+  if (el) {
+    paneRefs.set(tab.instanceId, el as InstanceType<typeof TerminalPane>);
+  } else {
+    paneRefs.delete(tab.instanceId);
+  }
+}
+
+// --- Tab 栏（共享 TabBar 组件） ---------------------------------------------
+
+/** 映射为 TabBar 的数据抽象。 */
+const tabItems = computed<TabBarItem[]>(() =>
+  terminals.tabs.map((t) => ({
+    key: t.instanceId || t.session.id,
+    title: t.session.name,
+    connecting: t.connecting,
+    disconnected: t.disconnected,
+  })),
+);
+
+/** TabBar 右键菜单命令（作用于对应 tab）。 */
+function onTabMenuCommand(cmd: string, key: string) {
+  const t = terminals.tabs.find((x) => (x.instanceId || x.session.id) === key);
+  if (!t?.instanceId) return;
+  switch (cmd) {
+    case "close":
+      void terminals.close(t.instanceId);
+      break;
+    case "closeOthers":
+      for (const x of [...terminals.tabs]) {
+        if (x.instanceId !== t.instanceId) void terminals.close(x.instanceId);
+      }
+      break;
+    case "closeAll":
+      for (const x of [...terminals.tabs]) {
+        if (x.instanceId) void terminals.close(x.instanceId);
+      }
+      break;
+    case "reconnect":
+      void terminals.reconnect(t.instanceId);
+      break;
+  }
 }
 
 // 终端被通知连接断开（由 TerminalPane emit "closed"）：标记断开并顺手清理后端
@@ -51,78 +100,6 @@ function zoom(delta: number) {
   settings.setTerminal({ fontSize: next });
 }
 
-// --- Tab 交互增强 ---------------------------------------------------------
-
-/** 中键点击 tab：关闭（并阻止中键自动滚动）。 */
-function onTabAuxClick(tab: TerminalTab, e: MouseEvent) {
-  if (e.button === 1) {
-    e.preventDefault();
-    if (tab.instanceId) void terminals.close(tab.instanceId);
-  }
-}
-
-/** 右键菜单（自定义浮层，与终端右键菜单同一套样式惯例）。 */
-const tabMenu = ref<{ x: number; y: number; tab: TerminalTab | null }>({
-  x: 0,
-  y: 0,
-  tab: null,
-});
-function openTabMenu(tab: TerminalTab, e: MouseEvent) {
-  tabMenu.value = { x: e.clientX, y: e.clientY, tab };
-}
-function closeTabMenu() {
-  tabMenu.value.tab = null;
-}
-function onTabMenuCommand(cmd: string) {
-  const t = tabMenu.value.tab;
-  closeTabMenu();
-  if (!t?.instanceId) return;
-  switch (cmd) {
-    case "close":
-      void terminals.close(t.instanceId);
-      break;
-    case "closeOthers":
-      for (const x of [...terminals.tabs]) {
-        if (x.instanceId !== t.instanceId) void terminals.close(x.instanceId);
-      }
-      break;
-    case "closeAll":
-      for (const x of [...terminals.tabs]) void terminals.close(x.instanceId);
-      break;
-    case "reconnect":
-      void terminals.reconnect(t.instanceId);
-      break;
-  }
-}
-
-/** 标签区滚轮：纵向滚动转为横向滚动。 */
-function onTabsWheel(e: WheelEvent) {
-  const el = e.currentTarget as HTMLElement;
-  el.scrollLeft += e.deltaY;
-}
-
-/** 拖拽排序 tab（HTML5 DnD，dragover 时按过半即换位）。 */
-const dragTabId = ref<string | null>(null);
-function onTabDragStart(e: DragEvent, id: string) {
-  dragTabId.value = id;
-  if (e.dataTransfer) {
-    e.dataTransfer.effectAllowed = "move";
-    e.dataTransfer.setData("text/plain", id);
-  }
-}
-function onTabDragOver(e: DragEvent, targetId: string) {
-  const from = dragTabId.value;
-  if (!from || from === targetId) return;
-  e.preventDefault();
-  if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
-  const el = e.currentTarget as HTMLElement;
-  const before = e.offsetX < el.clientWidth / 2;
-  terminals.moveTab(from, targetId, before);
-}
-function onTabDragEnd() {
-  dragTabId.value = null;
-}
-
 // --- 快捷命令栏 ---------------------------------------------------------
 
 /** 当前激活的分组标签（"__all__" 表示全部）。 */
@@ -140,11 +117,21 @@ const visibleShortcuts = computed(() => {
 /** 把命令文本中的占位符 {host}/{user}/{port} 按当前活动会话替换。 */
 function resolveCommand(cmd: string): string {
   const s = active.value?.session;
-  if (!s) return cmd;
+  // 本地终端无会话配置（合成占位 Session），跳过占位符替换。
+  if (!s || s.protocol === "local") return cmd;
   return cmd
     .replaceAll("{host}", s.host)
     .replaceAll("{user}", s.username)
     .replaceAll("{port}", String(s.port));
+}
+
+/** 打开本地终端标签页（默认 shell 在设置中配置）。 */
+async function openLocalTerminal() {
+  try {
+    await terminals.openLocal();
+  } catch (e) {
+    ElMessage.error(String(e));
+  }
 }
 
 /** 向活动终端发送一条快捷命令。 */
@@ -220,10 +207,6 @@ async function saveNewShortcut() {
 function onGlobalKeydown(e: KeyboardEvent) {
   // 长按连发（e.repeat）只响应首次按键，避免自定义命令被连续执行。
   if (e.repeat) return;
-  // Esc 关闭 tab 右键菜单。
-  if (e.key === "Escape") {
-    closeTabMenu();
-  }
   // 仅当聚焦在 body 或非可编辑元素时才响应快捷键，避免与输入框冲突。
   const target = e.target as HTMLElement | null;
   if (target) {
@@ -236,68 +219,64 @@ function onGlobalKeydown(e: KeyboardEvent) {
   if (hit) {
     e.preventDefault();
     runShortcut(hit);
+    return;
+  }
+  // 内置标签快捷键（用户自定义命令未占用时生效，与桌面页一致）：
+  // Ctrl+W 关闭当前标签；Ctrl+1~9 切换标签。
+  // 焦点在终端画布内时按键归远端（终端应用自己的 Ctrl+组合），不触发。
+  if ((e.ctrlKey || e.metaKey) && !e.altKey) {
+    const target = e.target as HTMLElement | null;
+    if (!target?.closest(".xterm-wrap")) {
+      if (e.key.toLowerCase() === "w") {
+        if (!active.value?.instanceId) return;
+        e.preventDefault();
+        void terminals.close(active.value.instanceId);
+        return;
+      }
+      if (/^[1-9]$/.test(e.key)) {
+        const idx = Number(e.key) - 1;
+        const tab = terminals.tabs[idx];
+        if (tab?.instanceId) {
+          e.preventDefault();
+          terminals.setActive(tab.instanceId);
+        }
+      }
+    }
   }
 }
 
 // 本组件被 KeepAlive 缓存（MainLayout），切到其他页面时不会卸载——若在
-// onMounted 里注册全局监听，切走后自定义命令快捷键仍会在后台终端执行命令、
-// 点击也会误关菜单。改为随页面激活/停用注册/注销。
+// onMounted 里注册全局监听，切走后自定义命令快捷键仍会在后台终端执行命令。
+// 改为随页面激活/停用注册/注销（tab 右键菜单的关闭监听由 TabBar 组件自理）。
 onActivated(() => {
   window.addEventListener("keydown", onGlobalKeydown);
-  // 点击任意处关闭 tab 右键菜单。
-  window.addEventListener("click", closeTabMenu);
 });
 onDeactivated(() => {
   window.removeEventListener("keydown", onGlobalKeydown);
-  window.removeEventListener("click", closeTabMenu);
 });
 // 兜底：组件真正销毁（如应用退出）时确保清理。
 onBeforeUnmount(() => {
   window.removeEventListener("keydown", onGlobalKeydown);
-  window.removeEventListener("click", closeTabMenu);
 });
 </script>
 
 <template>
   <div class="workspace">
     <div class="tab-bar">
-      <div class="tabs-scroll" @wheel="onTabsWheel">
-        <div
-          v-for="(tab, i) in terminals.tabs"
-          :key="tab.instanceId || tab.session.id"
-          class="tab"
-          :class="{ active: tab.instanceId === terminals.activeId, dragging: dragTabId === tab.instanceId }"
-          draggable="true"
-          @click="tab.instanceId && terminals.setActive(tab.instanceId)"
-          @auxclick="(e: MouseEvent) => onTabAuxClick(tab, e)"
-          @mousedown.middle.prevent
-          @contextmenu.prevent="(e: MouseEvent) => openTabMenu(tab, e)"
-          @dragstart="(e: DragEvent) => onTabDragStart(e, tab.instanceId)"
-          @dragover="(e: DragEvent) => onTabDragOver(e, tab.instanceId)"
-          @dragend="onTabDragEnd"
-        >
-          <span class="dot" :class="{ connecting: tab.connecting, dead: tab.disconnected }" />
-          <span class="tab-idx" v-if="i < 9">{{ i + 1 }}</span>
-          <span class="title">{{ tab.session.name }}</span>
-          <el-icon class="close" @click="(e: Event) => closeTab(tab.instanceId, e)"><Close /></el-icon>
-        </div>
-        <div v-if="terminals.tabs.length === 0" class="tab-hint">从左侧会话树双击连接</div>
-      </div>
-      <!-- Tab 右键菜单（fixed 浮层） -->
-      <div
-        v-if="tabMenu.tab"
-        class="tab-menu"
-        :style="{ left: tabMenu.x + 'px', top: tabMenu.y + 'px' }"
-        @click.stop
-      >
-        <div class="tab-menu-item" @click="onTabMenuCommand('close')">关闭</div>
-        <div class="tab-menu-item" @click="onTabMenuCommand('closeOthers')">关闭其他</div>
-        <div class="tab-menu-item" @click="onTabMenuCommand('closeAll')">关闭全部</div>
-        <template v-if="tabMenu.tab.disconnected">
-          <div class="tab-menu-sep" />
-          <div class="tab-menu-item" @click="onTabMenuCommand('reconnect')">重新连接</div>
-        </template>
-      </div>
+      <TabBar
+        :tabs="tabItems"
+        :active-key="terminals.activeId"
+        empty-hint="从左侧会话树双击连接"
+        @select="(k) => terminals.setActive(k)"
+        @close="(k) => void terminals.close(k)"
+        @move="(from, to, before) => terminals.moveTab(from, to, before)"
+        @command="onTabMenuCommand"
+      />
+      <!-- 本地终端：常驻按钮，无论有无会话都可用 -->
+      <button class="local-term-btn" title="打开本地终端（默认 Shell 可在设置中配置）" @click="openLocalTerminal">
+        <el-icon><Monitor /></el-icon>
+        <span>本地终端</span>
+      </button>
       <!-- 终端工具栏 -->
       <div v-if="active" class="term-toolbar">
         <el-tooltip content="清屏" placement="bottom">
@@ -326,7 +305,7 @@ onBeforeUnmount(() => {
         >
           <template v-if="tab.instanceId">
             <TerminalPane
-              :ref="(el: any) => { if (tab.instanceId === terminals.activeId) activePaneRef = el }"
+              :ref="(el: any) => onPaneRef(tab, el)"
               :instance-id="tab.instanceId"
               @closed="onTerminalClosed(tab.instanceId)"
             />
@@ -347,7 +326,16 @@ onBeforeUnmount(() => {
           </template>
           <div v-else-if="tab.connecting" class="pane-status">连接中…</div>
           <div v-else-if="tab.error" class="pane-status error">
-            连接失败：{{ tab.error }}
+            <span class="pane-error-text">连接失败：{{ tab.error }}</span>
+            <!-- 认证失败：提供手动输入密码/口令码重试的入口（弹窗） -->
+            <el-button
+              v-if="isAuthError(tab.error)"
+              size="small"
+              :icon="Key"
+              @click="terminals.openManualAuth(tab)"
+            >
+              手动认证
+            </el-button>
           </div>
         </div>
         <div v-if="!active" class="workspace-empty">
@@ -477,15 +465,26 @@ onBeforeUnmount(() => {
   padding: 0 4px;
   flex-shrink: 0;
 }
-.tabs-scroll {
+/* 本地终端按钮：tab 栏右侧常驻。 */
+.local-term-btn {
   display: flex;
   align-items: center;
-  flex: 1;
-  min-width: 0;
-  overflow-x: auto;
+  gap: 4px;
+  height: 26px;
+  padding: 0 10px;
+  margin-left: 4px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  flex-shrink: 0;
+  white-space: nowrap;
 }
-.tabs-scroll::-webkit-scrollbar {
-  height: 0;
+.local-term-btn:hover {
+  background: var(--el-fill-color-light);
+  color: var(--el-color-primary);
 }
 .term-toolbar {
   display: flex;
@@ -502,93 +501,6 @@ onBeforeUnmount(() => {
 }
 .tool-btn:hover {
   color: var(--el-color-primary);
-}
-.tab-idx {
-  font-size: 10px;
-  color: var(--el-text-color-placeholder);
-  margin-right: 2px;
-}
-.tab {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 10px;
-  margin-right: 2px;
-  border-radius: 4px 4px 0 0;
-  cursor: pointer;
-  font-size: 13px;
-  color: var(--el-text-color-regular);
-  max-width: 200px;
-}
-.tab:hover {
-  background: var(--el-fill-color-light);
-}
-.tab.active {
-  background: var(--el-bg-color-page);
-  color: var(--el-color-primary);
-}
-.tab .title {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.tab .dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--el-color-success);
-}
-.tab .dot.connecting {
-  background: var(--el-color-warning);
-}
-.tab .dot.dead {
-  background: var(--el-color-danger);
-}
-/* 拖拽中的 tab 半透明提示 */
-.tab.dragging {
-  opacity: 0.5;
-}
-.tab .close {
-  font-size: 12px;
-  padding: 2px;
-  border-radius: 2px;
-}
-.tab .close:hover {
-  background: var(--el-fill-color-dark);
-}
-.tab-hint {
-  font-size: 12px;
-  color: var(--el-text-color-secondary);
-  margin-left: 8px;
-}
-
-/* --- Tab 右键菜单（fixed 浮层，与终端右键菜单同一套样式） --- */
-.tab-menu {
-  position: fixed;
-  min-width: 140px;
-  background: var(--el-bg-color-overlay);
-  border: 1px solid var(--el-border-color);
-  border-radius: 6px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
-  padding: 4px 0;
-  /* 与 SqlConsoleView 同款菜单保持一致；高于 el-dialog 遮罩（2000+），
-     避免右键菜单打开时被弹窗遮罩盖住 */
-  z-index: 3000;
-}
-.tab-menu-item {
-  padding: 6px 14px;
-  font-size: 13px;
-  color: var(--el-text-color-primary);
-  cursor: pointer;
-}
-.tab-menu-item:hover {
-  background: var(--el-color-primary-light-9);
-  color: var(--el-color-primary);
-}
-.tab-menu-sep {
-  height: 1px;
-  background: var(--el-border-color-lighter);
-  margin: 4px 0;
 }
 .workspace-body {
   flex: 1;
@@ -641,6 +553,14 @@ onBeforeUnmount(() => {
 }
 .pane-status.error {
   color: var(--el-color-danger);
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 0 32px;
+  text-align: center;
+}
+
+.pane-error-text {
+  word-break: break-all;
 }
 
 /* --- 终端底部快捷命令栏 --- */

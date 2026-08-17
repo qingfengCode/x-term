@@ -496,7 +496,6 @@ impl LlmProvider for ClaudeProvider {
             Ok(r) => r,
             Err(e) => {
                 let msg = format!("连接 Claude 服务失败: {e}");
-                emit_error(&app, &request_id, &msg);
                 log::error!("[ai:{}:claude/tools] {msg}", request_id);
                 return Err(AppError::Ai(msg));
             }
@@ -506,7 +505,6 @@ impl LlmProvider for ClaudeProvider {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
             let msg = format!("Claude 返回错误状态 {status}: {}", truncate(&text, 500));
-            emit_error(&app, &request_id, &msg);
             log::error!("[ai:{}:claude/tools] {msg}", request_id);
             return Err(AppError::Ai(msg));
         }
@@ -526,7 +524,6 @@ impl LlmProvider for ClaudeProvider {
                 Ok(c) => c,
                 Err(e) => {
                     let msg = format!("读取 Claude 流式响应失败: {e}");
-                    emit_error(&app, &request_id, &msg);
                     log::error!("[ai:{}:claude/tools] {msg}", request_id);
                     return Err(AppError::Ai(msg));
                 }

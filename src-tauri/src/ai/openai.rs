@@ -373,7 +373,6 @@ impl LlmProvider for OpenAiProvider {
             Ok(r) => r,
             Err(e) => {
                 let msg = format!("连接 LLM 服务失败: {e}");
-                emit_error(&app, &request_id, &msg);
                 log::error!("[ai:{}:openai/tools] {msg}", request_id);
                 return Err(AppError::Ai(msg));
             }
@@ -383,7 +382,6 @@ impl LlmProvider for OpenAiProvider {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
             let msg = format!("LLM 返回错误状态 {status}: {}", truncate(&text, 500));
-            emit_error(&app, &request_id, &msg);
             log::error!("[ai:{}:openai/tools] {msg}", request_id);
             return Err(AppError::Ai(msg));
         }
@@ -404,7 +402,6 @@ impl LlmProvider for OpenAiProvider {
                 Ok(c) => c,
                 Err(e) => {
                     let msg = format!("读取流式响应失败: {e}");
-                    emit_error(&app, &request_id, &msg);
                     log::error!("[ai:{}:openai/tools] {msg}", request_id);
                     return Err(AppError::Ai(msg));
                 }

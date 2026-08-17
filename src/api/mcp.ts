@@ -24,7 +24,7 @@ export type McpBoundSource = "config" | "terminal";
 export interface McpInstanceConfig {
   /** 是否启用（记录意图；实际启停以 mcpStart/mcpStop 为准）。 */
   enabled: boolean;
-  /** 监听地址，默认 0.0.0.0。 */
+  /** 监听地址，默认 127.0.0.1（仅本机）；可配置 0.0.0.0 / 局域网 IP 对外开放。 */
   host: string;
   /** 监听端口（ssh 默认 8765、db 默认 8766）。 */
   port: number;

@@ -10,7 +10,7 @@ import { computed, reactive, ref, watch } from "vue";
 import { ElMessage } from "element-plus";
 import type { FormInstance, FormRules } from "element-plus";
 import { useSessionsStore } from "@/stores/sessions";
-import { credentialSave } from "@/api/vault";
+import { credentialDelete, credentialSave } from "@/api/vault";
 import { dbSaveProfile, dbListGroups } from "@/api/db";
 import type { DbGroup, DbProfile, Session } from "@/api/types";
 
@@ -150,18 +150,23 @@ async function submit() {
     return;
   }
   saving.value = true;
+  // 本次新建的凭据 id（编辑已有凭据时为 null）：账号保存失败时补偿删除，避免孤儿。
+  let createdCredId: string | null = null;
   try {
     const base = props.profile;
     let credentialId = base?.credentialId ?? null;
 
-    // 密码非空 → 保存（更新）为 credential。
+    // 密码非空 → 保存（更新）为 credential。编辑时传原 id 原地更新，
+    // 不再每次新建 credential（旧实现每次修改密码都新增一条、旧凭据永不删除）。
     const pwd = form.password;
     if (pwd) {
       credentialId = await credentialSave({
+        id: base?.credentialId ?? undefined,
         name: `mysql:${form.name}`,
         kind: KIND_MYSQL_PASSWORD,
         value: pwd,
       });
+      if (!base?.credentialId) createdCredId = credentialId;
     }
 
     const profile: DbProfile = {
@@ -183,6 +188,10 @@ async function submit() {
     emit("saved", profile);
     close();
   } catch (e: unknown) {
+    // 新建场景下账号保存失败：补偿删除刚创建的凭据，避免孤儿。
+    if (createdCredId) {
+      await credentialDelete(createdCredId).catch(() => {});
+    }
     const msg = e instanceof Error ? e.message : String(e);
     ElMessage.error("保存失败：" + msg);
   } finally {

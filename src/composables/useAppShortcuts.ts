@@ -25,7 +25,7 @@ export interface AppShortcutHandlers {
 }
 
 /** 是否在可编辑元素中（输入框/textarea/CodeMirror 等），此类元素中一般不触发应用快捷键。 */
-function isEditableTarget(e: KeyboardEvent): boolean {
+export function isEditableTarget(e: KeyboardEvent): boolean {
   const t = e.target as HTMLElement | null;
   if (!t) return false;
   const tag = t.tagName;

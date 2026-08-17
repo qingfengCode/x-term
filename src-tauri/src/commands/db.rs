@@ -72,30 +72,37 @@ pub fn db_delete_group(id: String, state: State<'_, AppState>) -> AppResult<()> 
 ///
 /// 根据 profile 是否设置了 `ssh_session_config_id` 选择直连或 SSH 隧道。
 /// 建好的 [`MySqlConn`] 存入 `state.mysql_conns`。
+///
+/// 同步的 SQLite 查询与 vault 解析放进 `spawn_blocking`：async 命令直接在
+/// tokio worker 线程上执行同步 IO，会话并发时会造成运行时抖动。
 #[tauri::command]
 pub async fn db_connect(profile_id: String, state: State<'_, AppState>) -> AppResult<String> {
-    // 1. 取 profile。
-    let profile = {
-        let conn = state.conn()?;
-        crate::database::profiles::get_db_profile(&conn, &profile_id)?
-            .ok_or_else(|| AppError::NotFound(format!("DB profile {} 不存在", profile_id)))?
-    };
-
-    // 2. 解析 MySQL 密码。
-    let mysql_pass = {
-        let cred_id = profile
-            .credential_id
-            .as_ref()
-            .ok_or_else(|| AppError::Auth("DB profile 缺少 credential_id".to_string()))?;
-        let vault_guard = state.vault_read()?;
-        let vault = vault_guard
-            .as_ref()
-            .ok_or_else(|| AppError::Auth("保险库未解锁".to_string()))?
-            .clone();
-        drop(vault_guard);
-        let conn = state.conn()?;
-        crate::database::mysql::fetch_mysql_password(&conn, cred_id, &vault)?
-    };
+    // 1+2. 取 profile、解析 MySQL 密码（同步 IO → 阻塞线程池）。
+    let st = state.inner().clone();
+    let (profile, mysql_pass) = tokio::task::spawn_blocking(move || -> AppResult<_> {
+        let profile = {
+            let conn = st.conn()?;
+            crate::database::profiles::get_db_profile(&conn, &profile_id)?
+                .ok_or_else(|| AppError::NotFound(format!("DB profile {} 不存在", profile_id)))?
+        };
+        let mysql_pass = {
+            let cred_id = profile
+                .credential_id
+                .as_ref()
+                .ok_or_else(|| AppError::Auth("DB profile 缺少 credential_id".to_string()))?;
+            let vault_guard = st.vault_read()?;
+            let vault = vault_guard
+                .as_ref()
+                .ok_or_else(|| AppError::Auth("保险库未解锁".to_string()))?
+                .clone();
+            drop(vault_guard);
+            let conn = st.conn()?;
+            crate::database::mysql::fetch_mysql_password(&conn, cred_id, &vault)?
+        };
+        Ok((profile, mysql_pass))
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("后台任务失败: {}", e)))??;
 
     // 3. 建立连接。
     let conn_obj: MySqlConn = if let Some(ssh_id) = &profile.ssh_session_config_id {
@@ -369,15 +376,11 @@ pub async fn db_list_tables(
         .cloned()
         .ok_or_else(|| AppError::NotFound(format!("DB 连接 {} 不存在", conn_id)))?;
 
-    // 构造 SQL：指定库时用 SHOW TABLES FROM <db>。库名做简单防注入。
+    // 构造 SQL：指定库时用 SHOW TABLES FROM <db>。库名走统一白名单校验
+    // （与 db_use_database / db_show_create_table 一致，黑名单易随修改失效）。
     let sql = match &database {
         Some(db) => {
-            if db
-                .chars()
-                .any(|c| c.is_whitespace() || c == ';' || c == '-' || c == '/' || c == '`')
-            {
-                return Err(AppError::InvalidInput(format!("非法库名: {}", db)));
-            }
+            crate::database::mysql::validate_database_identifier(db)?;
             format!("SHOW TABLES FROM `{}`", db)
         }
         None => "SHOW TABLES".into(),

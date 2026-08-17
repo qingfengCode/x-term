@@ -71,6 +71,12 @@ pub const SSH_AUTH_CHALLENGE: &str = "ssh:auth_challenge";
 /// `ssh_host_key_respond` 命令回传决策（接受并更新 / 仅本次接受 / 拒绝）。
 pub const SSH_HOST_KEY_CHALLENGE: &str = "ssh:host_key_challenge";
 
+/// 端口转发运行状态变化事件。payload: [`ForwardStateEvent`]。
+///
+/// 后端在隧道启动、停止，以及监控任务发现 SSH 连接断开（隧道异常退出）时 emit，
+/// 前端据此实时更新"运行中/已停止"标签，不再依赖进页面时的一次性拉取。
+pub const FORWARD_STATE: &str = "forward:state";
+
 // ===========================================================================
 // 事件 payload 结构体
 // ===========================================================================
@@ -189,6 +195,12 @@ pub struct AiToolCallEvent {
     /// 这种 tool_call 后端不再等待人工确认，已直接执行。
     #[serde(default)]
     pub auto_approved: bool,
+    /// 桌面工具（desktop_*）绑定的内嵌 RDP 桥接实例 id。
+    ///
+    /// 仅桌面工具非空：执行体在前端（IronRDP WASM 会话），前端据此定位要操作的
+    /// 桌面（请求发起时的活动桌面），不依赖执行瞬间的标签状态。其余工具为 None。
+    #[serde(default)]
+    pub desktop_id: Option<String>,
 }
 
 /// 工具执行结果。
@@ -315,6 +327,18 @@ pub struct SshHostKeyEvent {
     pub fingerprint: String,
     /// known_hosts 中记录的旧指纹（用于前端展示新旧对比）。
     pub known_fingerprint: String,
+}
+
+/// 端口转发运行状态变化。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForwardStateEvent {
+    /// 转发规则 id。
+    pub rule_id: String,
+    /// 是否运行中。
+    pub running: bool,
+    /// 状态变化原因（如 "started" / "stopped" / "ssh 连接断开"），用于展示/日志。
+    pub reason: String,
 }
 
 // ===========================================================================

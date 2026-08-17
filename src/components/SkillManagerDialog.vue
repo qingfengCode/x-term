@@ -15,7 +15,7 @@ import SkillDialog from "@/components/SkillDialog.vue";
 const props = defineProps<{
   visible: boolean;
   /** 管理哪个 domain 的 skill。 */
-  domain: "ssh" | "db";
+  domain: "ssh" | "db" | "desktop";
 }>();
 
 const emit = defineEmits<{
@@ -85,7 +85,7 @@ async function removeSkill(s: SkillConfig) {
 <template>
   <el-dialog
     :model-value="visible"
-    :title="`技能管理 · ${domain === 'ssh' ? '终端助手' : 'SQL 助手'}`"
+    :title="`技能管理 · ${domain === 'ssh' ? '终端助手' : domain === 'db' ? 'SQL 助手' : '桌面助手'}`"
     width="600px"
     append-to-body
     @update:model-value="close"

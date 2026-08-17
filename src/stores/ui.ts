@@ -10,7 +10,11 @@ export const useUiStore = defineStore("ui", () => {
   const aiCollapsed = ref(true);
 
   /** AI 面板展开宽度（按 domain 独立记忆，拖拽调整后保持，重启恢复默认）。 */
-  const aiWidths = ref<Record<"ssh" | "db", number>>({ ssh: 340, db: 340 });
+  const aiWidths = ref<Record<"ssh" | "db" | "desktop", number>>({
+    ssh: 340,
+    db: 340,
+    desktop: 340,
+  });
 
   /**
    * SSH 认证类全局弹窗互斥：认证挑战弹窗（SshAuthPrompt）与主机公钥确认弹窗
@@ -28,7 +32,7 @@ export const useUiStore = defineStore("ui", () => {
     aiCollapsed.value = v;
   }
 
-  function setAiWidth(domain: "ssh" | "db", w: number) {
+  function setAiWidth(domain: "ssh" | "db" | "desktop", w: number) {
     aiWidths.value = { ...aiWidths.value, [domain]: Math.round(w) };
   }
 

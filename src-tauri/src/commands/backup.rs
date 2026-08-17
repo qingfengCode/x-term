@@ -240,11 +240,16 @@ pub fn backup_inspect(path: String, password: String) -> AppResult<BackupInfo> {
 /// - `mode = "overwrite"`：清空全部相关表后写入（同一事务，失败自动回滚）。
 ///
 /// 文件包含凭据 / TOTP 且保险库未解锁时**报错中止**（不会静默丢弃凭据）。
+///
+/// `force`：备份不含任何凭据/TOTP 且用覆盖模式时，会清空本机全部凭据与 TOTP
+/// 且无法从备份恢复（多半是导出时保险库未解锁导致的残缺备份）。此时默认报错，
+/// 前端弹二次确认后传 `force = true` 才放行。
 #[tauri::command]
 pub fn backup_import(
     path: String,
     password: String,
     mode: String,
+    force: bool,
     state: State<'_, AppState>,
 ) -> AppResult<BackupSummary> {
     let content = std::fs::read_to_string(&path)?;
@@ -253,6 +258,20 @@ pub fn backup_import(
 
     // 凭据 / TOTP 需要保险库：先校验，未解锁直接中止。
     let has_secrets = !payload.credentials.is_empty() || !payload.totp_secrets.is_empty();
+
+    // 覆盖模式 + 无凭据备份 + 未强制确认：本机凭据会被静默清空，先拦截。
+    if overwrite && !has_secrets && !force {
+        let conn = state.conn()?;
+        let cred_count = count_rows(&conn, "SELECT COUNT(*) FROM credentials")?;
+        let totp_count = count_rows(&conn, "SELECT COUNT(*) FROM totp_secrets")?;
+        if cred_count > 0 || totp_count > 0 {
+            return Err(AppError::InvalidInput(format!(
+                "该备份不包含凭据/TOTP（导出时保险库可能未解锁），覆盖导入将清空本机现有的 {} 条凭据、{} 条 TOTP 且无法恢复，请确认后重试",
+                cred_count, totp_count
+            )));
+        }
+    }
+
     if has_secrets && !state.vault_ready() {
         return Err(AppError::Auth(
             "备份文件包含凭据（密码/私钥），请先创建或解锁凭据保险库再导入".into(),

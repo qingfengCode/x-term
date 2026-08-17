@@ -50,6 +50,34 @@ pub struct TerminalSettings {
     /// 0 表示永不超时。作用于所有 SSH 连接（终端 / SFTP / 隧道 / AI 执行）。
     #[serde(default = "default_ssh_connect_timeout_secs")]
     pub ssh_connect_timeout_secs: u32,
+    /// 本地终端默认 Shell："cmd" | "powershell" | "git-bash"。
+    /// 「本地终端」按钮按此默认启动；本机不可用时回退 cmd。
+    #[serde(default = "default_local_shell")]
+    pub local_shell: String,
+    /// 桌面客户端选择（VNC / RDP 各自独立：程序内嵌或系统客户端）。
+    #[serde(default = "default_desktop_clients")]
+    pub desktop_clients: DesktopClients,
+    /// 内嵌 RDP 是否校验服务器证书（严格模式：系统信任根验证证书链）。
+    /// 默认 false：与官方 Gateway 客户端一致不校验（凭据经 CredSSP 保护）。
+    #[serde(default)]
+    pub rdp_verify_cert: bool,
+}
+
+/// 内嵌桌面客户端模式常量（终端页标签页打开，无需安装客户端）。
+pub const DESKTOP_CLIENT_APP: &str = "app";
+/// 系统桌面客户端模式常量（RDP: mstsc / VNC: vncviewer）。
+pub const DESKTOP_CLIENT_SYSTEM: &str = "system";
+
+/// 桌面客户端选择（VNC / RDP 各自独立）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopClients {
+    /// VNC 客户端模式："app"（程序内嵌 noVNC）| "system"（系统 vncviewer）。
+    #[serde(default = "default_vnc_client_mode")]
+    pub vnc: String,
+    /// RDP 客户端模式："app"（程序内嵌 IronRDP）| "system"（系统 mstsc）。
+    #[serde(default = "default_rdp_client_mode")]
+    pub rdp: String,
 }
 
 fn default_theme() -> String {
@@ -85,6 +113,31 @@ fn default_ssh_keepalive_secs() -> u32 {
 fn default_ssh_connect_timeout_secs() -> u32 {
     15
 }
+/// 默认本地终端 Shell：cmd 恒可用，作为兜底。
+fn default_local_shell() -> String {
+    "cmd".into()
+}
+/// 默认 VNC 客户端模式：程序内嵌（保持当前行为）。
+fn default_vnc_client_mode() -> String {
+    DESKTOP_CLIENT_APP.into()
+}
+/// 默认 RDP 客户端模式：系统 mstsc（保持当前行为；内嵌 RDP 为新增可选）。
+fn default_rdp_client_mode() -> String {
+    DESKTOP_CLIENT_SYSTEM.into()
+}
+/// 默认桌面客户端选择。
+fn default_desktop_clients() -> DesktopClients {
+    DesktopClients::default()
+}
+
+impl Default for DesktopClients {
+    fn default() -> Self {
+        Self {
+            vnc: default_vnc_client_mode(),
+            rdp: default_rdp_client_mode(),
+        }
+    }
+}
 
 impl Default for TerminalSettings {
     fn default() -> Self {
@@ -99,6 +152,9 @@ impl Default for TerminalSettings {
             ssh_idle_timeout_minutes: default_ssh_idle_timeout_minutes(),
             ssh_keepalive_secs: default_ssh_keepalive_secs(),
             ssh_connect_timeout_secs: default_ssh_connect_timeout_secs(),
+            local_shell: default_local_shell(),
+            desktop_clients: default_desktop_clients(),
+            rdp_verify_cert: false,
         }
     }
 }
@@ -450,11 +506,12 @@ fn default_command_whitelist() -> Vec<String> {
         "dig".into(),
         "host".into(),
         // 文本处理（管道一侧常用）
+        // 注意：不放 sed——`sed -i` 会静默修改文件，前缀匹配无法区分；
+        // 需要 sed 的用户可自行在设置页加入白名单（is_dangerous 仍会拦截 sed -i）。
         "grep".into(),
         "egrep".into(),
         "fgrep".into(),
         "awk".into(),
-        "sed".into(), // 注意：sed -i 会改文件，但默认按前缀放行；改文件类由 is_dangerous/人工把关
         // 服务状态（只读查询）
         "systemctl status".into(),
         "systemctl list-units".into(),
@@ -580,12 +637,23 @@ pub const SETTINGS_FILENAME: &str = "settings.json";
 
 /// 内部读取设置（命令实现共享）。
 ///
-/// 读取后调用 [`migrate_legacy_ai`] 把旧版顶层 AI 配置迁移到 `ssh_agent`。
+/// 首次从磁盘读取（含 [`migrate_legacy_ai`] 迁移）后写入 [`AppState::settings_cache`]，
+/// 后续命中缓存直接返回——终端/SFTP/隧道/AI 每次建连都读设置，避免重复读盘。
+/// `settings_save` 保存后通过 [`settings_invalidate_cache`] 失效缓存。
 pub fn settings_load_inner(state: &AppState) -> AppResult<Settings> {
+    if let Some(cached) = state.settings_cache.read().clone() {
+        return Ok(cached);
+    }
     let path = state.settings_path.as_path().join(SETTINGS_FILENAME);
     let mut settings = json_store::read_json_or_default::<Settings>(&path)?;
     migrate_legacy_ai(&mut settings.ai);
+    *state.settings_cache.write() = Some(settings.clone());
     Ok(settings)
+}
+
+/// 失效设置缓存（`settings_save` 成功写盘后调用，下次读取重新落盘）。
+pub fn settings_invalidate_cache(state: &AppState) {
+    *state.settings_cache.write() = None;
 }
 
 // ===========================================================================

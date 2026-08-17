@@ -97,9 +97,10 @@ async function duplicateSession(s: Session) {
 async function connectSession(s: Session) {
   const msg = ElMessage.info({ message: `正在连接 ${s.name}...`, duration: 0 });
   try {
-    await terminalsStore.open(s);
+    // 认证失败时 open 返回 false（已保留 tab 并弹手动认证框），不提示"已连接"。
+    const ok = await terminalsStore.open(s);
     msg.close();
-    ElMessage.success(`已连接 ${s.name}`);
+    if (ok) ElMessage.success(`已连接 ${s.name}`);
   } catch (e) {
     msg.close();
     ElMessage.error("连接失败: " + String(e));
@@ -344,7 +345,10 @@ async function onNodeDrop(
           class="recent-name"
           :style="s.color ? { borderLeftColor: s.color } : undefined"
           :title="`${s.username}@${s.host}:${s.port}`"
+          role="button"
+          tabindex="0"
           @click="connectSession(s)"
+          @keydown.enter.prevent="connectSession(s)"
           >{{ s.name }}</span
         >
         <el-dropdown

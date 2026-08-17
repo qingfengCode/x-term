@@ -5,8 +5,9 @@ export function forwardListRules(): Promise<ForwardRule[]> {
   return invoke<ForwardRule[]>("forward_list_rules");
 }
 
-export function forwardSaveRule(rule: ForwardRule): Promise<void> {
-  return invoke<void>("forward_save_rule", { rule });
+/** 保存转发规则，返回落库后的完整规则（含最终 id，后端可能规范化客户端 id）。 */
+export function forwardSaveRule(rule: ForwardRule): Promise<ForwardRule> {
+  return invoke<ForwardRule>("forward_save_rule", { rule });
 }
 
 export function forwardDeleteRule(id: string): Promise<void> {

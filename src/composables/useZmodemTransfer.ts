@@ -54,11 +54,11 @@ export function useZmodemTransfer(
 
   function sender(octets: number[]) {
     const bytes = new Uint8Array(octets);
-    writeChain = writeChain
-      .then(() => sendRaw(bytes))
-      .catch(() => {
-        /* 连接已断开：忽略，由 terminal:closed 事件兜底复位 */
-      });
+    writeChain = writeChain.then(() => sendRaw(bytes)).catch(() => {
+      // 连接已断开：中止当前会话，让传输流程尽快退出
+      // （否则下载的 accept 永久挂起 / 上传把整个文件读完后无意义重发）。
+      if (session && !session.aborted()) session.abort();
+    });
   }
 
   /** 等待已入队的发送全部完成（含 SSH 通道写确认）。 */
@@ -116,9 +116,11 @@ export function useZmodemTransfer(
     };
 
     // 攒批落盘：input 回调只压缓冲，flush 链串行写文件（避免并发写交错）。
+    // 注意 flush 链不吞错：写盘失败让 rejection 传播到 await flushChain，
+    // 由 catch 提示"下载失败"，避免磁盘满/权限错误时误报"已下载"。
     let buffer: Uint8Array[] = [];
     let buffered = 0;
-    let flushChain: Promise<void> = Promise.resolve();
+    let flushChain: Promise<unknown> = Promise.resolve();
     const flush = () => {
       if (!buffer.length) return;
       const all = new Uint8Array(buffered);
@@ -129,23 +131,48 @@ export function useZmodemTransfer(
       }
       buffer = [];
       buffered = 0;
-      flushChain = flushChain.then(() => handle.write(all)).then(() => {});
+      flushChain = flushChain.then(() => handle.write(all));
+    };
+
+    // 会话结束（连接断开/取消/对端中止）时立即结束 accept：zmodem.js 的
+    // accept promise 只在收到 ZEOF 时才 settle，不兜底会永久挂起、句柄不关。
+    const sessionEnded = new Promise<void>((resolve) => {
+      sess.on("session_end", () => resolve());
+    });
+
+    // 60 秒无数据视为远端挂死，主动中止（正常传输中 on_input 持续刷新计时）。
+    let timedOut = false;
+    let inactivityTimer: ReturnType<typeof setTimeout> | null = null;
+    const refreshTimer = () => {
+      if (inactivityTimer) clearTimeout(inactivityTimer);
+      inactivityTimer = setTimeout(() => {
+        timedOut = true;
+        if (!sess.aborted()) sess.abort();
+      }, 60_000);
     };
 
     try {
-      await offer.accept({
-        on_input: (octets) => {
-          const chunk = new Uint8Array(octets);
-          buffer.push(chunk);
-          buffered += chunk.length;
-          if (progress.value) progress.value.transferred += chunk.length;
-          if (buffered >= FLUSH_THRESHOLD) flush();
-        },
-      });
+      await Promise.race([
+        offer.accept({
+          on_input: (octets) => {
+            refreshTimer();
+            const chunk = new Uint8Array(octets);
+            buffer.push(chunk);
+            buffered += chunk.length;
+            if (progress.value) progress.value.transferred += chunk.length;
+            if (buffered >= FLUSH_THRESHOLD) flush();
+          },
+        }),
+        sessionEnded,
+      ]);
       // ZEOF 后还有最后一批缓冲未刷盘。
       flush();
       await flushChain;
-      if (!sess.aborted()) {
+      if (timedOut) {
+        ElMessage.error(`下载失败：${name}（远端 60 秒无数据，已中止）`);
+      } else if (sess.aborted()) {
+        ElMessage.warning(`下载已中止：${name}`);
+      } else {
         ElMessage.success(`已下载：${name}`);
       }
     } catch (err) {
@@ -154,6 +181,7 @@ export function useZmodemTransfer(
         ElMessage.error(`下载失败：${err instanceof Error ? err.message : String(err)}`);
       }
     } finally {
+      if (inactivityTimer) clearTimeout(inactivityTimer);
       progress.value = null;
       await handle.close().catch(() => {});
     }
@@ -223,8 +251,9 @@ export function useZmodemTransfer(
       if (!sess.aborted()) {
         console.warn("[zmodem] 上传失败", err);
         ElMessage.error(`上传失败：${err instanceof Error ? err.message : String(err)}`);
+        // abort() 二次调用会抛 already_aborted，先判 aborted 状态。
+        sess.abort();
       }
-      sess.abort();
     }
   }
 
@@ -253,8 +282,8 @@ export function useZmodemTransfer(
         console.warn("[zmodem] 会话异常", err);
         if (!sess.aborted()) {
           ElMessage.error(`传输异常：${err instanceof Error ? err.message : String(err)}`);
+          sess.abort();
         }
-        sess.abort();
       }
     })();
   }
@@ -286,11 +315,12 @@ export function useZmodemTransfer(
 
   /** 取消当前传输（发送 ZMODEM 中止序列，远端 rz/sz 会退出）。 */
   function cancel() {
-    session?.abort();
+    if (session && !session.aborted()) session.abort();
   }
 
-  /** 连接断开等场景的强制复位。 */
+  /** 连接断开等场景的强制复位：先中止会话让 zmodem.js 状态机退出，再清引用。 */
   function reset() {
+    if (session && !session.aborted()) session.abort();
     onSessionEnd();
   }
 

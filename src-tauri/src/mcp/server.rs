@@ -10,11 +10,11 @@
 //!
 //! # 安全
 //! - Bearer token 校验（`Authorization: Bearer <token>` 或 `?token=<token>`）。
-//! - 默认仅绑定 `127.0.0.1`。
+//! - 默认仅绑定 `127.0.0.1`；监听地址可由用户配置为 0.0.0.0 / 局域网 IP，
+//!   暴露风险由用户自行承担。
 //! - exec_* 工具调用必须经人工确认（见 [`crate::mcp::approval`]）。
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::AppHandle;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::error::{AppError, AppResult};
@@ -45,6 +45,14 @@ use crate::state::AppState;
 
 /// MCP 协议版本（与 Claude Desktop 等客户端协商用）。
 const PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// 资源上限（防御持 token 的恶意/故障客户端打爆本机资源）：
+/// - 并发工具调用数上限（每个调用最长可阻塞 5 分钟等人工确认 + 30s 执行）；
+/// - SSE 长连接数上限（每个连接占一个后台任务 + 一个 channel 缓冲）；
+/// - 每个 SSE 连接的待推送响应队列长度（客户端不读时限制内存堆积）。
+const MAX_CONCURRENT_CALLS: usize = 16;
+const MAX_SSE_CLIENTS: usize = 32;
+const SSE_CHANNEL_CAPACITY: usize = 256;
 
 // ===========================================================================
 // 全局服务端句柄（按 kind 管理：SSH MCP / DB MCP 各一个实例）
@@ -57,7 +65,7 @@ pub struct McpServerStatus {
     pub running: bool,
     pub host: String,
     pub port: u16,
-    /// 完整 SSE 入口 URL（如 `http://0.0.0.0:8765/sse`）。
+    /// 完整 SSE 入口 URL（如 `http://127.0.0.1:8765/sse`）。
     pub endpoint: String,
 }
 
@@ -109,7 +117,8 @@ pub fn mcp_server_status(kind: McpKind) -> McpServerStatus {
 /// 启动 MCP 服务端。
 ///
 /// 绑定 `host:port`，用 `token` 做 Bearer 校验。成功后后台 spawn 一个 axum 任务运行，
-/// 句柄存入全局 [`SERVERS`]。
+/// 句柄存入全局 [`SERVERS`]。host 允许任意监听地址（0.0.0.0 / 局域网 IP 亦可，
+/// 暴露风险由用户自行承担）。
 ///
 /// `bound_resource_id` 是该 MCP 绑定的资源 id（SSH 会话 id 或 DB profile id，或
 /// bound_source=terminal 时的终端实例 id），执行工具时按此 id 解析目标；
@@ -157,14 +166,15 @@ pub async fn start_mcp_server(
         "config"
     };
 
-    // 绑定监听端口。
-    let addr: SocketAddr = format!("{}:{}", host, port).parse().map_err(|e| {
-        AppError::InvalidInput(format!("非法 host:port ({}:{}): {}", host, port, e))
-    })?;
-    let listener = TcpListener::bind(addr).await.map_err(|e| {
+    // 绑定监听端口：填什么就 bind 什么（IP / 主机名均可，由系统解析；
+    // 地址不存在、不可用或端口被占用时启动失败并返回错误）。
+    let listener = TcpListener::bind((host.as_str(), port)).await.map_err(|e| {
         AppError::Io(std::io::Error::new(
             e.kind(),
-            format!("绑定 {}:{} 失败: {}", host, port, e),
+            format!(
+                "绑定 {}:{} 失败（地址不存在/不可用或端口被占用）: {}",
+                host, port, e
+            ),
         ))
     })?;
     let bound_addr = listener.local_addr().map_err(|e| {
@@ -225,6 +235,8 @@ pub async fn start_mcp_server(
         clients: Arc::new(Mutex::new(HashMap::new())),
         streamable_sessions: Arc::new(Mutex::new(HashMap::new())),
         sse_shutdown: sse_shutdown.clone(),
+        call_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_CALLS)),
+        sse_slots: Arc::new(Semaphore::new(MAX_SSE_CLIENTS)),
         log_path,
     });
 
@@ -358,7 +370,10 @@ pub fn rebind_mcp(kind: McpKind, bound_source: &str, resource_id: &str) -> AppRe
 // ===========================================================================
 
 /// 每个 SSE 连持有一个发送端：用于把 JSON-RPC 响应推回该连接。
-type SseSender = mpsc::UnboundedSender<String>;
+///
+/// 有界 channel（容量 [`SSE_CHANNEL_CAPACITY`]）：客户端不读时发送端
+/// `send().await` 阻塞而不是无限堆积内存。
+type SseSender = mpsc::Sender<String>;
 
 /// 路由共享状态。
 struct SharedState {
@@ -387,6 +402,10 @@ struct SharedState {
     streamable_sessions: Arc<Mutex<HashMap<String, ()>>>,
     /// 服务停止信号：`stop_mcp_server` 通知后所有 SSE 流结束（关闭长连接）。
     sse_shutdown: Arc<tokio::sync::Notify>,
+    /// 并发工具调用信号量：有界任务数（见 [`MAX_CONCURRENT_CALLS`]）。
+    call_slots: Arc<Semaphore>,
+    /// SSE 长连接数信号量：有界连接数（见 [`MAX_SSE_CLIENTS`]）。
+    sse_slots: Arc<Semaphore>,
     /// 执行日志文件路径（None = 未开启日志）。
     log_path: Option<PathBuf>,
 }
@@ -416,8 +435,26 @@ async fn sse_handler(
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
+    // SSE 连接数上限：恶意客户端可低成本建立海量 SSE 长连接（每个连接
+    // 占一个后台任务 + 一个 channel 缓冲），超限直接拒绝。
+    let sse_permit = match shared.sse_slots.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            log::warn!(
+                "[mcp] SSE 连接数已达上限（{}），拒绝新连接",
+                MAX_SSE_CLIENTS
+            );
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("SSE 连接数已达上限（{}）", MAX_SSE_CLIENTS),
+            )
+                .into_response();
+        }
+    };
+
     let session_id = uuid::Uuid::new_v4().to_string();
-    let (tx, rx) = mpsc::unbounded_channel::<String>();
+    // 有界 channel：客户端不读时响应堆积被限制在 SSE_CHANNEL_CAPACITY 条内。
+    let (tx, rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
 
     shared.clients.lock().insert(session_id.clone(), tx);
 
@@ -427,10 +464,11 @@ async fn sse_handler(
     let endpoint_url = format!("/messages?sessionId={}", session_id);
     let initial = Some(Event::default().event("endpoint").data(endpoint_url));
 
-    // cleanup guard：stream 被 drop 时（客户端断开）自动清理 clients map。
+    // cleanup guard：stream 被 drop 时（客户端断开）自动清理 clients map 并释放连接名额。
     let cleanup = SseCleanupGuard {
         clients: shared.clients.clone(),
         session_id: session_id.clone(),
+        _sse_permit: sse_permit,
     };
 
     // 把 mpsc 接收端转成 Stream<Event>：先发 initial，再持续从 rx 取消息；
@@ -482,10 +520,12 @@ async fn sse_handler(
 /// SSE 连接断开时的清理守卫。
 ///
 /// 当持有此结构体的 stream 被 drop（客户端断开连接或流结束），
-/// 自动从 `clients` map 中移除对应的 session 条目。
+/// 自动从 `clients` map 中移除对应的 session 条目，并释放 SSE 连接名额。
 struct SseCleanupGuard {
     clients: Arc<Mutex<HashMap<String, SseSender>>>,
     session_id: String,
+    /// 持有 SSE 连接名额，drop 时自动归还（见 [`SharedState::sse_slots`]）。
+    _sse_permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl Drop for SseCleanupGuard {
@@ -565,9 +605,27 @@ async fn messages_handler(
     };
 
     // 5. 异步执行并推送响应（不阻塞 POST 响应）。
+    // 并发信号量：每个调用最长可阻塞 5 分钟（等人工确认），无界 spawn 会被
+    // 恶意客户端低成本打爆任务数；满时直接回 busy 错误。
     let shared_clone = shared.clone();
     let req_clone = req.clone();
+    let slots = shared.call_slots.clone();
+    let sid_for_log = session_id.clone();
     tokio::spawn(async move {
+        let _permit = match slots.try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                let busy = JsonRpcResponse::error(
+                    req_clone.id.clone(),
+                    -32000,
+                    &format!("服务繁忙，请稍后重试（并发调用数已达上限 {}）", MAX_CONCURRENT_CALLS),
+                );
+                let _ = tx
+                    .send(serde_json::to_string(&busy).unwrap_or_default())
+                    .await;
+                return;
+            }
+        };
         let response = dispatch(&shared_clone, &req_clone).await;
         let json_str = match serde_json::to_string(&response) {
             Ok(s) => s,
@@ -576,8 +634,9 @@ async fn messages_handler(
                 return;
             }
         };
-        if tx.send(json_str).is_err() {
-            log::warn!("[mcp] SSE 会话 {} 已断开，响应未送达", session_id);
+        // 有界 channel：客户端不读时此处阻塞而非无限堆积内存。
+        if tx.send(json_str).await.is_err() {
+            log::warn!("[mcp] SSE 会话 {} 已断开，响应未送达", sid_for_log);
         }
     });
 
@@ -653,7 +712,19 @@ async fn mcp_handler(
         }
         log::info!("[mcp] Streamable HTTP 客户端初始化: session={}", session_id);
 
+        // 并发信号量：dispatch（tools/call 等）最长可阻塞 5 分钟，超限直接拒绝。
+        let permit = match shared.call_slots.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!("服务繁忙，请稍后重试（并发调用数已达上限 {}）", MAX_CONCURRENT_CALLS),
+                )
+                    .into_response();
+            }
+        };
         let response = dispatch(&shared, &req).await;
+        drop(permit);
         let json_body = serde_json::to_string(&response).unwrap_or_else(|_| "{}".into());
         let mut resp = (StatusCode::OK, json_body).into_response();
         resp.headers_mut().insert(
@@ -683,7 +754,20 @@ async fn mcp_handler(
     }
 
     // 6. 执行并返回 application/json。
+    // 并发信号量：与 initialize 分支一致，tools/call 最长阻塞 5 分钟（等人工确认），
+    // 超限直接返回 429，避免无界并发任务。
+    let permit = match shared.call_slots.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("服务繁忙，请稍后重试（并发调用数已达上限 {}）", MAX_CONCURRENT_CALLS),
+            )
+                .into_response();
+        }
+    };
     let response = dispatch(&shared, &req).await;
+    drop(permit);
     let json_body = serde_json::to_string(&response).unwrap_or_else(|_| "{}".into());
     let mut resp = (StatusCode::OK, json_body).into_response();
     resp.headers_mut().insert(
@@ -822,7 +906,11 @@ async fn handle_tool_call(shared: &Arc<SharedState>, name: &str, arguments: &Val
     let exec_detail = exec_detail_for(name, arguments);
 
     // 自动放行：跳过人工确认直接执行。
-    if is_auto_approved(shared.kind) {
+    // 例外：文件传输工具（upload_file / download_file）读写**本机任意路径**
+    // （localPath 不设沙箱是功能刚需——外部客户端要把本机任意文件上传到
+    // S3/SFTP），即使开启 auto_approve 也必须人工确认；确认卡片会展示完整的
+    // 本地/远端路径与目标，用户可见可控。
+    if is_auto_approved(shared.kind) && !matches!(name, "upload_file" | "download_file") {
         log::info!(
             "[mcp] {} 自动放行，直接执行（目标: {}）",
             shared.kind.label(),

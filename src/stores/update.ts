@@ -43,6 +43,8 @@ export const useUpdateStore = defineStore("update", () => {
   const skippedVersion = ref<string>(localStorage.getItem(SKIP_KEY) ?? "");
 
   let unlisten: UnlistenFn | null = null;
+  /** 下载防重入：并发调用 download 时第二次会覆盖 unlisten 变量，首次订阅永远无法解除。 */
+  let downloading = false;
 
   function fail(msg: string) {
     status.value = "error";
@@ -89,14 +91,21 @@ export const useUpdateStore = defineStore("update", () => {
   async function download() {
     const m = manifest.value;
     if (!m) return;
+    if (downloading) return; // 防重入：已在下载中，忽略重复调用
+    downloading = true;
     status.value = "downloading";
     error.value = null;
     progress.value = { received: 0, total: 0, percent: 0 };
-    // 订阅进度（下载结束后解绑）。
-    unlisten = await listen<UpdateProgressEvent>("update:progress", (e) => {
-      progress.value = e.payload;
-    });
     try {
+      // 订阅进度（下载结束后解绑）。listen 失败也要有兜底：
+      // 状态已是 downloading，listen 抛错不能产生未处理拒绝。
+      try {
+        unlisten = await listen<UpdateProgressEvent>("update:progress", (e) => {
+          progress.value = e.payload;
+        });
+      } catch (e) {
+        console.warn("更新进度事件订阅失败:", e);
+      }
       downloadedPath.value = await updateDownload(m);
       status.value = "downloaded";
     } catch (e) {
@@ -106,6 +115,7 @@ export const useUpdateStore = defineStore("update", () => {
         unlisten();
         unlisten = null;
       }
+      downloading = false;
     }
   }
 

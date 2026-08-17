@@ -10,7 +10,7 @@
 import { computed, reactive, ref, watch } from "vue";
 import { ElMessage } from "element-plus";
 import type { FormInstance, FormRules } from "element-plus";
-import { credentialSave } from "@/api/vault";
+import { credentialDelete, credentialSave } from "@/api/vault";
 import { fileAccountSave } from "@/api/fileBackend";
 import type { FileAccount } from "@/api/fileBackend";
 
@@ -120,6 +120,8 @@ async function submit() {
     return;
   }
   saving.value = true;
+  // 本次新建的凭据 id（编辑已有凭据时为 null）：账号保存失败时补偿删除，避免孤儿。
+  let createdCredId: string | null = null;
   try {
     const base = props.account;
     let credentialId = base?.credentialId ?? null;
@@ -135,11 +137,14 @@ async function submit() {
       return;
     }
     if (ak && sk) {
+      // 编辑时传原 id 原地更新，不再每次新建 credential（避免旧凭据累积成孤儿）。
       credentialId = await credentialSave({
+        id: base?.credentialId ?? undefined,
         name: `s3:${form.name.trim()}`,
         kind: KIND_S3_CREDENTIAL,
         value: JSON.stringify({ access_key: ak, secret_key: sk }),
       });
+      if (!base?.credentialId) createdCredId = credentialId;
     } else if (!credentialId) {
       // 新建且未填凭据：保存出来的账号第一次访问必失败（后端拿不到 AK/SK）。
       ElMessage.error("请填写 AccessKey 与 SecretKey");
@@ -166,6 +171,10 @@ async function submit() {
     emit("saved", account);
     close();
   } catch (e: unknown) {
+    // 新建场景下账号保存失败：补偿删除刚创建的凭据，避免孤儿。
+    if (createdCredId) {
+      await credentialDelete(createdCredId).catch(() => {});
+    }
     const msg = e instanceof Error ? e.message : String(e);
     ElMessage.error("保存失败：" + msg);
   } finally {

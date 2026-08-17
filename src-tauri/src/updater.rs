@@ -23,19 +23,37 @@ use tokio::io::AsyncWriteExt;
 use crate::error::{AppError, AppResult};
 use crate::events::{self, UpdateProgressEvent};
 
-/// 清单请求 / 下载分块读取的超时上限。
+/// 清单请求的总超时上限（含响应体读取；清单体积很小，30s 足够）。
+/// 安装包下载**不能**用总超时——大文件在慢速网络下需要数分钟，总超时会把
+/// 下载强制中断，见 [`DOWNLOAD_READ_TIMEOUT`] 与 [`DOWNLOAD_HTTP`]。
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 安装包下载的读闲置超时：两次收到数据之间的最大间隔。
+/// 只限制"连接建立时间 + 数据闲置时间"，不限制总下载时长，
+/// 既防服务器挂起（slowloris），又不误杀慢速大文件下载。
+const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 进度事件节流：累计下载超过该字节数才再次 emit（避免刷屏）。
 const PROGRESS_EMIT_INTERVAL: u64 = 128 * 1024;
 
-/// 全局复用的 HTTP 客户端（rustls，连接池复用）。
+/// 清单请求的 HTTP 客户端（rustls，连接池复用；小响应，总超时合理）。
 static HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
     reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .user_agent(concat!("X-Term/", env!("CARGO_PKG_VERSION")))
         .build()
         .expect("构建 reqwest 客户端失败")
+});
+
+/// 安装包下载专用客户端：只设连接超时与读闲置超时，**不设总超时**——
+/// 几十 MB 的安装包在普通网速下下载必然超过 30s，总超时会使更新功能不可用。
+static DOWNLOAD_HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(REQUEST_TIMEOUT)
+        .read_timeout(DOWNLOAD_READ_TIMEOUT)
+        .user_agent(concat!("X-Term/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .expect("构建 reqwest 下载客户端失败")
 });
 
 // ===========================================================================
@@ -140,7 +158,7 @@ pub async fn download(
     // 临时文件：下载完整 + 校验通过后再原子改名，避免半成品被当作可用安装包。
     let tmp = dest.with_extension("part");
 
-    let resp = HTTP
+    let resp = DOWNLOAD_HTTP
         .get(&manifest.url)
         .send()
         .await

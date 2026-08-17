@@ -32,6 +32,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { homeDir, join, sep as pathSep, dirname, basename } from "@tauri-apps/api/path";
 import { useSessionsStore } from "@/stores/sessions";
 import { useTransferStore } from "@/stores/transfer";
+import { formatSize } from "@/utils/format";
 import type { Session, FileEntry } from "@/api/types";
 import {
   sftpList,
@@ -404,6 +405,11 @@ async function connectSftp() {
     ElMessage.warning("请先选择目标会话");
     return;
   }
+  // 已连接时先关闭旧连接，避免后端 SSH 连接与 sftp_sessions 注册条目泄漏
+  // （反复"重连"会不断累积旧连接）。
+  if (sftpId.value) {
+    await closeSftpCore();
+  }
   connecting.value = true;
   const msg = ElMessage.info({
     message: "正在打开 SFTP 连接...",
@@ -595,6 +601,8 @@ const remotePaneRef = ref<HTMLElement | null>(null);
 const dragOver = ref(false);
 let dragDropUnlisten: UnlistenFn | null = null;
 let transferDoneUnlisten: UnlistenFn | null = null;
+// 组件销毁标志：监听注册未 resolve 前组件可能已卸载，resolve 后据此立即反订阅。
+let unmounted = false;
 
 // --- 面板间拖拽传输（HTML5 DnD） ---
 const paneDragOver = ref<"local" | "remote" | null>(null);
@@ -756,14 +764,7 @@ async function onPaneDrop(target: "local" | "remote", e: DragEvent) {
 // ---------------------------------------------------------------------------
 function humanSize(n: number): string {
   if (!n || n <= 0) return "-";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let v = n;
-  let i = 0;
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${units[i]}`;
+  return formatSize(n);
 }
 
 function formatTime(s: string | null): string {
@@ -795,7 +796,14 @@ const selectedSession = computed<Session | undefined>(() =>
 // ---------------------------------------------------------------------------
 onMounted(async () => {
   await initSep();
-  if (!sessionsStore.loaded) await sessionsStore.load();
+  if (!sessionsStore.loaded) {
+    try {
+      await sessionsStore.load();
+    } catch (e) {
+      // 会话列表 IPC 失败不阻断页面：用户仍可浏览本地目录。
+      console.warn("加载会话列表失败:", e);
+    }
+  }
   // 默认选第一个会话 + 默认进入本地家目录。
   if (sessionsStore.sessions.length > 0 && !selectedSessionId.value) {
     selectedSessionId.value = sessionsStore.sessions[0].id;
@@ -807,22 +815,37 @@ onMounted(async () => {
     ElMessage.error("无法读取本地家目录: " + String(e));
   }
   // 注册 Tauri 原生拖拽事件（获取 OS 文件真实路径，HTML5 drop 不暴露路径）。
-  dragDropUnlisten = await getCurrentWebview().onDragDropEvent((e) => {
-    void handleDragDrop(e as unknown as Parameters<typeof handleDragDrop>[0]);
-  });
+  try {
+    const fn = await getCurrentWebview().onDragDropEvent((e) => {
+      if (unmounted) return;
+      void handleDragDrop(e as unknown as Parameters<typeof handleDragDrop>[0]);
+    });
+    if (unmounted) fn();
+    else dragDropUnlisten = fn;
+  } catch (e) {
+    console.error("拖拽事件注册失败:", e);
+  }
   // 传输完成后自动刷新对应侧：upload→刷新远程列表，download→刷新本地列表。
-  transferDoneUnlisten = await listen<{ taskId: string }>("transfer:done", (e) => {
-    const task = transfer.tasks.find((t) => t.id === e.payload.taskId);
-    if (!task) return;
-    if (task.direction === "upload" && sftpId.value && remotePath.value) {
-      void loadRemote(remotePath.value);
-    } else if (task.direction === "download" && localPath.value) {
-      void loadLocal(localPath.value);
-    }
-  });
+  try {
+    const fn = await listen<{ taskId: string }>("transfer:done", (e) => {
+      if (unmounted) return;
+      const task = transfer.tasks.find((t) => t.id === e.payload.taskId);
+      if (!task) return;
+      if (task.direction === "upload" && sftpId.value && remotePath.value) {
+        void loadRemote(remotePath.value);
+      } else if (task.direction === "download" && localPath.value) {
+        void loadLocal(localPath.value);
+      }
+    });
+    if (unmounted) fn();
+    else transferDoneUnlisten = fn;
+  } catch (e) {
+    console.error("传输完成事件订阅失败:", e);
+  }
 });
 
 onBeforeUnmount(() => {
+  unmounted = true;
   if (dragDropUnlisten) {
     dragDropUnlisten();
     dragDropUnlisten = null;

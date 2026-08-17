@@ -18,6 +18,8 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { setWorkspaceDir } from "@/api/ai";
 import * as backupApi from "@/api/backup";
 import type { BackupInfo } from "@/api/backup";
+import { localTerminalShells } from "@/api/local";
+import type { LocalShellInfo } from "@/api/local";
 import { useSettingsStore } from "@/stores/settings";
 import { useUpdateStore } from "@/stores/update";
 import { useVaultStore } from "@/stores/vault";
@@ -27,6 +29,7 @@ import {
   APP_SHORTCUT_METAS,
   RUN_MODE_OPTIONS,
   SQL_MODE_OPTIONS,
+  DESKTOP_CLIENT_MODE_OPTIONS,
   defaultAppShortcuts,
 } from "@/api/types";
 import { eventToCombo, isModifierOnly } from "@/utils/shortcut";
@@ -180,8 +183,18 @@ function resetAppShortcuts() {
   Object.assign(appForm, defaultAppShortcuts());
 }
 
-// 终端表单（与 store 解耦的本地副本，点"应用"才写回）
-const termForm = reactive<TerminalSettings>({ ...settings.terminal });
+// 终端表单（与 store 解耦的本地副本，点"应用"才写回；desktopClients 嵌套对象单独拷贝，
+// 避免改下拉直接改到 store 里，导致"重置"失效）
+const termForm = reactive<TerminalSettings>({
+  ...settings.terminal,
+  desktopClients: { ...settings.terminal.desktopClients },
+});
+
+/** 本机可用的本地 shell 列表（本地终端默认 Shell 下拉；不可用项隐藏）。 */
+const localShells = ref<LocalShellInfo[]>([]);
+
+/** 可选的本地 shell（过滤掉本机不可用的）。 */
+const localShellOptions = computed(() => localShells.value.filter((s) => s.available));
 
 /** 终端字体预设（等宽字体，value 为完整 font-family 栈，label 为显示名）。 */
 const FONT_PRESETS: { label: string; value: string }[] = [
@@ -482,6 +495,7 @@ async function applyTerminal() {
 
 function resetTerminal() {
   Object.assign(termForm, settings.terminal);
+  termForm.desktopClients = { ...settings.terminal.desktopClients };
   toggleDarkClass(termForm.theme);
 }
 
@@ -563,11 +577,18 @@ onMounted(async () => {
     }
   }
   Object.assign(termForm, settings.terminal);
+  termForm.desktopClients = { ...settings.terminal.desktopClients };
   toggleDarkClass(termForm.theme);
   // 同步 SSH 命令白名单到 textarea 文本（每行一条）。
   whitelistText.value = settings.sshAgent.commandWhitelist.join("\n");
   // 同步应用快捷键到本地副本。
   Object.assign(appForm, defaultAppShortcuts(), settings.appShortcuts);
+  // 检测本机可用的本地 shell（本地终端默认 Shell 下拉）。
+  try {
+    localShells.value = await localTerminalShells();
+  } catch {
+    /* 检测失败则下拉为空，仅影响展示 */
+  }
 });
 
 // --- SSH 智能体：命令白名单编辑 -------------------------------------------
@@ -702,6 +723,11 @@ async function doImport() {
   }
   if (importMode.value === "overwrite") {
     lines.push("⚠ 覆盖模式：将清空本机现有会话/凭据等全部数据后写入，且不可撤销！");
+    if (!info.hasCredentials && !info.hasTotp) {
+      lines.push(
+        "⚠ 该备份不含凭据与 TOTP：覆盖导入将清空本机全部凭据与 TOTP，且无法从本备份恢复！",
+      );
+    }
   }
 
   try {
@@ -722,9 +748,31 @@ async function doImport() {
     return; // 用户取消
   }
 
+  // 覆盖模式 + 备份不含凭据/TOTP：本机凭据将被清空且无法从备份恢复，
+  // 需要二次显式确认（对应后端 force=true 门禁）。
+  let force = false;
+  if (importMode.value === "overwrite" && !info.hasCredentials && !info.hasTotp) {
+    try {
+      await ElMessageBox.confirm(
+        "该备份不含任何凭据与 TOTP（导出时保险库可能未解锁）。\n\n" +
+          "覆盖导入会清空本机现有的全部凭据与 TOTP，且无法从该备份恢复。\n\n" +
+          "确认仍要清空并继续导入吗？",
+        "缺少凭据的备份",
+        {
+          type: "error",
+          confirmButtonText: "确认清空并导入",
+          cancelButtonText: "取消",
+        },
+      );
+      force = true;
+    } catch {
+      return; // 用户取消
+    }
+  }
+
   importing.value = true;
   try {
-    const summary = await backupApi.backupImport(picked, pwd, importMode.value);
+    const summary = await backupApi.backupImport(picked, pwd, importMode.value, force);
     // 刷新本地状态：设置 + MCP 配置（会话/数据库等列表在各自页面下次进入时重新加载）。
     await settings.load();
     await mcpStore.loadAll();
@@ -940,6 +988,47 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
                 />
                 <span class="unit-hint">秒</span>
                 <HelpTip content="0 表示永不超时" />
+              </el-form-item>
+
+              <el-form-item label="本地终端默认 Shell">
+                <el-select v-model="termForm.localShell" style="width: 160px">
+                  <el-option
+                    v-for="s in localShellOptions"
+                    :key="s.id"
+                    :label="s.label"
+                    :value="s.id"
+                  />
+                </el-select>
+                <HelpTip content="「本地终端」按钮默认启动的 Shell（本机不可用的 Shell 不显示）" />
+              </el-form-item>
+
+              <el-form-item label="VNC 客户端">
+                <el-select v-model="termForm.desktopClients.vnc" style="width: 160px">
+                  <el-option
+                    v-for="m in DESKTOP_CLIENT_MODE_OPTIONS"
+                    :key="m.value"
+                    :label="m.label"
+                    :value="m.value"
+                  />
+                </el-select>
+                <HelpTip content="程序内嵌：终端页标签页内打开（无需安装客户端）；系统客户端：调用本机 vncviewer" />
+              </el-form-item>
+
+              <el-form-item label="RDP 客户端">
+                <el-select v-model="termForm.desktopClients.rdp" style="width: 160px">
+                  <el-option
+                    v-for="m in DESKTOP_CLIENT_MODE_OPTIONS"
+                    :key="m.value"
+                    :label="m.label"
+                    :value="m.value"
+                  />
+                </el-select>
+                <HelpTip content="程序内嵌：终端页标签页内打开（需用户名和密码）；系统客户端：调用 Windows 自带 mstsc" />
+              </el-form-item>
+
+              <el-form-item label="RDP 证书校验">
+                <el-switch v-model="termForm.rdpVerifyCert" />
+                <HelpTip content="程序内嵌连接时是否校验服务器证书链（严格模式用系统信任根验证）。默认关闭，与官方 mstsc 直连行为一致" />
               </el-form-item>
             </el-form>
           </div>
@@ -1350,14 +1439,14 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
         <el-dialog
           v-model="providerDialogVisible"
           :title="editingIndex !== null ? '编辑 Provider' : '添加 Provider'"
-          width="560px"
+          width="620px"
           :close-on-click-modal="false"
         >
           <el-form
             ref="providerFormRef"
             :model="providerForm"
             :rules="providerRules"
-            label-width="100px"
+            label-width="120px"
             label-position="right"
           >
             <el-form-item label="类型" prop="kind">
@@ -1394,89 +1483,96 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
 
             <el-divider content-position="left">模型参数</el-divider>
 
-            <el-form-item prop="maxOutput">
-              <template #label>
-                最大输出
-                <HelpTip content="tokens（请求体 max_tokens）" />
-              </template>
-              <el-input-number
-                v-model="providerForm.maxOutput"
-                :min="1"
-                :max="1000000"
-                :step="1024"
-                style="width: 180px"
-              />
-            </el-form-item>
+            <div class="provider-params-grid">
+              <el-form-item prop="contextWindow">
+                <template #label>
+                  上下文大小
+                  <HelpTip content="tokens，超出部分的历史消息会被裁剪" />
+                </template>
+                <el-input-number
+                  v-model="providerForm.contextWindow"
+                  :min="1"
+                  :max="10000000"
+                  :step="4096"
+                  :controls="false"
+                  style="width: 100%"
+                />
+              </el-form-item>
 
-            <el-form-item prop="contextWindow">
-              <template #label>
-                上下文大小
-                <HelpTip content="tokens，超出部分的历史消息会被裁剪" />
-              </template>
-              <el-input-number
-                v-model="providerForm.contextWindow"
-                :min="1"
-                :max="10000000"
-                :step="4096"
-                style="width: 180px"
-              />
-            </el-form-item>
+              <el-form-item prop="maxOutput">
+                <template #label>
+                  最大输出
+                  <HelpTip content="tokens（请求体 max_tokens）" />
+                </template>
+                <el-input-number
+                  v-model="providerForm.maxOutput"
+                  :min="1"
+                  :max="1000000"
+                  :step="1024"
+                  :controls="false"
+                  style="width: 100%"
+                />
+              </el-form-item>
 
-            <el-form-item prop="maxToolCalls">
-              <template #label>
-                工具调用数
-                <HelpTip content="智能体模式单次对话的最大工具调用数" />
-              </template>
-              <el-input-number
-                v-model="providerForm.maxToolCalls"
-                :min="1"
-                :max="1000"
-                style="width: 180px"
-              />
-            </el-form-item>
+              <el-form-item prop="maxToolCalls">
+                <template #label>
+                  工具调用数
+                  <HelpTip content="智能体模式单次对话的最大工具调用数" />
+                </template>
+                <el-input-number
+                  v-model="providerForm.maxToolCalls"
+                  :min="1"
+                  :max="1000"
+                  :controls="false"
+                  style="width: 100%"
+                />
+              </el-form-item>
 
-            <el-form-item prop="temperature">
-              <template #label>
-                温度
-                <HelpTip content="采样温度，留空表示不发送" />
-              </template>
-              <el-input-number
-                v-model="providerForm.temperature"
-                :min="0"
-                :max="2"
-                :step="0.1"
-                :precision="1"
-                :controls="false"
-                placeholder="留空由服务端默认"
-                style="width: 180px"
-              />
-            </el-form-item>
+              <el-form-item prop="temperature">
+                <template #label>
+                  温度
+                  <HelpTip content="采样温度，留空表示不发送" />
+                </template>
+                <el-input-number
+                  v-model="providerForm.temperature"
+                  :min="0"
+                  :max="2"
+                  :step="0.1"
+                  :precision="1"
+                  :controls="false"
+                  placeholder="留空由服务端默认"
+                  style="width: 100%"
+                />
+              </el-form-item>
 
-            <el-form-item prop="connectTimeoutSecs">
-              <template #label>
-                建连超时
-                <HelpTip content="秒，DNS 解析/建连最长等待" />
-              </template>
-              <el-input-number
-                v-model="providerForm.connectTimeoutSecs"
-                :min="1"
-                :max="3600"
-                style="width: 180px"
-              />
-            </el-form-item>
+              <el-form-item prop="connectTimeoutSecs">
+                <template #label>
+                  建连超时
+                  <HelpTip content="秒，DNS 解析/建连最长等待" />
+                </template>
+                <el-input-number
+                  v-model="providerForm.connectTimeoutSecs"
+                  :min="1"
+                  :max="3600"
+                  :controls="false"
+                  style="width: 100%"
+                />
+              </el-form-item>
 
-            <el-form-item prop="readTimeoutSecs">
-              <template #label>
-                读取超时
-                <HelpTip content="秒，流式响应间隔最长等待；长思考模型需调大" />
-              </template>
-              <el-input-number
-                v-model="providerForm.readTimeoutSecs"
-                :min="1"
-                :max="3600"
-                style="width: 180px"
-              />
-            </el-form-item>
+              <el-form-item prop="readTimeoutSecs">
+                <template #label>
+                  读取超时
+                  <HelpTip content="秒，流式响应间隔最长等待；长思考模型需调大" />
+                </template>
+                <el-input-number
+                  v-model="providerForm.readTimeoutSecs"
+                  :min="1"
+                  :max="3600"
+                  :controls="false"
+                  style="width: 100%"
+                />
+              </el-form-item>
+            </div>
           </el-form>
 
           <template #footer>
@@ -1799,6 +1895,28 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
 .form-hint {
   margin-left: 10px;
   font-size: 12px;
+}
+
+/* Provider 弹窗：模型参数两列并排（上下文/最大输出、工具调用数/温度、建连超时/读取超时）。 */
+.provider-params-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  column-gap: 16px;
+}
+.provider-params-grid :deep(.el-form-item) {
+  margin-bottom: 14px;
+}
+.provider-params-grid :deep(.el-form-item__label) {
+  white-space: nowrap;
+  /* el-form-item__label 默认 align-items: flex-start，问号图标会被顶到顶部；
+     改为 center 让图标与文字垂直居中对齐 */
+  align-items: center;
+}
+/* el-tooltip 触发器 span 默认行高 32px 且图标基线对齐，会产生偏移；
+   改成 inline-flex 后图标以自身高度居中 */
+.provider-params-grid :deep(.el-tooltip__trigger) {
+  display: inline-flex;
+  align-items: center;
 }
 
 /* 模型列表中的「多模态」标签。 */

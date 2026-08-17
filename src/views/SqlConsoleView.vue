@@ -1153,20 +1153,30 @@ async function deleteProfile() {
 // 仅命令行模式把 AI 执行的 SQL + 结构化结果回显进**活动标签**的输出流。
 // 后端在 sql_agent.terminal_visualization 开启时 emit；代码模式不回显。
 let unlistenSqlResult: (() => void) | null = null;
+// 组件销毁标志：listen 未 resolve 前组件可能已卸载，resolve 后据此立即反订阅。
+let unmounted = false;
 
 // --- 生命周期 ---------------------------------------------------------------
 onMounted(async () => {
   await loadProfiles();
   window.addEventListener("click", closeTabMenu);
   // 订阅 ai:sql_result（exec_sql 终端可视化回显到活动标签）。
-  unlistenSqlResult = await listen<AiSqlResultEvent>("ai:sql_result", (e) => {
-    // 仅命令行模式回显（代码模式有自己的结果区，不混入输出流）。
-    const s = activeState.value;
-    if (s && s.editorMode.value === "console") s.console.pushExternal(e.payload);
-  });
+  try {
+    const fn = await listen<AiSqlResultEvent>("ai:sql_result", (e) => {
+      if (unmounted) return;
+      // 仅命令行模式回显（代码模式有自己的结果区，不混入输出流）。
+      const s = activeState.value;
+      if (s && s.editorMode.value === "console") s.console.pushExternal(e.payload);
+    });
+    if (unmounted) fn();
+    else unlistenSqlResult = fn;
+  } catch (e) {
+    console.error("SQL 结果事件订阅失败:", e);
+  }
 });
 
 onBeforeUnmount(() => {
+  unmounted = true;
   window.removeEventListener("click", closeTabMenu);
   if (unlistenSqlResult) {
     unlistenSqlResult();

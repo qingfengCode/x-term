@@ -9,6 +9,7 @@ import { computed, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { Download, Upload, Delete, FolderOpened, CaretBottom, CaretTop } from "@element-plus/icons-vue";
 import { useTransferStore, type TransferTask } from "@/stores/transfer";
+import { formatSize } from "@/utils/format";
 
 const transfer = useTransferStore();
 
@@ -54,14 +55,7 @@ function progressStatus(t: TransferTask): "" | "success" | "exception" | "warnin
 // 人类可读大小。
 function humanSize(n: number): string {
   if (!n || n <= 0) return "-";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let v = n;
-  let i = 0;
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${units[i]}`;
+  return formatSize(n);
 }
 
 async function removeTask(t: TransferTask) {

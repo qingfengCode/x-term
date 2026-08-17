@@ -15,8 +15,8 @@ const props = withDefaults(
     visible: boolean;
     /** 传入则编辑，否则新建。新建时 domain 必填。 */
     skill?: SkillConfig | null;
-    /** 所属域："ssh" | "db"。新建时用；编辑时从 skill 取。 */
-    domain?: "ssh" | "db";
+    /** 所属域："ssh" | "db" | "desktop"。新建时用；编辑时从 skill 取。 */
+    domain?: "ssh" | "db" | "desktop";
   }>(),
   { skill: null, domain: "ssh" },
 );
@@ -30,7 +30,7 @@ interface FormState {
   title: string;
   content: string;
   enabled: boolean;
-  domain: "ssh" | "db";
+  domain: "ssh" | "db" | "desktop";
 }
 
 const formRef = ref<FormInstance>();
@@ -107,8 +107,11 @@ function submit() {
         <el-input v-model="form.title" placeholder="如：MySQL 慢查询排查 / 磁盘清理流程" />
       </el-form-item>
       <el-form-item label="所属域">
-        <el-tag size="small" :type="form.domain === 'ssh' ? 'primary' : 'success'">
-          {{ form.domain === "ssh" ? "终端助手" : "SQL 助手" }}
+        <el-tag
+          size="small"
+          :type="form.domain === 'ssh' ? 'primary' : form.domain === 'db' ? 'success' : 'warning'"
+        >
+          {{ form.domain === "ssh" ? "终端助手" : form.domain === "db" ? "SQL 助手" : "桌面助手" }}
         </el-tag>
       </el-form-item>
       <el-form-item label="内容" prop="content">

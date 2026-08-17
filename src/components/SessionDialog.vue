@@ -276,18 +276,27 @@ async function handleSave() {
 
     let credentialId = existed?.credentialId ?? null;
     let keyPath: string | null = null;
+    // 凭据的创建/清理统一延后到"会话保存成功"之后执行：
+    // 若先删旧凭据/建新凭据再保存会话，后者失败会造成旧凭据已删而会话
+    // 仍指向旧 id（或新凭据成孤儿）。新建凭据的 id 由前端生成并预填，
+    // 保证会话先行落库时 credentialId 已确定。
+    let applyCredentialOps: (() => Promise<void>) | null = null;
 
     if (form.auth === "password") {
       if (form.password) {
         // 填了新密码 → 原地更新原密码凭据（传 id 不产生孤儿）；若原先是密钥
         // 认证（切换到密码），新建后清掉遗留的密钥凭据。
-        credentialId = await credentialSave({
-          id: origPasswordId.value ?? undefined,
-          name: `${form.name} · password`,
-          kind: KIND_PASSWORD,
-          value: form.password,
-        });
-        await deleteCredentialQuiet(origKeyId.value);
+        credentialId = origPasswordId.value ?? crypto.randomUUID();
+        const newId = credentialId;
+        applyCredentialOps = async () => {
+          await credentialSave({
+            id: newId,
+            name: `${form.name} · password`,
+            kind: KIND_PASSWORD,
+            value: form.password,
+          });
+          await deleteCredentialQuiet(origKeyId.value);
+        };
       } else {
         // 编辑留空表示不修改（切换认证方式后留空已被表单校验拦截）。
         credentialId = origPasswordId.value;
@@ -295,21 +304,27 @@ async function handleSave() {
     } else if (form.auth === "keyText") {
       if (form.keyText.trim()) {
         // 同上：原地更新原密钥凭据；从密码切换到文本密钥时清掉密码凭据。
-        credentialId = await credentialSave({
-          id: origKeyId.value ?? undefined,
-          name: `${form.name} · private_key`,
-          kind: KIND_PRIVATE_KEY_TEXT,
-          value: form.keyText,
-          passphrase: form.passphrase || undefined,
-        });
-        await deleteCredentialQuiet(origPasswordId.value);
+        credentialId = origKeyId.value ?? crypto.randomUUID();
+        const newId = credentialId;
+        applyCredentialOps = async () => {
+          await credentialSave({
+            id: newId,
+            name: `${form.name} · private_key`,
+            kind: KIND_PRIVATE_KEY_TEXT,
+            value: form.keyText,
+            passphrase: form.passphrase || undefined,
+          });
+          await deleteCredentialQuiet(origPasswordId.value);
+        };
       } else {
         credentialId = origKeyId.value;
       }
     } else if (form.auth === "keyFile") {
       keyPath = form.keyPath || null;
       // 文件密钥不关联 vault 凭据：清掉原密码/文本密钥凭据，避免遗留。
-      await deleteCredentialQuiet(origPasswordId.value ?? origKeyId.value);
+      applyCredentialOps = async () => {
+        await deleteCredentialQuiet(origPasswordId.value ?? origKeyId.value);
+      };
       credentialId = null;
     }
 
@@ -334,6 +349,15 @@ async function handleSave() {
     };
 
     await sessionsStore.saveSession(session);
+    // 会话已保存成功，再落地凭据变更（新建/原地更新 + 清理废弃凭据）。
+    if (applyCredentialOps) {
+      try {
+        await applyCredentialOps();
+      } catch (e) {
+        // 凭据落地失败仅提示：会话本身已保存，凭据可再编辑一次修复。
+        ElMessage.warning("会话已保存，但凭据更新失败：" + String(e));
+      }
+    }
     emit("saved", session);
     ElMessage.success(isEdit.value ? "已更新会话" : "已创建会话");
     close();

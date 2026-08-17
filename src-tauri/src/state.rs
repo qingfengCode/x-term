@@ -17,6 +17,7 @@ use std::sync::Arc;
 use parking_lot::{Mutex, RwLock};
 
 use crate::error::{AppError, AppResult};
+use crate::local::LocalSession;
 use crate::ssh::client::ClientHandler;
 use crate::ssh::session::SshSession;
 use crate::ssh::sftp::SftpSession;
@@ -25,11 +26,12 @@ use crate::storage::db::DbPool;
 use crate::storage::secure::CredentialVault;
 use crate::telnet::TelnetSession;
 
-/// 终端会话统一枚举（SSH / Telnet 共用同一 terminals map）。
+/// 终端会话统一枚举（SSH / Telnet / 本地 shell 共用同一 terminals map）。
 /// terminal_write / terminal_resize / disconnect_session 按 variant 分派。
 pub enum TerminalSession {
     Ssh(SshSession),
     Telnet(TelnetSession),
+    Local(LocalSession),
 }
 
 impl TerminalSession {
@@ -37,16 +39,18 @@ impl TerminalSession {
         match self {
             TerminalSession::Ssh(s) => s.write(data),
             TerminalSession::Telnet(s) => s.write(data),
+            TerminalSession::Local(s) => s.write(data),
         }
     }
 
     /// 带写完成确认的写入（背压用）。
     ///
-    /// SSH 会话返回 reader 的写确认 receiver；Telnet 写是同步的，
+    /// SSH / 本地会话返回后台任务的写确认 receiver；Telnet 写是同步的，
     /// 直接返回已完成的 receiver。见 [`SshSession::write_with_ack`]。
     pub fn write_with_ack(&self, data: Vec<u8>) -> AppResult<tokio::sync::oneshot::Receiver<()>> {
         match self {
             TerminalSession::Ssh(s) => s.write_with_ack(data),
+            TerminalSession::Local(s) => s.write_with_ack(data),
             TerminalSession::Telnet(s) => {
                 s.write(data)?;
                 let (tx, rx) = tokio::sync::oneshot::channel();
@@ -59,12 +63,14 @@ impl TerminalSession {
         match self {
             TerminalSession::Ssh(s) => s.resize(cols, rows),
             TerminalSession::Telnet(s) => s.resize(cols, rows),
+            TerminalSession::Local(s) => s.resize(cols, rows),
         }
     }
     pub fn snapshot(&self, max_bytes: usize) -> String {
         match self {
             TerminalSession::Ssh(s) => s.snapshot(max_bytes),
             TerminalSession::Telnet(s) => s.snapshot(max_bytes),
+            TerminalSession::Local(s) => s.snapshot(max_bytes),
         }
     }
     /// 取终端输出的完整快照（整个环形缓冲），供 AI 可视化命令哨兵检测/截取。
@@ -72,6 +78,7 @@ impl TerminalSession {
         match self {
             TerminalSession::Ssh(s) => s.full_snapshot(),
             TerminalSession::Telnet(s) => s.full_snapshot(),
+            TerminalSession::Local(s) => s.full_snapshot(),
         }
     }
     /// 累计写入字节数（不受环形截断影响），判断"输出是否仍在增长"用。
@@ -79,24 +86,38 @@ impl TerminalSession {
         match self {
             TerminalSession::Ssh(s) => s.total_output_bytes(),
             TerminalSession::Telnet(s) => s.total_output_bytes(),
+            TerminalSession::Local(s) => s.total_output_bytes(),
         }
     }
     pub fn output_offset(&self) -> usize {
         match self {
             TerminalSession::Ssh(s) => s.output_offset(),
             TerminalSession::Telnet(s) => s.output_offset(),
+            TerminalSession::Local(s) => s.output_offset(),
+        }
+    }
+    /// 取 `since_total` 累计字节之后的输出窗口（AI 可视化命令截取新增输出用）。
+    /// 返回 (文本, 是否溢出窗口容量)。
+    pub fn snapshot_after(&self, since_total: usize) -> (String, bool) {
+        match self {
+            TerminalSession::Ssh(s) => s.snapshot_after(since_total),
+            TerminalSession::Telnet(s) => s.snapshot_after(since_total),
+            TerminalSession::Local(s) => s.snapshot_after(since_total),
         }
     }
     pub fn id(&self) -> &str {
         match self {
             TerminalSession::Ssh(s) => &s.id,
             TerminalSession::Telnet(s) => &s.id,
+            TerminalSession::Local(s) => &s.id,
         }
     }
     pub fn session_config_id(&self) -> &str {
         match self {
             TerminalSession::Ssh(s) => &s.session_config_id,
             TerminalSession::Telnet(s) => &s.session_config_id,
+            // 本地 shell 不关联任何会话配置。
+            TerminalSession::Local(_) => "",
         }
     }
 }
@@ -169,6 +190,24 @@ pub struct AppState {
         >,
     >,
 
+    /// 待前端执行的 AI 桌面工具（desktop_*，RDP 控制）：toolCallId -> (requestId, oneshot)。
+    ///
+    /// RDP 会话（IronRDP WASM）活在前端，桌面工具的后端侧无法执行——编排循环 emit
+    /// `ai:tool_call` 后阻塞在此，等待前端通过 `ai_desktop_tool_respond` 回传
+    /// 「批准 + 执行结果」一体的回执。附带 requestId，使 `ai_stop` 能精确清理
+    /// **属于被终止请求**的等待项（仿照 [`Self::pending_tool_calls`]）。
+    pub pending_desktop_calls: Arc<
+        Mutex<
+            HashMap<
+                String,
+                (
+                    String,
+                    tokio::sync::oneshot::Sender<crate::ai::tools::DesktopToolOutcome>,
+                ),
+            >,
+        >,
+    >,
+
     /// 正在运行的 AI 请求后台任务：requestId -> JoinHandle。
     ///
     /// `ai_chat` spawn 时登记，`ai_stop` 取出 handle 调 `abort()` 终止；
@@ -204,6 +243,16 @@ pub struct AppState {
     /// [`crate::mcp::approval`]。
     pub approval_registry: Arc<crate::mcp::approval::ApprovalRegistry>,
 
+    /// 内嵌 VNC 查看器的 WebSocket↔TCP 桥接实例：instanceId -> VncBridge。
+    ///
+    /// `vnc_bridge_start` 启动时登记，`vnc_bridge_stop` 移除（Drop 兜底回收）。
+    pub vnc_bridges: Arc<Mutex<HashMap<String, crate::vnc::VncBridge>>>,
+
+    /// 内嵌 RDP 客户端的迷你网关桥接实例：instanceId -> RdpBridge。
+    ///
+    /// `rdp_bridge_start` 启动时登记，`rdp_bridge_stop` 移除（Drop 兜底回收）。
+    pub rdp_bridges: Arc<Mutex<HashMap<String, crate::rdp::RdpBridge>>>,
+
     /// 正被 MCP「终端绑定」执行占用的终端实例 id（并发保护）。
     ///
     /// 同一终端标签页同一时刻只允许一个 MCP 工具调用写入 PTY：多个并发写会
@@ -212,6 +261,12 @@ pub struct AppState {
 
     /// settings.json 的路径（缓存的快捷访问）。
     pub settings_path: Arc<PathBuf>,
+
+    /// settings.json 的内存缓存：首次读取后驻留，`settings_save` 时失效。
+    ///
+    /// 终端/SFTP/隧道/AI 每次建立连接都会读设置（空闲断开、保活等），此前每次
+    /// 都同步读盘 + 反序列化，会话并发时在 tokio worker 上造成 IO 抖动。
+    pub settings_cache: Arc<parking_lot::RwLock<Option<crate::config::Settings>>>,
 }
 
 impl AppState {
@@ -232,13 +287,17 @@ impl AppState {
             file_backends: Arc::new(Mutex::new(HashMap::new())),
             mysql_conns: Arc::new(Mutex::new(HashMap::new())),
             pending_tool_calls: Arc::new(Mutex::new(HashMap::new())),
+            pending_desktop_calls: Arc::new(Mutex::new(HashMap::new())),
             pending_ai_tasks: Arc::new(Mutex::new(HashMap::new())),
             pending_auth_challenges: Arc::new(Mutex::new(HashMap::new())),
             pending_host_keys: Arc::new(Mutex::new(HashMap::new())),
             app,
             approval_registry: Arc::new(crate::mcp::approval::ApprovalRegistry::new()),
+            vnc_bridges: Arc::new(Mutex::new(HashMap::new())),
+            rdp_bridges: Arc::new(Mutex::new(HashMap::new())),
             mcp_terminal_busy: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             settings_path: Arc::new(settings_path),
+            settings_cache: Arc::new(parking_lot::RwLock::new(None)),
         }
     }
 

@@ -5,12 +5,12 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { ElMessage } from "element-plus";
 import { useVaultStore } from "@/stores/vault";
 import { useSessionsStore } from "@/stores/sessions";
-import { useAiSshStore, useAiDbStore } from "@/stores/ai";
+import { useAiSshStore, useAiDbStore, useAiDesktopStore } from "@/stores/ai";
 import { useTransferStore } from "@/stores/transfer";
 import { useTerminalsStore } from "@/stores/terminals";
 import { useUiStore } from "@/stores/ui";
 import { useMcpStore } from "@/stores/mcp";
-import { useAppShortcuts } from "@/composables/useAppShortcuts";
+import { useAppShortcuts, isEditableTarget } from "@/composables/useAppShortcuts";
 import { useSettingsStore } from "@/stores/settings";
 import SessionSidebar from "@/components/SessionSidebar.vue";
 import McpApprovalToast from "@/components/McpApprovalToast.vue";
@@ -20,9 +20,10 @@ const route = useRoute();
 const router = useRouter();
 const vault = useVaultStore();
 const sessions = useSessionsStore();
-// 两个独立 AI 助手 store：事件双分发，各自只响应自己的 requestId（convForRequest 找不到即静默 return）。
+// 三个独立 AI 助手 store：事件多分发，各自只响应自己的 requestId（convForRequest 找不到即静默 return）。
 const aiSsh = useAiSshStore();
 const aiDb = useAiDbStore();
+const aiDesktop = useAiDesktopStore();
 const transfer = useTransferStore();
 const terminalsStore = useTerminalsStore();
 const ui = useUiStore();
@@ -40,7 +41,7 @@ const navItems = [
   { key: "files", label: "文件", icon: "Files" },
   { key: "sql", label: "SQL", icon: "Coin" },
   { key: "forward", label: "转发", icon: "Connection" },
-  { key: "remote", label: "桌面", icon: "Monitor" },
+  { key: "remote", label: "桌面", icon: "Platform" },
   { key: "keys", label: "密钥", icon: "Key" },
   { key: "mfa", label: "MFA", icon: "Iphone" },
   { key: "mcp", label: "MCP", icon: "Link" },
@@ -86,6 +87,18 @@ function go(key: string) {
   router.push({ name: key });
 }
 
+// --- AI / 传输 / MCP 事件订阅的注销句柄 ----------------------------------
+// 必须在 setup 顶层（onMounted 之外）声明并注册 onBeforeUnmount：
+// onMounted 传入的 async 回调在首个 await 之后失去组件实例上下文，此时才
+// 注册的 onBeforeUnmount 会被 Vue 静默丢弃（不报错、不生效），导致每次
+// 重挂载都重复注册监听（AI 工具调用会被确认两次、执行两次）。
+const unlistens: UnlistenFn[] = [];
+let unmounted = false;
+onBeforeUnmount(() => {
+  unmounted = true;
+  for (const u of unlistens) u();
+});
+
 onMounted(async () => {
   // vault 解锁门卫由 router 全局守卫负责（先于本组件挂载执行），
   // 能挂载到这里说明已解锁，无需再判断/重定向。
@@ -98,46 +111,61 @@ onMounted(async () => {
     console.error("加载会话列表失败:", e);
   }
   try {
-    await Promise.all([aiSsh.loadPersisted(), aiDb.loadPersisted()]);
+    await Promise.all([aiSsh.loadPersisted(), aiDb.loadPersisted(), aiDesktop.loadPersisted()]);
   } catch (e) {
     console.error("加载 AI 会话历史失败:", e);
   }
 
-  // 订阅 AI 流式事件（双分发到 SSH / DB 两个 store）。
+  // 订阅 AI 流式事件（多分发到 SSH / DB / desktop 三个 store）。
   // 每个 store 的 convForRequest(requestId) 只在自己的 requestToCid 里命中，
   // 找不到即静默 return，实现天然隔离路由。
-  // 注意：layout 会被卸载（锁定保险库 → /unlock → 重新解锁 → 重挂载），
-  // 若不在 onBeforeUnmount 注销监听，每次重挂载都会重复注册 → 事件双倍触发
-  // （AI 工具调用会被确认两次、执行两次）。故全部收集进 unlistens。
-  const unlistens: UnlistenFn[] = [];
-  unlistens.push(
-    await listen<{ requestId: string; delta: string }>("ai:chunk", (e) => {
+  // unlistens / onBeforeUnmount 已在 setup 顶层声明（见上方 onMounted 之前），
+  // 这里直接使用；track 配合 unmounted 标志：若组件在某个 await listen 尚未
+  // resolve 时就被卸载（挂载后立刻锁定跳 /unlock），后续才 resolve 的监听必须
+  // 在注册后立即注销；任一 listen reject 也只影响该事件、不阻断其余订阅。
+  /** 注册一个事件监听：resolve 时组件已卸载则立即注销，注册失败单独容错。 */
+  const track = async (un: Promise<UnlistenFn>) => {
+    try {
+      const fn = await un;
+      if (unmounted) fn();
+      else unlistens.push(fn);
+    } catch (e) {
+      console.error("事件订阅失败:", e);
+    }
+  };
+
+  await track(
+    listen<{ requestId: string; delta: string }>("ai:chunk", (e) => {
       aiSsh.onChunk(e.payload.requestId, e.payload.delta);
       aiDb.onChunk(e.payload.requestId, e.payload.delta);
+      aiDesktop.onChunk(e.payload.requestId, e.payload.delta);
     }),
   );
-  unlistens.push(
-    await listen<{ requestId: string; fullText: string }>("ai:done", (e) => {
+  await track(
+    listen<{ requestId: string; fullText: string }>("ai:done", (e) => {
       aiSsh.onDone(e.payload.requestId);
       aiDb.onDone(e.payload.requestId);
+      aiDesktop.onDone(e.payload.requestId);
     }),
   );
-  unlistens.push(
-    await listen<{ requestId: string; message: string }>("ai:error", (e) => {
+  await track(
+    listen<{ requestId: string; message: string }>("ai:error", (e) => {
       aiSsh.onError(e.payload.requestId, e.payload.message);
       aiDb.onError(e.payload.requestId, e.payload.message);
+      aiDesktop.onError(e.payload.requestId, e.payload.message);
     }),
   );
-  unlistens.push(
-    await listen<{ requestId: string }>("ai:stopped", (e) => {
+  await track(
+    listen<{ requestId: string }>("ai:stopped", (e) => {
       aiSsh.onStopped(e.payload.requestId);
       aiDb.onStopped(e.payload.requestId);
+      aiDesktop.onStopped(e.payload.requestId);
     }),
   );
 
-  // 订阅 AI 工具调用事件（人确认执行机制；双分发）。
-  unlistens.push(
-    await listen<{
+  // 订阅 AI 工具调用事件（人确认执行机制；多分发）。
+  await track(
+    listen<{
       requestId: string;
       toolCallId: string;
       name: string;
@@ -146,24 +174,27 @@ onMounted(async () => {
       dangerous: boolean;
       whitelisted: boolean;
       autoApproved: boolean;
+      desktopId?: string | null;
     }>("ai:tool_call", (e) => {
       aiSsh.onToolCall(e.payload.requestId, e.payload);
       aiDb.onToolCall(e.payload.requestId, e.payload);
+      aiDesktop.onToolCall(e.payload.requestId, e.payload);
     }),
   );
-  unlistens.push(
-    await listen<{ requestId: string; toolCallId: string; ok: boolean; output: string }>(
+  await track(
+    listen<{ requestId: string; toolCallId: string; ok: boolean; output: string }>(
       "ai:tool_result",
       (e) => {
         aiSsh.onToolResult(e.payload.requestId, e.payload);
         aiDb.onToolResult(e.payload.requestId, e.payload);
+        aiDesktop.onToolResult(e.payload.requestId, e.payload);
       }
     ),
   );
 
   // 订阅传输进度事件。
-  unlistens.push(
-    await listen<{ taskId: string; transferred: number; total: number; speed: number }>(
+  await track(
+    listen<{ taskId: string; transferred: number; total: number; speed: number }>(
       "transfer:progress",
       (e) => {
         transfer.update(e.payload.taskId, {
@@ -174,36 +205,33 @@ onMounted(async () => {
       }
     ),
   );
-  unlistens.push(
-    await listen<{ taskId: string }>("transfer:done", (e) => {
+  await track(
+    listen<{ taskId: string }>("transfer:done", (e) => {
       transfer.update(e.payload.taskId, { status: "done" });
     }),
   );
-  unlistens.push(
-    await listen<{ taskId: string; message: string }>("transfer:error", (e) => {
+  await track(
+    listen<{ taskId: string; message: string }>("transfer:error", (e) => {
       transfer.update(e.payload.taskId, { status: "error", message: e.payload.message });
     }),
   );
 
   // 订阅 MCP 工具调用确认请求（外部 MCP 客户端发起 exec_ssh/exec_sql 时，
   // 后端 emit mcp:approval_request；推入 store，由全局浮层 McpApprovalToast 展示）。
-  unlistens.push(
-    await listen<McpApprovalRequest>("mcp:approval_request", (e) => {
+  await track(
+    listen<McpApprovalRequest>("mcp:approval_request", (e) => {
       mcp.onApprovalRequest(e.payload);
     }),
   );
 
   // 订阅 MCP 确认请求过期事件（后端超时自动拒绝后 emit），移除对应浮层卡片。
-  unlistens.push(
-    await listen<{ requestId: string }>("mcp:approval_expired", (e) => {
+  await track(
+    listen<{ requestId: string }>("mcp:approval_expired", (e) => {
       mcp.onApprovalExpired(e.payload.requestId);
     }),
   );
 
   // 全局快捷键（应用级）由 useAppShortcuts 在下面注册。
-  onBeforeUnmount(() => {
-    for (const u of unlistens) u();
-  });
 });
 
 // --- 应用级快捷键分发 ----------------------------------------------------
@@ -287,6 +315,9 @@ function startSidebarResize(e: MouseEvent) {
 // 作为额外的便捷绑定保留；仅在终端页生效）。
 function onNumberKeydown(e: KeyboardEvent) {
   if (activeNav.value !== "terminals") return;
+  // 与 useAppShortcuts 一致：焦点在输入框/搜索框等可编辑元素时不抢占（避免
+  // 在 AI 输入框按 Ctrl+1 时切走后台终端 tab）。
+  if (isEditableTarget(e)) return;
   if (!(e.ctrlKey || e.metaKey) || !/^[1-9]$/.test(e.key)) return;
   const tabs = terminalsStore.tabs;
   const idx = Number(e.key) - 1;
@@ -305,13 +336,17 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onNumberKeydown));
     <aside class="nav-rail">
       <div class="nav-logo">X</div>
       <!-- 中间导航项：超高时可滚动 -->
-      <div class="nav-items">
+      <div class="nav-items" role="navigation" aria-label="主导航">
         <div
           v-for="item in navItems"
           :key="item.key"
           class="nav-item"
           :class="{ active: activeNav === item.key }"
+          role="button"
+          tabindex="0"
+          :aria-current="activeNav === item.key ? 'page' : undefined"
           @click="go(item.key)"
+          @keydown.enter.prevent="go(item.key)"
         >
           <el-icon><component :is="item.icon" /></el-icon>
           <span>{{ item.label }}</span>
@@ -332,7 +367,11 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onNumberKeydown));
         :key="item.key"
         class="nav-item nav-item-fixed"
         :class="{ active: activeNav === item.key }"
+        role="button"
+        tabindex="0"
+        :aria-current="activeNav === item.key ? 'page' : undefined"
         @click="go(item.key)"
+        @keydown.enter.prevent="go(item.key)"
       >
         <el-icon><component :is="item.icon" /></el-icon>
         <span>{{ item.label }}</span>
@@ -354,10 +393,10 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onNumberKeydown));
 
     <!-- 主内容 -->
     <main class="main-content">
-      <!-- KeepAlive 缓存终端页/SQL 页，保留 AI 助手面板的滚动位置/输入草稿；
-           store 是单例，状态本就常驻，流式中途切走再切回仍能继续接收。 -->
+      <!-- KeepAlive 缓存终端页/SQL 页/桌面页：保留 AI 助手面板的滚动位置/输入草稿，
+           且桌面页已连接的 VNC/RDP 会话在切走再切回时不中断（store 单例常驻 + 组件不卸载）。 -->
       <router-view v-slot="{ Component }">
-        <KeepAlive :include="['Workspace', 'SqlConsoleView']">
+        <KeepAlive :include="['Workspace', 'SqlConsoleView', 'RemoteDesktopView']">
           <component :is="Component" />
         </KeepAlive>
       </router-view>

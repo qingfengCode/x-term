@@ -35,7 +35,9 @@ pub struct McpInstanceConfig {
     /// 是否启用（前端开关；当前启动逻辑以显式 mcp_start 为准，此字段记录意图）。
     #[serde(default)]
     pub enabled: bool,
-    /// 监听地址，默认 `0.0.0.0`（对局域网开放）。
+    /// 监听地址，默认 `127.0.0.1`（仅本机）。
+    ///
+    /// 允许任意地址（含 0.0.0.0 / 局域网 IP），由用户自行承担暴露风险。
     #[serde(default = "default_host")]
     pub host: String,
     /// 监听端口。
@@ -74,8 +76,12 @@ pub struct McpInstanceConfig {
     pub enable_log: bool,
 }
 
+/// 默认监听地址：仅本机回环。
+///
+/// 仅为默认值；用户可改为 0.0.0.0 或局域网 IP 以对局域网/外部开放，
+/// 风险由用户自行承担。
 fn default_host() -> String {
-    "0.0.0.0".into()
+    "127.0.0.1".into()
 }
 
 fn default_enable_log() -> bool {
@@ -160,24 +166,20 @@ fn config_path(state: &AppState) -> std::path::PathBuf {
 
 /// 读取 `mcp.json`；文件不存在或解析失败返回默认双配置。
 ///
-/// 向后兼容：旧版 `mcp.json` 是单份 `{host,port,token}`，反序列化到双结构时会走
-/// 各字段 default（host/port 用默认、token 丢失）。这种旧文件极少见，不做特殊迁移。
+/// 解析失败（损坏）时由 json_store 把损坏文件改名留证（`<path>.corrupt-*`）后
+/// 返回默认配置——绝不静默覆盖，token/端口等配置事后可从留证文件恢复。
 fn read_config_file(state: &AppState) -> McpConfigFile {
     let path = config_path(state);
-    let txt = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(_) => return McpConfigFile::default(),
-    };
-    // 解析失败回退默认，避免损坏文件阻塞功能。
-    serde_json::from_str(&txt).unwrap_or_default()
+    crate::storage::json_store::read_json_or_default(&path).unwrap_or_default()
 }
 
-/// 写 `mcp.json`（原子写：先写 .tmp 再 rename）。
+/// 写 `mcp.json`（原子写：复用 json_store 的「先写唯一 .tmp 再 rename」两阶段
+/// 替换流程，任意时刻崩溃目标文件要么是旧内容要么是完整新内容——裸
+/// `std::fs::write` 会留下半个文件，损坏后下次启动静默回默认配置、已配置的
+/// token 全部丢失）。
 fn write_config_file(state: &AppState, cfg: &McpConfigFile) -> AppResult<()> {
     let path = config_path(state);
-    let s = serde_json::to_string_pretty(cfg)?;
-    std::fs::write(&path, s)?;
-    Ok(())
+    crate::storage::json_store::write_json(&path, cfg)
 }
 
 /// 从配置文件取指定 kind 的配置（保证字段非空：host/port 用默认兜底）。
@@ -215,7 +217,8 @@ fn set_instance_config(state: &AppState, kind: McpKind, c: McpInstanceConfig) ->
 
 /// 启动指定 kind 的 MCP 服务端。
 ///
-/// - `host` / `port` 可选，省略时用配置文件中的值（默认 0.0.0.0 / 8765|8766）。
+/// - `host` / `port` 可选，省略时用配置文件中的值（默认 127.0.0.1 / 8765|8766）。
+/// - host 允许任意监听地址（0.0.0.0 / 局域网 IP 亦可），暴露风险由用户自行承担。
 /// - token 必须已生成（配置文件中存在），否则返回 Config 错误。
 /// - 资源校验按 `resource_mode` 分支：
 ///   - bound（默认）：必须已绑定资源（resourceId 非空），否则返回错误；
@@ -326,6 +329,8 @@ pub fn mcp_save_config(
     state: State<'_, AppState>,
 ) -> AppResult<()> {
     let kind = McpKind::parse(&kind);
+    // host 不做地址限制：允许 0.0.0.0 / 局域网 IP 等任意监听地址（空值允许——
+    // 启动时回退默认 127.0.0.1）。
     // auto_approve 立即生效（无需重启服务）。
     crate::mcp::server::set_auto_approve(kind, config.auto_approve);
     set_instance_config(state.inner(), kind, config)

@@ -14,7 +14,7 @@
 //! 注意 `resolve_credential` / `fetch_mysql_password` 都是同步的且需要短生命 DB
 //! 连接，本模块在调用前集中获取连接、解析凭据后立即释放，不在 `.await` 间持有。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -265,12 +265,13 @@ pub async fn exec_ssh_terminal(
         )));
     }
 
-    // 占用该终端：同一终端同一时刻只允许一个 MCP 调用写入。
+    // 占用该终端：同一终端同一时刻只允许一个调用写入（AI 助手可视化执行与
+    // MCP 终端绑定执行共用这把锁）。
     {
         let mut busy = state.mcp_terminal_busy.lock().await;
         if busy.insert(instance_id.to_string(), ()).is_some() {
             return Err(AppError::InvalidInput(
-                "该终端正有另一个 MCP 调用在执行，请稍后再试".into(),
+                "该终端正有另一个命令（AI 助手或 MCP 调用）在执行，请稍后再试".into(),
             ));
         }
     }
@@ -292,14 +293,17 @@ pub async fn exec_ssh_terminal(
             command
         );
 
-        // 写入 PTY（mpsc send，非阻塞）。
-        {
+        // 写入 PTY 前记录累计字节基准（同一把锁内先记基准再写，保证命令回显
+        // 与输出都落在基准之后的窗口里）。
+        let base = {
             let terminals = state.terminals.lock();
             match terminals.get(instance_id) {
                 Some(t) => {
+                    let base = t.total_output_bytes();
                     if let Err(e) = t.write(wrapped.into_bytes()) {
                         return Err(AppError::Ssh(format!("写入终端失败: {e}")));
                     }
+                    base
                 }
                 None => {
                     return Err(AppError::NotFound(format!(
@@ -307,20 +311,20 @@ pub async fn exec_ssh_terminal(
                     )))
                 }
             }
-        }
+        };
 
         // 轮询等待命令执行完毕（最长 30 秒）。
         // 完成信号（与 ai::tools::exec_ssh_visual 对齐）：
         // - 哨兵出现 ≥2 次：命令回显行与 echo 输出行都已出现，命令已结束；
-        // - 哨兵只出现 1 次且**不在回显行**（无回显 shell、或回显行已滚出
-        //   环形缓冲），且输出停止增长一段时间：echo 输出行即唯一哨兵，
-        //   输出停止即视为结束；
+        // - 哨兵只出现 1 次且**不在回显行**（无回显 shell、长命令折行拆断
+        //   回显行内的哨兵、或回显行已滚出环形缓冲），且输出停止增长一段
+        //   时间：echo 输出行即唯一哨兵，输出停止即视为结束；
         // - 其它情况继续等待。哨兵在回显行里的特征：PTY 回显的是包装后的
         //   `cmd; echo SENTINEL`，整行包含 `echo <SENTINEL>`；真正的 echo
         //   输出行则只是哨兵本身，二者由此区分。
         //
         // 注意必须用 full_snapshot()（整个环形缓冲）而不是 snapshot(0)
-        // （8KiB 窗口）：输出稍大回显行就会被窗口截没，既误判完成又截丢内容。
+        // （8KiB 窗口）：输出稍大回显行就会被窗口截没，误判完成。
         let echo_marker = format!("echo {sentinel}");
         const POLL_INTERVAL: Duration = Duration::from_millis(200);
         /// 哨兵出现且输出停止后，视为执行完成的静默宽限时间。
@@ -353,7 +357,7 @@ pub async fn exec_ssh_terminal(
             // 无回显 shell / 回显行已滚出缓冲：哨兵只出现一次（echo 输出行），
             // 且输出停止增长一段时间 → 命令已结束。
             if occurrences == 1
-                && !sentinel_in_echo_line(&snapshot, &sentinel, &echo_marker)
+                && !crate::ai::tools::sentinel_in_echo_line(&snapshot, &sentinel, &echo_marker)
                 && total == last_total
                 && silence_since.elapsed() >= SILENCE_GRACE
             {
@@ -366,90 +370,55 @@ pub async fn exec_ssh_terminal(
             last_total = total;
 
             if std::time::Instant::now() >= deadline {
-                // 超时：返回目前已收集到的输出（可能命令还在跑或卡住等输入）。
-                let cleaned = strip_ansi(&snapshot);
-                return Ok(format!(
+                // 超时：返回基准之后已收集的输出（可能命令还在跑或卡住等输入）。
+                let (window, overflow) = {
+                    let terminals = state.terminals.lock();
+                    match terminals.get(instance_id) {
+                        Some(t) => t.snapshot_after(base),
+                        None => {
+                            return Err(AppError::NotFound(format!(
+                                "终端会话 {instance_id} 已断开"
+                            )))
+                        }
+                    }
+                };
+                let cleaned = strip_ansi(&window);
+                let mut result = format!(
                     "命令已写入终端执行，但 30 秒内未检测到完成（可能仍在运行或等待输入）。\n目前输出：\n{}",
                     truncate_output(&cleaned)
-                ));
+                );
+                if overflow {
+                    result.push_str(&crate::ai::tools::output_overflow_note());
+                }
+                return Ok(result);
             }
         }
 
-        // 截取回显行之后、echo 输出行之前的新增输出（去掉命令回显、哨兵本身）。
-        let new_output = extract_terminal_output(&snapshot, &sentinel);
-        let cleaned = strip_ansi(&new_output);
-        Ok(truncate_output(&cleaned))
+        // 取"写入点之后"的输出窗口，清掉命令回显与哨兵行
+        // （与 ai::tools::exec_ssh_visual 共用同一套清理逻辑）。
+        let (window, overflow) = {
+            let terminals = state.terminals.lock();
+            match terminals.get(instance_id) {
+                Some(t) => t.snapshot_after(base),
+                None => {
+                    return Err(AppError::NotFound(format!(
+                        "终端会话 {instance_id} 已断开"
+                    )))
+                }
+            }
+        };
+        let cleaned = crate::ai::tools::clean_window(&strip_ansi(&window), cmd, &sentinel);
+        let mut result = truncate_output(&cleaned);
+        if overflow {
+            result.push_str(&crate::ai::tools::output_overflow_note());
+        }
+        Ok(result)
     }
     .await;
 
     // 释放占用（无论成功/超时/出错）。
     state.mcp_terminal_busy.lock().await.remove(instance_id);
     result
-}
-
-/// 从终端快照中提取"命令执行期间的新增输出"。
-///
-/// 哨兵会出现在两处：**命令回显行**（PTY 回显 `cmd; echo SENTINEL`，第一次
-/// 出现）和 **echo 命令的实际输出行**（最后一次出现）。正常返回第一个含哨兵
-/// 行之后、最后一个含哨兵行之前的内容；若输出末尾没有换行（printf/echo -n/
-/// 进度条），哨兵会与最后一行输出粘在同一行，剥离行内哨兵后再并入。
-///
-/// 只有一处哨兵时（无回显 shell、或命令输出过大导致回显行已滚出环形缓冲），
-/// 取哨兵行**之前**的内容——命令已完成，输出都在哨兵行之前（或与行内哨兵
-/// 粘在一起）。语义与 `ai::tools::extract_new_output` 保持一致。
-fn extract_terminal_output(snapshot: &str, sentinel: &str) -> String {
-    let lines: Vec<&str> = snapshot.split_inclusive('\n').collect();
-    let mut first: Option<usize> = None;
-    let mut last: Option<usize> = None;
-    for (i, line) in lines.iter().enumerate() {
-        if line.contains(sentinel) {
-            if first.is_none() {
-                first = Some(i);
-            }
-            last = Some(i);
-        }
-    }
-    match (first, last) {
-        (Some(f), Some(l)) => {
-            let mut out = String::new();
-            if l > f {
-                // 常规路径：回显行与哨兵输出行都在，取两者之间的内容。
-                out.push_str(&lines[f + 1..l].concat());
-                // 输出末尾无换行时哨兵与最后一行输出粘在同一行，剥离后并入。
-                if let Some(p) = lines[l].find(sentinel) {
-                    out.push_str(&lines[l][..p]);
-                }
-            } else {
-                // 只有一处哨兵：输出在哨兵行之前（回显行滚出缓冲/无回显 shell），
-                // 或与该行内哨兵粘在一起（printf/echo -n 无换行输出）。
-                out.push_str(&lines[..f].concat());
-                if let Some(p) = lines[f].find(sentinel) {
-                    out.push_str(&lines[f][..p]);
-                }
-            }
-            out
-        }
-        // 快照里找不到哨兵：返回全量（调用方按超时/部分输出处理）。
-        _ => snapshot.to_string(),
-    }
-}
-
-/// 判断哨兵在快照中的出现位置是否位于"命令回显行"。
-///
-/// 命令写入 PTY 的瞬间，shell 会把包装后的 `cmd; echo SENTINEL` 回显成一行
-/// 输出（该行含 `echo <SENTINEL>` 标记）；而 echo 的实际输出行（哨兵本身）
-/// 只在命令执行完毕后出现。据此区分"命令还在跑"与"命令已结束"，
-/// 避免把回显行误当作完成信号。逻辑与 `ai::tools::sentinel_in_echo_line` 一致。
-fn sentinel_in_echo_line(snapshot: &str, sentinel: &str, echo_marker: &str) -> bool {
-    let Some(pos) = snapshot.find(sentinel) else {
-        return false;
-    };
-    let line_start = snapshot[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
-    let line_end = snapshot[pos..]
-        .find('\n')
-        .map(|i| pos + i)
-        .unwrap_or(snapshot.len());
-    snapshot[line_start..line_end].contains(echo_marker)
 }
 
 /// 截断输出到 `EXEC_OUTPUT_CAP` 字节，超出则尾部提示。
@@ -494,7 +463,7 @@ pub async fn exec_ssh_direct(
         username,
         // 直连模式没有会话配置，二次认证弹窗仅展示 host:port。
         "direct",
-        AuthMethod::Password(password.to_string()),
+        AuthMethod::password(password.to_string()),
         command,
         state,
     )
@@ -1069,7 +1038,7 @@ pub async fn list_files_direct(
             port,
             username,
             "direct",
-            AuthMethod::Password(password.to_string()),
+            AuthMethod::password(password.to_string()),
             state,
         )
         .await?;
@@ -1088,6 +1057,33 @@ pub async fn list_files_direct(
     };
     serde_json::to_string(&entries)
         .map_err(|e| AppError::Storage(format!("序列化目录列表失败: {}", e)))
+}
+
+/// 下载到本机前的写入路径安全校验。
+///
+/// MCP 文件传输的 `localPath` **有意不做目录沙箱**（功能刚需：外部客户端要把
+/// 本机任意文件上传到 S3/SFTP，或把远端文件拉到本机任意位置），安全边界由
+/// "强制人工确认"承担。但下载方向额外禁止写入 X-Term 自身的配置/数据目录
+/// （settings.json、master.key、known_hosts 等所在），防止覆盖应用自身文件。
+fn ensure_local_write_allowed(state: &AppState, local: &Path) -> AppResult<()> {
+    // 调用方已校验父目录存在；canonicalize 消除相对路径 / `..` 的绕过。
+    let parent = local
+        .parent()
+        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()))
+        .unwrap_or_default();
+    let protected: [PathBuf; 2] = [
+        std::fs::canonicalize(state.settings_path.as_path())
+            .unwrap_or_else(|_| state.settings_path.as_path().to_path_buf()),
+        std::fs::canonicalize(state.data_dir.as_path())
+            .unwrap_or_else(|_| state.data_dir.as_path().to_path_buf()),
+    ];
+    if protected.iter().any(|d| parent.starts_with(d)) {
+        return Err(AppError::InvalidInput(format!(
+            "拒绝写入 X-Term 配置目录: `{}`（禁止把文件下载到应用自身数据目录）",
+            local.display()
+        )));
+    }
+    Ok(())
 }
 
 /// 在指定（按 id 查到的）SSH 会话对应的服务器上上传文件（MCP 绑定模式）。
@@ -1158,7 +1154,7 @@ pub async fn upload_file_direct(
             port,
             username,
             "direct",
-            AuthMethod::Password(password.to_string()),
+            AuthMethod::password(password.to_string()),
             state,
         )
         .await?;
@@ -1197,6 +1193,8 @@ pub async fn download_file_by_id(
             )));
         }
     }
+    // 禁止下载到 X-Term 自身配置/数据目录（见 ensure_local_write_allowed 说明）。
+    ensure_local_write_allowed(state, &local)?;
     let run = async {
         let (backend, handle) = open_sftp_for_config(state, session_config).await?;
         let noop: crate::file_backend::ProgressCb = std::sync::Arc::new(|_, _| {});
@@ -1235,6 +1233,8 @@ pub async fn download_file_direct(
             )));
         }
     }
+    // 禁止下载到 X-Term 自身配置/数据目录（见 ensure_local_write_allowed 说明）。
+    ensure_local_write_allowed(&state, &local)?;
     log::info!(
         "[mcp] download_file（直连）开始：{}@{}:{} {} → {}",
         username,
@@ -1249,7 +1249,7 @@ pub async fn download_file_direct(
             port,
             username,
             "direct",
-            AuthMethod::Password(password.to_string()),
+            AuthMethod::password(password.to_string()),
             state,
         )
         .await?;
@@ -1402,6 +1402,8 @@ pub async fn download_file_by_account(
             )));
         }
     }
+    // 禁止下载到 X-Term 自身配置/数据目录（见 ensure_local_write_allowed 说明）。
+    ensure_local_write_allowed(state, &local)?;
     let run = async {
         let backend = open_s3_for_account(state, account).await?;
         let noop: crate::file_backend::ProgressCb = std::sync::Arc::new(|_, _| {});
@@ -1421,53 +1423,61 @@ pub async fn download_file_by_account(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     const S: &str = "__XTERM_DONE_abcd__";
 
-    /// 常规场景：回显行 + echo 输出行都存在，取两者之间。
+    /// 常规场景：回显行 + echo 输出行都存在，去掉回显、哨兵行与提示符只留输出。
     #[test]
-    fn extract_between_echo_and_output() {
-        let snap = format!("$ echo hi; echo {S}\nhi\n{S}\n$ ");
-        let out = extract_terminal_output(&snap, S);
-        assert_eq!(out, "hi\n");
+    fn clean_window_between_echo_and_output() {
+        let win = format!("echo hi; echo {S}\nhi\n{S}\n$ ");
+        assert_eq!(crate::ai::tools::clean_window(&win, "echo hi", S), "hi\n");
     }
 
-    /// 单哨兵（回显行滚出缓冲/无回显 shell）：取哨兵行之前。
+    /// 无回显 shell / 回显不匹配：放弃剥离回显，但去掉哨兵行与提示符。
     #[test]
-    fn extract_before_single_sentinel() {
-        let snap = format!("line1\nline2\n{S}\n$ ");
-        let out = extract_terminal_output(&snap, S);
-        assert_eq!(out, "line1\nline2\n");
+    fn clean_window_no_echo_shell() {
+        let win = format!("line1\nline2\n{S}\n$ ");
+        assert_eq!(
+            crate::ai::tools::clean_window(&win, "cat x", S),
+            "line1\nline2\n"
+        );
     }
 
-    /// 输出末尾无换行：哨兵与最后一行输出粘在同一行，剥离行内哨兵。
+    /// 输出末尾无换行：哨兵与最后一行输出粘在同一行，截到哨兵之前。
     #[test]
-    fn extract_inline_sentinel_no_newline() {
-        let snap = format!("progress{S}\n");
-        let out = extract_terminal_output(&snap, S);
-        assert_eq!(out, "progress");
+    fn clean_window_inline_sentinel_no_newline() {
+        let win = format!("progress{S}\n");
+        assert_eq!(
+            crate::ai::tools::clean_window(&win, "cat x", S),
+            "progress"
+        );
     }
 
-    /// 快照里找不到哨兵：返回全量（超时路径）。
+    /// 窗口里找不到哨兵：原样返回（调用方按部分输出处理）。
     #[test]
-    fn extract_missing_sentinel_returns_full() {
-        let snap = "nothing here\n";
-        let out = extract_terminal_output(snap, S);
-        assert_eq!(out, snap);
+    fn clean_window_missing_sentinel_keeps_window() {
+        let win = "nothing here\n";
+        assert_eq!(crate::ai::tools::clean_window(win, "cat x", S), win);
     }
 
     /// 哨兵位于回显行（该行含 `echo SENTINEL` 标记）→ 判定为回显行。
     #[test]
     fn sentinel_in_echo_line_detected() {
         let snap = format!("$ ls; echo {S}\n{S}\n");
-        assert!(sentinel_in_echo_line(&snap, S, &format!("echo {S}")));
+        assert!(crate::ai::tools::sentinel_in_echo_line(
+            &snap,
+            S,
+            &format!("echo {S}")
+        ));
     }
 
     /// 快照中唯一哨兵为 echo 实际输出行（回显行已滚出）→ 非回显行。
     #[test]
     fn sentinel_in_echo_line_false_for_output_only() {
         let snap = format!("out1\nout2\n{S}\n$ ");
-        assert!(!sentinel_in_echo_line(&snap, S, &format!("echo {S}")));
+        assert!(!crate::ai::tools::sentinel_in_echo_line(
+            &snap,
+            S,
+            &format!("echo {S}")
+        ));
     }
 }

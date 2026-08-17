@@ -40,7 +40,7 @@ export const useMcpStore = defineStore("mcp", () => {
     const port = kind === "ssh" ? 8765 : kind === "db" ? 8766 : 8767;
     return {
       enabled: false,
-      host: "0.0.0.0",
+      host: "127.0.0.1",
       port,
       token: undefined,
       resourceId: undefined,
@@ -159,8 +159,9 @@ export const useMcpStore = defineStore("mcp", () => {
     respondingIds.value.add(requestId);
     try {
       await mcpApi.mcpRespondApproval(requestId, approved);
-      pendingApprovals.value = pendingApprovals.value.filter((r) => r.requestId !== requestId);
     } finally {
+      // 无论后端是否报错都移除卡片（invoke reject 时 try 内不会执行到移除）。
+      pendingApprovals.value = pendingApprovals.value.filter((r) => r.requestId !== requestId);
       respondingIds.value.delete(requestId);
     }
   }

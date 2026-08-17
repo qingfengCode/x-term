@@ -280,7 +280,9 @@ pub struct ChatWithToolsResult {
 /// 实现方负责把 `messages` 发往对应厂商的流式接口，并在响应过程中：
 /// - 每得到一段增量文本，发射 `ai:chunk` 事件（payload: [`crate::events::AiChunkEvent`]）；
 /// - 正常结束时发射 `ai:done` 事件（payload: [`crate::events::AiDoneEvent`]），并返回完整文本；
-/// - 任何阶段出错时发射 `ai:error` 事件（payload: [`crate::events::AiErrorEvent`]），并返回 `Err`。
+/// - 出错时返回 `Err`。`chat_stream` 失败时由实现方自行发射 `ai:error` 事件；
+///   `chat_with_tools` 失败时**不**发射（重试编排需要抑制中间错误，最终错误由
+///   `ai_chat` 的任务收尾统一发射一次），见 [`LlmProvider::chat_with_tools`]。
 ///
 /// `request_id` 由调用方生成，用于把事件与原始请求一一对应。
 #[async_trait]
@@ -305,6 +307,11 @@ pub trait LlmProvider: Send + Sync {
     /// 流式过程中每得到一段文本增量都发射 `ai:chunk`（与 `chat_stream` 一致），
     /// 但**不**发射 `ai:done`——`ai:done` 由编排循环在最终（无工具调用）回合发出，
     /// 因为带工具的对话可能跨多轮。
+    ///
+    /// 出错时**不**发射 `ai:error`：编排循环（`chat_with_tools_with_retry`）会对
+    /// 429/5xx/建连失败做指数退避重试、对上下文超限 400 做降级重试，中途发射
+    /// 错误事件会让前端提前置为终态（删除 requestToCid），重试成功的回复将无处
+    /// 路由。最终失败的 `ai:error` 由 `ai_chat` 的任务收尾统一发射。
     ///
     /// 返回值：本轮文本 + 工具调用列表。
     async fn chat_with_tools(

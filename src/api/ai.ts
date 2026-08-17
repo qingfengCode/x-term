@@ -10,7 +10,9 @@ export interface AiChatRequest {
   activeTerminalId?: string;
   /** 当前活动 MySQL 连接 id（可选）。 */
   activeDbConnId?: string;
-  /** 请求所属助手域："ssh"（终端助手）| "db"（数据库助手）。文件工具据此取工作目录。 */
+  /** 当前活动内嵌 RDP 会话的桥接实例 id（桌面助手用，启用 desktop_* 工具）。 */
+  activeDesktopId?: string;
+  /** 请求所属助手域："ssh"（终端助手）| "db"（数据库助手）| "desktop"（桌面助手）。文件工具据此取工作目录。 */
   domain?: string;
 }
 

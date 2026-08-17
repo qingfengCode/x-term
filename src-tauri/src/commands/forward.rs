@@ -5,12 +5,54 @@
 //! （不复用终端/SFTP 连接）。
 
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, State};
 
 use crate::error::{AppError, AppResult};
+use crate::events::{self, ForwardStateEvent};
 use crate::ssh::session::resolve_credential;
 use crate::ssh::tunnel::{TunnelKind, TunnelSpec};
 use crate::state::AppState;
+
+/// 连接存活监控的轮询间隔。
+const TUNNEL_MONITOR_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 向前端广播一条转发规则的状态变化。
+fn emit_state(app: &AppHandle, rule_id: &str, running: bool, reason: &str) {
+    events::emit(
+        app,
+        events::FORWARD_STATE,
+        ForwardStateEvent {
+            rule_id: rule_id.to_string(),
+            running,
+            reason: reason.to_string(),
+        },
+    );
+}
+
+/// 后台监控一条运行中的隧道：轮询 SSH 连接存活状态，连接断开（服务器重启 /
+/// 网络中断 / keepalive 超时）时把它从 tunnels 表移除并通知前端——否则前端会
+/// 一直显示"运行中"，而实际转发早已不可用。
+fn spawn_tunnel_monitor(app: AppHandle, state: AppState, rule_id: String, tunnel_handle: std::sync::Arc<russh::client::Handle<crate::ssh::client::ClientHandler>>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(TUNNEL_MONITOR_INTERVAL).await;
+            // stop() 移除时监控任务应随之退出：连接句柄仍可能被 accept 循环
+            // 持有（已 abort 则已释放），以 tunnels 表是否仍登记该规则为准。
+            if !state.tunnels.lock().contains_key(&rule_id) {
+                return;
+            }
+            if tunnel_handle.is_closed() {
+                log::warn!("转发 {} 的 SSH 连接已断开，标记为停止", rule_id);
+                let tunnel = state.tunnels.lock().remove(&rule_id);
+                if let Some(t) = tunnel {
+                    tokio::spawn(crate::ssh::tunnel::stop(t));
+                }
+                emit_state(&app, &rule_id, false, "SSH 连接断开");
+                return;
+            }
+        }
+    });
+}
 
 /// 从查询结果读取端口列；越界（> 65535 或负数）报错而非 `as u16` 静默截断
 /// （截断会把 70000 静默变成 4464，绑定到错误的端口）。
@@ -78,8 +120,13 @@ pub fn forward_list_rules(state: State<'_, AppState>) -> AppResult<Vec<ForwardRu
     Ok(out)
 }
 
+/// 保存（插入或 upsert）一条转发规则，返回落库后的规则。
+///
+/// 返回完整规则（含最终 id）供前端使用：前端本地生成的 id 可能被后端
+/// 规范化，autoStart 等后续操作必须用返回值里的 id，避免自启动打到
+/// 不存在的规则上。
 #[tauri::command]
-pub fn forward_save_rule(rule: ForwardRule, state: State<'_, AppState>) -> AppResult<()> {
+pub fn forward_save_rule(rule: ForwardRule, state: State<'_, AppState>) -> AppResult<ForwardRule> {
     let conn = state.conn()?;
     conn.execute(
         "INSERT INTO forward_rules (id, name, session_id, kind, local_host, local_port, \
@@ -103,11 +150,11 @@ pub fn forward_save_rule(rule: ForwardRule, state: State<'_, AppState>) -> AppRe
             rule.created_at,
         ],
     )?;
-    Ok(())
+    Ok(rule)
 }
 
 #[tauri::command]
-pub fn forward_delete_rule(id: String, state: State<'_, AppState>) -> AppResult<()> {
+pub fn forward_delete_rule(id: String, app: AppHandle, state: State<'_, AppState>) -> AppResult<()> {
     let conn = state.conn()?;
     conn.execute("DELETE FROM forward_rules WHERE id = ?1", [&id])?;
     // 同步停止运行中的隧道。
@@ -116,6 +163,7 @@ pub fn forward_delete_rule(id: String, state: State<'_, AppState>) -> AppResult<
         // 注意：同步 Tauri 命令运行在主线程（无 tokio 运行时上下文），裸
         // tokio::spawn 会 panic 导致程序崩溃；async_runtime::spawn 任意线程可用。
         tauri::async_runtime::spawn(crate::ssh::tunnel::stop(tunnel));
+        emit_state(&app, &id, false, "规则已删除");
     }
     Ok(())
 }
@@ -126,7 +174,11 @@ pub fn forward_delete_rule(id: String, state: State<'_, AppState>) -> AppResult<
 
 /// 启动一条转发规则（按规则建立新连接并开始转发）。返回规则 id（便于前端引用）。
 #[tauri::command]
-pub async fn forward_start(rule_id: String, state: State<'_, AppState>) -> AppResult<String> {
+pub async fn forward_start(
+    rule_id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<String> {
     // 取规则。
     let rule = {
         let conn = state.conn()?;
@@ -239,6 +291,8 @@ pub async fn forward_start(rule_id: String, state: State<'_, AppState>) -> AppRe
     // 建连过程（可能数秒），并发点击启动时两个请求都会通过检查。必须在 insert
     // 时再次确认；若已被他人注册，立即停掉自己刚建立的连接，避免泄漏。
     // 注意：parking_lot guard 非 Send，不能持锁 await stop，用 spawn 异步停。
+    // 存活监控用的连接句柄副本（tunnel 本体将移入注册表）。
+    let tunnel_handle = tunnel.handle.clone();
     {
         let mut guard = state.tunnels.lock();
         if guard.contains_key(&rule.id) {
@@ -248,18 +302,29 @@ pub async fn forward_start(rule_id: String, state: State<'_, AppState>) -> AppRe
         }
         guard.insert(rule.id.clone(), tunnel);
     }
+    // 通知前端 + 启动连接存活监控（SSH 断开时自动收尾并推送停止状态）。
+    emit_state(&app, &rule.id, true, "started");
+    if let Some(handle) = tunnel_handle {
+        spawn_tunnel_monitor(app.clone(), state.inner().clone(), rule.id.clone(), handle);
+    }
     Ok(rule.id)
 }
 
 /// 停止一条正在运行的转发。
 #[tauri::command]
-pub async fn forward_stop(rule_id: String, state: State<'_, AppState>) -> AppResult<()> {
+pub async fn forward_stop(
+    rule_id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
     let tunnel = state
         .tunnels
         .lock()
         .remove(&rule_id)
         .ok_or_else(|| AppError::NotFound(format!("转发 {} 未在运行", rule_id)))?;
-    crate::ssh::tunnel::stop(tunnel).await
+    crate::ssh::tunnel::stop(tunnel).await?;
+    emit_state(&app, &rule_id, false, "stopped");
+    Ok(())
 }
 
 /// 返回当前正在运行的转发规则 id 列表。

@@ -92,6 +92,25 @@ impl OutputRing {
         let slice: Vec<u8> = self.buf.iter().copied().skip(start).collect();
         String::from_utf8_lossy(&slice).into_owned()
     }
+
+    /// 取 `since_total` 累计字节之后仍留在缓冲中的输出（UTF-8 lossy 转 String）。
+    ///
+    /// 与 [`Self::snapshot`] 的区别：按**累计写入位置**切窗口，而不是"最近 N 字节"。
+    /// 用于截取"命令执行期间产生的新输出"——调用方在写入命令前记录
+    /// [`Self::total_bytes`]，命令结束后取窗口即可拿到本次新增输出，不受缓冲中
+    /// 历史内容（上一轮命令输出、登录横幅、提示符等）与终端折行的干扰。
+    ///
+    /// 返回 `(文本, 是否溢出)`：窗口字节数超过环形容量时，窗口头部已被环形
+    /// 截断丢弃，溢出为 `true`（此时文本只剩窗口尾部）。调用方应把溢出情况
+    /// 告知模型，避免其把残缺输出当作完整结果。
+    pub fn snapshot_after(&self, since_total: usize) -> (String, bool) {
+        let window = self.total.saturating_sub(since_total);
+        let kept = window.min(self.buf.len());
+        let truncated = kept < window;
+        let start = self.buf.len() - kept;
+        let slice: Vec<u8> = self.buf.iter().copied().skip(start).collect();
+        (String::from_utf8_lossy(&slice).into_owned(), truncated)
+    }
 }
 
 /// 进程内共享的输出缓冲类型。
@@ -116,9 +135,17 @@ use crate::storage::sessions_repo::{AuthType, Session};
 ///
 /// 由 [`resolve_credential`] 产出，包含可直接交给 [`client::connect_direct`]
 /// 使用的 [`AuthMethod`]。
-#[derive(Debug)]
 pub struct ResolvedCredential {
     pub auth_method: AuthMethod,
+}
+
+// 手写 Debug：内容依赖 [`AuthMethod`]（已脱敏），此处仅为说明安全边界保留手写实现。
+impl std::fmt::Debug for ResolvedCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedCredential")
+            .field("auth_method", &self.auth_method)
+            .finish()
+    }
 }
 
 /// `credentials.enc_data` 解密后的明文 JSON 结构。
@@ -127,12 +154,23 @@ pub struct ResolvedCredential {
 /// - `kind`: `"password"` 表示密码；`"private_key_text"` 表示私钥文本。
 /// - `value`: 实际内容（密码字符串或 PEM/OpenSSH 私钥文本）。
 /// - `passphrase`: 私钥被加密时所需的口令，密码类型忽略。
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct CredentialData {
     kind: String,
     value: String,
     #[serde(default)]
     passphrase: Option<String>,
+}
+
+// 手写 Debug：`value` / `passphrase` 为明文机密，脱敏后仅展示 kind。
+impl std::fmt::Debug for CredentialData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialData")
+            .field("kind", &self.kind)
+            .field("value", &"***")
+            .field("passphrase", &self.passphrase.as_ref().map(|_| "***"))
+            .finish()
+    }
 }
 
 /// 根据会话配置解析出 [`ResolvedCredential`]。
@@ -173,7 +211,7 @@ pub fn resolve_credential(
                 )));
             }
             Ok(ResolvedCredential {
-                auth_method: AuthMethod::Password(data.value),
+                auth_method: AuthMethod::password(data.value),
             })
         }
         AuthType::PrivateKey => {
@@ -286,6 +324,19 @@ pub struct SshSession {
 /// `exec_ssh_visual`）。256 KiB 对绝大多数命令输出绰绰有余。
 pub const OUTPUT_BUFFER_CAP: usize = 256 * 1024;
 
+/// `close()` 中等待 disconnect 完成的最长时间。
+///
+/// russh 0.45 的 `Handle::disconnect` 通过内部有界 channel（容量 10）投递消息：
+/// 底层连接任务卡住（半开连接、发送队列满）时该 await 永久挂起，表现为
+/// 关 tab 永远转圈、连接不释放。超时后放弃等待，由 Handle 随 SshSession 释放兜底。
+const DISCONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// 单块数据写入 SSH channel 的最长等待时间。
+///
+/// `Channel::data` 在远端窗口耗尽（对端不读 stdin 的流控）或连接任务卡死时
+/// 会无限阻塞；写入按此超时兜底，超时视为连接已坏、退出 reader 循环。
+const CHANNEL_WRITE_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl SshSession {
     /// 打开一个新的交互式终端会话。
     ///
@@ -377,12 +428,24 @@ impl SshSession {
         }
     }
 
-    /// 返回输出环形缓冲的当前字节数（用于记录命令执行前的基准位置，
-    /// 配合 [`Self::snapshot_after`] 截取命令执行期间产生的新输出）。
+    /// 返回输出环形缓冲的当前字节数（缓冲写满后恒等于容量）。
+    ///
+    /// 如需记录"命令执行前"的基准位置，应使用 [`Self::total_output_bytes`]
+    /// （累计值、单调递增），配合 [`Self::snapshot_after`] 截取新增输出。
     pub fn output_offset(&self) -> usize {
         match self.output_buffer.lock() {
             Ok(buf) => buf.len(),
             Err(_) => 0,
+        }
+    }
+
+    /// 取 `since_total` 累计字节之后的输出窗口（配合
+    /// [`Self::total_output_bytes`] 截取命令执行期间的新增输出）。
+    /// 返回 (文本, 是否溢出窗口容量)。
+    pub fn snapshot_after(&self, since_total: usize) -> (String, bool) {
+        match self.output_buffer.lock() {
+            Ok(buf) => buf.snapshot_after(since_total),
+            Err(_) => (String::new(), false),
         }
     }
 
@@ -464,7 +527,17 @@ impl SshSession {
                 }
             };
 
+            // 待写数据队列：远端窗口（flow control）耗尽时写入停在此处，
+            // 由循环顶部/尾部的按窗口冲刷逻辑在窗口恢复后继续写入。
+            let mut pending_writes: VecDeque<(Vec<u8>, Option<oneshot::Sender<()>>)> =
+                VecDeque::new();
+
             loop {
+                // 先冲刷积压写入（窗口可用时）。返回 false 表示写失败/连接卡死。
+                if !flush_pending_writes(&mut channel, &mut pending_writes).await {
+                    break;
+                }
+
                 tokio::select! {
                     // 远程 → 前端：channel 输出。
                     // 注意：不能用 biased —— 高吞吐输出流会持续占用第一分支，
@@ -507,28 +580,48 @@ impl SshSession {
                     inp = input_rx.recv() => {
                         match inp {
                             Some(InputMsg::Write { buf, ack }) => {
-                                let result = channel.data(&buf[..]).await;
-                                // 无论成败都回 ack，避免命令层无限等待；
-                                // 失败时连接即将关闭，由 TERMINAL_CLOSED 事件兜底。
-                                if let Some(ack) = ack {
-                                    let _ = ack.send(());
-                                }
-                                if result.is_err() {
-                                    break;
-                                }
+                                // 不在这里 await channel.data()：远端不读 stdin 时
+                                // 流控会无限阻塞，输出分支随之停摆、整个终端冻结。
+                                // 入队即可，由 flush_pending_writes 按窗口余量分块冲刷。
+                                pending_writes.push_back((buf, ack));
                             }
                             Some(InputMsg::Resize { cols, rows }) => {
-                                let _ = channel.window_change(cols, rows, 0, 0).await;
+                                // window_change 与 data 共用内部有界 channel，
+                                // 连接卡死时同样会挂起：加超时兜底。
+                                let _ = tokio::time::timeout(
+                                    CHANNEL_WRITE_STALL_TIMEOUT,
+                                    channel.window_change(cols, rows, 0, 0),
+                                )
+                                .await;
                             }
                             Some(InputMsg::Close(ack)) => {
-                                let _ = channel.eof().await;
-                                let _ = channel.close().await;
+                                // eof/close 同样可能被卡死的连接挂起：加超时兜底。
+                                let _ = tokio::time::timeout(
+                                    CHANNEL_WRITE_STALL_TIMEOUT,
+                                    async {
+                                        let _ = channel.eof().await;
+                                        let _ = channel.close().await;
+                                    },
+                                )
+                                .await;
                                 let _ = ack.send(());
                                 break;
                             }
                             None => break, // 输入端全部 drop，无人再交互
                         }
                     }
+                }
+
+                // 窗口调整可能发生在 select 等待期间，出 select 后再冲刷一次。
+                if !flush_pending_writes(&mut channel, &mut pending_writes).await {
+                    break;
+                }
+            }
+
+            // 退出前回掉所有积压写入的 ack，避免命令层（terminal_write 背压）永久等待。
+            for (_, ack) in pending_writes.drain(..) {
+                if let Some(ack) = ack {
+                    let _ = ack.send(());
                 }
             }
 
@@ -548,8 +641,8 @@ impl SshSession {
         Ok(())
     }
 
-    /// 关闭会话：通过输入通道通知 reader 关闭 channel、abort 任务、断开底层连接。
-    pub async fn close(&mut self) -> AppResult<()> {
+/// 关闭会话：通过输入通道通知 reader 关闭 channel、abort 任务、断开底层连接。
+pub async fn close(&mut self) -> AppResult<()> {
         // 先通知 reader 关闭 channel（优雅）。
         if let Some(tx) = self.input_tx.take() {
             let (ack_tx, ack_rx) = oneshot::channel();
@@ -569,12 +662,107 @@ impl SshSession {
             let _ = channel.close().await;
         }
 
-        // 断开传输层。
-        self.handle
-            .disconnect(Disconnect::ByApplication, "bye", "en")
-            .await
-            .map_err(|e| AppError::Ssh(format!("disconnect 失败: {}", e)))?;
+        // 断开传输层。disconnect 经内部有界 channel 投递，底层任务卡死时永久
+        // 挂起（关 tab 永远转圈），加超时兜底：超时后放弃等待，SshSession 被
+        // drop 时 Handle 随之释放，连接最终被清理。
+        match tokio::time::timeout(
+            DISCONNECT_TIMEOUT,
+            self.handle
+                .disconnect(Disconnect::ByApplication, "bye", "en"),
+        )
+        .await
+        {
+            Ok(res) => res.map_err(|e| AppError::Ssh(format!("disconnect 失败: {}", e)))?,
+            Err(_) => {
+                log::warn!(
+                    "disconnect 超过 {} 秒未完成，放弃等待（连接由 handle 释放兜底）",
+                    DISCONNECT_TIMEOUT.as_secs()
+                );
+            }
+        }
 
         Ok(())
+    }
+}
+
+/// 按 SSH 窗口余量冲刷待写数据（分块写入）。
+///
+/// 背景：`Channel::data` 在远端窗口耗尽（对端不读 stdin 的流控）或底层连接
+/// 任务卡死时会无限阻塞。若在 reader 的 select 臂内直接 await 它，输出分支
+/// 随之停摆、整个终端冻结。因此写入改走队列：本函数只在窗口有余量时写入
+/// （每块 ≤ 当前窗口余量，单块写不会跨窗口等待），窗口为 0 时立即返回、
+/// 数据留在队列等窗口恢复；单块写入超时（[`CHANNEL_WRITE_STALL_TIMEOUT`]）
+/// 视为连接已坏。
+///
+/// 带 ack 的写入在**整条**数据写完（或失败/退出）时才回 ack，保持
+/// `write_with_ack` 的真实背压语义。返回 `false` 表示写失败或连接卡死，
+/// 调用方应退出 reader 循环。
+async fn flush_pending_writes(
+    channel: &mut Channel<Msg>,
+    pending: &mut VecDeque<(Vec<u8>, Option<oneshot::Sender<()>>)>,
+) -> bool {
+    loop {
+        let Some((mut buf, ack)) = pending.pop_front() else {
+            return true;
+        };
+        // 一条写入可能因窗口耗尽分多块完成，整条写完才回 ack。
+        loop {
+            let win = channel.writable_packet_size().await;
+            if win == 0 {
+                // 远端流控：整条放回队首，等窗口恢复（不阻塞输出分支）。
+                pending.push_front((buf, ack));
+                return true;
+            }
+            let n = buf.len().min(win);
+            let chunk = buf[..n].to_vec();
+            let done = n == buf.len();
+            match tokio::time::timeout(CHANNEL_WRITE_STALL_TIMEOUT, channel.data(&chunk[..]))
+                .await
+            {
+                Ok(Ok(())) => {
+                    if done {
+                        if let Some(ack) = ack {
+                            let _ = ack.send(());
+                        }
+                        break; // 本条写完，处理队列下一条
+                    }
+                    buf = buf[n..].to_vec();
+                }
+                Ok(Err(_)) | Err(_) => {
+                    // 写失败或连接卡死：回 ack 并通知退出。
+                    if let Some(ack) = ack {
+                        let _ = ack.send(());
+                    }
+                    return false;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 窗口取基准之后的全部新写入内容。
+    #[test]
+    fn snapshot_after_returns_window_since_total() {
+        let mut ring = OutputRing::new(16);
+        ring.push(b"AAAA");
+        let base = ring.total_bytes();
+        ring.push(b"BBBB");
+        assert_eq!(ring.snapshot_after(base), ("BBBB".to_string(), false));
+    }
+
+    /// 窗口超过环形容量时头部被环形截断丢弃，必须报溢出。
+    #[test]
+    fn snapshot_after_reports_overflow() {
+        let mut ring = OutputRing::new(4);
+        ring.push(b"ABCD");
+        let base = ring.total_bytes();
+        ring.push(b"EFGHIJ"); // 窗口 6 字节 > 容量 4，头部丢失
+        let (text, overflow) = ring.snapshot_after(base);
+        assert!(overflow);
+        assert_eq!(text, "GHIJ");
     }
 }

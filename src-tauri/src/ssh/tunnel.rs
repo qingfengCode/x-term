@@ -20,6 +20,16 @@ use tokio::sync::oneshot;
 use crate::error::{AppError, AppResult};
 use crate::ssh::client::ClientHandler;
 
+/// SOCKS5 握手的最长等待时间。客户端只连不发的连接会永久占用一个桥接任务
+/// （连同其持有的 `Arc<Handle>`），超时直接断开。
+const SOCKS5_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 该转发下存量桥接任务的注册表类型。
+///
+/// 桥接任务持有 `Arc<Handle>`，只要有一条空闲连接不关闭，整条 SSH 连接就
+/// 永不释放。`stop` 时遍历 abort 所有句柄，切断这条泄漏链。
+pub type BridgeTasks = std::sync::Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>>;
+
 // ===========================================================================
 // 数据模型
 // ===========================================================================
@@ -58,25 +68,36 @@ pub struct TunnelSpec {
 ///   转发没有本地 accept 循环，此字段仍创建但发送后无消费者（无害）。
 /// - `accept_task`：accept 循环的任务句柄，`stop` 时 abort 以强制释放端口。
 ///   远程转发没有本地 accept 任务，为 `None`。
+/// - `bridge_tasks`：本地/动态转发下所有存量桥接任务句柄，`stop` 时逐个 abort。
+///   远程转发没有本地 accept 循环，其桥接注册表在
+///   [`crate::ssh::client::ForwardsMap`] 的每个目标条目里（由 handler 回调登记），
+///   本字段为空。
 /// - `remote_forward`：仅远程转发使用：stop 时据此调用
 ///   [`Handle::cancel_tcpip_forward`] 取消远端监听，并清理 ClientHandler 中的
-///   转发映射。本地/动态转发为 `None`。
+///   转发映射与其存量桥接任务。本地/动态转发为 `None`。
+/// - `handle`：SSH 连接句柄的共享引用，仅用于连接存活检测
+///   （[`Handle::is_closed`]，监控任务据此发现隧道异常退出）。三类转发均填充。
 pub struct Tunnel {
     pub spec: TunnelSpec,
     pub listener: Option<TcpListener>,
     pub stop_tx: oneshot::Sender<()>,
     pub accept_task: Option<tokio::task::JoinHandle<()>>,
+    pub bridge_tasks: BridgeTasks,
     pub remote_forward: Option<RemoteForwardHandle>,
+    pub handle: Option<std::sync::Arc<Handle<ClientHandler>>>,
 }
 
 /// 远程转发专用句柄（由 [`start_remote`] 填充）。
 ///
-/// 持有 SSH 连接的 `Handle`（包在 Arc 中供 stop 异步调用）和远端监听的
-/// `(host, port)`，stop 时据此取消远端监听。
+/// 持有 SSH 连接的 `Handle`（包在 Arc 中供 stop 异步调用）、远端监听的
+/// `(host, port)` 与转发映射表，stop 时据此取消远端监听、移除映射并
+/// abort 该映射下的存量桥接任务。
 pub struct RemoteForwardHandle {
     pub handle: std::sync::Arc<Handle<ClientHandler>>,
     pub remote_host: String,
     pub remote_port: u32,
+    /// 转发映射表（与 handler 回调共享）：stop 时按 key 移除条目。
+    pub forwards: crate::ssh::client::ForwardsMap,
 }
 
 // ===========================================================================
@@ -115,8 +136,14 @@ pub async fn start_local(handle: Handle<ClientHandler>, spec: TunnelSpec) -> App
     let remote_port = spec.remote_port as u32;
     // 把 handle 包进 Arc，accept 循环里每条入站连接克隆一份 Arc 使用。
     let handle_arc = std::sync::Arc::new(handle);
+    // 存活监控用副本：handle_arc 本体会被移入下方 accept 循环闭包。
+    let monitor_handle = handle_arc.clone();
+    // 桥接任务注册表：每条入站连接的桥接任务句柄登记于此，stop 时统一 abort。
+    let bridge_tasks: BridgeTasks = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let accept_bridge_tasks = bridge_tasks.clone();
 
     let accept_task = tokio::spawn(async move {
+        let bridge_tasks = accept_bridge_tasks;
         loop {
             // accept 与 stop 信号二选一。
             tokio::select! {
@@ -138,7 +165,8 @@ pub async fn start_local(handle: Handle<ClientHandler>, spec: TunnelSpec) -> App
 
                     let handle = handle_arc.clone();
                     let remote_host = remote_host.clone();
-                    tokio::spawn(async move {
+                    let bridge_tasks = bridge_tasks.clone();
+                    let bridge = tokio::spawn(async move {
                         let origin_host = peer.ip().to_string();
                         let origin_port = peer.port() as u32;
 
@@ -172,6 +200,7 @@ pub async fn start_local(handle: Handle<ClientHandler>, spec: TunnelSpec) -> App
                             }
                         }
                     });
+                    bridge_tasks.lock().push(bridge);
                 }
             }
         }
@@ -183,7 +212,9 @@ pub async fn start_local(handle: Handle<ClientHandler>, spec: TunnelSpec) -> App
         listener: None,
         stop_tx,
         accept_task: Some(accept_task),
+        bridge_tasks,
         remote_forward: None,
+        handle: Some(monitor_handle),
     })
 }
 
@@ -216,10 +247,15 @@ pub async fn start_remote(
     let remote_host = spec.remote_host.clone();
     let remote_port = spec.remote_port;
 
-    // 1. 登记转发映射（回调据此查表桥接）。
+    // 1. 登记转发映射（回调据此查表桥接）。目标条目自带桥接任务注册表，
+    //    入站桥接任务由 handler 回调登记，stop 时统一 abort。
     forwards.lock().insert(
         (remote_host.clone(), remote_port),
-        (spec.local_host.clone(), spec.local_port),
+        crate::ssh::client::ForwardTarget {
+            host: spec.local_host.clone(),
+            port: spec.local_port,
+            bridge_tasks: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+        },
     );
 
     // 2. 请求服务端在远端监听（tcpip_forward 需要 &mut，故在包 Arc 前调用）。
@@ -239,18 +275,21 @@ pub async fn start_remote(
     let handle_arc = std::sync::Arc::new(handle);
 
     // 远程转发没有本地 accept 循环，stop_tx 仍创建（stop 会发送但无消费者，无害），
-    // accept_task 为 None。
+    // accept_task / bridge_tasks 为空（桥接注册表在 forwards 映射的条目里）。
     let (stop_tx, _stop_rx) = oneshot::channel::<()>();
     Ok(Tunnel {
         spec,
         listener: None,
         stop_tx,
         accept_task: None,
+        bridge_tasks: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
         remote_forward: Some(RemoteForwardHandle {
-            handle: handle_arc,
+            handle: handle_arc.clone(),
             remote_host,
             remote_port: u32::from(remote_port),
+            forwards,
         }),
+        handle: Some(handle_arc),
     })
 }
 
@@ -279,8 +318,14 @@ pub async fn start_dynamic(handle: Handle<ClientHandler>, spec: TunnelSpec) -> A
 
     let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
     let handle_arc = std::sync::Arc::new(handle);
+    // 存活监控用副本：handle_arc 本体会被移入下方 accept 循环闭包。
+    let monitor_handle = handle_arc.clone();
+    // 桥接任务注册表（与 start_local 一致）：stop 时统一 abort 释放 Arc<Handle>。
+    let bridge_tasks: BridgeTasks = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let accept_bridge_tasks = bridge_tasks.clone();
 
     let accept_task = tokio::spawn(async move {
+        let bridge_tasks = accept_bridge_tasks;
         loop {
             tokio::select! {
                 biased;
@@ -300,12 +345,27 @@ pub async fn start_dynamic(handle: Handle<ClientHandler>, spec: TunnelSpec) -> A
                     };
 
                     let handle = handle_arc.clone();
-                    tokio::spawn(async move {
-                        // 1. SOCKS5 握手，解析目标地址。
-                        let target = match socks5_handshake(&mut tcp).await {
-                            Ok(t) => t,
-                            Err(e) => {
+                    let bridge_tasks = bridge_tasks.clone();
+                    let bridge = tokio::spawn(async move {
+                        // 1. SOCKS5 握手，解析目标地址。握手必须限时：客户端只连
+                        //    不发的连接会永久占用一个桥接任务 + Arc<Handle>。
+                        let target = match tokio::time::timeout(
+                            SOCKS5_HANDSHAKE_TIMEOUT,
+                            socks5_handshake(&mut tcp),
+                        )
+                        .await
+                        {
+                            Ok(Ok(t)) => t,
+                            Ok(Err(e)) => {
                                 log::debug!("SOCKS5 握手失败 ({}): {}", peer, e);
+                                return;
+                            }
+                            Err(_) => {
+                                log::debug!(
+                                    "SOCKS5 握手超时（{} 秒），关闭连接 ({})",
+                                    SOCKS5_HANDSHAKE_TIMEOUT.as_secs(),
+                                    peer
+                                );
                                 return;
                             }
                         };
@@ -337,6 +397,7 @@ pub async fn start_dynamic(handle: Handle<ClientHandler>, spec: TunnelSpec) -> A
                             Err(e) => log::warn!("动态转发通道出错 [{}]: {}", target, e),
                         }
                     });
+                    bridge_tasks.lock().push(bridge);
                 }
             }
         }
@@ -347,7 +408,9 @@ pub async fn start_dynamic(handle: Handle<ClientHandler>, spec: TunnelSpec) -> A
         listener: None,
         stop_tx,
         accept_task: Some(accept_task),
+        bridge_tasks,
         remote_forward: None,
+        handle: Some(monitor_handle),
     })
 }
 
@@ -468,7 +531,11 @@ where
 ///
 /// - 本地/动态转发：发送 stop 信号通知 accept 循环退出，并 abort 掉 accept
 ///   任务以强制释放端口绑定。
-/// - 远程转发：调用 [`Handle::cancel_tcpip_forward`] 让服务端停止远端监听。
+/// - 远程转发：调用 [`Handle::cancel_tcpip_forward`] 让服务端停止远端监听，
+///   并从映射表移除条目（之后入站 channel 会被回调直接关闭），abort 该映射下
+///   的存量桥接任务。
+/// - 所有种类：abort 存量桥接任务——桥接任务持有 `Arc<Handle>`，不显式终止的
+///   话一条空闲连接就足以让整条 SSH 连接永不释放。
 ///
 /// 若有直接持有的 `listener` 也一并 drop。
 pub async fn stop(mut tunnel: Tunnel) -> AppResult<()> {
@@ -480,7 +547,12 @@ pub async fn stop(mut tunnel: Tunnel) -> AppResult<()> {
         task.abort();
     }
 
-    // 远程转发：取消远端监听。
+    // 本地/动态转发：abort 所有存量桥接任务，释放各自持有的 Arc<Handle>。
+    for bridge in tunnel.bridge_tasks.lock().drain(..) {
+        bridge.abort();
+    }
+
+    // 远程转发：取消远端监听 + 移除映射 + abort 存量桥接任务。
     if let Some(rf) = tunnel.remote_forward.take() {
         if let Err(e) = rf
             .handle
@@ -488,6 +560,15 @@ pub async fn stop(mut tunnel: Tunnel) -> AppResult<()> {
             .await
         {
             log::warn!("cancel_tcpip_forward 失败: {}", e);
+        }
+        let key = (
+            rf.remote_host.clone(),
+            u16::try_from(rf.remote_port).unwrap_or(0),
+        );
+        if let Some(target) = rf.forwards.lock().remove(&key) {
+            for bridge in target.bridge_tasks.lock().drain(..) {
+                bridge.abort();
+            }
         }
     }
 

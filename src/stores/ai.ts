@@ -27,6 +27,8 @@ export interface ToolCallItem {
   whitelisted: boolean;
   /** 是否已被自动放行（白名单模式 + 命中白名单）。true 时卡片直接显示"已自动执行"终态。 */
   autoApproved: boolean;
+  /** 桌面工具（desktop_*）绑定的 RDP 桥接实例 id（请求发起时的活动桌面）。 */
+  desktopId?: string | null;
   /** pending=待确认；approved=已执行；rejected=已拒绝；done=已有结果。 */
   status: "pending" | "approved" | "rejected" | "done";
   result?: ToolResult;
@@ -57,6 +59,8 @@ export interface AiMessage {
   /** 是否正在流式接收中。 */
   streaming: boolean;
   error?: string;
+  /** 该助手消息产生时的 agent 模式（"重新生成"据此重建上下文，而非当前面板 mode）。 */
+  agent?: boolean;
   /** 该助手消息产生的工具调用（用于在气泡内渲染卡片）。 */
   toolCalls?: ToolCallItem[];
   /**
@@ -69,15 +73,16 @@ export interface AiMessage {
 /**
  * AI 助手 store 工厂。
  *
- * 拆分为两个完全隔离的助手（各自独立的对话列表 / 多会话 / requestToCid 路由表）：
+ * 拆分为三个完全隔离的助手（各自独立的对话列表 / 多会话 / requestToCid 路由表）：
  * - `useAiSshStore`（id "ai:ssh"）：终端助手（终端页）
  * - `useAiDbStore`（id "ai:db"）：SQL 页数据库助手
+ * - `useAiDesktopStore`（id "ai:desktop"）：桌面助手（桌面页，desktop_* 工具）
  *
- * 事件路由：MainLayout 把 `ai:*` 事件同时分发给两个 store，每个 store 的
+ * 事件路由：MainLayout 把 `ai:*` 事件同时分发给三个 store，每个 store 的
  * `convForRequest(requestId)` 只会在自己的 `requestToCid` 里命中——对方 store
  * 找不到该 requestId 即静默 return，天然实现隔离，无需给事件加 domain 字段。
  */
-const makeAiStore = (id: string) =>
+export const makeAiStore = (id: string) =>
   defineStore(id, () => {
   // 从 store id 派生 domain（"ai:ssh"→"ssh"），用于持久化文件名。
   const domain = id.split(":")[1] ?? "ssh";
@@ -232,7 +237,8 @@ const makeAiStore = (id: string) =>
    * @param opts.agent 是否启用工具调用（智能体模式）
    * @param opts.activeTerminalId 当前活动终端（agent 模式上下文）
    * @param opts.activeDbConnId 当前活动 MySQL 连接
-   * @param opts.domain 请求所属助手域（"ssh" | "db"），文件工具据此取工作目录
+   * @param opts.activeDesktopId 当前活动内嵌 RDP 会话（桌面助手上下文）
+   * @param opts.domain 请求所属助手域（"ssh" | "db" | "desktop"），文件工具据此取工作目录
    * @param opts.images 附带的多模态图片（仅多模态模型下使用）
    */
   async function send(
@@ -242,6 +248,7 @@ const makeAiStore = (id: string) =>
       agent?: boolean;
       activeTerminalId?: string;
       activeDbConnId?: string;
+      activeDesktopId?: string;
       domain?: string;
       images?: ImagePart[];
     }
@@ -274,6 +281,9 @@ const makeAiStore = (id: string) =>
       content: "",
       streaming: true,
       parts: [],
+      // 记录生成时的 agent 模式：AiPanel 的"重新生成"据此重建上下文，
+      // 而不是用面板当前 mode（否则同一问题重问得到的上下文不一致）。
+      agent: opts?.agent ?? false,
     };
     conv.messages.push(assistantMsg);
 
@@ -317,6 +327,7 @@ const makeAiStore = (id: string) =>
         agentMode: opts?.agent ?? false,
         activeTerminalId: opts?.activeTerminalId,
         activeDbConnId: opts?.activeDbConnId,
+        activeDesktopId: opts?.activeDesktopId,
         domain: opts?.domain,
       });
     } catch (e) {
@@ -362,6 +373,14 @@ const makeAiStore = (id: string) =>
     appendTextPart(m, delta);
   }
 
+  /** 请求结束后的路由表延迟清理（ms）：ai:tool_result 可能晚于 ai:done 到达
+   * （多工具/慢命令时），立即 delete 会让晚到的结果路由失败、卡片永远停在
+   * "执行中"。保留短暂 TTL 再清理；期间新请求用新 requestId，不受影响。 */
+  const REQUEST_CLEANUP_DELAY_MS = 30_000;
+  function scheduleRequestCleanup(requestId: string) {
+    setTimeout(() => requestToCid.delete(requestId), REQUEST_CLEANUP_DELAY_MS);
+  }
+
   function onDone(requestId: string) {
     const conv = convForRequest(requestId);
     if (!conv) return;
@@ -369,7 +388,7 @@ const makeAiStore = (id: string) =>
     if (m) m.streaming = false;
     conv.sending = false;
     conv.activeRequestId = null;
-    requestToCid.delete(requestId);
+    scheduleRequestCleanup(requestId);
     persist();
   }
 
@@ -431,6 +450,34 @@ const makeAiStore = (id: string) =>
     onStopped(rid);
   }
 
+  // --- 桌面工具（desktop_*，RDP 控制）执行 -----------------------------------
+  // 桌面工具的执行体在**前端** RDP 会话里（后端桥接只透传字节），因此「批准即执行」
+  // 由本 store 委托给桌面助手面板注册的执行器：执行器在 RDP 会话上截图/点击/输入，
+  // 再通过 ai_desktop_tool_respond 把「批准/拒绝 + 执行结果」一体回执发给后端。
+  const DESKTOP_TOOL_NAMES = [
+    "desktop_screenshot",
+    "desktop_click",
+    "desktop_type",
+    "desktop_key",
+  ];
+  type DesktopToolExecutor = (
+    toolCallId: string,
+    approved: boolean,
+    name: string,
+    args: Record<string, unknown>,
+    desktopId: string | null
+  ) => Promise<void>;
+  let desktopToolExecutor: DesktopToolExecutor | null = null;
+
+  /** 注册桌面工具执行器（桌面助手面板挂载时调用；其它域不注册、永不命中）。 */
+  function setDesktopToolExecutor(fn: DesktopToolExecutor) {
+    desktopToolExecutor = fn;
+  }
+
+  function isDesktopTool(name: string): boolean {
+    return DESKTOP_TOOL_NAMES.includes(name);
+  }
+
   /** 收到一个工具调用请求（前端展示确认卡片）。 */
   function onToolCall(
     requestId: string,
@@ -442,6 +489,7 @@ const makeAiStore = (id: string) =>
       dangerous: boolean;
       whitelisted: boolean;
       autoApproved: boolean;
+      desktopId?: string | null;
     }
   ) {
     const conv = convForRequest(requestId);
@@ -464,12 +512,24 @@ const makeAiStore = (id: string) =>
       // 自动放行的 tool_call：后端已直接执行，前端直接显示"已自动执行"终态，
       // 后续 onToolResult 会回填结果。
       autoApproved: payload.autoApproved ?? false,
+      desktopId: payload.desktopId ?? null,
       status: payload.autoApproved ? "approved" : "pending",
     };
     if (!m.toolCalls) m.toolCalls = [];
     m.toolCalls.push(item);
     // 按到达顺序记录到 parts（item 引用共享，卡片状态随 toolCalls 自动同步）。
     (m.parts ??= []).push({ kind: "tool", item });
+    // 桌面工具被自动放行（desktop_screenshot）：执行体在前端，需立即执行并回传
+    // 结果——不像后端工具那样已由后端执行完。执行器由桌面助手面板注册。
+    if (payload.autoApproved && isDesktopTool(payload.name) && desktopToolExecutor) {
+      void desktopToolExecutor(
+        payload.toolCallId,
+        true,
+        payload.name,
+        parsed,
+        payload.desktopId ?? null
+      );
+    }
   }
 
   /** 工具执行结果回填（更新对应卡片状态）。 */
@@ -490,6 +550,20 @@ const makeAiStore = (id: string) =>
 
   /** 用户点击"执行"。本地立即更新卡片状态为 approved，并通知后端。 */
   async function approveToolCall(toolCallId: string) {
+    // 桌面工具：批准即执行——执行体在前端 RDP 会话（后端桥接只透传字节），
+    // 由桌面助手面板注册的执行器负责执行并把「批准+结果」一体回执发给后端。
+    const item = findToolCallItem(toolCallId);
+    if (item && isDesktopTool(item.name) && desktopToolExecutor) {
+      updateToolCallStatus(toolCallId, "approved");
+      await desktopToolExecutor(
+        toolCallId,
+        true,
+        item.name,
+        item.arguments,
+        item.desktopId ?? null
+      );
+      return;
+    }
     updateToolCallStatus(toolCallId, "approved");
     await dbApi.aiExecuteTool(toolCallId).catch(() => {
       /* ignore */
@@ -534,24 +608,41 @@ const makeAiStore = (id: string) =>
 
   /** 用户点击"拒绝"。 */
   async function rejectToolCall(toolCallId: string) {
+    // 桌面工具的拒绝同样走前端执行器（approved=false 回执），后端从
+    // pending_desktop_calls 取到拒绝结果后以"用户拒绝"收尾该轮。
+    const item = findToolCallItem(toolCallId);
+    if (item && isDesktopTool(item.name) && desktopToolExecutor) {
+      updateToolCallStatus(toolCallId, "rejected");
+      await desktopToolExecutor(
+        toolCallId,
+        false,
+        item.name,
+        item.arguments,
+        item.desktopId ?? null
+      );
+      return;
+    }
     updateToolCallStatus(toolCallId, "rejected");
     await dbApi.aiCancelTool(toolCallId).catch(() => {
       /* ignore */
     });
   }
 
-  function updateToolCallStatus(toolCallId: string, status: ToolCallItem["status"]) {
-    // 工具调用可能位于任意会话（用户可能在另一标签确认），扫描全部。
+  /** 在所有会话中按 toolCallId 找到工具调用项（跨会话扫描，与事件路由一致）。 */
+  function findToolCallItem(toolCallId: string): ToolCallItem | null {
     for (const conv of conversations.value) {
       for (const m of conv.messages) {
         if (!m.toolCalls) continue;
         const item = m.toolCalls.find((t) => t.toolCallId === toolCallId);
-        if (item) {
-          item.status = status;
-          return;
-        }
+        if (item) return item;
       }
     }
+    return null;
+  }
+
+  function updateToolCallStatus(toolCallId: string, status: ToolCallItem["status"]) {
+    const item = findToolCallItem(toolCallId);
+    if (item) item.status = status;
   }
 
   /** 清空当前活动会话的消息。 */
@@ -590,6 +681,7 @@ const makeAiStore = (id: string) =>
       agent?: boolean;
       activeTerminalId?: string;
       activeDbConnId?: string;
+      activeDesktopId?: string;
       domain?: string;
     },
   ) {
@@ -640,6 +732,7 @@ const makeAiStore = (id: string) =>
     approveToolCall,
     addToWhitelistAndApprove,
     rejectToolCall,
+    setDesktopToolExecutor,
     clear,
     renameConversation,
     regenerate,
@@ -649,3 +742,4 @@ const makeAiStore = (id: string) =>
 
 export const useAiSshStore = makeAiStore("ai:ssh");
 export const useAiDbStore = makeAiStore("ai:db");
+export const useAiDesktopStore = makeAiStore("ai:desktop");

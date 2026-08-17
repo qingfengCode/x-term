@@ -33,6 +33,26 @@ export function connectSession(sessionConfigId: string): Promise<string> {
   return invoke<string>("connect_session", { sessionConfigId });
 }
 
+/**
+ * 认证失败后使用手动输入的密码/验证码重试连接（`connect_session` 的手动认证版）。
+ *
+ * - `password` 非空时忽略会话配置的认证方式（私钥会话也回退），改用该密码认证；
+ * - `otp` 为二次认证验证码（口令码/动态口令等），后端会预填进 keyboard-interactive
+ *   首个验证码提示，其余提示仍走 `ssh:auth_challenge` 弹窗；
+ * - 传空串或 null 时回退使用会话配置已保存的凭据。
+ */
+export function connectSessionWithManualAuth(
+  sessionConfigId: string,
+  password: string | null,
+  otp: string | null,
+): Promise<string> {
+  return invoke<string>("connect_session_with_manual_auth", {
+    sessionConfigId,
+    password,
+    otp,
+  });
+}
+
 export function disconnectSession(instanceId: string): Promise<void> {
   return invoke<void>("disconnect_session", { instanceId });
 }

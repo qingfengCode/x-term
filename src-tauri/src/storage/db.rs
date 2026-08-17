@@ -169,6 +169,14 @@ pub fn run_migrations(conn: &Connection) -> AppResult<()> {
             updated_at  TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS desktop_groups (
+            id          TEXT PRIMARY KEY,
+            name        TEXT NOT NULL,
+            parent_id   TEXT,
+            sort_order  INTEGER NOT NULL DEFAULT 0,
+            created_at  TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS totp_secrets (
             id          TEXT PRIMARY KEY,
             issuer      TEXT NOT NULL,
@@ -225,6 +233,10 @@ pub fn run_migrations(conn: &Connection) -> AppResult<()> {
         "path_style",
         "INTEGER NOT NULL DEFAULT 1",
     )?;
+    // 给 desktops 加 group_id 列：桌面连接所属分组（NULL = 未分组）。
+    add_column_if_missing(conn, "desktops", "group_id", "TEXT")?;
+    // 给 desktops 加 desktop_size 列：上次使用的 RDP 分辨率（"宽x高"，NULL = 未记忆）。
+    add_column_if_missing(conn, "desktops", "desktop_size", "TEXT")?;
 
     Ok(())
 }

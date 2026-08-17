@@ -336,8 +336,11 @@ export function useSqlConsole(
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         replaceEntry(entryId, { id: entryId, kind: "error", sql, message: msg });
-        pendingQueryId.value = null;
-        pendingEntryId.value = null;
+        // 旧查询的 reject 可能在新查询启动后才到达：仅当 pending 仍指向
+        // 本次查询时才清空，否则会抹掉新查询的 pending，使其结果事件被
+        // onQueryResult 按 queryId 不匹配丢弃、条目永久停在 running。
+        if (pendingQueryId.value === queryId) pendingQueryId.value = null;
+        if (pendingEntryId.value === entryId) pendingEntryId.value = null;
       }
       return true;
     } finally {

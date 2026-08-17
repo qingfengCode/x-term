@@ -8,7 +8,8 @@
  * - 多个挑战（如快速连多个会话）按到达顺序排队串行处理，避免弹多个框；
  * - 若用户已保存 TOTP 条目，提供"使用 TOTP 验证码"下拉，选中后实时取码
  *   填入第一个空输入框（保险库未解锁时自动隐藏）；
- * - 后端等待超时 120s，前端设置 125s 兜底计时器自动取消，防止弹窗悬挂。
+ * - 后端等待超时 120s，前端设置 115s 兜底计时器**先于后端**自动取消，
+ *   防止弹窗悬挂（若晚于后端，用户提交只会得到"挑战已关闭"的误导错误）。
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -17,8 +18,8 @@ import { sshAuthRespond, type SshAuthChallengeEvent } from "@/api/session";
 import { totpGenerate, totpList, type TotpEntry } from "@/api/totp";
 import { useUiStore } from "@/stores/ui";
 
-/** 后端等待超时 120s，前端兜底略长，到点自动取消弹窗。 */
-const CHALLENGE_TIMEOUT_MS = 125_000;
+/** 后端等待超时 120s，前端兜底略短（115s）先到，到点自动取消弹窗。 */
+const CHALLENGE_TIMEOUT_MS = 115_000;
 
 interface QueuedChallenge {
   challenge: SshAuthChallengeEvent;
@@ -35,6 +36,8 @@ const queue = ref<QueuedChallenge[]>([]);
 const busy = ref(false);
 let unlisten: UnlistenFn | null = null;
 
+const ui = useUiStore();
+
 const current = computed(() => queue.value[0] ?? null);
 const visible = computed(() => queue.value.length > 0);
 /**
@@ -49,8 +52,6 @@ watch(
   },
   { immediate: true }
 );
-
-const ui = useUiStore();
 
 // --- 事件监听 ---------------------------------------------------------------
 

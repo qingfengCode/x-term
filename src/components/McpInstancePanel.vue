@@ -15,11 +15,11 @@
   功能：
   - 资源模式开关（直连模式隐藏绑定 UI 并展示安全提示；File kind 隐藏此开关）。
   - 绑定资源下拉（启动前/后均可改；运行中改后提示"需重启生效"）。
-  - 监听地址（默认 0.0.0.0）与端口可编辑。
+  - 监听地址（默认 127.0.0.1；可改为 0.0.0.0 / 局域网 IP 对外开放）与端口可编辑。
   - token 生成 / 复制。
   - 启停按钮 + 运行状态徽标 + SSE 端点。
   - 客户端配置 JSON（一键复制）。
-  - 0.0.0.0 安全提示。
+  - 对外监听（0.0.0.0）风险提示。
 -->
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
@@ -32,7 +32,7 @@ import { useTerminalsStore } from "@/stores/terminals";
 import { dbListProfiles, dbConnect, dbListDatabases, dbDisconnect } from "@/api/db";
 import { fileAccountList } from "@/api/fileBackend";
 import type { FileAccount } from "@/api/fileBackend";
-import type { McpBoundSource, McpKind } from "@/api/mcp";
+import type { McpBoundSource, McpInstanceConfig, McpKind } from "@/api/mcp";
 import type { DbProfile, Session } from "@/api/types";
 
 const props = defineProps<{ kind: McpKind }>();
@@ -305,11 +305,15 @@ async function onResourceChange() {
  * `hotRebind`：绑定类改动在服务运行中尝试热切换（`mcp_rebind`，立即生效无需重启）；
  * 未传则按原有行为提示"需重启生效"。
  *
+ * 保存失败时把内存配置回滚到最近一次成功保存的快照（见 [`rollbackConfig`]），
+ * 避免 UI 显示新值而 mcp.json 仍是旧值的前后端不一致。
+ *
  * @returns 是否保存成功（false 时调用方应中止后续依赖新配置的操作，如启动）。
  */
 async function saveConfigAndMaybeWarn(opts?: { hotRebind?: boolean }): Promise<boolean> {
   try {
     await mcp.saveConfig(props.kind);
+    lastSaved = { ...config.value };
     if (!needsRestart.value) return true;
     if (opts?.hotRebind) {
       if (!config.value.resourceId) {
@@ -328,17 +332,40 @@ async function saveConfigAndMaybeWarn(opts?: { hotRebind?: boolean }): Promise<b
     ElMessage.warning("配置已保存，需重启该 MCP 服务才能生效。");
     return true;
   } catch (e) {
+    rollbackConfig();
     ElMessage.error("保存配置失败：" + String(e));
     return false;
   }
+}
+
+/** 最近一次成功保存/加载的配置副本：保存失败时用它回滚内存配置。 */
+let lastSaved: McpInstanceConfig | null = null;
+
+/** 把内存配置回滚到最近一次成功保存的状态（与 mcp.json 保持一致）。 */
+function rollbackConfig() {
+  if (lastSaved) Object.assign(config.value, lastSaved);
+}
+
+/**
+ * 字段值变化统一保存处理器（绑定库 / 监听地址 / 端口 / 执行日志开关）。
+ *
+ * 这些控件的 @change 会把控件值作为第一个参数传入；若直接把
+ * saveConfigAndMaybeWarn 绑到 @change，事件值会被误当作 options 对象，
+ * `opts?.hotRebind` 恒为 undefined，所有改动都落入"需重启生效"分支。
+ * 这里显式忽略事件值。
+ */
+function onFieldChange() {
+  void saveConfigAndMaybeWarn();
 }
 
 /** 自动放行开关改动：保存配置（后端立即生效，无需重启）。 */
 async function saveAutoApprove() {
   try {
     await mcp.saveConfig(props.kind);
+    lastSaved = { ...config.value };
     ElMessage.success(config.value.autoApprove ? "已开启自动放行" : "已关闭自动放行");
   } catch (e) {
+    rollbackConfig();
     ElMessage.error("保存失败：" + String(e));
   }
 }
@@ -401,6 +428,8 @@ async function copy(text: string, label = "已复制") {
 }
 
 onMounted(async () => {
+  // 记录已加载的配置作为回滚基准（后续保存失败时恢复到该状态）。
+  lastSaved = { ...config.value };
   await loadResources();
   // 仅 DB kind：若已有绑定 profile，加载其数据库列表。
   if (props.kind === "db" && config.value.resourceId) {
@@ -520,7 +549,7 @@ onMounted(async () => {
           class="field-control"
           :loading="loadingDbs"
           :disabled="!config.resourceId"
-          @change="saveConfigAndMaybeWarn"
+          @change="onFieldChange"
         >
           <el-option v-for="db in databases" :key="db" :label="db" :value="db" />
         </el-select>
@@ -543,9 +572,9 @@ onMounted(async () => {
         <div class="field-row flex1">
           <label class="field-label">
             监听地址
-            <HelpTip content="默认 0.0.0.0（对局域网开放）；仅本机使用可填 127.0.0.1。" />
+            <HelpTip content="默认 127.0.0.1（仅本机）。可改为 0.0.0.0 或局域网 IP（如 192.168.x.x），供局域网内其他机器连接。" />
           </label>
-          <el-input v-model="config.host" placeholder="0.0.0.0" class="field-control" @change="saveConfigAndMaybeWarn" />
+          <el-input v-model="config.host" placeholder="127.0.0.1" class="field-control" @change="onFieldChange" />
         </div>
         <div class="field-row port-field">
           <label class="field-label">端口</label>
@@ -555,13 +584,13 @@ onMounted(async () => {
             :max="65535"
             controls-position="right"
             class="field-control"
-            @change="saveConfigAndMaybeWarn"
+            @change="onFieldChange"
           />
         </div>
       </div>
-      <!-- 安全警告：保持直接展示，不收进 tooltip -->
+      <!-- 对外监听提示：0.0.0.0 对所有网卡开放，局域网内持有 token 者均可调用 -->
       <div v-if="config.host === '0.0.0.0'" class="hint-text warn-inline">
-        ⚠ 当前监听 0.0.0.0：对局域网开放，务必保管好 token。
+        ⚠ 0.0.0.0 表示监听所有网卡，局域网内其他机器可通过本机 IP 连接（请妥善保管 token）。
       </div>
     </div>
 
@@ -633,7 +662,7 @@ onMounted(async () => {
             <HelpTip :content="logHint" />
           </div>
         </div>
-        <el-switch v-model="config.enableLog" @change="saveConfigAndMaybeWarn" />
+        <el-switch v-model="config.enableLog" @change="onFieldChange" />
       </div>
     </div>
 

@@ -10,9 +10,10 @@
   运行状态采用纯前端内存维护（Set<string>），刷新页面后默认为停止。
 -->
 <script setup lang="ts">
-import { onMounted, reactive, ref } from "vue";
+import { onMounted, onUnmounted, reactive, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import type { FormInstance, FormRules } from "element-plus";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useSessionsStore } from "@/stores/sessions";
 import {
   forwardDeleteRule,
@@ -171,15 +172,17 @@ async function submitForm() {
     createdAt: form.createdAt || new Date().toISOString(),
   };
   try {
-    await forwardSaveRule(rule);
-    const wasRunning = running.value.has(rule.id);
+    // 用后端返回的最终规则（id 以后端落库为准），autoStart 才能命中真实 id。
+    const saved = await forwardSaveRule(rule);
+    const savedId = saved.id || rule.id;
+    const wasRunning = running.value.has(savedId);
     dialogVisible.value = false;
     await loadRules();
     // autoStart 消费：保存后自动启动本规则（编辑运行中的规则时已在运行则跳过）。
-    if (rule.autoStart && !wasRunning && !running.value.has(rule.id)) {
+    if (rule.autoStart && !wasRunning && !running.value.has(savedId)) {
       try {
-        await forwardStart(rule.id);
-        running.value.add(rule.id);
+        await forwardStart(savedId);
+        running.value.add(savedId);
         ElMessage.success(`已保存并启动：${rule.name}`);
       } catch (e: any) {
         ElMessage.warning("规则已保存，但自动启动失败：" + (e?.message ?? String(e)));
@@ -258,6 +261,34 @@ onMounted(async () => {
     }
   }
   await loadRules();
+});
+
+// 订阅后端状态推送：隧道启动/停止/异常退出（SSH 断开）时实时更新标签，
+// 修复"SSH 断开后仍显示运行中"的陈旧状态问题。
+const forwardStateUnlisten = ref<UnlistenFn | null>(null);
+onMounted(async () => {
+  try {
+    forwardStateUnlisten.value = await listen<{ ruleId: string; running: boolean; reason: string }>(
+      "forward:state",
+      (e) => {
+        const { ruleId, running: isRunning, reason } = e.payload;
+        if (isRunning) running.value.add(ruleId);
+        else {
+          running.value.delete(ruleId);
+          // 非用户主动操作导致的状态变化（如 SSH 断开）给出提示。
+          if (reason && reason !== "stopped" && reason !== "规则已删除") {
+            const rule = rules.value.find((r) => r.id === ruleId);
+            ElMessage.warning(`转发「${rule?.name ?? ruleId}」已停止：${reason}`);
+          }
+        }
+      },
+    );
+  } catch (e) {
+    console.error("订阅 forward:state 失败:", e);
+  }
+});
+onUnmounted(() => {
+  forwardStateUnlisten.value?.();
 });
 </script>
 

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { Promotion, Delete, ChatDotRound, DArrowRight, Connection, Tools, ArrowDown, Plus, Close, CopyDocument, RefreshRight, VideoPause, Document, Loading, Download, MagicStick, Collection, Picture } from "@element-plus/icons-vue";
 import { marked } from "marked";
@@ -7,27 +7,38 @@ import DOMPurify from "dompurify";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { readFile, writeTextFile } from "@tauri-apps/plugin-fs";
 import { homeDir, join } from "@tauri-apps/api/path";
-import { useAiSshStore, useAiDbStore, type AiMessage } from "@/stores/ai";
+import { useAiSshStore, useAiDbStore, useAiDesktopStore, type AiMessage } from "@/stores/ai";
 import { useSettingsStore } from "@/stores/settings";
 import { useTerminalsStore } from "@/stores/terminals";
 import { useDbStore } from "@/stores/db";
 import { useUiStore } from "@/stores/ui";
+import { useDesktopTabsStore } from "@/stores/desktopTabs";
 import { dbShowCreateTable, type DraggedTable } from "@/api/db";
+import { executeDesktopTool, aiDesktopToolRespond, getDesktopControl } from "@/api/desktopControl";
 import type { ToolCallItem } from "@/stores/ai";
+import { bytesToBase64 } from "@/utils/binary";
 import type { ImagePart } from "@/api/types";
 import SkillDialog from "@/components/SkillDialog.vue";
 import SkillManagerDialog from "@/components/SkillManagerDialog.vue";
 import type { SkillConfig } from "@/api/types";
 
-/** 助手域：ssh=终端助手（终端页）；db=数据库助手（SQL 页）。决定用哪个 store、暴露哪些工具。 */
-const props = defineProps<{ domain: "ssh" | "db" }>();
+/** 助手域：ssh=终端助手（终端页）；db=数据库助手（SQL 页）；desktop=桌面助手（桌面页）。
+ *  决定用哪个 store、暴露哪些工具。 */
+const props = defineProps<{ domain: "ssh" | "db" | "desktop" }>();
 
-// 按 domain 选 store：两个 store 是同一 factory 产出的独立实例，状态完全隔离。
-const ai = props.domain === "ssh" ? useAiSshStore() : useAiDbStore();
+// 按 domain 选 store：三个 store 是同一 factory 产出的独立实例，状态完全隔离。
+const ai =
+  props.domain === "ssh"
+    ? useAiSshStore()
+    : props.domain === "db"
+      ? useAiDbStore()
+      : useAiDesktopStore();
 const settings = useSettingsStore();
-// SSH 域需要读 terminals；DB 域需要读 db。两个都实例化（取用时按域判断），开销可忽略。
+// SSH 域需要读 terminals；DB 域需要读 db；desktop 域需要读 desktopTabs。
+// 都实例化（取用时按域判断），开销可忽略。
 const terminals = useTerminalsStore();
 const db = useDbStore();
+const desktopTabs = useDesktopTabsStore();
 const ui = useUiStore();
 
 // --- 折叠 / 展开 ---------------------------------------------------------
@@ -67,6 +78,9 @@ function startResize(e: MouseEvent) {
   document.body.style.userSelect = "none";
   document.addEventListener("mousemove", onResizeMove);
   document.addEventListener("mouseup", onResizeEnd);
+  // 鼠标在窗口外释放（拖出窗口边缘 / Alt-Tab 切走）时 mouseup 不触发，
+  // 监听器与 col-resize 光标、userSelect:none 会永久残留——用 window blur 兜底清理。
+  window.addEventListener("blur", onResizeEnd);
 }
 
 function onResizeMove(e: MouseEvent) {
@@ -83,6 +97,7 @@ function onResizeEnd() {
   document.body.style.userSelect = "";
   document.removeEventListener("mousemove", onResizeMove);
   document.removeEventListener("mouseup", onResizeEnd);
+  window.removeEventListener("blur", onResizeEnd);
 }
 
 /** 双击竖条：恢复默认宽度。 */
@@ -95,10 +110,12 @@ onBeforeUnmount(() => {
 });
 
 // --- 模式 ----------------------------------------------------------------
-// 按域定制：SSH 域聚焦服务器运维，DB 域聚焦数据库。两套模式与提示词独立。
+// 按域定制：SSH 域聚焦服务器运维，DB 域聚焦数据库，desktop 域聚焦 RDP 桌面操作。
+// 三套模式与提示词独立。
 type SshMode = "chat" | "translate" | "diagnose" | "explain" | "agent";
 type DbMode = "chat" | "optimize" | "explain" | "agent";
-type Mode = SshMode | DbMode;
+type DesktopMode = "chat" | "agent";
+type Mode = SshMode | DbMode | DesktopMode;
 
 const SSH_PROMPTS: Record<SshMode, string> = {
   chat:
@@ -150,7 +167,28 @@ const DB_PROMPTS: Record<DbMode, string> = {
     "工具的 dbConnId 是数据库连接 id（前端会提供）。",
 };
 
-const SYSTEM_PROMPTS = (props.domain === "ssh" ? SSH_PROMPTS : DB_PROMPTS) as Record<Mode, string>;
+const DESKTOP_PROMPTS: Record<DesktopMode, string> = {
+  chat:
+    "你是一名 Windows 桌面操作助手，熟悉 Windows 系统、常用软件操作与故障排查。" +
+    "回答简洁专业；涉及具体操作时给出清晰步骤。",
+  agent:
+    "你是一名可操作远程 Windows 桌面（RDP）的智能体。你可以调用工具查看桌面截图" +
+    "（desktop_screenshot）、点击（desktop_click）、输入文本（desktop_type）和发送按键" +
+    "（desktop_key）来完成任务。\n" +
+    "规则：\n" +
+    "1. 动手前必须先调用 desktop_screenshot 查看当前界面，不要凭空猜测界面内容。\n" +
+    "2. 每次只做一小步：截图 → 判断 → 一次点击/输入 → 再截图确认效果，然后决定下一步。\n" +
+    "3. 点击坐标以最近一次截图的像素坐标系为准（左上角为 (0,0)，与截图同尺寸）。\n" +
+    "4. 每一步都先告诉用户你要做什么，再调用工具；点击/输入会经用户确认后执行。\n" +
+    "5. 输入普通文本用 desktop_type（先确认焦点在目标输入框上）；快捷键、回车、\n" +
+    "   方向键等组合输入用 desktop_key（code 如 Enter / F5 / KeyA，修饰键如 ControlLeft）。\n" +
+    "6. 无法确定如何操作或操作有风险（删除数据、修改系统设置等）时，先向用户说明再动手。\n" +
+    "7. 完成后用中文简洁总结。",
+};
+
+const SYSTEM_PROMPTS = (
+  props.domain === "ssh" ? SSH_PROMPTS : props.domain === "db" ? DB_PROMPTS : DESKTOP_PROMPTS
+) as Record<Mode, string>;
 
 const SSH_MODES: { label: string; value: SshMode }[] = [
   { label: "智能体", value: "agent" },
@@ -165,12 +203,19 @@ const DB_MODES: { label: string; value: DbMode }[] = [
   { label: "优化 SQL", value: "optimize" },
   { label: "解释 SQL", value: "explain" },
 ];
-const MODE_OPTIONS = props.domain === "ssh" ? SSH_MODES : DB_MODES;
+const DESKTOP_MODES: { label: string; value: DesktopMode }[] = [
+  { label: "智能体", value: "agent" },
+  { label: "对话", value: "chat" },
+];
+const MODE_OPTIONS =
+  props.domain === "ssh" ? SSH_MODES : props.domain === "db" ? DB_MODES : DESKTOP_MODES;
 
 const mode = ref<Mode>("agent");
 
 /** 面板标题：按域显示。 */
-const panelTitle = computed(() => (props.domain === "ssh" ? "终端助手" : "数据库助手"));
+const panelTitle = computed(() =>
+  props.domain === "ssh" ? "终端助手" : props.domain === "db" ? "数据库助手" : "桌面助手"
+);
 
 // --- 对话标签重命名（双击进入编辑） ---
 const editingCid = ref<string | null>(null);
@@ -197,6 +242,11 @@ function cancelRename() {
 // --- 智能体上下文 --------------------------------------------------------
 /** agent 模式当前可用的活动终端 instanceId。 */
 const activeTerminalId = computed(() => terminals.activeId);
+/** agent 模式当前可用的活动内嵌 RDP 会话（仅 rdp 协议；VNC 不注册控制句柄）。 */
+const activeDesktopId = computed(() => {
+  const tab = desktopTabs.tabs.find((t) => t.instanceId === desktopTabs.activeId);
+  return tab && tab.protocol === "rdp" ? tab.instanceId : null;
+});
 /** agent 模式上下文提示文字（按域显示）。 */
 const contextTip = computed(() => {
   if (mode.value !== "agent") return "";
@@ -206,18 +256,23 @@ const contextTip = computed(() => {
       const tab = terminals.tabs.find((t) => t.instanceId === activeTerminalId.value);
       if (tab) parts.push(`终端: ${tab.session.name}`);
     }
-  } else {
-    // db 域
+  } else if (props.domain === "db") {
     if (db.activeConnId) {
       const tab = db.activeTab;
       parts.push(`数据库: ${tab?.profileName ?? db.activeConnId}`);
       // 追加当前绑定库（点库/表或拖表时设置）。
       if (db.activeDatabase) parts.push(`库: ${db.activeDatabase}`);
     }
+  } else {
+    // desktop 域
+    const tab = activeDesktopId.value
+      ? desktopTabs.tabs.find((t) => t.instanceId === activeDesktopId.value)
+      : undefined;
+    if (tab) parts.push(`桌面: ${tab.name}`);
   }
-  // 本地文件读写：启用时展示工作目录状态（未设置则提示，引导去设置页）。
-  if (settings.fileAccess.enabled) {
-    const dir = settings.fileAccess.workspaceDirs[props.domain];
+  // 本地文件读写：仅 ssh/db 域启用（桌面助手不下发文件工具），未设置则提示。
+  if (settings.fileAccess.enabled && props.domain !== "desktop") {
+    const dir = settings.fileAccess.workspaceDirs[props.domain as "ssh" | "db"];
     parts.push(dir ? `文件: ${dir}` : "⚠ 文件读写已开启，未设置工作目录");
   }
   if (props.domain === "ssh") {
@@ -225,9 +280,37 @@ const contextTip = computed(() => {
       ? `已附加: ${parts.join("、")}`
       : "未选择活动终端，请先连接后 AI 才能操作";
   }
+  if (props.domain === "db") {
+    return parts.length
+      ? `已附加: ${parts.join(" · ")}`
+      : "未连接数据库，请先在 SQL 控制台连接后 AI 才能操作";
+  }
   return parts.length
     ? `已附加: ${parts.join(" · ")}`
-    : "未连接数据库，请先在 SQL 控制台连接后 AI 才能操作";
+    : "未打开内嵌 RDP 桌面，请先在左侧列表连接后 AI 才能操作";
+});
+
+// --- 桌面工具执行器（仅 desktop 域） ---------------------------------------
+// desktop_* 工具的执行体在前端 RDP 会话里（见 @/api/desktopControl）：
+// 注册到 store，批准即在本面板的执行器里截图/点击/输入，再把回执发给后端。
+// 目标桌面取自 tool_call 事件携带的 desktopId（请求发起时的活动桌面）——
+// 不用执行瞬间的 activeId，避免 agent 循环期间用户切换标签导致操作落到错误桌面。
+onMounted(() => {
+  if (props.domain !== "desktop") return;
+  ai.setDesktopToolExecutor(async (toolCallId, approved, name, args, desktopId) => {
+    if (!approved) {
+      // 拒绝：把 approved=false 回执发给后端（无执行结果）。
+      await aiDesktopToolRespond(toolCallId, false).catch(() => {
+        /* 后端可能已因超时/终止移除等待项，忽略 */
+      });
+      return;
+    }
+    const control = desktopId ? getDesktopControl(desktopId) : undefined;
+    const result = await executeDesktopTool(name, args, control);
+    await aiDesktopToolRespond(toolCallId, true, result).catch(() => {
+      /* 同上，忽略（ai:tool_result 事件不会再来，卡片由 onToolResult 状态兜底） */
+    });
+  });
 });
 
 // --- 配置状态 ------------------------------------------------------------
@@ -293,16 +376,6 @@ function previewImages(m: AiMessage, index: number) {
   viewerUrls.value = m.images.map(imageDataUrl);
   viewerIndex.value = index;
   viewerVisible.value = true;
-}
-
-/** Uint8Array → base64（分块拼接，避免栈溢出）。 */
-function bytesToBase64(bytes: Uint8Array): string {
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-  }
-  return btoa(binary);
 }
 
 /** 按文件名后缀推断 MIME 类型（取不到时默认 image/png）。 */
@@ -441,8 +514,15 @@ async function attachTable(payload: DraggedTable) {
   }
   // 拖表也算选中该表所在库（与点表行为一致）：把活动标签的绑定库切过去并自动
   // USE，让助手关联到正确库（后端同步，后续 AI 执行的 SQL 落在这个库上）。
+  // USE 失败必须中止附加：注入的 prompt 声称"当前库为 X、已自动 USE"，
+  // 若后端切换失败还继续附加，AI 的写操作会落在错误的 schema 上。
   if (props.domain === "db" && payload.database && db.activeTabId) {
-    void db.useDatabase(db.activeTabId, payload.database).catch(() => {});
+    try {
+      await db.useDatabase(db.activeTabId, payload.database);
+    } catch (e) {
+      ElMessage.error(`切换到库 "${payload.database}" 失败：${e}`);
+      return;
+    }
   }
   const qualified = payload.database
     ? `${payload.database}.${payload.table}`
@@ -538,6 +618,13 @@ function clearAttachedTables() {
   attachedTables.value = [];
 }
 
+// 切换数据库连接（关闭标签/切 tab/断开）时清空附加表：表结构属于旧连接，
+// 残留会把 A 连接的表 DDL 拼进 B 连接的系统提示词，误导 AI 在错误库上下文中作答。
+watch(
+  () => (props.domain === "db" ? db.activeConnId : undefined),
+  () => clearAttachedTables(),
+);
+
 async function scrollToBottom() {
   await nextTick();
   const wrap = scrollbarRef.value?.wrapRef as HTMLElement | undefined;
@@ -559,8 +646,11 @@ function isNearBottom(): boolean {
 watch(() => ai.messages.length, () => {
   if (isNearBottom()) void scrollToBottom();
 });
+// 内容变化（流式增长）时同样跟随。只看最后一条消息的长度而非全量 join：
+// join 每个 chunk 都会拼接整段会话文本（长对话 O(总字符数)/token），改为
+// watch 流式更新的目标——末条消息的 content.length，避免无谓的大字符串分配。
 watch(
-  () => ai.messages.map((m) => m.content).join(""),
+  () => ai.messages[ai.messages.length - 1]?.content.length ?? 0,
   () => {
     if (isNearBottom()) void scrollToBottom();
   }
@@ -601,6 +691,124 @@ function onSwitchConversation(cid: string) {
   void scrollToBottom();
 }
 
+/** 按 agent / 非 agent 模式构建系统提示与发送选项。
+ *  handleSend 与 regenerateMessage 共用，保证"重新生成"的上下文与首次发送一致
+ *  （agent 的动态上下文、附加表 DDL、skill 段落都走同一条路径）。 */
+function buildSendContext(agent: boolean): {
+  prompt: string;
+  opts: {
+    agent: boolean;
+    activeTerminalId?: string;
+    activeDbConnId?: string;
+    activeDesktopId?: string;
+    domain: string;
+  };
+} {
+  if (!agent) {
+    let prompt = SYSTEM_PROMPTS[mode.value];
+    const ddlSection = buildAttachedDdlSection();
+    if (ddlSection) prompt += ddlSection;
+    prompt += buildSkillsSection();
+    return { prompt, opts: { agent: false, domain: props.domain } };
+  }
+
+  // 动态构建系统提示：把当前活动上下文的真实 id 注入，让模型直接填对参数。
+  // 按域裁剪：SSH 面板只传 terminalId（后端就只暴露 SSH 工具），
+  // DB 面板只传 dbConnId（后端就只暴露 SQL 工具），
+  // desktop 面板只传 desktopId（后端就只暴露桌面工具），实现工具集硬隔离。
+  let prompt = SYSTEM_PROMPTS.agent;
+  const ctxParts: string[] = [];
+  let activeTerminal: string | undefined;
+  let activeDb: string | undefined;
+  let activeDesktop: string | undefined;
+  if (props.domain === "ssh") {
+    if (activeTerminalId.value) {
+      const tab = terminals.tabs.find((t) => t.instanceId === activeTerminalId.value);
+      const name = tab?.session.name ?? "未命名";
+      ctxParts.push(
+        `当前活动 SSH 终端：sessionId="${activeTerminalId.value}"（${name}）。调用 exec_ssh / terminal_snapshot 时直接用这个 sessionId。`
+      );
+      activeTerminal = activeTerminalId.value;
+    } else {
+      ctxParts.push(
+        "当前没有活动终端。请直接告诉用户：请先连接终端后再让我操作。不要调用任何工具。"
+      );
+    }
+  } else if (props.domain === "db") {
+    if (db.activeConnId) {
+      const tab = db.activeTab;
+      const name = tab?.profileName ?? "未命名";
+      ctxParts.push(
+        `当前活动 MySQL 连接：dbConnId="${db.activeConnId}"（${name}）。调用 exec_sql / list_db_tables / describe_table 时直接用这个 dbConnId。`
+      );
+      activeDb = db.activeConnId;
+      // 注入当前绑定库（点库/表或拖表时设置），让 AI 默认在该库 schema 下操作。
+      if (db.activeDatabase) {
+        ctxParts.push(
+          `当前库（schema）为 "${db.activeDatabase}"，该连接已自动 USE 此库。` +
+            `执行 SQL 时直接引用表名（如 \`表名\`）即可，不要加库前缀；` +
+            `确需跨库时才用 \`${db.activeDatabase}\`.\`表名\` 限定。`
+        );
+      }
+    } else {
+      ctxParts.push(
+        "当前没有连接数据库。请直接告诉用户：请先在 SQL 控制台连接数据库后再让我操作。不要调用任何工具。"
+      );
+    }
+  } else {
+    // desktop 域：桌面工具依赖多模态模型（截图需视觉能力）。
+    // 非多模态时后端同样不会下发桌面工具（activeDesktopId 被门控忽略），
+    // 这里同步告知模型，避免它以为能调用工具却调不动。
+    if (!multimodalEnabled.value) {
+      ctxParts.push(
+        "当前激活模型未开启多模态，无法使用桌面工具（截图需要视觉能力）。" +
+          "请告诉用户：到「设置 → AI」中为当前模型开启多模态后重试。不要调用任何桌面工具。"
+      );
+    } else if (activeDesktopId.value) {
+      const tab = desktopTabs.tabs.find((t) => t.instanceId === activeDesktopId.value);
+      const name = tab?.name ?? "未命名";
+      ctxParts.push(
+        `当前活动内嵌 RDP 桌面：instanceId="${activeDesktopId.value}"（${name}）。` +
+          `调用 desktop_screenshot / desktop_click / desktop_type / desktop_key 时直接操作这个桌面。`
+      );
+      activeDesktop = activeDesktopId.value;
+    } else {
+      ctxParts.push(
+        "当前没有打开内嵌 RDP 桌面。请直接告诉用户：请先在桌面页打开一个 RDP 连接（内嵌模式）后再让我操作。不要调用任何工具。"
+      );
+    }
+  }
+  // 本地文件读写（设置页开启后注入，仅 ssh/db 域）：告知模型工作目录与工具用法。
+  if (settings.fileAccess.enabled && props.domain !== "desktop") {
+    const dir = settings.fileAccess.workspaceDirs[props.domain as "ssh" | "db"];
+    if (dir) {
+      ctxParts.push(
+        `本地文件读写已启用，工作目录为 "${dir}"。可用 read_file / write_file / list_files ` +
+          `工具（path 为相对工作目录的路径）读取数据文件或导出结果文件。`
+      );
+    } else {
+      ctxParts.push(
+        "本地文件读写已开启，但当前助手尚未设置工作目录。请告诉用户去设置页配置，不要调用文件工具。"
+      );
+    }
+  }
+  prompt += "\n\n=== 当前可用上下文 ===\n" + ctxParts.join("\n");
+  // 附加表结构（拖表产生）：把 DDL 拼进 system prompt。
+  prompt += buildAttachedDdlSection();
+  // 已启用的可复用 skill（历史总结沉淀）。
+  prompt += buildSkillsSection();
+  return {
+    prompt,
+    opts: {
+      agent: true,
+      activeTerminalId: activeTerminal,
+      activeDbConnId: activeDb,
+      activeDesktopId: activeDesktop,
+      domain: props.domain,
+    },
+  };
+}
+
 async function handleSend() {
   const text = inputText.value.trim();
   // 图片模式下允许"只发图片不带文字"；但两者都空则不发。
@@ -615,82 +823,8 @@ async function handleSend() {
   }
   inputText.value = "";
   recordHistory(text);
-  if (mode.value === "agent") {
-    // 动态构建系统提示：把当前活动上下文的真实 id 注入，让模型直接填对参数。
-    // 按域裁剪：SSH 面板只传 terminalId（后端就只暴露 SSH 工具），
-    // DB 面板只传 dbConnId（后端就只暴露 SQL 工具），实现工具集硬隔离。
-    let prompt = SYSTEM_PROMPTS.agent;
-    const ctxParts: string[] = [];
-    let activeTerminal: string | undefined;
-    let activeDb: string | undefined;
-    if (props.domain === "ssh") {
-      if (activeTerminalId.value) {
-        const tab = terminals.tabs.find((t) => t.instanceId === activeTerminalId.value);
-        const name = tab?.session.name ?? "未命名";
-        ctxParts.push(
-          `当前活动 SSH 终端：sessionId="${activeTerminalId.value}"（${name}）。调用 exec_ssh / terminal_snapshot 时直接用这个 sessionId。`
-        );
-        activeTerminal = activeTerminalId.value;
-      } else {
-        ctxParts.push(
-          "当前没有活动终端。请直接告诉用户：请先连接终端后再让我操作。不要调用任何工具。"
-        );
-      }
-    } else {
-      if (db.activeConnId) {
-        const tab = db.activeTab;
-        const name = tab?.profileName ?? "未命名";
-        ctxParts.push(
-          `当前活动 MySQL 连接：dbConnId="${db.activeConnId}"（${name}）。调用 exec_sql / list_db_tables / describe_table 时直接用这个 dbConnId。`
-        );
-        activeDb = db.activeConnId;
-        // 注入当前绑定库（点库/表或拖表时设置），让 AI 默认在该库 schema 下操作。
-        if (db.activeDatabase) {
-          ctxParts.push(
-            `当前库（schema）为 "${db.activeDatabase}"，该连接已自动 USE 此库。` +
-              `执行 SQL 时直接引用表名（如 \`表名\`）即可，不要加库前缀；` +
-              `确需跨库时才用 \`${db.activeDatabase}\`.\`表名\` 限定。`
-          );
-        }
-      } else {
-        ctxParts.push(
-          "当前没有连接数据库。请直接告诉用户：请先在 SQL 控制台连接数据库后再让我操作。不要调用任何工具。"
-        );
-      }
-    }
-    // 本地文件读写（设置页开启后注入）：告知模型工作目录与工具用法。
-    if (settings.fileAccess.enabled) {
-      const dir = settings.fileAccess.workspaceDirs[props.domain];
-      if (dir) {
-        ctxParts.push(
-          `本地文件读写已启用，工作目录为 "${dir}"。可用 read_file / write_file / list_files ` +
-            `工具（path 为相对工作目录的路径）读取数据文件或导出结果文件。`
-        );
-      } else {
-        ctxParts.push(
-          "本地文件读写已开启，但当前助手尚未设置工作目录。请告诉用户去设置页配置，不要调用文件工具。"
-        );
-      }
-    }
-    prompt += "\n\n=== 当前可用上下文 ===\n" + ctxParts.join("\n");
-    // 附加表结构（拖表产生）：把 DDL 拼进 system prompt。
-    prompt += buildAttachedDdlSection();
-    // 已启用的可复用 skill（历史总结沉淀）。
-    prompt += buildSkillsSection();
-    await ai.send(text, prompt, {
-      agent: true,
-      activeTerminalId: activeTerminal,
-      activeDbConnId: activeDb,
-      domain: props.domain,
-      images,
-    });
-  } else {
-    let prompt = SYSTEM_PROMPTS[mode.value];
-    const ddlSection = buildAttachedDdlSection();
-    if (ddlSection) prompt += ddlSection;
-    prompt += buildSkillsSection();
-    await ai.send(text, prompt, { images });
-  }
+  const ctx = buildSendContext(mode.value === "agent");
+  await ai.send(text, ctx.prompt, { ...ctx.opts, images });
   // 发送后强制跟随滚动到底部（用户主动发送，应看到自己的消息与回复开始；
   // 若此刻正在上翻浏览，也以发送为准回到最新位置）。
   void scrollToBottom();
@@ -765,14 +899,31 @@ async function handleSummarizeSkill() {
     // null 时跳过轮询，把仍在流式中的半截消息当成总结结果。
     const rid = conv.activeRequestId;
     if (rid) {
-      const waitDone = async () => {
-        for (let i = 0; i < 600; i++) {
-          // 600 * 500ms = 5min 上限
-          await new Promise((r) => setTimeout(r, 500));
-          if (!conv.sending) break;
+      // 等待流式完成：watch 该会话的 sending 状态翻转为 false 即 resolve
+      // （响应式回调，替代此前 500ms×600 次的轮询空转）；5 分钟兜底超时，
+      // 防事件丢失时永久挂起。
+      await new Promise<void>((resolve) => {
+        const stop = watch(
+          () => conv.sending,
+          (sending) => {
+            if (!sending) {
+              stop();
+              clearTimeout(timer);
+              resolve();
+            }
+          }
+        );
+        const timer = setTimeout(() => {
+          stop();
+          resolve();
+        }, 5 * 60 * 1000);
+        // send 已同步收尾（如立即失败）时直接完成。
+        if (!conv.sending) {
+          stop();
+          clearTimeout(timer);
+          resolve();
         }
-      };
-      await waitDone();
+      });
     }
     const msgs = conv.messages;
     const lastMsg = msgs[msgs.length - 1];
@@ -836,19 +987,11 @@ async function copyText(text: string) {
 /** 重新生成某条 assistant 消息。 */
 async function regenerateMessage(m: AiMessage) {
   if (ai.sending) return;
-  // 重生时根据当前 mode 选系统提示；agent 模式需重建上下文（重新 send 会注入）。
-  const prompt = SYSTEM_PROMPTS[mode.value];
-  const opts =
-    mode.value === "agent"
-      ? {
-          agent: true,
-          activeTerminalId: props.domain === "ssh" ? (activeTerminalId.value ?? undefined) : undefined,
-          activeDbConnId: props.domain === "db" ? (db.activeConnId ?? undefined) : undefined,
-          domain: props.domain,
-        }
-      : undefined;
+  // 用消息生成时的 agent 模式（而非面板当前 mode）重建上下文，保证"重问"
+  // 得到的上下文与首次发送一致；附加表 DDL / skill 段落同样按当前状态注入。
+  const ctx = buildSendContext(m.agent === true);
   try {
-    await ai.regenerate(m.id, prompt, opts);
+    await ai.regenerate(m.id, ctx.prompt, ctx.opts);
   } catch (e) {
     ElMessage.error("重生失败：" + String(e));
   }
@@ -1179,8 +1322,12 @@ function renderMarkdown(text: string): string {
             <template v-if="domain === 'ssh'">
               智能体模式：AI 可在你的服务器上执行 SSH 命令。先连接一个终端，然后描述任务。
             </template>
-            <template v-else>
+            <template v-else-if="domain === 'db'">
               智能体模式：AI 可在你的数据库上执行 SQL。先在 SQL 控制台连接数据库，然后描述任务。
+            </template>
+            <template v-else>
+              智能体模式：AI 可查看并操作你的内嵌 RDP 桌面（截图 / 点击 / 输入）。
+              先在左侧连接一个 RDP 桌面（需多模态模型），然后描述任务。
             </template>
           </template>
           <template v-else>暂无对话。选择模式后输入你的问题。</template>

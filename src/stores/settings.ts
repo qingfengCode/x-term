@@ -41,6 +41,9 @@ const defaultTerminal: TerminalSettings = {
   sshIdleTimeoutMinutes: 30,
   sshKeepaliveSecs: 30,
   sshConnectTimeoutSecs: 15,
+  localShell: "cmd",
+  desktopClients: { vnc: "app", rdp: "system" },
+  rdpVerifyCert: false,
 };
 
 export const useSettingsStore = defineStore("settings", () => {
@@ -87,6 +90,12 @@ export const useSettingsStore = defineStore("settings", () => {
   async function load() {
     const s = await configApi.settingsLoad();
     terminal.value = { ...defaultTerminal, ...s.terminal };
+    // desktopClients 是嵌套对象：浅展开不会补默认值，这里显式嵌套合并，
+    // 兼容旧配置文件缺该键或只缺其中某个字段的情况。
+    terminal.value.desktopClients = {
+      ...defaultTerminal.desktopClients,
+      ...(s.terminal.desktopClients ?? {}),
+    };
     syncThemeCache();
     // 旧配置缺模型参数字段时补默认值（后端 serde default 已兜底，这里防御旧前端缓存）。
     aiProviders.value = (s.ai.providers ?? []).map((p) => ({

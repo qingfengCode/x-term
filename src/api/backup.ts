@@ -52,11 +52,13 @@ export function backupInspect(path: string, password: string): Promise<BackupInf
 /**
  * 从加密备份文件导入数据。
  * @param mode "merge"（默认，按 id 合并）| "overwrite"（清空后覆盖导入）
+ * @param force 覆盖模式且备份不含凭据/TOTP 时，清空本机凭据需显式确认；后端默认拒绝，传 true 放行
  */
 export function backupImport(
   path: string,
   password: string,
   mode: "merge" | "overwrite",
+  force = false,
 ): Promise<BackupSummary> {
-  return invoke<BackupSummary>("backup_import", { path, password, mode });
+  return invoke<BackupSummary>("backup_import", { path, password, mode, force });
 }

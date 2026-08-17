@@ -9,7 +9,8 @@
  * - 拒绝（终止连接）
  *
  * 多个确认（如快速连多个会话）按到达顺序排队串行处理。后端等待超时 120s，
- * 前端设置 125s 兜底计时器自动拒绝，防止弹窗悬挂。
+ * 前端设置 115s 兜底计时器**先于后端**自动拒绝，防止弹窗悬挂（若晚于后端，
+ * 用户提交只会得到"挑战已关闭"的误导错误）。
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -21,8 +22,8 @@ import {
 } from "@/api/session";
 import { useUiStore } from "@/stores/ui";
 
-/** 后端等待超时 120s，前端兜底略长，到点自动拒绝。 */
-const CHALLENGE_TIMEOUT_MS = 125_000;
+/** 后端等待超时 120s，前端兜底略短（115s）先到，到点自动拒绝。 */
+const CHALLENGE_TIMEOUT_MS = 115_000;
 
 interface QueuedChallenge {
   challenge: SshHostKeyEvent;

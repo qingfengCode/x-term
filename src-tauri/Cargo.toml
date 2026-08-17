@@ -1,6 +1,6 @@
 [package]
 name = "x-term"
-version = "0.1.22"
+version = "0.1.27"
 description = "X-Term 现代化运维终端客户端"
 authors = ["x-term"]
 edition = "2021"
@@ -19,6 +19,8 @@ tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-os = "2"
+# 日志：attachConsole 把 webview console 转发到后端日志，排查前端问题必备。
+tauri-plugin-log = "2"
 
 # 序列化
 serde = { version = "1", features = ["derive"] }
@@ -33,6 +35,9 @@ futures = "0.3"
 russh = "0.45"
 russh-keys = "0.45"
 russh-sftp = "2"
+
+# 本地终端（Windows ConPTY / Unix PTY）
+portable-pty = "0.8"
 
 # 数据库
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -62,13 +67,20 @@ axum = { version = "0.7", default-features = false, features = ["http1", "json",
 tower = { version = "0.5", default-features = false }
 tower-http = { version = "0.6", default-features = false, features = ["cors"] }
 
+# 内嵌 RDP：桥接端终止 TLS（rustls，ring provider 与现有依赖树一致，避免引入 aws-lc）
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = "0.26"
+# 内嵌 RDP 严格模式：从 Windows 系统证书库加载信任根校验证书链（默认不校验）。
+rustls-native-certs = "0.8"
+# RDCleanPath 握手 PDU 的 DER 编解码（Devolutions Gateway 协议，与官方一致）
+der = { version = "0.7", features = ["derive"] }
+
 # 工具
 uuid = { version = "1", features = ["v4", "serde"] }
 anyhow = "1"
 thiserror = "1"
 chrono = { version = "0.4", features = ["serde"] }
 log = "0.4"
-env_logger = "0.11"
 dirs = "5"
 once_cell = "1"
 parking_lot = "0.12"
@@ -89,6 +101,10 @@ bytes = "1"
 async-stream = "0.3"
 # md-5：S3 DeleteObjects 批量删除要求的 Content-MD5 头。
 md-5 = "0.10"
+
+[dev-dependencies]
+# 桥接回归测试：真实 WebSocket 升级握手（与 axum 0.7 ws 特性同版本）。
+tokio-tungstenite = "0.24"
 
 [profile.release]
 panic = "abort"

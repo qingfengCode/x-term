@@ -27,6 +27,11 @@ const WILL: u8 = 251;
 const SB: u8 = 250; // 子协商开始
 const SE: u8 = 240; // 子协商结束
 
+/// leftover 缓冲上限。增量解析会缓存未闭合的序列（新增行为），防御远端
+/// 持续发送未闭合的 SB 序列导致内存无界增长。正常协商序列（WILL/DO/终端
+/// 类型等）只有几个字节，远小于此值；超限丢弃并重新同步。
+const MAX_IAC_LEFTOVER: usize = 64 * 1024;
+
 // 常用选项码。
 const OPT_ECHO: u8 = 1;
 const OPT_SUPPRESS_GA: u8 = 3;
@@ -85,6 +90,16 @@ impl TelnetSession {
         }
     }
 
+    /// 取 `since_total` 累计字节之后的输出窗口（配合
+    /// [`Self::total_output_bytes`] 截取命令执行期间的新增输出）。
+    /// 返回 (文本, 是否溢出窗口容量)。
+    pub fn snapshot_after(&self, since_total: usize) -> (String, bool) {
+        match self.output_buffer.lock() {
+            Ok(buf) => buf.snapshot_after(since_total),
+            Err(_) => (String::new(), false),
+        }
+    }
+
     pub fn write(&self, data: Vec<u8>) -> AppResult<()> {
         let tx = self
             .input_tx
@@ -121,6 +136,8 @@ impl TelnetSession {
             let mut buf = [0u8; 4096];
             let mut cols: u16 = 80;
             let mut rows: u16 = 24;
+            // IAC 解析状态跨 read 分片保持（协商序列可能被 TCP 切断）。
+            let mut parser = TelnetIacParser::new();
 
             // 发送初始 NAWS。
             let _ = send_naws(&mut write_half, cols, rows).await;
@@ -135,7 +152,7 @@ impl TelnetSession {
                             Ok(0) | Err(_) => break, // 连接关闭
                             Ok(len) => {
                                 let data = &buf[..len];
-                                let clean = process_iac(data, &mut write_half, &mut cols, &mut rows).await;
+                                let clean = process_iac(&mut parser, data, &mut write_half).await;
                                 if !clean.is_empty() {
                                     // 写入输出缓冲。
                                     if let Ok(mut ob) = output_buffer.lock() {
@@ -190,95 +207,169 @@ impl TelnetSession {
     }
 }
 
-/// 处理 IAC 协商：解析命令序列，响应必要的选项，返回纯数据字节。
+/// Telnet IAC 解析器（跨 TCP 分片的增量状态机）。
 ///
-/// 遍历字节流，遇到 IAC(255) 起始的命令序列就解析并消费，非命令字节累积为数据返回。
-async fn process_iac(
-    data: &[u8],
-    write_half: &mut tokio::net::tcp::OwnedWriteHalf,
-    _cols: &mut u16,
-    _rows: &mut u16,
-) -> Vec<u8> {
-    let mut clean = Vec::with_capacity(data.len());
-    let mut i = 0;
-    let mut to_send: Vec<u8> = Vec::new(); // 待发送的响应
+/// TCP 是字节流，IAC 协商序列（`IAC WILL <opt>`、`IAC SB ... IAC SE` 等）随时
+/// 可能被分片切断。旧实现按「每次 read 到的 chunk」独立解析，chunk 末尾不完整
+/// 的序列直接丢弃，于是协商序列跨分片时：命令字节漏进数据流（乱码）、数据丢失、
+/// 该序列对应的选项协商失效（远端以为客户端不响应）。本解析器把未完成的序列
+/// 尾部缓存起来，与下一 chunk 拼接后继续解析，并正确处理子协商内的
+/// `IAC IAC` 转义。
+struct TelnetIacParser {
+    /// 上一批数据解析后剩余的不完整序列字节（等待后续数据补齐）。
+    leftover: Vec<u8>,
+}
 
-    while i < data.len() {
-        if data[i] == IAC {
-            if i + 1 >= data.len() {
-                break; // 不完整的 IAC，丢弃
+/// 一批数据解析后的产物。
+struct ParsedTelnet {
+    /// 过滤掉协商序列后的纯数据（展示用）。
+    data: Vec<u8>,
+    /// 需写回远端的协商响应。
+    responses: Vec<u8>,
+}
+
+impl TelnetIacParser {
+    fn new() -> Self {
+        Self { leftover: Vec::new() }
+    }
+
+    /// 增量解析一批字节：先与 leftover 拼接，解析中遇到不完整序列时把未完成
+    /// 的尾部存回 leftover，等待下一批补齐。
+    fn push(&mut self, chunk: &[u8]) -> ParsedTelnet {
+        let mut buf = std::mem::take(&mut self.leftover);
+        buf.extend_from_slice(chunk);
+
+        let mut data = Vec::new();
+        let mut responses = Vec::new();
+        let mut i = 0usize;
+        let mut incomplete_from: Option<usize> = None;
+
+        while i < buf.len() {
+            if buf[i] != IAC {
+                // 数据模式：一直推进到下一个 IAC（或结尾）。
+                let start = i;
+                while i < buf.len() && buf[i] != IAC {
+                    i += 1;
+                }
+                data.extend_from_slice(&buf[start..i]);
+                continue;
             }
-            let cmd = data[i + 1];
-            match cmd {
-                DO | DONT | WILL | WONT => {
-                    if i + 2 >= data.len() {
-                        break;
-                    }
-                    let opt = data[i + 2];
-                    // 响应策略。
-                    match (cmd, opt) {
-                        (WILL, OPT_ECHO) | (WILL, OPT_SUPPRESS_GA) => {
-                            to_send.extend_from_slice(&[IAC, DO, opt]); // 接受
-                        }
-                        (DO, OPT_TERM_TYPE) => {
-                            to_send.extend_from_slice(&[IAC, WILL, opt]); // 同意提供终端类型
-                        }
-                        (DO, OPT_NAWS) => {
-                            to_send.extend_from_slice(&[IAC, WILL, opt]); // 同意 NAWS
-                        }
-                        (WILL, _) => {
-                            to_send.extend_from_slice(&[IAC, WONT, opt]); // 拒绝其它 WILL
-                        }
-                        (DO, _) => {
-                            to_send.extend_from_slice(&[IAC, WONT, opt]); // 拒绝其它 DO
-                        }
-                        _ => {} // DONT/WONT 不响应
-                    }
-                    i += 3;
+            match buf.get(i + 1).copied() {
+                None => {
+                    // 孤立的 IAC（下一字节还没到）：整体缓存等待补齐。
+                    incomplete_from = Some(i);
+                    break;
                 }
-                SB => {
-                    // 子协商：SB ... SE，找到 SE 消费整个块。
-                    // 终端类型请求：SB TERMINAL_TYPE SEND IAC SE → 回 SB TERMINAL_TYPE IS <name> IAC SE
-                    let mut j = i + 2;
-                    while j < data.len() {
-                        if data[j] == IAC && j + 1 < data.len() && data[j + 1] == SE {
-                            break;
-                        }
-                        j += 1;
-                    }
-                    // 解析子协商内容。
-                    if i + 2 < data.len() && data[i + 2] == OPT_TERM_TYPE {
-                        // 回终端类型。
-                        let name = b"xterm-256color";
-                        to_send.extend_from_slice(&[IAC, SB, OPT_TERM_TYPE, 0]); // 0 = IS
-                        to_send.extend_from_slice(name);
-                        to_send.extend_from_slice(&[IAC, SE]);
-                    }
-                    i = j + 2;
-                }
-                IAC => {
+                Some(IAC) => {
                     // IAC IAC → 转义的数据字节 255。
-                    clean.push(IAC);
+                    data.push(IAC);
                     i += 2;
                 }
-                _ => {
+                Some(cmd @ (DO | DONT | WILL | WONT)) => {
+                    match buf.get(i + 2).copied() {
+                        None => {
+                            incomplete_from = Some(i);
+                            break;
+                        }
+                        Some(opt) => {
+                            // 响应策略。
+                            match (cmd, opt) {
+                                (WILL, OPT_ECHO) | (WILL, OPT_SUPPRESS_GA) => {
+                                    responses.extend_from_slice(&[IAC, DO, opt]); // 接受
+                                }
+                                (DO, OPT_TERM_TYPE) => {
+                                    responses.extend_from_slice(&[IAC, WILL, opt]); // 同意提供终端类型
+                                }
+                                (DO, OPT_NAWS) => {
+                                    responses.extend_from_slice(&[IAC, WILL, opt]); // 同意 NAWS
+                                }
+                                (WILL, _) => {
+                                    responses.extend_from_slice(&[IAC, WONT, opt]); // 拒绝其它 WILL
+                                }
+                                (DO, _) => {
+                                    responses.extend_from_slice(&[IAC, WONT, opt]); // 拒绝其它 DO
+                                }
+                                _ => {} // DONT/WONT 不响应
+                            }
+                            i += 3;
+                        }
+                    }
+                }
+                Some(SB) => {
+                    // 子协商：内容直到 IAC SE 结束；内容中的 IAC IAC 转义为 255。
+                    let mut j = i + 2;
+                    let mut sub = Vec::new();
+                    let mut found_end = false;
+                    while j < buf.len() {
+                        match (buf[j], buf.get(j + 1).copied()) {
+                            (IAC, Some(SE)) => {
+                                found_end = true;
+                                j += 2;
+                                break;
+                            }
+                            (IAC, Some(IAC)) => {
+                                sub.push(IAC);
+                                j += 2;
+                            }
+                            (b, _) => {
+                                sub.push(b);
+                                j += 1;
+                            }
+                        }
+                    }
+                    if !found_end {
+                        // SE 尚未到达：整个 SB 序列缓存等待补齐。
+                        incomplete_from = Some(i);
+                        break;
+                    }
+                    // 终端类型请求（SB TERM_TYPE ... SE）→ 回 IS + 名称。
+                    if sub.first() == Some(&OPT_TERM_TYPE) {
+                        let mut r = vec![IAC, SB, OPT_TERM_TYPE, 0]; // 0 = IS
+                        r.extend_from_slice(b"xterm-256color");
+                        r.extend_from_slice(&[IAC, SE]);
+                        responses.extend_from_slice(&r);
+                    }
+                    i = j;
+                }
+                Some(_) => {
                     // 其它单字节命令（如 NOP），跳过。
                     i += 2;
                 }
             }
-        } else {
-            clean.push(data[i]);
-            i += 1;
         }
-    }
 
-    // 发送响应。
-    if !to_send.is_empty() {
-        let _ = write_half.write_all(&to_send).await;
+        if let Some(from) = incomplete_from {
+            self.leftover = buf[from..].to_vec();
+        } else {
+            self.leftover.clear();
+        }
+        // 防御：远端持续发送未闭合序列时缓存会无限增长，超限丢弃并重新同步。
+        if self.leftover.len() > MAX_IAC_LEFTOVER {
+            log::warn!(
+                "Telnet IAC 未闭合序列超过 {} 字节，丢弃并重新同步",
+                MAX_IAC_LEFTOVER
+            );
+            self.leftover.clear();
+        }
+        ParsedTelnet { data, responses }
+    }
+}
+
+/// 处理一批远端字节的 IAC 协商，返回纯数据字节。
+///
+/// `parser` 保存跨 TCP 分片的解析状态（见 [`TelnetIacParser`]）；协商响应
+/// 直接写回 `write_half`。
+async fn process_iac(
+    parser: &mut TelnetIacParser,
+    data: &[u8],
+    write_half: &mut tokio::net::tcp::OwnedWriteHalf,
+) -> Vec<u8> {
+    let parsed = parser.push(data);
+    if !parsed.responses.is_empty() {
+        let _ = write_half.write_all(&parsed.responses).await;
         let _ = write_half.flush().await;
     }
-
-    clean
+    parsed.data
 }
 
 /// 发送 NAWS（窗口大小）子协商。
@@ -348,5 +439,86 @@ impl Drop for TelnetSession {
         if let Some(handle) = self.reader_handle.take() {
             handle.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 按分片序列喂给解析器，汇总全部纯数据与响应。
+    fn parse_all(chunks: &[&[u8]]) -> (Vec<u8>, Vec<u8>) {
+        let mut parser = TelnetIacParser::new();
+        let mut data = Vec::new();
+        let mut responses = Vec::new();
+        for c in chunks {
+            let p = parser.push(c);
+            data.extend_from_slice(&p.data);
+            responses.extend_from_slice(&p.responses);
+        }
+        (data, responses)
+    }
+
+    /// 纯数据原样透传，无响应。
+    #[test]
+    fn passthrough_plain_data() {
+        let (data, responses) = parse_all(&[b"hello"]);
+        assert_eq!(data, b"hello");
+        assert!(responses.is_empty());
+    }
+
+    /// IAC IAC 转义为单个 255 数据字节。
+    #[test]
+    fn iac_iac_escape_is_data() {
+        let (data, _) = parse_all(&[&[IAC, IAC, b'a']]);
+        assert_eq!(data, vec![IAC, b'a']);
+    }
+
+    /// 协商响应：WILL ECHO → DO ECHO；DO 未知 → WONT；DONT 不响应。
+    #[test]
+    fn negotiation_responses() {
+        let (_, r) = parse_all(&[&[IAC, WILL, OPT_ECHO]]);
+        assert_eq!(r, vec![IAC, DO, OPT_ECHO]);
+        let (_, r) = parse_all(&[&[IAC, DO, 42]]);
+        assert_eq!(r, vec![IAC, WONT, 42]);
+        let (_, r) = parse_all(&[&[IAC, DONT, OPT_ECHO]]);
+        assert!(r.is_empty());
+    }
+
+    /// 终端类型子协商 → 回 IS + xterm-256color。
+    #[test]
+    fn terminal_type_subnegotiation() {
+        let (data, r) = parse_all(&[&[IAC, SB, OPT_TERM_TYPE, 1, IAC, SE]]);
+        assert!(data.is_empty());
+        let mut expect = vec![IAC, SB, OPT_TERM_TYPE, 0];
+        expect.extend_from_slice(b"xterm-256color");
+        expect.extend_from_slice(&[IAC, SE]);
+        assert_eq!(r, expect);
+    }
+
+    /// 跨分片：IAC WILL 与选项字节被 TCP 分片切断，必须拼回并正确响应。
+    #[test]
+    fn split_negotiation_across_chunks() {
+        let (data, r) = parse_all(&[&[IAC, WILL], &[OPT_ECHO]]);
+        assert!(data.is_empty());
+        assert_eq!(r, vec![IAC, DO, OPT_ECHO]);
+    }
+
+    /// 跨分片：孤立 IAC 位于 chunk 末尾，下一 chunk 以 IAC 开头 → 转义数据 255。
+    #[test]
+    fn split_iac_escape_across_chunks() {
+        let (data, _) = parse_all(&[&[b'a', IAC], &[IAC, b'b']]);
+        assert_eq!(data, vec![b'a', IAC, b'b']);
+    }
+
+    /// 跨分片：子协商被切断，前半部分不得漏进数据流，拼全后正常响应。
+    #[test]
+    fn split_subnegotiation_across_chunks() {
+        let (data, r) = parse_all(&[&[b'x', IAC, SB, OPT_TERM_TYPE], &[1, IAC, SE, b'y']]);
+        assert_eq!(data, vec![b'x', b'y']);
+        let mut expect = vec![IAC, SB, OPT_TERM_TYPE, 0];
+        expect.extend_from_slice(b"xterm-256color");
+        expect.extend_from_slice(&[IAC, SE]);
+        assert_eq!(r, expect);
     }
 }
