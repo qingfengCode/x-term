@@ -74,6 +74,15 @@ impl TelnetSession {
         }
     }
 
+    /// 取原始字节快照 + 累计字节数（同一锁内，原子一致）。
+    /// 供前端 attach 回放（terminal_attach 命令），见 [`SshSession::attach_snapshot`]。
+    pub fn attach_snapshot(&self) -> (Vec<u8>, usize) {
+        match self.output_buffer.lock() {
+            Ok(buf) => buf.snapshot_raw_with_total(),
+            Err(_) => (Vec::new(), 0),
+        }
+    }
+
     /// 累计写入字节数（不受环形截断影响），判断"输出是否仍在增长"用。
     pub fn total_output_bytes(&self) -> usize {
         match self.output_buffer.lock() {
@@ -154,10 +163,12 @@ impl TelnetSession {
                                 let data = &buf[..len];
                                 let clean = process_iac(&mut parser, data, &mut write_half).await;
                                 if !clean.is_empty() {
-                                    // 写入输出缓冲。
-                                    if let Ok(mut ob) = output_buffer.lock() {
+                                    // 写入输出缓冲（锁内取追加后的累计字节数，
+                                    // 随事件 emit 供前端 attach 回放去重）。
+                                    let total = output_buffer.lock().ok().map(|mut ob| {
                                         ob.push(&clean);
-                                    }
+                                        ob.total_bytes()
+                                    });
                                     // emit 给前端（base64）。
                                     let b64 = base64::engine::general_purpose::STANDARD.encode(&clean);
                                     emit(
@@ -166,6 +177,7 @@ impl TelnetSession {
                                         TerminalDataEvent {
                                             session_id: session_id.clone(),
                                             data: b64,
+                                            total: total.unwrap_or(0),
                                         },
                                     );
                                 }

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref, watch } from "vue";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
@@ -8,6 +8,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { Upload, Download } from "@element-plus/icons-vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import * as terminalApi from "@/api/terminal";
+import type { TerminalDataPayload } from "@/api/terminal";
 import { useSettingsStore } from "@/stores/settings";
 import { matchesCombo } from "@/utils/shortcut";
 import { base64ToBytes, bytesToBase64 } from "@/utils/binary";
@@ -23,10 +24,60 @@ const containerRef = ref<HTMLElement | null>(null);
 let term: Terminal | null = null;
 let fitAddon: FitAddon | null = null;
 let searchAddon: SearchAddon | null = null;
+let webglAddon: WebglAddon | null = null;
 let unlistens: UnlistenFn[] = [];
 let resizeObs: ResizeObserver | null = null;
 // 组件销毁标志：listen 未 resolve 前组件可能已卸载，resolve 后据此立即反订阅。
 let unmounted = false;
+
+// --- attach 回放状态（首屏输出不丢；重连换 instanceId 时重置复用同一 xterm）---
+// 后端 reader 在 connect 返回前就开始推 terminal:data，监听注册之前的输出会丢。
+// 流程：监听先注册（期间事件缓存 pendingData，不渲染）→ terminal_attach 取
+// 「缓冲快照 + 累计基线」→ 快照先入终端 → 缓存事件按 total 基线去重后放行
+// （≤ 基线的块已含在快照里）。attach 完成后 live 事件直通。
+let attachDone = false;
+let attachBaseline = 0;
+let pendingData: { bytes: Uint8Array; total: number }[] = [];
+// attach 代际：连续快速重连（重连→立刻再重连）时旧的 attach 尚在 await 中，
+// 新的已重置状态——旧代返回后必须丢弃，否则会把旧实例的快照写进新会话。
+let attachGen = 0;
+
+/** 把字节喂给渲染链（ZMODEM Sentry → 终端），快照与事件统一走这一入口。 */
+function feedOutput(bytes: Uint8Array) {
+  zmodemFeed(bytes);
+}
+
+/**
+ * 绑定一个终端实例：重置回放状态 → 同步当前尺寸 → attach 快照 → 放行缓存。
+ * 挂载时与 props.instanceId 变化（重连/手动认证成功换新实例）时调用。
+ */
+async function attachSession(instanceId: string) {
+  const gen = ++attachGen;
+  attachDone = false;
+  attachBaseline = 0;
+  pendingData = [];
+  if (!instanceId) return;
+  // 新实例 PTY 默认 80x24：先把当前实际尺寸同步过去，尽早对齐减少首屏折行。
+  terminalApi
+    .terminalResize(instanceId, term?.cols ?? 80, term?.rows ?? 24)
+    .catch(() => {});
+  try {
+    const snap = await terminalApi.terminalAttach(instanceId);
+    // 已卸载，或期间又发生了重绑（新一次 attachSession）：丢弃本次结果。
+    if (unmounted || gen !== attachGen) return;
+    attachBaseline = snap.total;
+    const bytes = base64ToBytes(snap.data);
+    if (bytes.length) feedOutput(bytes);
+  } catch {
+    /* 会话已不存在（连接瞬间失败等）：无基线，缓存事件全量放行。
+       同样要防旧代复活——gen 不匹配直接放弃。 */
+    if (unmounted || gen !== attachGen) return;
+  }
+  attachDone = true;
+  for (const p of pendingData.splice(0)) {
+    if (p.total > attachBaseline) feedOutput(p.bytes);
+  }
+}
 
 /** 注册事件监听：resolve 前已卸载则立刻反订阅，避免监听器泄漏到卸载之后。 */
 const track = async (un: Promise<UnlistenFn>) => {
@@ -115,6 +166,14 @@ async function readClipboard(): Promise<string> {
   }
 }
 
+// --- 写入失败提示（防抖：只提示一次，成功写入后复位） ---
+let writeFailed = false;
+
+// --- 每面板字号覆盖（null = 跟随全局设置） ---
+// 工具栏 ± / Ctrl+= 只改本面板的覆盖值：不再污染全局设置（避免"临时放大
+// 被之后的 settings.save() 顺带持久化"），也不影响其它 tab；重置回到全局值。
+let fontSizeOverride: number | null = null;
+
 onMounted(async () => {
   if (!containerRef.value) return;
   term = new Terminal(buildOptions());
@@ -125,9 +184,18 @@ onMounted(async () => {
   term.loadAddon(searchAddon);
   if (settings.terminal.enableWebgl) {
     try {
-      term.loadAddon(new WebglAddon());
+      webglAddon = new WebglAddon();
+      // WebGL 上下文被浏览器/驱动驱逐（多标签超限、系统休眠恢复、驱动重置）
+      // 时 xterm 不会自动降级，终端会永久空白。dispose 后 xterm 自动回退
+      // DOM 渲染器，内容（含 scrollback）原样重绘。
+      webglAddon.onContextLoss(() => {
+        webglAddon?.dispose();
+        webglAddon = null;
+      });
+      term.loadAddon(webglAddon);
     } catch {
       /* WebGL 不可用时回退到 canvas */
+      webglAddon = null;
     }
   }
   term.open(containerRef.value);
@@ -136,15 +204,24 @@ onMounted(async () => {
   // ZMODEM Sentry 必须在注册 terminal:data 监听之前初始化。
   zmodemInit();
 
-  // 监听后端推送的终端数据：按 instanceId 过滤。
+  // 监听后端推送的终端数据：按 instanceId 过滤（动态读 props——重连换新
+  // 实例时同一监听继续生效，无需重注册）。
   // 字节先经过 ZMODEM Sentry（检测起始序列 / 路由协议字节），
-  // 非传输数据由 Sentry 转回终端写入。
+  // 非传输数据由 Sentry 转回终端写入。attach 完成前先缓存（见 attachSession）。
   await track(
-    listen<{ sessionId: string; data: string }>("terminal:data", (e) => {
+    listen<TerminalDataPayload>("terminal:data", (e) => {
       if (unmounted) return;
+      // 动态读当前 instanceId：重连/手动认证成功后监听自动切到新实例。
       if (e.payload.sessionId !== props.instanceId) return;
       const bytes = base64ToBytes(e.payload.data);
-      zmodemFeed(bytes);
+      if (!attachDone) {
+        pendingData.push({ bytes, total: e.payload.total ?? 0 });
+        return;
+      }
+      // attach 快照基线之前的块已包含在快照里，跳过避免重复渲染。
+      const total = e.payload.total ?? 0;
+      if (total > 0 && total <= attachBaseline) return;
+      feedOutput(bytes);
     }),
   );
 
@@ -160,12 +237,22 @@ onMounted(async () => {
   );
 
   // 用户键盘输入 → 后端。ZMODEM 传输期间屏蔽，避免干扰协议。
+  // 写失败（连接已断/卡死超时）在终端内提示一次，成功后自动复位标志——
+  // 否则用户对着冻结的终端敲字毫无反馈。
   term.onData((data) => {
     if (zmodemActive.value) return;
     const b64 = bytesToBase64(new TextEncoder().encode(data));
-    terminalApi.terminalWrite(props.instanceId, b64).catch(() => {
-      /* 写入失败通常是连接已断 */
-    });
+    terminalApi
+      .terminalWrite(props.instanceId, b64)
+      .then(() => {
+        writeFailed = false;
+      })
+      .catch(() => {
+        if (!writeFailed) {
+          writeFailed = true;
+          term?.write("\r\n\x1b[31m[写入失败：连接可能已断开或已卡死，可尝试重连]\x1b[0m\r\n");
+        }
+      });
   });
 
   // copyOnSelect：选中即复制。回调内实时读设置值（而非挂载时读一次），
@@ -190,10 +277,9 @@ onMounted(async () => {
   });
   resizeObs.observe(containerRef.value);
 
-  // 初始尺寸同步给后端。
-  terminalApi
-    .terminalResize(props.instanceId, term.cols, term.rows)
-    .catch(() => {});
+  // attach 回放（含初始尺寸同步，见 attachSession）：补齐监听注册前丢失的
+  // 首屏输出（SSH banner/MOTD、本地 shell 提示符等）。
+  void attachSession(props.instanceId);
 
   // 搜索结果计数。
   searchAddon?.onDidChangeResults((ev) => {
@@ -204,6 +290,16 @@ onMounted(async () => {
 
   // 全局快捷键：Ctrl+F 搜索（仅本实例激活时，避免多 tab 冲突——下文用 windowKeydownTarget 判断焦点）。
   window.addEventListener("keydown", onGlobalKeydown);
+});
+
+// 终端页被 KeepAlive 缓存：切到数据库/桌面页时本组件 deactivated 但监听
+// 仍挂着——隐藏终端的字号缩放（Ctrl+=/-/0）会误改。随页面激活/停用注册/注销
+// （activated 钩子沿 KeepAlive 组件树传播到后代；重复注册同引用幂等）。
+onActivated(() => {
+  window.addEventListener("keydown", onGlobalKeydown);
+});
+onDeactivated(() => {
+  window.removeEventListener("keydown", onGlobalKeydown);
 });
 
 // 搜索（组合键跟随设置页绑定，默认 Ctrl+F）、复制/粘贴、字号缩放。
@@ -242,7 +338,8 @@ function onGlobalKeydown(e: KeyboardEvent) {
     return;
   }
 
-  // 字号缩放：Ctrl+= / Ctrl+- / Ctrl+0（重置为默认 14）。与工具条按钮一致，仅存内存。
+  // 字号缩放：Ctrl+= / Ctrl+- / Ctrl+0（重置为全局设置值）。与工具条按钮一致，
+  // 改的是本面板的覆盖值（不写全局设置、不持久化）。
   if (e.ctrlKey || e.metaKey) {
     if (e.key === "=" || e.key === "+") {
       e.preventDefault();
@@ -252,24 +349,56 @@ function onGlobalKeydown(e: KeyboardEvent) {
       zoomFont(-1);
     } else if (e.key === "0") {
       e.preventDefault();
-      settings.setTerminal({ fontSize: 14 });
+      resetZoom();
     }
   }
 }
 
+/** 放大/缩小本面板字号（8..36，基于当前生效值叠加）。 */
 function zoomFont(delta: number) {
-  const next = Math.max(8, Math.min(36, settings.terminal.fontSize + delta));
-  settings.setTerminal({ fontSize: next });
+  const base = fontSizeOverride ?? settings.terminal.fontSize;
+  fontSizeOverride = Math.max(8, Math.min(36, base + delta));
+  if (term) term.options.fontSize = fontSizeOverride;
+  try {
+    fitAddon?.fit();
+  } catch {
+    /* ignore */
+  }
 }
 
-// 设置变化时重建主题。
+/** 重置本面板字号覆盖，回到全局设置值。 */
+function resetZoom() {
+  fontSizeOverride = null;
+  if (term) term.options.fontSize = settings.terminal.fontSize;
+  try {
+    fitAddon?.fit();
+  } catch {
+    /* ignore */
+  }
+}
+
+// 重连/手动认证成功换新实例：复用同一 xterm 实例（scrollback 保留），只重绑
+// 数据流——重置 ZMODEM 状态并重新 attach 新实例的输出缓冲。
+watch(
+  () => props.instanceId,
+  (id) => {
+    if (!id || unmounted) return;
+    zmodemReset();
+    writeFailed = false;
+    void attachSession(id);
+  },
+);
+
+// 设置变化时热更新（字号遵循面板覆盖优先；scrollback 同步热更，xterm 支持
+// 运行时调整，改设置页的回滚行数对已开终端立即生效）。
 watch(
   () => settings.terminal,
   (t) => {
     if (term) {
       term.options.fontFamily = t.fontFamily;
-      term.options.fontSize = t.fontSize;
+      term.options.fontSize = fontSizeOverride ?? t.fontSize;
       term.options.lineHeight = t.lineHeight;
+      term.options.scrollback = t.scrollback;
       term.options.theme = t.theme === "dark" ? DARK_THEME : LIGHT_THEME;
       try {
         fitAddon?.fit();
@@ -365,6 +494,10 @@ defineExpose({
   clearSearch: () => searchAddon?.clearDecorations(),
   clear: () => term?.clear(),
   focus: () => term?.focus(),
+  /** 本面板字号缩放（覆盖值，不写全局设置）。工具栏 ± 按钮调用。 */
+  zoomFont,
+  /** 重置本面板字号到全局设置值。 */
+  resetZoom,
   /**
    * 向终端发送一条命令（自动追加换行）。
    * 用于快捷命令按钮 / 快捷键触发。

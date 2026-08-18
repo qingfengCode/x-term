@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { ElMessage, ElMessageBox } from "element-plus";
-import { Promotion, Delete, ChatDotRound, DArrowRight, Connection, Tools, ArrowDown, Plus, Close, CopyDocument, RefreshRight, VideoPause, Document, Loading, Download, MagicStick, Collection, Picture } from "@element-plus/icons-vue";
+import { ElMessage, ElMessageBox, ElNotification } from "element-plus";
+import { Promotion, Delete, ChatDotRound, DArrowRight, Connection, Tools, ArrowDown, ArrowUp, Plus, Close, CopyDocument, RefreshRight, VideoPause, Document, Loading, Download, MagicStick, Collection, Picture, CircleCheckFilled, Clock, Odometer, MoreFilled } from "@element-plus/icons-vue";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 import { open, save } from "@tauri-apps/plugin-dialog";
@@ -14,6 +14,7 @@ import { useDbStore } from "@/stores/db";
 import { useUiStore } from "@/stores/ui";
 import { useDesktopTabsStore } from "@/stores/desktopTabs";
 import { dbShowCreateTable, type DraggedTable } from "@/api/db";
+import type { AskUserAnswer } from "@/api/db";
 import { executeDesktopTool, aiDesktopToolRespond, getDesktopControl } from "@/api/desktopControl";
 import type { ToolCallItem } from "@/stores/ai";
 import { bytesToBase64 } from "@/utils/binary";
@@ -216,6 +217,42 @@ const mode = ref<Mode>("agent");
 const panelTitle = computed(() =>
   props.domain === "ssh" ? "终端助手" : props.domain === "db" ? "数据库助手" : "桌面助手"
 );
+
+/** 当前活动会话的任务清单（todo_write 工具最新整表；无则空数组）。 */
+const activeTodos = computed(() => ai.activeConversation?.todos ?? []);
+
+/** 任务清单统计（完成数/总数/完成百分比）。 */
+const todoStats = computed(() => {
+  const total = activeTodos.value.length;
+  const completed = activeTodos.value.filter((t) => t.status === "completed").length;
+  return {
+    total,
+    completed,
+    pct: total > 0 ? Math.round((completed / total) * 100) : 0,
+  };
+});
+
+/** 任务清单条折叠状态（项数超过阈值时可手动收起）。 */
+const todoCollapsed = ref(false);
+/** 超过该条数时显示折叠按钮。 */
+const TODO_COLLAPSE_THRESHOLD = 6;
+
+/** 当前活动会话的累计 token 用量（ai:usage 事件累加；无则 0）。 */
+const activeUsage = computed(() => ai.activeConversation?.usage ?? { prompt: 0, completion: 0 });
+
+/** 用量展示文本："1.2k / 3M tokens"（千分位友好；整数千位不带小数，避免 "1.0k"）。 */
+function formatTokens(n: number): string {
+  if (n < 1000) return String(n);
+  const fmt = (v: number) => (Number.isInteger(v) ? String(v) : v.toFixed(1));
+  if (n < 1_000_000) return `${fmt(n / 1000)}k`;
+  return `${fmt(n / 1_000_000)}M`;
+}
+
+/** 系统注入的提醒消息（如重复调用守卫的 [重复调用提醒]）：以灰色提示渲染，
+ *  不伪装成用户自己发送的消息。 */
+function isSystemReminder(m: AiMessage): boolean {
+  return m.role === "user" && m.content.startsWith("[重复调用提醒]");
+}
 
 // --- 对话标签重命名（双击进入编辑） ---
 const editingCid = ref<string | null>(null);
@@ -482,6 +519,21 @@ const inputText = ref("");
 const scrollbarRef = ref();
 const inputRef = ref();
 
+// --- 会话标签栏：溢出时活动标签自动滚入视野 -------------------------------
+const convTabsRef = ref<HTMLElement | null>(null);
+// 切换/新建会话后，活动标签可能落在横向滚动区外（标签收缩 + 滚动方案下），
+// 平滑滚到最近可见位置，保证用户始终看得到当前会话。
+watch(
+  () => ai.activeCid,
+  async (cid) => {
+    if (!cid) return;
+    await nextTick();
+    convTabsRef.value
+      ?.querySelector(".conv-tab.active")
+      ?.scrollIntoView({ behavior: "smooth", inline: "nearest", block: "nearest" });
+  }
+);
+
 // --- 拖表附加表结构上下文（仅 DB 域） -----------------------------------
 // 用户从 SQL 控制台表树拖表到输入框时：
 // - 输入框插入表名引用（如 `users`）；
@@ -708,7 +760,8 @@ function buildSendContext(agent: boolean): {
     let prompt = SYSTEM_PROMPTS[mode.value];
     const ddlSection = buildAttachedDdlSection();
     if (ddlSection) prompt += ddlSection;
-    prompt += buildSkillsSection();
+    // 非 agent 模式没有工具可调：技能正文全量注入，保证模型能用。
+    prompt += buildSkillsSection(false);
     return { prompt, opts: { agent: false, domain: props.domain } };
   }
 
@@ -718,6 +771,11 @@ function buildSendContext(agent: boolean): {
   // desktop 面板只传 desktopId（后端就只暴露桌面工具），实现工具集硬隔离。
   let prompt = SYSTEM_PROMPTS.agent;
   const ctxParts: string[] = [];
+  // 当前时间上下文（借鉴 dsh time-context）：日志时间对比、证书过期、
+  // 定时任务等场景依赖"现在是什么时候"。
+  ctxParts.push(
+    `当前时间：${new Date().toLocaleString("zh-CN", { hour12: false })}（本地时区）。`
+  );
   let activeTerminal: string | undefined;
   let activeDb: string | undefined;
   let activeDesktop: string | undefined;
@@ -795,8 +853,21 @@ function buildSendContext(agent: boolean): {
   prompt += "\n\n=== 当前可用上下文 ===\n" + ctxParts.join("\n");
   // 附加表结构（拖表产生）：把 DDL 拼进 system prompt。
   prompt += buildAttachedDdlSection();
-  // 已启用的可复用 skill（历史总结沉淀）。
-  prompt += buildSkillsSection();
+  // 已启用的可复用 skill：agent 模式下只注入目录摘要（正文经 load_skill 按需加载）。
+  prompt += buildSkillsSection(true);
+  // 任务清单指导（借鉴 dsh tool-todo）：多步任务用 todo_write 维护步骤清单。
+  prompt +=
+    "\n\n=== 任务清单 ===\n" +
+    "多步骤任务开始时，先用 todo_write 工具列出全部步骤（status=pending）；" +
+    "每完成/进行到一步就调用 todo_write 更新对应项状态（整表替换，携带完整清单）；" +
+    "任务全部完成或放弃时调用 todo_write 传空数组 [] 清空清单。";
+  // 向用户提问指导（借鉴 dsh tool-ask-user）：信息不足时直接问，不猜不编。
+  prompt +=
+    "\n\n=== 向用户提问 ===\n" +
+    "当缺少继续执行的关键信息（端口、路径、目标主机、凭据名、方案取舍、需要用户确认等）时，" +
+    "调用 ask_user_question 向用户提问，不要猜测或编造。问题要简明具体，可附选项让用户快速选择；" +
+    "推荐项放在选项第一位并在 label 末尾加 (Recommended)；需要用户从多个候选中选择时" +
+    "把选项列全并设 multi_select=true 允许多选。一次最多提问 4 个问题，不要连发多张提问卡片。";
   return {
     prompt,
     opts: {
@@ -844,12 +915,30 @@ function buildAttachedDdlSection(): string {
   );
 }
 
-/** 拼接已启用的 skill 段落（注入 system prompt）。无启用 skill 返回空串。 */
-function buildSkillsSection(): string {
+/** 拼接已启用的 skill 段落（注入 system prompt）。无启用 skill 返回空串。
+ *
+ * 借鉴 deepseek-harness 的 tool-skill：**agent 模式**只注入目录摘要（标题 +
+ * 内容开头预览），完整正文由模型按需调用 load_skill 工具加载——技能多了之后
+ * 全量注入会持续膨胀每轮请求的上下文；**非 agent 模式**（无工具可调）保持
+ * 全量注入，保证技能内容对模型可见可用。 */
+function buildSkillsSection(agent: boolean): string {
   const skills = settings.skills.filter((s) => s.domain === props.domain && s.enabled);
   if (skills.length === 0) return "";
-  const blocks = skills.map((s) => `【${s.title}】\n${s.content}`);
-  return "\n\n=== 可复用技能（来自历史总结，处理同类任务时请遵循）===\n" + blocks.join("\n\n");
+  if (!agent) {
+    const blocks = skills.map((s) => `【${s.title}】\n${s.content}`);
+    return "\n\n=== 可复用技能（来自历史总结，处理同类任务时请遵循）===\n" + blocks.join("\n\n");
+  }
+  // 目录摘要：标题 + 内容开头（≤120 字），配合 load_skill 按需加载全文。
+  const entries = skills.map((s) => {
+    const preview = s.content.length > 120 ? s.content.slice(0, 120) + "…" : s.content;
+    return `- ${s.title}：${preview}`;
+  });
+  return (
+    "\n\n=== 可用技能（来自历史总结，处理同类任务时请遵循）===\n" +
+    entries.join("\n") +
+    "\n需要某条技能的完整步骤/命令细节时，调用 load_skill 工具（name 用上述标题，必须完全一致）" +
+    "加载全文；目录摘要已足够理解任务时不必加载，且不要重复加载同一技能。"
+  );
 }
 
 // --- skill 总结与管理 -----------------------------------------------------
@@ -1025,6 +1114,158 @@ function toggleExpand(id: string) {
   expanded.value[id] = !expanded.value[id];
 }
 
+// --- ask_user_question 问题表单状态 -------------------------------------
+/** 问题结构（与后端 ToolDef schema 对应）。 */
+interface AskUserQuestion {
+  id: string;
+  question: string;
+  header?: string | null;
+  options?: { label: string; description?: string | null }[];
+  multi_select?: boolean;
+}
+
+/** toolCallId -> 问题 id -> { 勾选标签, 自由输入 }（惰性初始化）。 */
+const askUserSelections = ref<
+  Record<string, Record<string, { selected: string[]; custom: string }>>
+>({});
+
+/** 取某张提问卡片某个问题的表单状态（首次访问惰性建表）。 */
+function askSel(tool: ToolCallItem, qid: string) {
+  const byQ = (askUserSelections.value[tool.toolCallId] ??= {});
+  return (byQ[qid] ??= { selected: [], custom: "" });
+}
+
+/**
+ * 从卡片 arguments 解析问题列表（onToolCall 已 parse 成对象）。
+ * 防御性过滤：缺 id/question 的问题、label 为空的选项直接丢弃
+ * （后端 plan_call 虽已预拒绝畸形结构，双保险避免渲染期 undefined key）。
+ */
+function askQuestions(tool: ToolCallItem): AskUserQuestion[] {
+  const raw = Array.isArray(tool.arguments.questions) ? tool.arguments.questions : [];
+  return raw
+    .filter(
+      (q): q is AskUserQuestion =>
+        !!q &&
+        typeof q.id === "string" &&
+        q.id.trim() !== "" &&
+        typeof q.question === "string" &&
+        q.question.trim() !== ""
+    )
+    .map((q) => ({
+      ...q,
+      options: Array.isArray(q.options)
+        ? q.options.filter((o) => o && typeof o.label === "string" && o.label.trim() !== "")
+        : undefined,
+    }));
+}
+
+/** 是否推荐项：提示词要求模型把推荐项放第一位并在 label 末尾加 (Recommended)。 */
+function isRecommended(label: string): boolean {
+  return /\(Recommended\)$/i.test(label.trim());
+}
+
+/** 选项展示文案：剥离 (Recommended) 后缀（由「推荐」标签替代，避免中英混杂）。 */
+function optLabel(label: string): string {
+  return label.trim().replace(/\s*\(Recommended\)$/i, "");
+}
+
+/**
+ * 已提交回答的摘要 chips（勾选的选项 + 自由输入）。
+ * 仅同会话内存中有记录时非空（重载恢复的历史卡片无记录，自然不显示）。
+ */
+function askAnswerChips(tool: ToolCallItem): string[] {
+  const byQ = askUserSelections.value[tool.toolCallId];
+  if (!byQ) return [];
+  const chips: string[] = [];
+  for (const q of askQuestions(tool)) {
+    const st = byQ[q.id];
+    if (!st) continue;
+    chips.push(...st.selected.map(optLabel));
+    const custom = st.custom.trim();
+    if (custom) chips.push(custom);
+  }
+  return chips;
+}
+
+/** 单选/多选切换。 */
+function toggleAskOption(tool: ToolCallItem, q: AskUserQuestion, label: string) {
+  const st = askSel(tool, q.id);
+  if (q.multi_select) {
+    const i = st.selected.indexOf(label);
+    if (i >= 0) st.selected.splice(i, 1);
+    else st.selected.push(label);
+  } else {
+    st.selected = [label];
+  }
+}
+
+/** 提交回答：组装 answers（dsh 规范字段）→ store 回传后端。 */
+async function submitAskUser(tool: ToolCallItem) {
+  if (tool.status !== "pending") return;
+  const questions = askQuestions(tool);
+  // 全空校验：一个问题都没填就提交，等于把空答案甩给模型（相当于无声跳过），
+  // 更可能是用户漏填——给出提示而非直接提交（想跳过请点「取消」）。
+  const allEmpty = questions.every((q) => {
+    const st = askSel(tool, q.id);
+    return st.selected.length === 0 && !st.custom.trim();
+  });
+  if (allEmpty) {
+    ElMessage.warning("请至少回答一个问题，或点击「取消」跳过提问");
+    return;
+  }
+  const answers: AskUserAnswer[] = questions.map((q) => {
+    const st = askSel(tool, q.id);
+    const custom = st.custom.trim();
+    return { id: q.id, selected: [...st.selected], custom: custom || null };
+  });
+  await ai.answerAskUser(tool.toolCallId, answers);
+}
+
+/** 取消提问（后端以"用户取消"回填该轮）。 */
+function cancelAskUser(tool: ToolCallItem) {
+  if (tool.status !== "pending") return;
+  ai.cancelAskUser(tool.toolCallId);
+}
+
+// --- 折叠时提问提醒 -------------------------------------------------------
+// 提问表单必须用户人工填写，面板折叠时用户看不到 → 300s 后超时（模型被迫
+// 按"用户取消"继续）。检测到**新出现**的 ask 卡片且面板折叠时：自动展开 +
+// 轻通知。用"已通知 toolCallId 集合"精确判定新增——会话切换导致签名重算
+// 时历史卡片不会误判为新增；组件挂载时已有卡片也不触发（首帧 prev 为空）。
+const notifiedAskIds = new Set<string>();
+watch(
+  () =>
+    (ai.messages ?? [])
+      .flatMap((m) => m.toolCalls ?? [])
+      .filter((t) => t.name === "ask_user_question")
+      .map((t) => `${t.toolCallId}:${t.status}`)
+      .join("|"),
+  () => {
+    // 只提醒**仍待回答**的新卡片：已超时/取消（rejected/done）的旧提问
+    // 在切回会话时不应再弹"向你提问"通知（问题早已过期）。
+    const fresh = (ai.messages ?? [])
+      .flatMap((m) => m.toolCalls ?? [])
+      .filter(
+        (t) =>
+          t.name === "ask_user_question" &&
+          t.status === "pending" &&
+          !notifiedAskIds.has(t.toolCallId)
+      );
+    if (fresh.length === 0) return;
+    for (const t of fresh) notifiedAskIds.add(t.toolCallId);
+    if (collapsed.value) {
+      toggle();
+      ElNotification({
+        title: `${panelTitle.value}向你提问`,
+        message: "AI 需要你回答几个问题，请查看面板填写表单",
+        type: "warning",
+        duration: 5000,
+      });
+    }
+  },
+  { flush: "post" }
+);
+
 function onKeydown(e: KeyboardEvent) {
   const el = e.target instanceof HTMLTextAreaElement ? e.target : null;
 
@@ -1102,6 +1343,24 @@ async function handleClear() {
   ElMessage.success("已清空");
 }
 
+/** 顶部"更多"下拉的命令分发（低频操作集中收纳，见 header 模板注释）。 */
+function onHeaderCommand(cmd: string) {
+  switch (cmd) {
+    case "export":
+      void handleExport();
+      break;
+    case "summarize":
+      void handleSummarizeSkill();
+      break;
+    case "skills":
+      skillManagerVisible.value = true;
+      break;
+    case "clear":
+      void handleClear();
+      break;
+  }
+}
+
 // --- 导出对话 ------------------------------------------------------------
 /** 工具调用状态 → 导出文案。 */
 const TOOL_STATUS_TEXT: Record<ToolCallItem["status"], string> = {
@@ -1125,6 +1384,18 @@ async function handleExport() {
   lines.push(`> 消息数: ${conv.messages.length}`);
   lines.push("");
   lines.push("---");
+
+  // 任务清单（todo_write 维护，导出时保留最终状态）。
+  if (conv.todos && conv.todos.length > 0) {
+    lines.push("");
+    lines.push("## 任务清单");
+    for (const t of conv.todos) {
+      const mark =
+        t.status === "completed" ? "[x]" : t.status === "in_progress" ? "[~]" : "[ ]";
+      lines.push(`- ${mark} ${t.content}`);
+    }
+    lines.push("");
+  }
 
   for (const m of conv.messages) {
     lines.push("");
@@ -1240,36 +1511,52 @@ function renderMarkdown(text: string): string {
       <div class="header">
         <div class="title">{{ panelTitle }}</div>
         <div class="header-actions">
+          <!-- 收起是高频操作，保留独立按钮；低频/破坏性操作收进"更多"下拉，
+               既缓解窄面板的拥挤，也避免"清空对话"误触。 -->
           <el-tooltip content="收起" placement="bottom">
             <el-button class="icon-btn" link @click="toggle">
               <el-icon><DArrowRight /></el-icon>
             </el-button>
           </el-tooltip>
-          <el-tooltip content="导出对话" placement="bottom">
-            <el-button class="icon-btn" link :disabled="ai.messages.length === 0" @click="handleExport">
-              <el-icon><Download /></el-icon>
+          <el-dropdown
+            trigger="click"
+            popper-class="ai-header-dropdown"
+            @command="onHeaderCommand"
+          >
+            <el-button class="icon-btn" link title="更多">
+              <el-icon><MoreFilled /></el-icon>
             </el-button>
-          </el-tooltip>
-          <el-tooltip content="总结成技能" placement="bottom">
-            <el-button class="icon-btn" link :disabled="ai.messages.length === 0 || ai.sending || summarizing" :loading="summarizing" @click="handleSummarizeSkill">
-              <el-icon v-if="!summarizing"><MagicStick /></el-icon>
-            </el-button>
-          </el-tooltip>
-          <el-tooltip content="技能管理" placement="bottom">
-            <el-button class="icon-btn" link @click="skillManagerVisible = true">
-              <el-icon><Collection /></el-icon>
-            </el-button>
-          </el-tooltip>
-          <el-tooltip content="清空对话" placement="bottom">
-            <el-button class="icon-btn" link :disabled="ai.messages.length === 0" @click="handleClear">
-              <el-icon><Delete /></el-icon>
-            </el-button>
-          </el-tooltip>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item command="export" :disabled="ai.messages.length === 0">
+                  <el-icon><Download /></el-icon>导出对话
+                </el-dropdown-item>
+                <el-dropdown-item
+                  command="summarize"
+                  :disabled="ai.messages.length === 0 || ai.sending || summarizing"
+                >
+                  <el-icon><MagicStick /></el-icon>
+                  {{ summarizing ? "总结成技能（生成中…）" : "总结成技能" }}
+                </el-dropdown-item>
+                <el-dropdown-item command="skills">
+                  <el-icon><Collection /></el-icon>技能管理
+                </el-dropdown-item>
+                <el-dropdown-item
+                  command="clear"
+                  divided
+                  :disabled="ai.messages.length === 0"
+                  class="danger-item"
+                >
+                  <el-icon><Delete /></el-icon>清空对话
+                </el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
         </div>
       </div>
 
-      <!-- 对话标签栏：多会话切换 -->
-      <div class="conv-tabs">
+      <!-- 对话标签栏：多会话切换（标签收缩 + 横向滚动，见 .conv-tabs 样式注释） -->
+      <div ref="convTabsRef" class="conv-tabs">
         <div
           v-for="c in ai.conversations"
           :key="c.id"
@@ -1317,6 +1604,37 @@ function renderMarkdown(text: string): string {
 
       <!-- 消息列表 -->
       <el-scrollbar ref="scrollbarRef" class="messages">
+        <!-- 智能体任务清单条（todo_write 维护；新回合自动清空） -->
+        <div v-if="activeTodos.length > 0" class="todo-strip">
+          <div class="todo-strip-title" @click="todoCollapsed = !todoCollapsed">
+            <el-icon><Collection /></el-icon>
+            <span>任务清单</span>
+            <span class="todo-stats">{{ todoStats.completed }}/{{ todoStats.total }} 完成</span>
+            <div class="todo-progress" :class="{ done: todoStats.completed === todoStats.total }">
+              <div class="todo-progress-bar" :style="{ width: todoStats.pct + '%' }" />
+            </div>
+            <el-icon
+              v-if="activeTodos.length > TODO_COLLAPSE_THRESHOLD"
+              class="todo-collapse"
+              :title="todoCollapsed ? '展开' : '收起'"
+            >{{ todoCollapsed ? ArrowDown : ArrowUp }}</el-icon>
+          </div>
+          <div v-show="!todoCollapsed" class="todo-items">
+            <div
+              v-for="(t, i) in activeTodos"
+              :key="i"
+              class="todo-item"
+              :class="`todo-${t.status}`"
+            >
+              <el-icon v-if="t.status === 'completed'" class="todo-icon done"><CircleCheckFilled /></el-icon>
+              <el-icon v-else-if="t.status === 'in_progress'" class="todo-icon in-progress is-loading"><Loading /></el-icon>
+              <el-icon v-else class="todo-icon"><Clock /></el-icon>
+              <span class="todo-content" :class="{ 'todo-content-done': t.status === 'completed' }">
+                {{ t.content }}
+              </span>
+            </div>
+          </div>
+        </div>
         <div v-if="ai.messages.length === 0" class="empty-hint">
           <template v-if="mode === 'agent'">
             <template v-if="domain === 'ssh'">
@@ -1378,7 +1696,11 @@ function renderMarkdown(text: string): string {
                   <div class="tool-head" @click="toggleExpand(part.item.toolCallId)">
                     <el-icon class="tool-icon"><Tools /></el-icon>
                     <span class="tool-desc">{{ part.item.description }}</span>
-                    <el-tag v-if="part.item.dangerous" type="danger" size="small" effect="dark">危险</el-tag>
+                    <!-- 记账/技能/提问工具：专用 tag 区分"已自动执行"的普通卡片 -->
+                    <el-tag v-if="part.item.name === 'todo_write'" type="primary" size="small" effect="dark">任务清单</el-tag>
+                    <el-tag v-else-if="part.item.name === 'load_skill'" type="info" size="small" effect="plain">技能</el-tag>
+                    <el-tag v-else-if="part.item.name === 'ask_user_question'" type="warning" size="small" effect="plain">提问</el-tag>
+                    <el-tag v-else-if="part.item.dangerous" type="danger" size="small" effect="dark">危险</el-tag>
                     <el-tag v-else-if="part.item.autoApproved" type="success" size="small" effect="dark">已自动执行</el-tag>
                     <el-tag v-else-if="part.item.whitelisted" type="success" size="small" effect="plain">白名单</el-tag>
                     <el-tag v-else type="warning" size="small" effect="plain">需确认</el-tag>
@@ -1390,18 +1712,124 @@ function renderMarkdown(text: string): string {
                     ><CopyDocument /></el-icon>
                     <el-icon class="tool-expand"><ArrowDown /></el-icon>
                   </div>
-                  <div v-if="expanded[part.item.toolCallId]" class="tool-detail">
-                    <div class="tool-args">
-                      <span class="label">参数:</span>
-                      <pre>{{ JSON.stringify(part.item.arguments, null, 2) }}</pre>
+                  <!--
+                    load_skill / ask_user_question 卡片默认展开（技能全文、问题表单
+                    用户通常想直接看到），只有用户显式收起（expanded 置 false）后才
+                    折叠；其余工具卡片默认折叠，点击展开。
+                  -->
+                  <div
+                    v-if="
+                      part.item.name === 'load_skill' || part.item.name === 'ask_user_question'
+                        ? expanded[part.item.toolCallId] !== false
+                        : expanded[part.item.toolCallId]
+                    "
+                    class="tool-detail"
+                  >
+                    <!-- ask_user_question：问题表单（选项 + 自由输入 + 提交/取消），
+                         不展示原始参数 JSON。问题卡片化、选项为可点选卡片
+                         （自绘单选/多选标记），提交后整体置灰并显示回答摘要。 -->
+                    <div
+                      v-if="part.item.name === 'ask_user_question'"
+                      class="ask-form"
+                      :class="{ 'is-done': part.item.status !== 'pending' }"
+                    >
+                      <div
+                        v-for="(q, qi) in askQuestions(part.item)"
+                        :key="q.id"
+                        class="ask-q"
+                      >
+                        <div class="ask-q-head">
+                          <span v-if="askQuestions(part.item).length > 1" class="ask-q-index">
+                            {{ qi + 1 }}/{{ askQuestions(part.item).length }}
+                          </span>
+                          <span v-if="q.header" class="ask-header">{{ q.header }}</span>
+                          <span v-if="q.multi_select" class="ask-multi-tag">可多选</span>
+                        </div>
+                        <div class="ask-question">{{ q.question }}</div>
+                        <div v-if="q.options && q.options.length" class="ask-options">
+                          <label
+                            v-for="opt in q.options"
+                            :key="opt.label"
+                            class="ask-option"
+                          >
+                            <input
+                              :type="q.multi_select ? 'checkbox' : 'radio'"
+                              :name="'ask-' + part.item.toolCallId + '-' + q.id"
+                              :disabled="part.item.status !== 'pending'"
+                              :checked="askSel(part.item, q.id).selected.includes(opt.label)"
+                              @change="toggleAskOption(part.item, q, opt.label)"
+                            />
+                            <span class="ask-opt-box" :class="{ multi: q.multi_select }" />
+                            <span class="ask-opt-body">
+                              <span class="ask-opt-label">
+                                {{ optLabel(opt.label) }}
+                                <span v-if="isRecommended(opt.label)" class="ask-opt-rec">推荐</span>
+                              </span>
+                              <span v-if="opt.description" class="ask-opt-desc">
+                                {{ opt.description }}
+                              </span>
+                            </span>
+                          </label>
+                        </div>
+                        <el-input
+                          v-model="askSel(part.item, q.id).custom"
+                          type="textarea"
+                          :rows="2"
+                          size="small"
+                          class="ask-input"
+                          :disabled="part.item.status !== 'pending'"
+                          :placeholder="
+                            q.options && q.options.length ? '补充说明（可选）' : '请输入…'
+                          "
+                        />
+                      </div>
+                      <!-- 已提交的回答摘要（同会话内存中有勾选/输入记录时展示） -->
+                      <div v-if="askAnswerChips(part.item).length" class="ask-answered">
+                        <span
+                          v-for="(chip, ci) in askAnswerChips(part.item)"
+                          :key="ci"
+                          class="ask-answered-chip"
+                        >
+                          {{ chip }}
+                        </span>
+                      </div>
+                      <div class="ask-actions">
+                        <el-button
+                          size="small"
+                          :disabled="part.item.status !== 'pending'"
+                          @click.stop="cancelAskUser(part.item)"
+                        >
+                          取消
+                        </el-button>
+                        <el-button
+                          size="small"
+                          type="primary"
+                          :disabled="part.item.status !== 'pending'"
+                          @click.stop="submitAskUser(part.item)"
+                        >
+                          提交回答
+                        </el-button>
+                      </div>
                     </div>
-                    <div v-if="part.item.result" class="tool-output">
-                      <span class="label">{{ part.item.result.ok ? '输出:' : '失败:' }}</span>
-                      <pre>{{ part.item.result.output }}</pre>
-                    </div>
+                    <template v-else>
+                      <div class="tool-args">
+                        <span class="label">参数:</span>
+                        <pre>{{ JSON.stringify(part.item.arguments, null, 2) }}</pre>
+                      </div>
+                      <div v-if="part.item.result" class="tool-output">
+                        <span class="label">{{ part.item.result.ok ? '输出:' : '失败:' }}</span>
+                        <pre>{{ part.item.result.output }}</pre>
+                      </div>
+                    </template>
                   </div>
-                  <!-- 操作按钮（仅 pending 时显示；自动放行的无按钮） -->
-                  <div v-if="part.item.status === 'pending'" class="tool-actions">
+                  <!-- 操作按钮（仅 pending 时显示；自动放行与提问表单无确认按钮） -->
+                  <div
+                    v-if="
+                      part.item.status === 'pending' &&
+                      part.item.name !== 'ask_user_question'
+                    "
+                    class="tool-actions"
+                  >
                     <el-button
                       size="small"
                       :type="part.item.dangerous ? 'danger' : 'primary'"
@@ -1421,9 +1849,12 @@ function renderMarkdown(text: string): string {
                     </el-button>
                     <el-button size="small" @click.stop="rejectTool(part.item)">拒绝</el-button>
                   </div>
+                  <div v-else-if="part.item.status === 'approved' && part.item.name === 'ask_user_question'" class="tool-status">已提交，等待模型继续</div>
                   <div v-else-if="part.item.status === 'approved' && !part.item.autoApproved" class="tool-status">执行中…</div>
                   <div v-else-if="part.item.status === 'approved' && part.item.autoApproved" class="tool-status">已自动执行</div>
-                  <div v-else-if="part.item.status === 'rejected'" class="tool-status">已拒绝</div>
+                  <div v-else-if="part.item.status === 'rejected'" class="tool-status">
+                    {{ part.item.name === 'ask_user_question' ? '已取消' : '已拒绝' }}
+                  </div>
                 </div>
               </template>
               <!-- 流式占位：无任何片段且正在流式 → 省略号；有文本且流式中 → 闪烁光标 -->
@@ -1434,18 +1865,22 @@ function renderMarkdown(text: string): string {
             <!-- 用户消息：图片（多模态）+ 文本。
                  图片限制最大宽高、按原比例完整展示（不裁剪），点击打开查看器看大图。 -->
             <template v-else>
-              <div v-if="m.images && m.images.length" class="msg-images">
-                <img
-                  v-for="(img, i) in m.images"
-                  :key="i"
-                  :src="imageDataUrl(img)"
-                  class="msg-img"
-                  alt="图片"
-                  title="点击查看大图"
-                  @click="previewImages(m, i)"
-                />
-              </div>
-              <template v-if="m.content">{{ m.content }}</template>
+              <!-- 系统注入的提醒（重复调用守卫等）：灰色居中提示，不伪装成用户消息 -->
+              <div v-if="isSystemReminder(m)" class="system-note">{{ m.content }}</div>
+              <template v-else>
+                <div v-if="m.images && m.images.length" class="msg-images">
+                  <img
+                    v-for="(img, i) in m.images"
+                    :key="i"
+                    :src="imageDataUrl(img)"
+                    class="msg-img"
+                    alt="图片"
+                    title="点击查看大图"
+                    @click="previewImages(m, i)"
+                  />
+                </div>
+                <template v-if="m.content">{{ m.content }}</template>
+              </template>
             </template>
           </div>
         </div>
@@ -1472,6 +1907,15 @@ function renderMarkdown(text: string): string {
           <span v-if="mode === 'agent' && !configBlocked" class="ctx-tip-inline">
             <el-icon><Connection /></el-icon>
             <span>{{ contextTip }}</span>
+          </span>
+          <!-- token 用量（当前会话累计；借鉴 dsh llm/token-meter） -->
+          <span
+            v-if="activeUsage.prompt > 0 || activeUsage.completion > 0"
+            class="usage-meter"
+            :title="`本会话累计：输入 ${activeUsage.prompt.toLocaleString()} tokens，输出 ${activeUsage.completion.toLocaleString()} tokens（清空对话后归零）`"
+          >
+            <el-icon><Odometer /></el-icon>
+            {{ formatTokens(activeUsage.prompt + activeUsage.completion) }} tokens
           </span>
         </div>
         <!-- 已附加的表（拖入后显示，结构会随问题一起发给 AI） -->
@@ -1700,7 +2144,8 @@ function renderMarkdown(text: string): string {
   gap: 4px;
 }
 
-/* 对话标签栏 */
+/* 对话标签栏：标签允许收缩（min-width:0 是 flex 收缩的关键，否则 nowrap
+   文本的 min-content 会撑住宽度不缩），溢出横向滚动兜底（细滚动条弱化视觉）。 */
 .conv-tabs {
   display: flex;
   align-items: center;
@@ -1709,11 +2154,24 @@ function renderMarkdown(text: string): string {
   flex-shrink: 0;
   overflow-x: auto;
   border-bottom: 1px solid var(--el-border-color-lighter);
+  scrollbar-width: thin;
+}
+.conv-tabs::-webkit-scrollbar {
+  height: 3px;
+}
+.conv-tabs::-webkit-scrollbar-thumb {
+  background: var(--el-border-color);
+  border-radius: 2px;
+}
+.conv-tabs::-webkit-scrollbar-track {
+  background: transparent;
 }
 .conv-tab {
   display: inline-flex;
   align-items: center;
   gap: 4px;
+  /* 收缩区间：窄面板下可压到 56px（约 2 字标题 + 关闭钮），宽面板放到 130px */
+  min-width: 56px;
   max-width: 130px;
   padding: 3px 8px;
   font-size: 12px;
@@ -1732,6 +2190,8 @@ function renderMarkdown(text: string): string {
   background: var(--el-color-primary-light-9);
 }
 .conv-tab-title {
+  /* flex item 内文本收缩 + ellipsis 的必要条件 */
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -1772,6 +2232,18 @@ function renderMarkdown(text: string): string {
   color: var(--el-color-primary);
 }
 
+/* 顶部"更多"下拉（element-plus 下拉挂 body，需全局样式而非 scoped） */
+:global(.ai-header-dropdown .el-dropdown-menu__item .el-icon) {
+  margin-right: 6px;
+}
+:global(.ai-header-dropdown .el-dropdown-menu__item.danger-item) {
+  color: var(--el-color-danger);
+}
+:global(.ai-header-dropdown .el-dropdown-menu__item.danger-item:not(.is-disabled):hover) {
+  color: var(--el-color-danger);
+  background: var(--el-color-danger-light-9);
+}
+
 .config-tip {
   padding: 8px 12px 0;
   flex-shrink: 0;
@@ -1788,6 +2260,87 @@ function renderMarkdown(text: string): string {
   font-size: 13px;
   text-align: center;
   margin-top: 32px;
+}
+/* --- 智能体任务清单条（todo_write 维护） --- */
+.todo-strip {
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 6px;
+  background: var(--el-fill-color-light);
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  font-size: 12px;
+}
+.todo-strip-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--el-text-color-secondary);
+  font-weight: 600;
+  margin-bottom: 4px;
+  cursor: pointer;
+  user-select: none;
+}
+.todo-strip-title:hover {
+  color: var(--el-text-color-primary);
+}
+.todo-stats {
+  font-weight: 400;
+  font-size: 11px;
+  flex-shrink: 0;
+}
+/* 进度条：细长灰底 + 主色填充；全部完成变绿 */
+.todo-progress {
+  flex: 1;
+  min-width: 40px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--el-fill-color-darker);
+  overflow: hidden;
+}
+.todo-progress.done .todo-progress-bar {
+  background: var(--el-color-success);
+}
+.todo-progress-bar {
+  height: 100%;
+  border-radius: 2px;
+  background: var(--el-color-primary);
+  transition: width 0.3s ease;
+}
+.todo-collapse {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  flex-shrink: 0;
+}
+.todo-items {
+  max-height: 220px;
+  overflow-y: auto;
+}
+.todo-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 2px 0;
+  color: var(--el-text-color-primary);
+  line-height: 1.5;
+}
+.todo-icon {
+  flex-shrink: 0;
+  margin-top: 2px;
+  font-size: 13px;
+  color: var(--el-text-color-placeholder);
+}
+.todo-item.todo-in_progress .todo-icon {
+  color: var(--el-color-primary);
+}
+.todo-item.todo-completed .todo-icon.done {
+  color: var(--el-color-success);
+}
+.todo-content {
+  word-break: break-word;
+}
+.todo-content-done {
+  color: var(--el-text-color-secondary);
+  text-decoration: line-through;
 }
 .msg {
   display: flex;
@@ -1862,6 +2415,19 @@ function renderMarkdown(text: string): string {
 .error-text {
   font-weight: 600;
   margin-top: 4px;
+}
+/* 系统注入的提醒（重复调用守卫等）：全宽灰色居中提示，与用户/助手气泡区分开 */
+.system-note {
+  width: 100%;
+  text-align: center;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--el-text-color-secondary);
+  background: var(--el-fill-color-light);
+  border: 1px dashed var(--el-border-color-lighter);
+  border-radius: 6px;
+  padding: 4px 10px;
+  word-break: break-word;
 }
 
 /* 流式光标与省略号 */
@@ -2146,10 +2712,27 @@ function renderMarkdown(text: string): string {
   gap: 4px;
   font-size: 11px;
   color: var(--el-text-color-secondary);
+  /* 占满中间剩余空间（usage-meter 靠右不被挤出） */
+  flex: 1;
+  min-width: 0;
   /* 截断过长的会话名，避免撑宽面板 */
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+}
+/* 当前会话累计 token 用量（ai:usage 事件累计，借鉴 dsh llm/token-meter） */
+.usage-meter {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: auto; /* 靠右，不挤占上下文提示 */
+  font-size: 11px;
+  color: var(--el-text-color-secondary);
+  white-space: nowrap;
+  cursor: default;
+}
+.usage-meter .el-icon {
+  font-size: 12px;
 }
 .composer-row {
   display: flex;
@@ -2296,5 +2879,211 @@ function renderMarkdown(text: string): string {
   padding: 4px 8px 6px;
   font-size: 11px;
   color: var(--el-text-color-secondary);
+}
+/* ask_user_question 问题表单：问题卡片化（序号/标题/多选标记），选项为可点选
+   卡片（原生 input 视觉隐藏 + 自绘单选圆点/多选方框），提交后整体置灰并显示
+   回答摘要 chips。 */
+.ask-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.ask-q {
+  padding: 8px 10px;
+  background: var(--el-fill-color-light);
+  border-radius: 8px;
+}
+/* 问题元信息行：序号 + 短标题 + 多选标记 */
+.ask-q-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+  min-height: 18px;
+}
+.ask-q-index {
+  font-size: 11px;
+  color: var(--el-text-color-secondary);
+  background: var(--el-fill-color);
+  border-radius: 4px;
+  padding: 0 6px;
+  line-height: 18px;
+  flex-shrink: 0;
+}
+.ask-header {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--el-color-warning);
+  background: var(--el-color-warning-light-9);
+  border-radius: 4px;
+  padding: 0 6px;
+  line-height: 18px;
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ask-multi-tag {
+  font-size: 11px;
+  color: var(--el-color-primary);
+  background: var(--el-color-primary-light-9);
+  border: 1px dashed var(--el-color-primary-light-5);
+  border-radius: 4px;
+  padding: 0 6px;
+  line-height: 16px;
+  flex-shrink: 0;
+}
+.ask-question {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--el-text-color-primary);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.ask-options {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px 0 2px;
+}
+/* 选项卡片：整卡可点，选中高亮边框 + 主色浅底 */
+.ask-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 6px 8px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 6px;
+  background: var(--el-fill-color-blank);
+  transition:
+    border-color 0.15s ease,
+    background-color 0.15s ease;
+}
+.ask-option:hover {
+  border-color: var(--el-color-primary-light-5);
+}
+.ask-option:has(input:checked) {
+  border-color: var(--el-color-primary);
+  background: var(--el-color-primary-light-9);
+}
+/* 键盘焦点环（input 视觉隐藏后由卡片承接焦点可见性） */
+.ask-option:has(input:focus-visible) {
+  outline: 2px solid var(--el-color-primary-light-5);
+  outline-offset: 1px;
+}
+/* 原生 input 移出视觉流（保留可点/可聚焦/表单语义，宽度塌缩不影响布局） */
+.ask-option input {
+  position: absolute;
+  width: 0;
+  height: 0;
+  margin: 0;
+  opacity: 0;
+}
+/* 自绘勾选标记：单选 = 圆点，多选 = 方框对勾 */
+.ask-opt-box {
+  flex-shrink: 0;
+  position: relative;
+  width: 14px;
+  height: 14px;
+  margin-top: 2px;
+  border: 1px solid var(--el-border-color);
+  border-radius: 50%;
+  background: var(--el-fill-color-blank);
+  transition:
+    border-color 0.15s ease,
+    background-color 0.15s ease;
+}
+.ask-opt-box.multi {
+  border-radius: 4px;
+}
+.ask-option input:checked + .ask-opt-box {
+  border-color: var(--el-color-primary);
+}
+/* 单选选中：内部实心圆点 */
+.ask-option input:checked + .ask-opt-box::after {
+  content: "";
+  position: absolute;
+  inset: 3px;
+  border-radius: 50%;
+  background: var(--el-color-primary);
+}
+/* 多选选中：主色底 + 白色对勾 */
+.ask-option input:checked + .ask-opt-box.multi {
+  background: var(--el-color-primary);
+}
+.ask-option input:checked + .ask-opt-box.multi::after {
+  content: "✓";
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  line-height: 1;
+  color: #fff;
+}
+.ask-opt-body {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.ask-opt-label {
+  color: var(--el-text-color-primary);
+  line-height: 1.5;
+  word-break: break-word;
+}
+/* 推荐标记：提示词要求推荐项放第一位并在 label 末尾加 (Recommended)，
+   展示为绿色小标签替代英文后缀 */
+.ask-opt-rec {
+  font-size: 10px;
+  color: var(--el-color-success);
+  background: var(--el-color-success-light-9);
+  border: 1px solid var(--el-color-success-light-7);
+  border-radius: 3px;
+  padding: 0 4px;
+  margin-left: 4px;
+  vertical-align: 1px;
+}
+.ask-opt-desc {
+  color: var(--el-text-color-secondary);
+  font-size: 11px;
+  line-height: 1.4;
+  word-break: break-word;
+}
+.ask-input {
+  margin-top: 6px;
+}
+/* 提交/取消后的终态：问题区置灰只读（inputs 已 disabled），摘要 chips 展示已选 */
+.ask-form.is-done .ask-q {
+  opacity: 0.75;
+}
+.ask-form.is-done .ask-option {
+  cursor: default;
+}
+.ask-answered {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.ask-answered-chip {
+  font-size: 11px;
+  color: var(--el-color-success);
+  background: var(--el-color-success-light-9);
+  border: 1px solid var(--el-color-success-light-7);
+  border-radius: 10px;
+  padding: 1px 8px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ask-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
 }
 </style>

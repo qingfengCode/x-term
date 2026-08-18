@@ -318,23 +318,35 @@ const tabItems = computed<TabBarItem[]>(() =>
   })),
 );
 
-/** TabBar 右键菜单命令（作用于对应 tab）。 */
+/**
+ * TabBar 右键菜单命令（作用于对应 tab）。
+ *
+ * key 为 TabBar 的复合键（instanceId || desktopId）：连接中的占位标签只有
+ * 复合键可用，close 系列命令照常生效；reconnect 仍要求已建立实例。
+ */
+
 function onTabMenuCommand(cmd: string, key: string) {
-  const t = desktopTabs.tabs.find((x) => (x.instanceId || x.desktopId) === key);
-  if (!t?.instanceId) return;
+  // 兜底匹配（与 store 的 close 一致）：桥接完成的瞬间旧 key（desktopId）
+  // 可能落空，按多字段解析避免"右键菜单点关闭没反应"。
+  const t = desktopTabs.tabs.find(
+    (x) => x.instanceId === key || x.desktopId === key || (x.instanceId || x.desktopId) === key
+  );
+  if (!t) return;
   switch (cmd) {
     case "close":
-      void desktopTabs.close(t.instanceId);
+      void desktopTabs.close(key);
       break;
     case "closeOthers":
-      void desktopTabs.closeOthers(t.instanceId);
+      void desktopTabs.closeOthers(key);
       break;
     case "closeAll":
       void desktopTabs.closeAll();
       break;
     case "reconnect": {
-      const target = desktopTabs.tabs.find((x) => x.instanceId === t.instanceId);
-      if (target) void reconnectTab(target);
+      if (t.instanceId) {
+        const target = desktopTabs.tabs.find((x) => x.instanceId === t.instanceId);
+        if (target) void reconnectTab(target);
+      }
       break;
     }
   }

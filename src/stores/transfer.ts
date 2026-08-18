@@ -15,8 +15,10 @@ export interface TransferTask {
   direction: "download" | "upload";
   transferred: number;
   total: number;
-  status: "pending" | "running" | "done" | "error";
+  status: "pending" | "running" | "done" | "error" | "cancelled";
   message?: string;
+  /** 后端是否支持取消（SFTP 传输 true；S3 等暂不支持取消的不显示按钮）。 */
+  cancellable?: boolean;
 }
 
 export const useTransferStore = defineStore("transfer", () => {
@@ -36,7 +38,9 @@ export const useTransferStore = defineStore("transfer", () => {
   }
 
   function clearDone() {
-    tasks.value = tasks.value.filter((x) => x.status !== "done" && x.status !== "error");
+    tasks.value = tasks.value.filter(
+      (x) => x.status !== "done" && x.status !== "error" && x.status !== "cancelled"
+    );
   }
 
   return { tasks, add, update, remove, clearDone };

@@ -7,9 +7,10 @@
 // ----------------------------------------------------------------------------
 import { computed, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
-import { Download, Upload, Delete, FolderOpened, CaretBottom, CaretTop } from "@element-plus/icons-vue";
+import { Download, Upload, Delete, FolderOpened, CaretBottom, CaretTop, VideoPause } from "@element-plus/icons-vue";
 import { useTransferStore, type TransferTask } from "@/stores/transfer";
 import { formatSize } from "@/utils/format";
+import { sftpTransferCancel } from "@/api/sftp";
 
 const transfer = useTransferStore();
 
@@ -24,7 +25,10 @@ const runningCount = computed(
 );
 
 const doneCount = computed(
-  () => transfer.tasks.filter((t) => t.status === "done" || t.status === "error").length
+  () =>
+    transfer.tasks.filter(
+      (t) => t.status === "done" || t.status === "error" || t.status === "cancelled"
+    ).length
 );
 
 function percent(t: TransferTask): number {
@@ -43,13 +47,24 @@ function statusText(t: TransferTask): string {
       return "已完成";
     case "error":
       return "失败";
+    case "cancelled":
+      return "已取消";
   }
 }
 
 function progressStatus(t: TransferTask): "" | "success" | "exception" | "warning" {
   if (t.status === "done") return "success";
   if (t.status === "error") return "exception";
+  if (t.status === "cancelled") return "warning";
   return "";
+}
+
+/** 取消传输：本地立即置 cancelled，后端在下一个块边界退出并清理半截文件。 */
+function cancelTask(t: TransferTask) {
+  transfer.update(t.id, { status: "cancelled" });
+  sftpTransferCancel(t.id).catch(() => {
+    /* 任务可能刚好已结束（幂等场景），忽略 */
+  });
 }
 
 // 人类可读大小。
@@ -60,7 +75,7 @@ function humanSize(n: number): string {
 
 async function removeTask(t: TransferTask) {
   // 仅清理本地展示；后端实际取消需另外提供 cancel 接口，这里按 MVP 处理。
-  if (t.status === "running") {
+  if (t.status === "running" || t.status === "pending") {
     try {
       await ElMessageBox.confirm(
         `任务 "${t.name}" 正在传输，移除后将不再显示进度。继续？`,
@@ -159,6 +174,12 @@ function toggle() {
             </el-tooltip>
           </div>
 
+          <el-icon
+            v-if="t.cancellable && (t.status === 'running' || t.status === 'pending')"
+            class="tq-cancel"
+            title="取消传输"
+            @click="cancelTask(t)"
+          ><VideoPause /></el-icon>
           <el-icon class="tq-remove" @click="removeTask(t)"><Delete /></el-icon>
         </div>
       </div>
@@ -327,6 +348,9 @@ function toggle() {
 .status-error {
   color: var(--el-color-danger);
 }
+.status-cancelled {
+  color: var(--el-color-warning);
+}
 .tq-errmsg {
   color: var(--el-color-danger);
   font-weight: bold;
@@ -340,6 +364,18 @@ function toggle() {
   padding: 4px;
   border-radius: 4px;
   flex-shrink: 0;
+}
+.tq-cancel {
+  font-size: 14px;
+  color: var(--el-text-color-secondary);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+.tq-cancel:hover {
+  color: var(--el-color-warning);
+  background: var(--el-fill-color);
 }
 .tq-remove:hover {
   color: var(--el-color-danger);

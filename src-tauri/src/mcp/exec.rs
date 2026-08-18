@@ -266,17 +266,16 @@ pub async fn exec_ssh_terminal(
     }
 
     // 占用该终端：同一终端同一时刻只允许一个调用写入（AI 助手可视化执行与
-    // MCP 终端绑定执行共用这把锁）。
-    {
-        let mut busy = state.mcp_terminal_busy.lock().await;
-        if busy.insert(instance_id.to_string(), ()).is_some() {
-            return Err(AppError::InvalidInput(
-                "该终端正有另一个命令（AI 助手或 MCP 调用）在执行，请稍后再试".into(),
-            ));
-        }
-    }
+    // MCP 终端绑定执行共用这把锁）。经 Drop 守卫释放——MCP 请求被取消 /
+    // AI 请求被终止（abort）时 future 在 await 点被丢弃，函数末尾的释放代码
+    // 不会执行，守卫保证任何路径都释放（否则该终端永久"正被占用"）。
+    let Some(_busy_guard) = state.try_lock_terminal(instance_id) else {
+        return Err(AppError::InvalidInput(
+            "该终端正有另一个命令（AI 助手或 MCP 调用）在执行，请稍后再试".into(),
+        ));
+    };
 
-    // 整个执行过程包在 async block 里，无论成功/超时/出错都在末尾释放占用。
+    // 整个执行过程包在 async block 里，无论成功/超时/出错都由守卫释放占用。
     let result = async {
         // 生成唯一哨兵（避免与正常输出撞车）。
         let nonce: u64 = rand::thread_rng().gen();
@@ -416,8 +415,7 @@ pub async fn exec_ssh_terminal(
     }
     .await;
 
-    // 释放占用（无论成功/超时/出错）。
-    state.mcp_terminal_busy.lock().await.remove(instance_id);
+    // 占用由 _busy_guard 的 Drop 释放（正常返回 / 错误 / 超时 / abort / panic）。
     result
 }
 

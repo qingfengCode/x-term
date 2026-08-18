@@ -12,7 +12,6 @@
 //!   `LlmProvider` trait 与工厂函数。
 //! - `openai`: OpenAI 兼容协议（同时覆盖 DeepSeek、智谱、Ollama、自定义兼容端）
 //!   的流式实现。
-//! - `claude`: Anthropic Claude 原生 Messages API 的流式实现。
 //! - `prompts`: 各业务场景（翻译为命令、诊断报错、解释输出、通用对话）的
 //!   中文系统提示词常量。
 //!
@@ -23,7 +22,6 @@
 //! - `ai:done` —— 响应完成（携带累计的完整文本）
 //! - `ai:error` —— 出错时携带可读错误信息
 
-pub mod claude;
 pub mod openai;
 pub mod prompts;
 pub mod provider;

@@ -2,6 +2,7 @@ import { defineStore } from "pinia";
 import { computed, ref } from "vue";
 import * as aiApi from "@/api/ai";
 import * as dbApi from "@/api/db";
+import type { AskUserAnswer } from "@/api/db";
 import { useSettingsStore } from "@/stores/settings";
 import type { ChatMessage, ChatRole, ImagePart, ToolCall, ToolResult } from "@/api/types";
 
@@ -14,7 +15,18 @@ import type { ChatMessage, ChatRole, ImagePart, ToolCall, ToolResult } from "@/a
  * 智能体（agent）模式下，模型会通过 ai:tool_call 事件请求执行工具（操作 SSH/SQL），
  * 此时该工具调用进入 pendingToolCalls 待用户确认；用户点击执行/拒绝后，
  * 通过 ai:tool_result 事件回填结果。
+ *
+ * 任务清单（todo，借鉴 dsh tool-todo）：agent 模式下模型通过 todo_write 工具
+ * 维护当前任务的步骤清单，后端经 ai:todo 事件推送整表，前端按会话持有并渲染
+ * 在消息列表上方。新用户消息（新回合）开始时清空旧清单（standing-plan 语义）。
  */
+
+/** 任务清单中的一项（todo_write 工具写入，状态以后端事件为准）。 */
+export interface AiTodoItem {
+  content: string;
+  /** pending=待办；in_progress=进行中；completed=已完成。 */
+  status: "pending" | "in_progress" | "completed";
+}
 
 /** 对话中的一个工具调用项（用于在消息流中渲染卡片）。 */
 export interface ToolCallItem {
@@ -96,7 +108,14 @@ export const makeAiStore = (id: string) =>
     /** 该会话当前在途的请求 id（用于把流式事件路由回来）。 */
     activeRequestId: string | null;
     sending: boolean;
+    /** 智能体任务清单（todo_write 工具最新整表；新用户消息时清空）。 */
+    todos: AiTodoItem[];
+    /** 会话累计 token 用量（ai:usage 事件累加，借鉴 dsh llm/token-meter）。 */
+    usage: { prompt: number; completion: number };
   }
+
+  /** 空用量（新会话初始值）。 */
+  const EMPTY_USAGE = (): { prompt: number; completion: number } => ({ prompt: 0, completion: 0 });
 
   function genId() {
     return `m-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -113,6 +132,8 @@ export const makeAiStore = (id: string) =>
       messages: [],
       activeRequestId: null,
       sending: false,
+      todos: [],
+      usage: EMPTY_USAGE(),
     },
   ]);
   const activeCid = ref<string | null>(conversations.value[0].id);
@@ -128,6 +149,8 @@ export const makeAiStore = (id: string) =>
         messages: [],
         activeRequestId: null,
         sending: false,
+        todos: [],
+        usage: EMPTY_USAGE(),
       });
     }
     if (!activeCid.value) activeCid.value = conversations.value[0].id;
@@ -145,6 +168,8 @@ export const makeAiStore = (id: string) =>
         id: c.id,
         title: c.title,
         messages: c.messages.map((m) => ({ ...m, streaming: false })),
+        todos: c.todos,
+        usage: c.usage,
       }));
       aiApi.aiSaveConversations(domain, data).catch(() => {
         /* 持久化失败不阻塞对话（如磁盘满），仅忽略 */
@@ -164,6 +189,12 @@ export const makeAiStore = (id: string) =>
           messages: (c.messages as AiMessage[]).map((m) => ({ ...m, streaming: false })),
           activeRequestId: null,
           sending: false,
+          // 旧持久化数据无 todos / usage 字段 → 默认空值。
+          todos: (c as unknown as { todos?: AiTodoItem[] }).todos ?? [],
+          usage: (c as unknown as { usage?: { prompt: number; completion: number } }).usage ?? {
+            prompt: 0,
+            completion: 0,
+          },
         }));
         activeCid.value = conversations.value[0].id;
       }
@@ -195,6 +226,8 @@ export const makeAiStore = (id: string) =>
       messages: [],
       activeRequestId: null,
       sending: false,
+      todos: [],
+      usage: EMPTY_USAGE(),
     };
     conversations.value.push(c);
     activeCid.value = c.id;
@@ -257,6 +290,9 @@ export const makeAiStore = (id: string) =>
     const conv = activeConversation.value!;
     if (conv.sending) return; // 按会话粒度互斥，不同会话可并发
     conv.sending = true;
+    // 新用户消息 = 新回合开始：清空上一任务的任务清单（借鉴 dsh tool-todo 的
+    // standing-plan 语义——旧清单只属于上一个任务，新回合从空白清单重新开始）。
+    conv.todos = [];
 
     const userMsg: AiMessage = {
       id: genId(),
@@ -305,7 +341,7 @@ export const makeAiStore = (id: string) =>
         })),
         toolCallId: m.toolCallId,
       });
-      // 关键：当 assistant 消息带 tool_calls 时，OpenAI/Anthropic 协议要求
+      // 关键：当 assistant 消息带 tool_calls 时，OpenAI 兼容协议要求
       // 后面必须紧跟每个 tool_call_id 对应的 role=tool 结果消息，否则 400。
       // 把每个工具调用的结果（或拒绝原因）作为独立 tool 消息补上。
       if (m.role === "assistant" && m.toolCalls && m.toolCalls.length > 0) {
@@ -502,6 +538,10 @@ export const makeAiStore = (id: string) =>
     } catch {
       parsed = { _raw: payload.arguments };
     }
+    // ask_user_question 的执行体在**前端表单**（用户必须人工回答）：后端
+    // auto_run=true 只表示"不弹二次确认卡片"，并不代表已自动执行——卡片必须
+    // 保持 pending，否则提交/取消按钮被禁用、状态行误显示"已提交"。
+    const isAsk = payload.name === "ask_user_question";
     const item: ToolCallItem = {
       toolCallId: payload.toolCallId,
       name: payload.name,
@@ -513,7 +553,7 @@ export const makeAiStore = (id: string) =>
       // 后续 onToolResult 会回填结果。
       autoApproved: payload.autoApproved ?? false,
       desktopId: payload.desktopId ?? null,
-      status: payload.autoApproved ? "approved" : "pending",
+      status: payload.autoApproved && !isAsk ? "approved" : "pending",
     };
     if (!m.toolCalls) m.toolCalls = [];
     m.toolCalls.push(item);
@@ -546,6 +586,41 @@ export const makeAiStore = (id: string) =>
       item.status = "done";
       item.result = { ok: payload.ok, output: payload.output };
     }
+  }
+
+  /** 任务清单更新（todo_write 工具调用，整表替换语义，last-write-wins）。 */
+  function onTodo(requestId: string, todos: AiTodoItem[]) {
+    const conv = convForRequest(requestId);
+    if (!conv) return;
+    conv.todos = todos;
+    persist();
+  }
+
+  /** token 用量上报（单次请求，ai:usage 事件）：累加到会话级统计。 */
+  function onUsage(requestId: string, promptTokens: number, completionTokens: number) {
+    const conv = convForRequest(requestId);
+    if (!conv) return;
+    conv.usage.prompt += promptTokens;
+    conv.usage.completion += completionTokens;
+    persist();
+  }
+
+  /**
+   * 系统注入的编排层提示（ai:system_note 事件，如重复调用守卫提醒）。
+   * 作为 user 消息插入前端消息流（模板按 "[重复调用提醒]" 前缀渲染为灰色
+   * 居中提示，不伪装成用户发言）；与后端注入模型上下文的副本内容一致，
+   * 下次请求重建 history 时两边自然对齐，不会重复。
+   */
+  function onSystemNote(requestId: string, text: string) {
+    const conv = convForRequest(requestId);
+    if (!conv) return;
+    conv.messages.push({
+      id: genId(),
+      role: "user",
+      content: text,
+      streaming: false,
+    });
+    persist();
   }
 
   /** 用户点击"执行"。本地立即更新卡片状态为 approved，并通知后端。 */
@@ -628,6 +703,25 @@ export const makeAiStore = (id: string) =>
     });
   }
 
+  /**
+   * 提交 ask_user_question 的回答（前端问题表单「提交」按钮）。
+   * 后端把答案作为 tool 结果回填，下一轮模型即可看到。
+   */
+  async function answerAskUser(toolCallId: string, answers: AskUserAnswer[]) {
+    updateToolCallStatus(toolCallId, "approved");
+    await dbApi.aiAskUserRespond(toolCallId, true, answers).catch(() => {
+      /* ignore */
+    });
+  }
+
+  /** 取消 ask_user_question（「取消」按钮）：后端以"用户取消"回填该轮。 */
+  async function cancelAskUser(toolCallId: string) {
+    updateToolCallStatus(toolCallId, "rejected");
+    await dbApi.aiAskUserRespond(toolCallId, false, []).catch(() => {
+      /* ignore */
+    });
+  }
+
   /** 在所有会话中按 toolCallId 找到工具调用项（跨会话扫描，与事件路由一致）。 */
   function findToolCallItem(toolCallId: string): ToolCallItem | null {
     for (const conv of conversations.value) {
@@ -651,6 +745,8 @@ export const makeAiStore = (id: string) =>
     if (conv) {
       conv.messages = [];
       conv.title = "新对话";
+      conv.todos = [];
+      conv.usage = EMPTY_USAGE();
       persist();
     }
   }
@@ -729,9 +825,14 @@ export const makeAiStore = (id: string) =>
     stop,
     onToolCall,
     onToolResult,
+    onTodo,
+    onUsage,
+    onSystemNote,
     approveToolCall,
     addToWhitelistAndApprove,
     rejectToolCall,
+    answerAskUser,
+    cancelAskUser,
     setDesktopToolExecutor,
     clear,
     renameConversation,

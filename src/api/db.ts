@@ -97,6 +97,27 @@ export function aiCancelTool(toolCallId: string): Promise<void> {
   return invoke<void>("ai_cancel_tool", { toolCallId });
 }
 
+/** ask_user_question 的单个回答（提交问题表单时逐题回传）。 */
+export interface AskUserAnswer {
+  id: string;
+  /** 勾选的选项 label（无选项/未勾选为空数组）。 */
+  selected?: string[];
+  /** 自由输入文本（单选时覆盖 selected）。 */
+  custom?: string | null;
+}
+
+/**
+ * 回传 ask_user_question 的用户回答（前端问题表单「提交/取消」触发）。
+ * `answered=false`（取消）时 answers 应为空数组。
+ */
+export function aiAskUserRespond(
+  toolCallId: string,
+  answered: boolean,
+  answers: AskUserAnswer[],
+): Promise<void> {
+  return invoke<void>("ai_ask_user_respond", { toolCallId, answered, answers });
+}
+
 /**
  * 把一条命令前缀加入白名单并持久化到 settings.json。
  * 卡片"加入白名单并执行"按钮触发；后端只取首个 token 作为白名单条目。

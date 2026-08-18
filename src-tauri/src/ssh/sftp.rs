@@ -36,6 +36,27 @@ type SftpMetadata = russh_sftp::client::fs::Metadata;
 const CHUNK_SIZE: usize = 64 * 1024;
 
 // ===========================================================================
+// 传输取消
+// ===========================================================================
+
+/// 传输取消标志：置位后传输循环在下一个块边界（≤64 KiB）退出。
+pub type CancelFlag = std::sync::Arc<std::sync::atomic::AtomicBool>;
+
+/// 不可取消的传输用的空标志（FileBackend trait 路径 / 内部调用）。
+pub fn never_cancel() -> CancelFlag {
+    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))
+}
+
+/// 传输结果：正常完成 / 被用户取消。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferOutcome {
+    Completed,
+    /// 用户取消：半截文件已清理（下载删本地、上传删远端），非错误——
+    /// 命令层不应 emit transfer:error（前端取消时已本地置 cancelled）。
+    Cancelled,
+}
+
+// ===========================================================================
 // SftpSession 包装
 // ===========================================================================
 
@@ -122,7 +143,10 @@ impl SftpSession {
         remote: &str,
         local_path: &Path,
         progress: ProgressCb,
-    ) -> AppResult<()> {
+        cancel: CancelFlag,
+    ) -> AppResult<TransferOutcome> {
+        use std::sync::atomic::Ordering;
+
         // 取文件大小用于进度百分比（失败则置 0）。
         let total = self
             .channel
@@ -151,6 +175,12 @@ impl SftpSession {
         let mut transferred: u64 = 0;
         let mut buf = vec![0u8; CHUNK_SIZE];
         loop {
+            // 取消：删掉半截本地文件（用户主动取消，半截无保留价值）后退出。
+            if cancel.load(Ordering::Relaxed) {
+                drop(local_file);
+                let _ = tokio::fs::remove_file(local_path).await;
+                return Ok(TransferOutcome::Cancelled);
+            }
             let n = remote_file
                 .read(&mut buf)
                 .await
@@ -171,18 +201,23 @@ impl SftpSession {
                 format!("刷新本地文件 `{}` 失败: {}", local_path.display(), e),
             ))
         })?;
-        Ok(())
+        Ok(TransferOutcome::Completed)
     }
 
     /// 上传本地文件到远程路径，逐块上传并回调进度。
     ///
     /// `progress(transferred, total)`：`total` 来自本地文件元信息。
+    ///
+    /// `cancel` 置位后在下一个块边界退出：**删除远端半截文件**并返回
+    /// [`TransferOutcome::Cancelled`]。
     pub async fn upload(
         &self,
         local_path: &Path,
         remote: &str,
         progress: ProgressCb,
-    ) -> AppResult<()> {
+        cancel: CancelFlag,
+    ) -> AppResult<TransferOutcome> {
+        use std::sync::atomic::Ordering;
         let local_meta = tokio::fs::metadata(local_path).await.map_err(|e| {
             AppError::Io(std::io::Error::new(
                 e.kind(),
@@ -214,6 +249,12 @@ impl SftpSession {
         let mut transferred: u64 = 0;
         let mut buf = vec![0u8; CHUNK_SIZE];
         loop {
+            // 取消：关闭远端句柄并删掉半截远端文件后退出（best-effort）。
+            if cancel.load(Ordering::Relaxed) {
+                drop(remote_file);
+                let _ = self.channel.remove_file(remote).await;
+                return Ok(TransferOutcome::Cancelled);
+            }
             let n = local_file
                 .read(&mut buf)
                 .await
@@ -234,7 +275,7 @@ impl SftpSession {
             .map_err(|e| AppError::Ssh(format!("flush 远程文件失败: {}", e)))?;
         // 优雅关闭文件句柄，确保服务端落盘。
         let _ = remote_file.shutdown().await;
-        Ok(())
+        Ok(TransferOutcome::Completed)
     }
 
     /// 重命名远程文件或目录。
@@ -289,11 +330,15 @@ impl FileBackend for SftpSession {
         local_path: &Path,
         progress: ProgressCb,
     ) -> AppResult<()> {
-        SftpSession::download(self, remote, local_path, progress).await
+        SftpSession::download(self, remote, local_path, progress, never_cancel())
+            .await
+            .map(|_| ())
     }
 
     async fn upload(&self, local_path: &Path, remote: &str, progress: ProgressCb) -> AppResult<()> {
-        SftpSession::upload(self, local_path, remote, progress).await
+        SftpSession::upload(self, local_path, remote, progress, never_cancel())
+            .await
+            .map(|_| ())
     }
 
     async fn rename(&self, oldpath: &str, newpath: &str) -> AppResult<()> {

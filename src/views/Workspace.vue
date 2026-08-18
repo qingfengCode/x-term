@@ -21,22 +21,23 @@ const active = computed(() =>
   terminals.tabs.find((t) => t.instanceId === terminals.activeId)
 );
 
-// 各 tab 的 TerminalPane 引用（按 instanceId 索引）。
+// 各 tab 的 TerminalPane 引用（按稳定 tab.id 索引——instanceId 在重连时会
+// 更换，用它做 key 会在重连瞬间误删新引用）。
 // reactive Map 保证增删触发 activePaneRef 重新求值。
 const paneRefs = reactive(new Map<string, InstanceType<typeof TerminalPane>>());
 
 /** 当前活动 tab 的 pane 引用（工具动作作用于它；vnc tab 时为 undefined）。 */
 const activePaneRef = computed(() => {
-  const id = terminals.activeId;
+  const id = active.value?.id;
   return id ? paneRefs.get(id) : undefined;
 });
 
 /** TerminalPane 挂载/卸载时的 ref 回调：登记或移除 pane 引用。 */
 function onPaneRef(tab: TerminalTab, el: unknown) {
   if (el) {
-    paneRefs.set(tab.instanceId, el as InstanceType<typeof TerminalPane>);
+    paneRefs.set(tab.id, el as InstanceType<typeof TerminalPane>);
   } else {
-    paneRefs.delete(tab.instanceId);
+    paneRefs.delete(tab.id);
   }
 }
 
@@ -52,26 +53,33 @@ const tabItems = computed<TabBarItem[]>(() =>
   })),
 );
 
-/** TabBar 右键菜单命令（作用于对应 tab）。 */
+/**
+ * TabBar 右键菜单命令（作用于对应 tab）。
+ *
+ * key 为 TabBar 的复合键（instanceId || session.id）：连接中的占位 tab 只有
+ * 复合键可用，close 系列命令照常生效；reconnect 仍要求已建立实例。
+ */
 function onTabMenuCommand(cmd: string, key: string) {
   const t = terminals.tabs.find((x) => (x.instanceId || x.session.id) === key);
-  if (!t?.instanceId) return;
+  if (!t) return;
   switch (cmd) {
     case "close":
-      void terminals.close(t.instanceId);
+      void terminals.close(key);
       break;
     case "closeOthers":
       for (const x of [...terminals.tabs]) {
-        if (x.instanceId !== t.instanceId) void terminals.close(x.instanceId);
+        if (x !== t) {
+          void terminals.close(x.instanceId || x.session.id);
+        }
       }
       break;
     case "closeAll":
       for (const x of [...terminals.tabs]) {
-        if (x.instanceId) void terminals.close(x.instanceId);
+        void terminals.close(x.instanceId || x.session.id);
       }
       break;
     case "reconnect":
-      void terminals.reconnect(t.instanceId);
+      if (t.instanceId) void terminals.reconnect(t.instanceId);
       break;
   }
 }
@@ -96,8 +104,8 @@ async function reconnectActive() {
   }
 }
 function zoom(delta: number) {
-  const next = Math.max(8, Math.min(36, settings.terminal.fontSize + delta));
-  settings.setTerminal({ fontSize: next });
+  // 作用于活动面板的字号覆盖（每 tab 独立、不写全局设置、不持久化）。
+  activePaneRef.value?.zoomFont(delta);
 }
 
 // --- 快捷命令栏 ---------------------------------------------------------
@@ -207,6 +215,17 @@ async function saveNewShortcut() {
 function onGlobalKeydown(e: KeyboardEvent) {
   // 长按连发（e.repeat）只响应首次按键，避免自定义命令被连续执行。
   if (e.repeat) return;
+  // Ctrl+W 关闭当前标签：放在可编辑元素排除**之前**——焦点在终端画布内时
+  // 事件源是 xterm 的隐藏 textarea，若先走排除逻辑就永远拦不到。捕获阶段
+  // 拦截 + stopPropagation：xterm 收不到就不会把 Ctrl+W（\x17 删词）发往
+  // 远端，关标签不会连带删掉远端一个词（shell 删词可用 Alt+Backspace）。
+  if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === "w") {
+    if (!active.value?.instanceId) return;
+    e.preventDefault();
+    e.stopPropagation();
+    void terminals.close(active.value.instanceId);
+    return;
+  }
   // 仅当聚焦在 body 或非可编辑元素时才响应快捷键，避免与输入框冲突。
   const target = e.target as HTMLElement | null;
   if (target) {
@@ -222,17 +241,10 @@ function onGlobalKeydown(e: KeyboardEvent) {
     return;
   }
   // 内置标签快捷键（用户自定义命令未占用时生效，与桌面页一致）：
-  // Ctrl+W 关闭当前标签；Ctrl+1~9 切换标签。
-  // 焦点在终端画布内时按键归远端（终端应用自己的 Ctrl+组合），不触发。
+  // Ctrl+1~9 切换标签。焦点在终端画布内时让给远端（终端应用的 Ctrl+组合
+  // 冲突更少，且切换有会话侧栏可用）。
   if ((e.ctrlKey || e.metaKey) && !e.altKey) {
-    const target = e.target as HTMLElement | null;
     if (!target?.closest(".xterm-wrap")) {
-      if (e.key.toLowerCase() === "w") {
-        if (!active.value?.instanceId) return;
-        e.preventDefault();
-        void terminals.close(active.value.instanceId);
-        return;
-      }
       if (/^[1-9]$/.test(e.key)) {
         const idx = Number(e.key) - 1;
         const tab = terminals.tabs[idx];
@@ -248,15 +260,17 @@ function onGlobalKeydown(e: KeyboardEvent) {
 // 本组件被 KeepAlive 缓存（MainLayout），切到其他页面时不会卸载——若在
 // onMounted 里注册全局监听，切走后自定义命令快捷键仍会在后台终端执行命令。
 // 改为随页面激活/停用注册/注销（tab 右键菜单的关闭监听由 TabBar 组件自理）。
+// 注册用捕获阶段：Ctrl+W 要抢在 xterm 的 textarea 处理之前拦截（否则删词
+// 已发往远端，关标签变成"关标签 + 删远端一个词"）。
 onActivated(() => {
-  window.addEventListener("keydown", onGlobalKeydown);
+  window.addEventListener("keydown", onGlobalKeydown, true);
 });
 onDeactivated(() => {
-  window.removeEventListener("keydown", onGlobalKeydown);
+  window.removeEventListener("keydown", onGlobalKeydown, true);
 });
 // 兜底：组件真正销毁（如应用退出）时确保清理。
 onBeforeUnmount(() => {
-  window.removeEventListener("keydown", onGlobalKeydown);
+  window.removeEventListener("keydown", onGlobalKeydown, true);
 });
 </script>
 
@@ -299,7 +313,7 @@ onBeforeUnmount(() => {
       <div class="panes">
         <div
           v-for="tab in terminals.tabs"
-          :key="tab.instanceId || tab.session.id"
+          :key="tab.id"
           v-show="tab.instanceId === terminals.activeId"
           class="pane"
         >

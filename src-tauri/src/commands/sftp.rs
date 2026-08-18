@@ -151,6 +151,13 @@ pub async fn sftp_download(
     let task_id = params.task_id.clone();
     let app_for_progress = app.clone();
 
+    // 注册取消标志（前端 sftp_transfer_cancel 置位）；无论结果如何都移除。
+    let cancel = crate::ssh::sftp::CancelFlag::default();
+    state
+        .sftp_transfers
+        .lock()
+        .insert(task_id.clone(), cancel.clone());
+
     let result = sftp
         .download(
             &params.remote_path,
@@ -167,11 +174,22 @@ pub async fn sftp_download(
                     },
                 );
             }) as crate::file_backend::ProgressCb,
+            cancel,
         )
         .await;
 
+    state.sftp_transfers.lock().remove(&params.task_id);
+
+    // 用户取消：前端已本地置 cancelled，不再 emit error（避免把"已取消"
+    // 显示成"失败"）。
+    if matches!(result, Ok(crate::ssh::sftp::TransferOutcome::Cancelled)) {
+        return Ok(());
+    }
+
     match result {
-        Ok(()) => {
+        // 取消已在上方提前 return，这里只会是完成或失败。
+        Ok(crate::ssh::sftp::TransferOutcome::Cancelled) => unreachable!("取消已提前返回"),
+        Ok(crate::ssh::sftp::TransferOutcome::Completed) => {
             events::emit(
                 &app,
                 TRANSFER_DONE,
@@ -225,6 +243,13 @@ pub async fn sftp_upload(
     let task_id = params.task_id.clone();
     let app_for_progress = app.clone();
 
+    // 注册取消标志（与 sftp_download 相同语义）。
+    let cancel = crate::ssh::sftp::CancelFlag::default();
+    state
+        .sftp_transfers
+        .lock()
+        .insert(task_id.clone(), cancel.clone());
+
     let result = sftp
         .upload(
             &local,
@@ -241,11 +266,20 @@ pub async fn sftp_upload(
                     },
                 );
             }) as crate::file_backend::ProgressCb,
+            cancel,
         )
         .await;
 
+    state.sftp_transfers.lock().remove(&params.task_id);
+
+    if matches!(result, Ok(crate::ssh::sftp::TransferOutcome::Cancelled)) {
+        return Ok(());
+    }
+
     match result {
-        Ok(()) => {
+        // 取消已在上方提前 return，这里只会是完成或失败。
+        Ok(crate::ssh::sftp::TransferOutcome::Cancelled) => unreachable!("取消已提前返回"),
+        Ok(crate::ssh::sftp::TransferOutcome::Completed) => {
             events::emit(
                 &app,
                 TRANSFER_DONE,
@@ -269,6 +303,20 @@ pub async fn sftp_upload(
             Err(e)
         }
     }
+}
+
+/// 取消一个进行中的 SFTP 传输任务（前端传输队列"取消"按钮触发）。
+///
+/// 置位取消标志后立即返回；传输循环在下一个块边界（≤64 KiB）退出并清理
+/// 半截文件（下载删本地、上传删远端）。任务不存在（已完成/已取消）幂等
+/// 返回 Ok。
+#[tauri::command]
+pub fn sftp_transfer_cancel(task_id: String, state: State<'_, AppState>) -> AppResult<()> {
+    let flag = state.sftp_transfers.lock().get(&task_id).cloned();
+    if let Some(flag) = flag {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(())
 }
 
 /// 关闭 SFTP 会话（断开底层连接）。

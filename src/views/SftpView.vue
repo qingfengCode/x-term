@@ -578,6 +578,7 @@ async function uploadOne(localAbs: string, name: string) {
     transferred: 0,
     total: 0,
     status: "pending",
+    cancellable: true,
   });
   // 后端命令整体 await（完成才返回），"运行中"须在发起前标记，
   // 否则完成后才更新会覆盖 transfer:done 事件的完成状态。
@@ -676,6 +677,7 @@ async function downloadSelected() {
     transferred: 0,
     total: remoteFile.size || 0,
     status: "pending",
+    cancellable: true,
   });
   transfer.update(taskId, { status: "running" });
   try {
@@ -705,6 +707,7 @@ async function downloadOne(remoteAbs: string, name: string) {
     transferred: 0,
     total: 0,
     status: "pending",
+    cancellable: true,
   });
   transfer.update(taskId, { status: "running" });
   try {

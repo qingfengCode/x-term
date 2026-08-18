@@ -21,6 +21,10 @@
 //! - `desktop_screenshot` / `desktop_click` / `desktop_type` / `desktop_key`：操作
 //!   内嵌 RDP 远程桌面（多模态模型 + 活动 RDP 会话时启用）。执行体在**前端**
 //!   （IronRDP WASM 会话），后端只负责下发与等待回执，详见 [`desktop_tools`]。
+//! - `todo_write`：任务清单记账工具（agent 模式**始终**下发，不受上下文裁剪）。
+//!   整表替换语义，emit `ai:todo` 事件供前端渲染，详见 [`todo_tool`]。
+//! - `load_skill`：按标题加载已启用技能全文（该域存在启用技能时才下发），
+//!   配合 agent 提示词里的技能目录摘要按需取用，详见 [`skill_tool`]。
 //!
 //! # 执行流程
 //!
@@ -121,6 +125,59 @@ pub struct DesktopToolOutcome {
     pub image: Option<ImagePart>,
 }
 
+/// 模型提问的单个问题（`ask_user_question` 参数项）。
+///
+/// `id` 必须稳定唯一（前端回传答案时原样带回）；`options` 提供可选项，
+/// `multi_select` 允许勾选多个（缺省单选）。与 dsh `tool-ask-user` 的
+/// question 结构一致。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AskUserQuestion {
+    pub id: String,
+    pub question: String,
+    #[serde(default)]
+    pub header: Option<String>,
+    #[serde(default)]
+    pub options: Vec<AskUserOption>,
+    #[serde(default)]
+    pub multi_select: bool,
+}
+
+/// `AskUserQuestion` 的可选项。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AskUserOption {
+    pub label: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// 用户对某个问题的回答（前端 `ai_ask_user_respond` 发回）。
+///
+/// `selected` 为勾选的选项 label；`custom` 为自由输入——单选时覆盖 `selected`，
+/// 多选时与 `selected` 并存。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AskUserAnswer {
+    pub id: String,
+    #[serde(default)]
+    pub selected: Vec<String>,
+    #[serde(default)]
+    pub custom: Option<String>,
+}
+
+/// `ask_user_question` 工具的前端回答回执。
+///
+/// 执行体在**前端**（用户填写回答）——编排层 emit `ai:tool_call` 后阻塞在
+/// [`crate::state::AppState::pending_ask_user_calls`]，等待前端通过
+/// `ai_ask_user_respond` 命令回传答案：
+/// - `answered=false`：用户取消 / 请求被终止 / 确认超时；
+/// - `answered=true`：`answers` 为逐题回答（按 `id` 与问题对应）。
+pub struct AskUserOutcome {
+    pub answered: bool,
+    pub answers: Vec<AskUserAnswer>,
+}
+
 // ===========================================================================
 // 常量
 // ===========================================================================
@@ -146,6 +203,9 @@ const MAX_FILE_READ_BYTES: usize = 1024 * 1024;
 const MAX_FILE_WRITE_BYTES: usize = 10 * 1024 * 1024;
 /// list_files 单目录最多返回条目数。
 const MAX_LIST_ENTRIES: usize = 200;
+/// load_skill 单条技能内容返回上限（4 KiB）。技能内容由对话总结生成（≤500 字），
+/// 该上限仅作防御（防用户手动编辑出超长内容撑爆上下文）。
+const MAX_SKILL_BYTES: usize = 4 * 1024;
 
 // ===========================================================================
 // 工具集
@@ -153,8 +213,8 @@ const MAX_LIST_ENTRIES: usize = 200;
 
 /// 返回全部工具定义。
 ///
-/// 工具参数用 `serde_json::json!` 构造 JSON Schema；具体厂商实现（OpenAI / Claude）
-/// 会按各自协议封装（OpenAI 包成 `function.parameters`，Claude 用 `input_schema`）。
+/// 工具参数用 `serde_json::json!` 构造 JSON Schema；厂商实现按 OpenAI 兼容
+/// 协议封装（包成 `function.parameters`）。
 /// SSH 上下文工具集（有活动终端时启用）。
 ///
 /// - `exec_ssh`：在服务器执行 shell 命令。
@@ -427,12 +487,228 @@ path 是相对工作目录的路径（如 data/users.csv），不允许绝对路
     ]
 }
 
+/// 任务清单工具（借鉴 deepseek-harness `tool-todo`）。
+///
+/// `todo_write(todos: [{content, status}])`：模型**整表替换**当前任务清单，
+/// 无部分更新/单条编辑——每次调用都携带完整清单，前端按事件流 last-write-wins
+/// 展示。status 取值 `pending`（待办）/ `in_progress`（进行中）/ `completed`（已完成）。
+///
+/// 该工具是纯记账（无副作用、不需要确认），agent 模式下**始终下发**，不受
+/// 活动上下文裁剪影响。清单状态不落后端（前端按会话持有），执行器只负责
+/// 校验与 emit `ai:todo` 事件。
+pub fn todo_tool() -> ToolDef {
+    ToolDef {
+        name: "todo_write".into(),
+        description: "维护当前任务的任务清单（**整表替换**：每次调用都必须携带当前完整的\
+任务清单，而不是只写变化的部分）。适用于多步骤任务：任务开始前列出所有步骤，\
+每完成/进行到一步就调用一次更新对应项状态。\
+status 取值：pending（待办）、in_progress（进行中）、completed（已完成）。\
+任务全部完成或放弃时调用一次，把清单改为空数组 []。"
+            .into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "description": "当前完整任务清单（全部步骤）",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {
+                                "type": "string",
+                                "description": "任务步骤描述（非空、不重复）"
+                            },
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed"],
+                                "description": "该步骤当前状态"
+                            }
+                        },
+                        "required": ["content", "status"]
+                    }
+                }
+            },
+            "required": ["todos"]
+        }),
+    }
+}
+
+/// 技能加载工具（借鉴 deepseek-harness `tool-skill`）。
+///
+/// agent 模式下系统提示词只注入**技能目录摘要**（标题 + 内容开头），模型需要
+/// 完整技能内容时调用本工具按**标题精确匹配**加载。是只读操作，自动放行。
+/// 仅当该助手域存在已启用的技能时由编排层下发。
+pub fn skill_tool() -> ToolDef {
+    ToolDef {
+        name: "load_skill".into(),
+        description: "加载一条已启用技能的完整内容。name 必须与系统提示词「可用技能」\
+目录中的标题**完全一致**。仅当你需要该技能的完整步骤/命令细节时才调用；\
+目录摘要已足够理解任务时不必加载。加载后按技能内容执行，不要重复加载同一技能。"
+            .into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "技能标题（与目录中的标题完全一致）"
+                }
+            },
+            "required": ["name"]
+        }),
+    }
+}
+
 /// 返回全部工具定义（SSH + SQL）。保留用于测试/兼容；运行时按上下文裁剪请用
 /// [`tools_for_context`]。
 pub fn all_tools() -> Vec<ToolDef> {
     let mut v = ssh_tools();
     v.extend(sql_tools());
     v
+}
+
+/// 向用户提问工具（借鉴 deepseek-harness `tool-ask-user`）。
+///
+/// 模型在信息不足（端口/目录/方案取舍/需要用户确认）时调用，由前端渲染为
+/// 问题表单（选项 + 自由输入），用户的回答作为 tool 结果回填上下文——避免
+/// 模型瞎猜或空转。执行体在**前端**（类似桌面工具）：编排层 emit
+/// `ai:tool_call` 后等待 `ai_ask_user_respond` 回执。agent 模式无条件下发。
+pub fn ask_user_tool() -> ToolDef {
+    ToolDef {
+        name: "ask_user_question".into(),
+        description: "向用户提出一个或多个问题，获取继续执行所需的信息（端口、\
+路径、目标主机、方案取舍、确认等）。适用于信息不足或需要用户决策时：\
+不要猜测关键信息，直接提问。每个问题需提供稳定的 id、问题文本，可附选项\
+（label + 可选说明；推荐项放第一位并在 label 末尾加 (Recommended)）与多选\
+开关。一次最多提问 4 个问题。答案会在你的下一轮上下文中以 \
+{\"answers\":[{\"id\",\"selected\",\"custom\"}]} 形式返回。"
+            .into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "description": "要问的问题列表（1-4 个）",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {
+                                "type": "string",
+                                "description": "稳定且唯一的问题 id（回传答案时原样带回）"
+                            },
+                            "question": {
+                                "type": "string",
+                                "description": "问题文本（简明、具体）"
+                            },
+                            "header": {
+                                "type": "string",
+                                "description": "可选短标题（≤12 字符）"
+                            },
+                            "options": {
+                                "type": "array",
+                                "description": "可选项（缺省为自由输入）",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": { "type": "string", "description": "选项文本" },
+                                        "description": { "type": "string", "description": "选项说明（可选）" }
+                                    },
+                                    "required": ["label"]
+                                }
+                            },
+                            "multi_select": {
+                                "type": "boolean",
+                                "description": "是否允许多选（缺省单选）"
+                            }
+                        },
+                        "required": ["id", "question"]
+                    }
+                }
+            },
+            "required": ["questions"]
+        }),
+    }
+}
+
+/// 校验 ask_user_question 参数（纯函数，便于单元测试）。
+///
+/// 规则：questions 必须是 1-4 个问题；每题 id / question 非空；options 每项
+/// label 非空。返回 Err(可读错误信息)。
+pub fn validate_ask_user_questions(args: &Value) -> Result<Vec<AskUserQuestion>, String> {
+    let Some(list) = args.get("questions").and_then(Value::as_array) else {
+        return Err("ask_user_question 缺少 questions 参数（必须是数组）".into());
+    };
+    if list.is_empty() {
+        return Err("questions 不能为空".into());
+    }
+    if list.len() > 4 {
+        return Err("一次最多提问 4 个问题".into());
+    }
+    let mut questions: Vec<AskUserQuestion> = Vec::with_capacity(list.len());
+    let mut seen: HashSet<String> = HashSet::new();
+    for (i, q) in list.iter().enumerate() {
+        let id = match q.get("id").and_then(Value::as_str) {
+            Some(s) => s.trim().to_string(),
+            None => return Err(format!("第 {} 个问题缺少 id", i + 1)),
+        };
+        if id.is_empty() {
+            return Err(format!("第 {} 个问题的 id 为空", i + 1));
+        }
+        if !seen.insert(id.clone()) {
+            return Err(format!("问题 id 重复：{id}"));
+        }
+        let question = match q.get("question").and_then(Value::as_str) {
+            Some(s) => s.trim().to_string(),
+            None => return Err(format!("第 {} 个问题缺少 question 文本", i + 1)),
+        };
+        if question.is_empty() {
+            return Err(format!("第 {} 个问题的 question 为空", i + 1));
+        }
+        let header = q
+            .get("header")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let multi_select = q.get("multi_select").and_then(Value::as_bool).unwrap_or(false);
+        let mut options: Vec<AskUserOption> = Vec::new();
+        if let Some(opts) = q.get("options").and_then(Value::as_array) {
+            // 前端表单以 label 作为勾选 key，重复 label 会互相覆盖 → 必须唯一。
+            let mut opt_seen: HashSet<String> = HashSet::new();
+            for (j, o) in opts.iter().enumerate() {
+                let label = match o.get("label").and_then(Value::as_str) {
+                    Some(s) => s.trim().to_string(),
+                    None => return Err(format!("第 {} 个问题第 {} 个选项缺少 label", i + 1, j + 1)),
+                };
+                if label.is_empty() {
+                    return Err(format!("第 {} 个问题第 {} 个选项的 label 为空", i + 1, j + 1));
+                }
+                if !opt_seen.insert(label.clone()) {
+                    return Err(format!("第 {} 个问题的选项 label 重复：{label}", i + 1));
+                }
+                options.push(AskUserOption {
+                    label,
+                    description: o
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty()),
+                });
+            }
+        }
+        questions.push(AskUserQuestion {
+            id,
+            question,
+            header,
+            options,
+            multi_select,
+        });
+    }
+    Ok(questions)
+}
+
+/// 把用户回答格式化为回填给模型的 tool 结果文本（dsh 规范：
+/// `{"answers":[{id, selected, custom}]}`，compact JSON 单行）。
+pub fn format_ask_user_answers(answers: &[AskUserAnswer]) -> String {
+    serde_json::json!({ "answers": answers }).to_string()
 }
 
 /// 按当前活动上下文裁剪工具集（块A 核心逻辑）。
@@ -490,8 +766,10 @@ pub fn allowed_tool_names(tools: &[ToolDef]) -> HashSet<String> {
 /// 若 `call.name` 不在其中，说明模型幻觉调用了未 advertised 的工具，直接拒绝——
 /// 防止"只给了 SSH 工具，模型却调 exec_sql"这类越权。
 ///
-/// `file_domain` 是请求所属助手域（"ssh"/"db"/""），文件工具据此取对应工作目录；
-/// 非文件工具忽略该参数。
+/// `file_domain` 是请求所属助手域（"ssh"/"db"/""），文件工具据此取对应工作目录，
+/// `load_skill` 据此过滤技能所属域；非文件工具忽略该参数。
+///
+/// `request_id` 是当前请求 id：`todo_write` 的 `ai:todo` 事件据此路由到前端会话。
 ///
 /// 任何执行错误都被吞掉并返回 `ToolResult { ok: false, output: <错误信息> }`，
 /// 由调用方把错误回填给模型，让模型据此重试或解释给用户。
@@ -502,6 +780,7 @@ pub async fn execute_tool(
     allowed: &HashSet<String>,
     visualization: bool,
     file_domain: &str,
+    request_id: &str,
 ) -> ToolResult {
     if !allowed.contains(&call.name) {
         return ToolResult::err(format!(
@@ -518,6 +797,10 @@ pub async fn execute_tool(
         "read_file" => read_file(state, &call.arguments, file_domain),
         "write_file" => write_file(state, &call.arguments, file_domain),
         "list_files" => list_files(state, &call.arguments, file_domain),
+        // todo_write：纯记账工具，校验后 emit ai:todo 事件（前端按事件流展示清单）。
+        "todo_write" => execute_todo_write(app, request_id, &call.arguments),
+        // load_skill：从设置读取技能全文（只读，无副作用）。
+        "load_skill" => execute_load_skill(state, &call.arguments, file_domain),
         // 桌面工具的执行体在**前端**（IronRDP WASM 会话）：编排层不应把它们
         // 送到这里，若到达说明路由有误，给出明确错误而不是静默失败。
         name if is_desktop_tool(name) => ToolResult::err(format!(
@@ -708,22 +991,22 @@ async fn exec_ssh(state: &AppState, args: &Value, visualization: bool) -> ToolRe
 /// 若在此时返回，AI 拿到的会是空/部分输出（"终端有输出但 AI 分析不到"
 /// 的主要根因）。
 async fn exec_ssh_visual(state: &AppState, session_id: &str, command: &str) -> ToolResult {
-    // 占用该终端：与 MCP 的 exec_ssh_terminal 共用同一把 busy 锁（try 获取，忙时
-    // 立即返回引导、不排队等待）。没有这把锁时，两个并发 AI 会话在同一终端上
-    // 执行会互相污染：A 写入的哨兵/回显混进 B 的 snapshot_after 窗口，A 的输出
+    // 占用该终端：与 MCP 的 exec_ssh_terminal 共用同一把忙锁（忙时立即返回
+    // 引导、不排队等待）。没有这把锁时，两个并发 AI 会话在同一终端上执行会
+    // 互相污染：A 写入的哨兵/回显混进 B 的 snapshot_after 窗口，A 的输出
     // 可能回填给 B，命令输出张冠李戴。
-    {
-        let mut busy = state.mcp_terminal_busy.lock().await;
-        if busy.insert(session_id.to_string(), ()).is_some() {
-            return ToolResult::err(
-                "该终端正有另一个命令（AI 助手或 MCP 调用）在执行，请稍后再试",
-            );
-        }
-    }
-    let result = exec_ssh_visual_unlocked(state, session_id, command).await;
-    // 无论成功/超时/出错都释放占用（unlocked 体内所有路径都返回）。
-    state.mcp_terminal_busy.lock().await.remove(session_id);
-    result
+    //
+    // 占用经 Drop 守卫释放：AI 请求被"终止"（ai_stop → abort）时本函数的
+    // future 在 await 点被整体丢弃，函数末尾的释放代码不会执行——守卫的
+    // Drop 保证 abort/panic 路径也释放，否则该终端永久"正被占用"。
+    let Some(_busy_guard) = state.try_lock_terminal(session_id) else {
+        return ToolResult::err(
+            "该终端正被占用（同请求的命令按顺序执行中，或另一 AI/MCP 会话正在\
+             该终端执行），请等待当前命令完成后重试",
+        );
+    };
+    exec_ssh_visual_unlocked(state, session_id, command).await
+    // _busy_guard 在此 drop（正常返回 / 错误 / 超时 / abort / panic 均释放）。
 }
 
 /// [`exec_ssh_visual`] 的执行主体（调用方已持有该终端的 busy 占用）。
@@ -1322,6 +1605,175 @@ fn list_files(state: &AppState, args: &Value, domain: &str) -> ToolResult {
 }
 
 // ===========================================================================
+// 任务清单工具（todo_write）
+// ===========================================================================
+
+/// 任务状态合法取值（与工具 JSON Schema 的 enum 一致）。
+const TODO_STATUSES: [&str; 3] = ["pending", "in_progress", "completed"];
+
+/// todo_write 执行器：校验参数 → emit `ai:todo` 事件（整表）→ 返回 counts 摘要。
+///
+/// 清单状态本身不落后端（前端按会话持有、按事件流 last-write-wins 更新），
+/// 因此本函数无持久副作用；校验失败返回错误，由编排层回填给模型。
+fn execute_todo_write(app: &AppHandle, request_id: &str, args: &Value) -> ToolResult {
+    let items = match validate_todo_list(args) {
+        Ok(items) => items,
+        Err(e) => return ToolResult::err(e),
+    };
+    // 校验通过才 emit（失败的事件不携带，前端清单保持不变）。
+    crate::events::emit(
+        app,
+        crate::events::AI_TODO,
+        crate::events::AiTodoEvent {
+            request_id: request_id.to_string(),
+            todos: items.clone(),
+        },
+    );
+    let counts = |s: &str| items.iter().filter(|t| t.status == s).count();
+    let n = items.len();
+    let mut text = format!(
+        "任务清单已更新（共 {n} 项：待办 {} · 进行中 {} · 已完成 {}）",
+        counts("pending"),
+        counts("in_progress"),
+        counts("completed")
+    );
+    // 完成自动收敛（借鉴 dsh goal 的 concludeTurn 思想）：清单全部完成（或清空）
+    // 时附加收尾提醒，避免模型在任务已完成后继续空转调用工具浪费轮次/token。
+    // 两种终态文案区分：全部完成 vs 清空清单（清空也可能是"放弃任务"）。
+    let all_done = !items.is_empty() && counts("completed") == n;
+    if all_done {
+        text.push_str(
+            "\n（所有任务已完成。如已无其他工作，请直接给出最终总结并结束，不要再调用工具。）",
+        );
+    } else if n == 0 {
+        text.push_str(
+            "\n（任务清单已清空。如已无其他工作，请直接给出最终总结并结束，不要再调用工具。）",
+        );
+    }
+    ToolResult::ok(text)
+}
+
+/// 校验 todo_write 参数并归一化为事件项列表（纯函数，便于单元测试）。
+///
+/// 规则：todos 必须是数组（≤50 项）；每项 content 非空且不重复；status 必须是
+/// pending / in_progress / completed 之一。返回 Err(可读错误信息)。
+fn validate_todo_list(args: &Value) -> Result<Vec<crate::events::AiTodoItem>, String> {
+    let Some(todos) = args.get("todos").and_then(Value::as_array) else {
+        return Err("todo_write 缺少 todos 参数（必须是数组）".into());
+    };
+    if todos.len() > 50 {
+        return Err("任务清单过长（上限 50 项）".into());
+    }
+    let mut items: Vec<crate::events::AiTodoItem> = Vec::with_capacity(todos.len());
+    let mut seen: HashSet<String> = HashSet::new();
+    for (i, t) in todos.iter().enumerate() {
+        let content = match t.get("content").and_then(Value::as_str) {
+            Some(c) => c.trim(),
+            None => return Err(format!("第 {} 项缺少 content（必须是非空字符串）", i + 1)),
+        };
+        if content.is_empty() {
+            return Err(format!("第 {} 项的 content 为空", i + 1));
+        }
+        if !seen.insert(content.to_string()) {
+            return Err(format!("任务内容重复：{content}"));
+        }
+        let status = match t.get("status").and_then(Value::as_str) {
+            Some(s) if TODO_STATUSES.contains(&s) => s.to_string(),
+            Some(s) => {
+                return Err(format!(
+                    "第 {} 项的 status `{s}` 非法（可选：pending / in_progress / completed）",
+                    i + 1
+                ));
+            }
+            None => return Err(format!("第 {} 项缺少 status", i + 1)),
+        };
+        items.push(crate::events::AiTodoItem {
+            content: content.to_string(),
+            status,
+        });
+    }
+    Ok(items)
+}
+
+// ===========================================================================
+// 技能加载工具（load_skill）
+// ===========================================================================
+
+/// load_skill 执行器：从设置按「标题精确匹配」加载技能全文。
+///
+/// 技能与前端 settings.json 同源（`ai.skills`，前端保存、后端读取），按请求
+/// 所属 domain + enabled 过滤。只读操作，无副作用。
+fn execute_load_skill(state: &AppState, args: &Value, domain: &str) -> ToolResult {
+    let name = match args.get("name").and_then(Value::as_str) {
+        Some(n) => n.trim(),
+        None => return ToolResult::err("load_skill 缺少 name 参数"),
+    };
+    if name.is_empty() {
+        return ToolResult::err("load_skill 的 name 不能为空");
+    }
+    let settings = match crate::config::settings_load_inner(state) {
+        Ok(s) => s,
+        Err(e) => return ToolResult::err(format!("读取设置失败: {e}")),
+    };
+    // 取该域启用的技能；未启用视为不可用（与前端目录注入的过滤规则一致）。
+    let mut catalog: Vec<crate::config::SkillConfig> = settings
+        .ai
+        .skills
+        .into_iter()
+        .filter(|s| s.enabled && s.domain == domain)
+        .collect();
+    // 标题精确匹配（trim 后比对；找不到返回引导，告诉模型有哪些可用技能）。
+    let skill = catalog
+        .iter()
+        .position(|s| s.title.trim() == name)
+        .map(|idx| catalog.remove(idx))
+        .unwrap_or_else(|| {
+            // 未命中：把可用标题列表附在错误里，帮模型纠正名称。
+            let titles: Vec<String> = catalog.into_iter().map(|s| s.title).collect();
+            if titles.is_empty() {
+                return crate::config::SkillConfig {
+                    id: String::new(),
+                    title: name.to_string(),
+                    content: String::new(),
+                    domain: domain.to_string(),
+                    enabled: false,
+                };
+            }
+            // 哨兵：content 置空 + 错误由下方处理。
+            crate::config::SkillConfig {
+                id: String::new(),
+                title: format!("__not_found__:{}", titles.join(" / ")),
+                content: String::new(),
+                domain: domain.to_string(),
+                enabled: false,
+            }
+        });
+    if skill.title.starts_with("__not_found__") {
+        let titles = skill.title.trim_start_matches("__not_found__:");
+        return ToolResult::err(format!(
+            "没有找到标题为「{name}」的技能。当前可用的技能：{titles}"
+        ));
+    }
+    // 防御性截断（技能内容正常 ≤500 字，上限 4 KiB 防手动编辑超长）。
+    let content = if skill.content.len() > MAX_SKILL_BYTES {
+        let cut = skill
+            .content
+            .char_indices()
+            .take_while(|(i, _)| *i <= MAX_SKILL_BYTES)
+            .last()
+            .map(|(i, _)| i)
+            .unwrap_or(MAX_SKILL_BYTES);
+        format!("{}…\n[技能内容过长，已截断]", &skill.content[..cut])
+    } else {
+        skill.content
+    };
+    ToolResult::ok(format!(
+        "技能「{}」完整内容如下：\n{}",
+        skill.title, content
+    ))
+}
+
+// ===========================================================================
 // 安全护栏
 // ===========================================================================
 
@@ -1659,6 +2111,26 @@ pub fn describe_call(name: &str, arguments: &Value) -> String {
                 .unwrap_or("工作目录");
             format!("列出目录: {p}")
         }
+        "todo_write" => {
+            let n = arguments
+                .get("todos")
+                .and_then(Value::as_array)
+                .map(|a| a.len())
+                .unwrap_or(0);
+            format!("更新任务清单（{n} 项）")
+        }
+        "load_skill" => {
+            let name = arguments.get("name").and_then(Value::as_str).unwrap_or("?");
+            format!("加载技能: {name}")
+        }
+        "ask_user_question" => {
+            let n = arguments
+                .get("questions")
+                .and_then(Value::as_array)
+                .map(|a| a.len())
+                .unwrap_or(0);
+            format!("向用户提问（{n} 个问题）")
+        }
         "desktop_screenshot" => "截取 RDP 桌面画面".into(),
         "desktop_click" => {
             let x = arguments.get("x").and_then(Value::as_i64).unwrap_or(-1);
@@ -1831,5 +2303,145 @@ mod tests {
         assert!(out.contains("terminal_snapshot"));
         // 未超限时原样返回。
         assert_eq!(truncate_output(&long, 200), long);
+    }
+
+    /// todo_write 合法清单：归一化、trim、按序保留。
+    #[test]
+    fn todo_accepts_valid_list() {
+        let args = serde_json::json!({
+            "todos": [
+                { "content": "  检查磁盘占用  ", "status": "pending" },
+                { "content": "清理日志", "status": "in_progress" },
+                { "content": "重启服务", "status": "completed" }
+            ]
+        });
+        let items = validate_todo_list(&args).unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].content, "检查磁盘占用"); // trim
+        assert_eq!(items[0].status, "pending");
+        assert_eq!(items[1].status, "in_progress");
+        assert_eq!(items[2].status, "completed");
+        // 空清单合法（任务完成/放弃时清空）。
+        assert!(validate_todo_list(&serde_json::json!({ "todos": [] })).unwrap().is_empty());
+    }
+
+    /// todo_write 非法清单：缺参数/空内容/重复/非法状态/超长 → 拒绝且带可读错误。
+    #[test]
+    fn todo_rejects_invalid_lists() {
+        // 缺 todos 参数。
+        assert!(validate_todo_list(&serde_json::json!({})).is_err());
+        // content 为空。
+        assert!(validate_todo_list(&serde_json::json!({ "todos": [{ "content": "  ", "status": "pending" }] })).is_err());
+        // content 重复。
+        assert!(validate_todo_list(&serde_json::json!({ "todos": [
+            { "content": "a", "status": "pending" },
+            { "content": "a", "status": "completed" }
+        ] })).is_err());
+        // 非法 status。
+        assert!(validate_todo_list(&serde_json::json!({ "todos": [{ "content": "a", "status": "done" }] })).is_err());
+        // 缺 status。
+        assert!(validate_todo_list(&serde_json::json!({ "todos": [{ "content": "a" }] })).is_err());
+        // 超过 50 项。
+        let many = serde_json::json!({
+            "todos": (0..51).map(|i| serde_json::json!({ "content": format!("任务{i}"), "status": "pending" })).collect::<Vec<_>>()
+        });
+        assert!(validate_todo_list(&many).is_err());
+    }
+
+    /// describe_call 对记账/加载工具给出可读描述。
+    #[test]
+    fn describe_new_tools() {
+        let todo = serde_json::json!({ "todos": [{"content":"x","status":"pending"}] });
+        assert_eq!(describe_call("todo_write", &todo), "更新任务清单（1 项）");
+        let skill = serde_json::json!({ "name": "磁盘清理" });
+        assert_eq!(describe_call("load_skill", &skill), "加载技能: 磁盘清理");
+        // is_dangerous：记账/加载工具恒为安全。
+        assert!(!is_dangerous("todo_write", &todo, None));
+        assert!(!is_dangerous("load_skill", &skill, None));
+    }
+
+    /// ask_user_question 合法参数：归一化（trim、可选字段过滤）、多选标记保留。
+    #[test]
+    fn ask_user_accepts_valid() {
+        let args = serde_json::json!({
+            "questions": [{
+                "id": "port",
+                "question": "  目标端口？  ",
+                "header": "部署配置",
+                "options": [
+                    { "label": " 80 (Recommended) ", "description": "HTTP" },
+                    { "label": "443" }
+                ],
+                "multi_select": false
+            }]
+        });
+        let qs = validate_ask_user_questions(&args).unwrap();
+        assert_eq!(qs.len(), 1);
+        assert_eq!(qs[0].id, "port");
+        assert_eq!(qs[0].question, "目标端口？"); // trim
+        assert_eq!(qs[0].options.len(), 2);
+        assert_eq!(qs[0].options[0].label, "80 (Recommended)");
+        assert_eq!(qs[0].options[0].description.as_deref(), Some("HTTP"));
+        assert!(!qs[0].multi_select);
+    }
+
+    /// ask_user_question 非法参数：缺 questions / 超 4 个 / id 重复 / 选项 label 重复/空 → 拒绝。
+    #[test]
+    fn ask_user_rejects_invalid() {
+        // 缺 questions。
+        assert!(validate_ask_user_questions(&serde_json::json!({})).is_err());
+        // 空数组。
+        assert!(validate_ask_user_questions(&serde_json::json!({ "questions": [] })).is_err());
+        // 超过 4 个问题。
+        let many = serde_json::json!({
+            "questions": (0..5).map(|i| serde_json::json!({ "id": format!("q{i}"), "question": "?" })).collect::<Vec<_>>()
+        });
+        assert!(validate_ask_user_questions(&many).is_err());
+        // id 重复。
+        assert!(validate_ask_user_questions(&serde_json::json!({
+            "questions": [
+                { "id": "a", "question": "1" },
+                { "id": "a", "question": "2" }
+            ]
+        })).is_err());
+        // question 为空。
+        assert!(validate_ask_user_questions(&serde_json::json!({
+            "questions": [{ "id": "a", "question": "  " }]
+        })).is_err());
+        // 选项 label 重复（前端表单以 label 为勾选 key，重复会互相覆盖）。
+        assert!(validate_ask_user_questions(&serde_json::json!({
+            "questions": [{
+                "id": "a",
+                "question": "选哪个？",
+                "options": [{ "label": "x" }, { "label": "x" }]
+            }]
+        })).is_err());
+        // 选项 label 为空。
+        assert!(validate_ask_user_questions(&serde_json::json!({
+            "questions": [{ "id": "a", "question": "选哪个？", "options": [{ "label": "  " }] }]
+        })).is_err());
+    }
+
+    /// 用户回答格式化为 dsh 规范 JSON（回填模型的 tool 结果）。
+    #[test]
+    fn ask_user_answers_roundtrip() {
+        let answers = vec![
+            crate::ai::tools::AskUserAnswer {
+                id: "port".into(),
+                selected: vec!["80".into()],
+                custom: None,
+            },
+            crate::ai::tools::AskUserAnswer {
+                id: "note".into(),
+                selected: vec![],
+                custom: Some("运维要求 https".into()),
+            },
+        ];
+        let text = crate::ai::tools::format_ask_user_answers(&answers);
+        // 可解析回 camelCase 字段（模型回填读的就是这个文本）。
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["answers"][0]["id"], "port");
+        assert_eq!(parsed["answers"][0]["selected"][0], "80");
+        assert_eq!(parsed["answers"][1]["custom"], "运维要求 https");
     }
 }

@@ -48,6 +48,27 @@ pub const AI_TOOL_CALL: &str = "ai:tool_call";
 /// 工具执行完成（前端展示结果）。payload: [`AiToolResultEvent`]。
 pub const AI_TOOL_RESULT: &str = "ai:tool_result";
 
+/// AI 智能体更新任务清单（todo_write 工具调用）。payload: [`AiTodoEvent`]。
+///
+/// 借鉴 deepseek-harness 的 tool-todo 语义：模型每次调用 `todo_write` 时**整表替换**
+/// 任务清单，前端按事件流 last-write-wins 展示最新清单（同一请求内多条 todo_write
+/// 事件按到达顺序覆盖）。
+pub const AI_TODO: &str = "ai:todo";
+
+/// AI 请求的 token 用量统计。payload: [`AiUsageEvent`]。
+///
+/// 借鉴 deepseek-harness 的 llm/token-meter：流式结束时从响应 usage 字段解析并
+/// 上报（OpenAI 兼容协议的 usage 在最后一个 chunk）。前端按会话累计展示。
+/// 厂商不返回 usage 时不发该事件。
+pub const AI_USAGE: &str = "ai:usage";
+
+/// 系统注入的编排层提示（如重复调用守卫的提醒）。payload: [`AiSystemNoteEvent`]。
+///
+/// 后端把它作为 user 消息注入模型上下文的同时 emit 一份给前端，前端以灰色
+/// 居中提示渲染（不伪装成用户消息，见 AiPanel 的 isSystemReminder），让用户
+/// 能感知"模型正在空转/已收到纠偏提醒"。
+pub const AI_SYSTEM_NOTE: &str = "ai:system_note";
+
 /// exec_sql 终端可视化：AI 执行 SQL 时把 SQL + 结构化结果回显到 SQL 控制台。
 /// payload: [`AiSqlResultEvent`]。仅在 `sql_agent.terminal_visualization` 开启时 emit。
 pub const AI_SQL_RESULT: &str = "ai:sql_result";
@@ -90,6 +111,11 @@ pub const FORWARD_STATE: &str = "forward:state";
 pub struct TerminalDataEvent {
     pub session_id: String,
     pub data: String,
+    /// 追加本块之后的累计输出字节数（环形缓冲的单调计数，含已被截断的头部）。
+    /// 前端 attach 回放（terminal_attach 命令）用它去重：快照基线之前的事件块
+    /// 已包含在快照里，直接跳过——"先监听后快照"的窗口期既不丢字节也不重复。
+    #[serde(default)]
+    pub total: usize,
 }
 
 /// 终端关闭。
@@ -211,6 +237,51 @@ pub struct AiToolResultEvent {
     pub tool_call_id: String,
     pub ok: bool,
     pub output: String,
+}
+
+/// 任务清单中的一项（todo_write 工具写入）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiTodoItem {
+    /// 任务描述（非空）。
+    pub content: String,
+    /// 状态：pending（待办）/ in_progress（进行中）/ completed（已完成）。
+    pub status: String,
+}
+
+/// AI 智能体任务清单更新事件。
+///
+/// 每次 `todo_write` 工具调用 emit 一次，携带**整表**任务清单（替换语义，
+/// 前端以最新事件为准）。`request_id` 用于路由到对应会话。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiTodoEvent {
+    pub request_id: String,
+    pub todos: Vec<AiTodoItem>,
+}
+
+/// AI 单次请求的 token 用量（流式结束时上报一次）。
+///
+/// OpenAI 系：`usage.prompt_tokens / completion_tokens`（流末尾 chunk）；
+/// 前端按 request_id 路由到会话并**累计**到会话级统计。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiUsageEvent {
+    /// 关联的请求/会话标识。
+    pub request_id: String,
+    /// 输入 token 数（prompt / input tokens）。
+    pub prompt_tokens: u64,
+    /// 输出 token 数（completion / output tokens）。
+    pub completion_tokens: u64,
+}
+
+/// 系统注入的编排层提示（重复调用守卫提醒等）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiSystemNoteEvent {
+    pub request_id: String,
+    /// 提示文本（以 `[重复调用提醒]` 等标记开头，前端据此走灰色提示渲染）。
+    pub text: String,
 }
 
 /// exec_sql 终端可视化回显事件。

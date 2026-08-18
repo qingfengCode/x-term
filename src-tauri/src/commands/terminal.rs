@@ -65,6 +65,44 @@ pub fn terminal_resize(
     session.resize(cols, rows)
 }
 
+/// terminal_attach 的返回：缓冲内容 + 累计字节基线。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalAttachResult {
+    /// 输出环形缓冲的原始字节（base64）。
+    pub data: String,
+    /// 快照对应的累计输出字节数（单调计数，含已被环形截断的头部）。
+    /// 前端把它作为去重基线：terminal:data 事件里 `total <= 基线` 的块
+    /// 已包含在快照中，直接跳过。
+    pub total: usize,
+}
+
+/// 取终端输出的缓冲快照（前端挂载/重绑时的 attach 回放）。
+///
+/// 后端 reader 在 connect 命令返回前就开始 emit `terminal:data`，而前端要等
+/// invoke 返回 → 渲染 → `listen()` 注册完成才能收到事件——窗口期内的输出
+/// （SSH banner/MOTD、telnet 登录提示、本地 shell 提示符）会整体丢失，表现
+/// 为终端开出来是空白屏。前端在注册监听**之后**调用本命令：
+/// 1. 先把监听期收到的事件缓存起来（不渲染）；
+/// 2. 本命令原子返回「缓冲快照 + 累计基线」（同一锁内读取）；
+/// 3. 写入快照，再按事件的 `total` 字段过滤缓存（≤ 基线的已含在快照里），
+///    既不丢字节也不重复渲染。
+#[tauri::command]
+pub fn terminal_attach(
+    instance_id: String,
+    state: State<'_, AppState>,
+) -> AppResult<TerminalAttachResult> {
+    let terminals = state.terminals.lock();
+    let session = terminals
+        .get(&instance_id)
+        .ok_or_else(|| AppError::NotFound(format!("终端 {} 不存在", instance_id)))?;
+    let (bytes, total) = session.attach_snapshot();
+    Ok(TerminalAttachResult {
+        data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        total,
+    })
+}
+
 /// 取终端最近输出的文本快照（用于"终端上下文感知"）。
 ///
 /// `max_bytes` 限制返回字节数，0 表示默认（8 KiB）。

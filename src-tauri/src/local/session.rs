@@ -295,10 +295,12 @@ impl LocalSession {
                     Ok(0) | Err(_) => break, // 子进程退出 / PTY 关闭
                     Ok(n) => {
                         let data = &buf[..n];
-                        // 写入输出环形缓冲（如果锁可用）。
-                        if let Ok(mut ob) = output_buffer.lock() {
+                        // 写入输出环形缓冲（锁内取追加后的累计字节数，随事件
+                        // emit 供前端 attach 回放去重；如果锁不可用则计 0）。
+                        let total = output_buffer.lock().ok().map(|mut ob| {
                             ob.push(data);
-                        }
+                            ob.total_bytes()
+                        });
                         // emit 给前端（base64，与 SSH / Telnet 一致）。
                         let b64 = base64::engine::general_purpose::STANDARD.encode(data);
                         emit(
@@ -307,6 +309,7 @@ impl LocalSession {
                             TerminalDataEvent {
                                 session_id: session_id.clone(),
                                 data: b64,
+                                total: total.unwrap_or(0),
                             },
                         );
                     }
@@ -405,6 +408,15 @@ impl LocalSession {
         match self.output_buffer.lock() {
             Ok(buf) => buf.snapshot(usize::MAX),
             Err(_) => String::new(),
+        }
+    }
+
+    /// 取原始字节快照 + 累计字节数（同一锁内，原子一致）。
+    /// 供前端 attach 回放（terminal_attach 命令），见 [`SshSession::attach_snapshot`]。
+    pub fn attach_snapshot(&self) -> (Vec<u8>, usize) {
+        match self.output_buffer.lock() {
+            Ok(buf) => buf.snapshot_raw_with_total(),
+            Err(_) => (Vec::new(), 0),
         }
     }
 

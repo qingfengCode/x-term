@@ -256,15 +256,22 @@ interface TreeNode {
 const treeData = ref<TreeNode[]>([]);
 const treeRef = ref<any>(null);
 
-/** 树懒加载缓存：实例层子节点（库）按 profileId，库层子节点（表）按 profileId:库名。 */
-const treeCache = new Map<string, TreeNode[]>();
+/** 树懒加载缓存：实例层子节点（库）按 profileId，库层子节点（表）按 profileId:库名。
+ *
+ * 缓存的是 promise 而非结果：用户点击与 syncTreeToActiveTab 的 node.expand()
+ * 会并发触发同一节点的 load，缓存 promise 让并发请求合并为一次后端调用。
+ */
+const treeCache = new Map<string, Promise<TreeNode[]>>();
 function cachedOrLoad(key: string, loader: () => Promise<TreeNode[]>): Promise<TreeNode[]> {
   const hit = treeCache.get(key);
-  if (hit) return Promise.resolve(hit);
-  return loader().then((nodes) => {
-    treeCache.set(key, nodes);
-    return nodes;
+  if (hit) return hit;
+  const p = loader().catch((e: unknown) => {
+    // 失败不缓存：下次展开重新加载（缓存了失败，展开会永远打不开）。
+    treeCache.delete(key);
+    throw e;
   });
+  treeCache.set(key, p);
+  return p;
 }
 
 /**
@@ -403,10 +410,13 @@ async function loadTreeNode(node: any, resolve: (children: TreeNode[]) => void, 
     }
     try {
       await openTabForProfile(profile);
-      const connId = db.activeConnId;
-      // 连接失败时 openTabForProfile 已吞掉错误并弹提示；此时活动标签可能仍是
-      // 别的 profile，不能拿它的连接来列库（否则张冠李戴）。
-      if (!connId || db.activeTab?.profileId !== profile.id) {
+      // 列库必须用「该 profile 自己的连接」，不能拿活动标签的连接：连接是
+      // 异步的，等待期间活动标签可能被切走（用户点了别的标签 / 并发展开两个
+      // 实例时另一个先连上把 activeTabId 顶掉），拿活动标签连接要么张冠李戴、
+      // 要么因 profileId 不匹配直接放弃——表现为"展开转一下又收起、没反应"。
+      const connId = await ensureProfileConn(profile.id);
+      if (!connId) {
+        // 连接失败：openTabForProfile 已吞掉错误并弹提示。
         fail();
         return;
       }

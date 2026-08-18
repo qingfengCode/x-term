@@ -191,6 +191,40 @@ onMounted(async () => {
       }
     ),
   );
+  // 订阅 AI 任务清单更新事件（todo_write 工具；多分发）。
+  await track(
+    listen<{
+      requestId: string;
+      todos: { content: string; status: string }[];
+    }>("ai:todo", (e) => {
+      const todos = e.payload.todos as {
+        content: string;
+        status: "pending" | "in_progress" | "completed";
+      }[];
+      aiSsh.onTodo(e.payload.requestId, todos);
+      aiDb.onTodo(e.payload.requestId, todos);
+      aiDesktop.onTodo(e.payload.requestId, todos);
+    }),
+  );
+  // 订阅 AI token 用量事件（单次请求用量；前端按会话累计展示，多分发）。
+  await track(
+    listen<{ requestId: string; promptTokens: number; completionTokens: number }>(
+      "ai:usage",
+      (e) => {
+        aiSsh.onUsage(e.payload.requestId, e.payload.promptTokens, e.payload.completionTokens);
+        aiDb.onUsage(e.payload.requestId, e.payload.promptTokens, e.payload.completionTokens);
+        aiDesktop.onUsage(e.payload.requestId, e.payload.promptTokens, e.payload.completionTokens);
+      }
+    ),
+  );
+  // 订阅编排层系统提示（重复调用守卫提醒等；前端灰色提示渲染，多分发）。
+  await track(
+    listen<{ requestId: string; text: string }>("ai:system_note", (e) => {
+      aiSsh.onSystemNote(e.payload.requestId, e.payload.text);
+      aiDb.onSystemNote(e.payload.requestId, e.payload.text);
+      aiDesktop.onSystemNote(e.payload.requestId, e.payload.text);
+    }),
+  );
 
   // 订阅传输进度事件。
   await track(
@@ -424,6 +458,13 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onNumberKeydown));
   flex-direction: column;
   align-items: center;
   padding: 8px 0 0;
+  /* 兜底滚动：页面缩放极大（Ctrl+滚轮/触摸板捏合）时视口 CSS 高度被除以缩放
+     倍数，logo+底部固定项本身可能超出栏高，被 main-layout 的 overflow:hidden
+     裁掉且无处可滚（设置图标"永久消失"）。整栏允许滚动后：空间充足时中间区
+     flex:1 内部滚动、固定项仍贴底（与原行为一致）；空间极度不足时整栏可滚到
+     底部，固定项始终可达。 */
+  overflow-y: auto;
+  scrollbar-width: thin;
 }
 /* 中间导航项区：超高（矮窗口）时可滚动，避免底部项被裁切 */
 .nav-items {
@@ -436,14 +477,17 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onNumberKeydown));
   overflow-y: auto;
   scrollbar-width: thin;
 }
-/* 窄栏用细滚动条，避免挤占 60px 宽度 */
+/* 窄栏用细滚动条，避免挤占 60px 宽度（nav-rail 与 nav-items 一致） */
+.nav-rail::-webkit-scrollbar,
 .nav-items::-webkit-scrollbar {
   width: 4px;
 }
+.nav-rail::-webkit-scrollbar-thumb,
 .nav-items::-webkit-scrollbar-thumb {
   background: var(--el-border-color);
   border-radius: 2px;
 }
+.nav-rail::-webkit-scrollbar-track,
 .nav-items::-webkit-scrollbar-track {
   background: transparent;
 }

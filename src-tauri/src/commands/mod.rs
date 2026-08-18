@@ -66,6 +66,8 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
         // terminal
         crate::commands::terminal::terminal_write,
         crate::commands::terminal::terminal_resize,
+        crate::commands::terminal::terminal_attach,
+        crate::commands::terminal::terminal_snapshot,
         // sftp
         crate::commands::sftp::sftp_list,
         crate::commands::sftp::sftp_stat,
@@ -76,6 +78,7 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
         crate::commands::sftp::sftp_download,
         crate::commands::sftp::sftp_upload,
         crate::commands::sftp::sftp_close,
+        crate::commands::sftp::sftp_transfer_cancel,
         // file backend (S3 / 兼容存储)
         crate::commands::file_backend::file_account_list,
         crate::commands::file_backend::file_account_save,
@@ -110,6 +113,7 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
         crate::commands::ai::ai_execute_tool,
         crate::commands::ai::ai_cancel_tool,
         crate::commands::ai::ai_desktop_tool_respond,
+        crate::commands::ai::ai_ask_user_respond,
         crate::commands::ai::ai_stop,
         crate::commands::ai::ai_add_to_whitelist,
         crate::commands::ai::set_workspace_dir,

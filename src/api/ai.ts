@@ -34,12 +34,16 @@ export function setWorkspaceDir(domain: string, path: string): Promise<void> {
 // 对话历史持久化（独立 JSON 文件，按 domain 分文件）
 // ---------------------------------------------------------------------------
 
-/** 可序列化的对话（持久化用）。只保留 id/title/messages。 */
+/** 可序列化的对话（持久化用）。只保留 id/title/messages/todos/usage。 */
 export interface SerializableConversation {
   id: string;
   title: string;
   /** messages 原样透传（结构同 AiMessage，后端不解释）。 */
   messages: unknown[];
+  /** 智能体任务清单（todo_write 维护；旧文件无此字段）。 */
+  todos?: { content: string; status: string }[];
+  /** 会话累计 token 用量（ai:usage 事件累计；旧文件无此字段）。 */
+  usage?: { prompt: number; completion: number };
 }
 
 /** 读取指定 domain（"ssh" / "db"）的对话历史。 */

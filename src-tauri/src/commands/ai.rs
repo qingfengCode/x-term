@@ -9,9 +9,14 @@
 //! [`run_agent_loop`] 多轮编排循环：
 //!
 //! 1. 把 [`crate::ai::tools::all_tools`] 一起发给模型。
-//! 2. 模型若返回 `tool_calls`，对每个调用：发射 `ai:tool_call` 事件（含危险标记
-//!    与人类可读描述）→ 通过 oneshot 阻塞等待前端确认 → 执行工具 → 发射
-//!    `ai:tool_result` → 把结果以 role=tool 消息回填。
+//! 2. 模型若返回 `tool_calls`，先预计算每个调用的执行计划，再**全部**发射
+//!    `ai:tool_call` 事件（含危险标记与人类可读描述，前端所有确认卡片同时出现），
+//!    确认通道轮初统一登记、按 [`MAX_PARALLEL_TOOL_CALLS`] 限制并发：多个工具
+//!    并行等待前端确认并并行执行 → 按调用原顺序发射 `ai:tool_result` → 把结果
+//!    以 role=tool 消息回填。
+//!    例外：终端可视化开启时 exec_ssh 写的是**共享 PTY**（忙锁 try-acquire，
+//!    忙时立即报错），同轮按原顺序**串行**执行（见 [`build_serial_gates`]），
+//!    其余调用照常并行。
 //! 3. 循环直到模型给出纯文本回复（无 tool_calls）或达到 `max_tool_calls` 上限。
 //!
 //! `agent_mode == false` 时（翻译/诊断/解释等旧场景）传入空工具集，模型不会
@@ -20,6 +25,7 @@
 //!
 //! 前端通过 [`ai_execute_tool`] / [`ai_cancel_tool`] 把工具确认结果发回。
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -43,6 +49,11 @@ use crate::state::AppState;
 
 /// 工具确认默认超时（5 分钟）。超时视为拒绝。
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// 同一轮 tool_calls 的并发执行上限（借鉴 dsh `maxParallelToolCalls` 的默认 10，
+/// 取 6 兼顾"多命令并行提速"与"同时打开的 SSH 连接 / 确认卡片不过量"）。
+/// 超过上限的调用排队等待，前序调用结束后立即执行（信号量语义）。
+const MAX_PARALLEL_TOOL_CALLS: usize = 6;
 
 /// 对话请求参数。
 #[derive(Debug, Clone, Deserialize)]
@@ -89,6 +100,14 @@ pub async fn ai_chat(
         .ai
         .active_provider()
         .ok_or_else(|| AppError::InvalidInput("未配置 AI provider，请先在设置中添加".into()))?;
+    // 该请求域（ssh/db/desktop）是否存在已启用技能：存在时 agent 模式追加
+    // load_skill 工具（配合系统提示词里的技能目录摘要按需加载）。
+    let req_domain = req.domain.clone().unwrap_or_default();
+    let has_skills = settings
+        .ai
+        .skills
+        .iter()
+        .any(|s| s.enabled && s.domain == req_domain);
     // 多模态兜底：非多模态模型不发送图片字段。前端发送时已按激活模型过滤，
     // 但旧对话历史 / 其它调用方仍可能带图——文本模型（如 DeepSeek）遇到
     // image_url / image 块会直接 400，这里在入口统一剥离，双保险。
@@ -132,6 +151,7 @@ pub async fn ai_chat(
             ssh_cfg,
             sql_cfg,
             file_cfg,
+            has_skills,
             max_tool_calls,
             context_budget,
         )
@@ -213,6 +233,25 @@ pub async fn ai_desktop_tool_respond(
     Ok(())
 }
 
+/// 回传 ask_user_question 的用户回答（前端问题表单「提交/取消」触发）。
+///
+/// 提问的执行体在**前端**（用户填写回答）：编排循环 emit `ai:tool_call` 后阻塞
+/// 在 `pending_ask_user_calls`，本命令把逐题回答回传。`answered=false`（取消）
+/// 时其余字段被忽略。
+#[tauri::command]
+pub async fn ai_ask_user_respond(
+    tool_call_id: String,
+    answered: bool,
+    answers: Vec<crate::ai::tools::AskUserAnswer>,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    let outcome = crate::ai::tools::AskUserOutcome { answered, answers };
+    if let Some((_, tx)) = state.pending_ask_user_calls.lock().remove(&tool_call_id) {
+        let _ = tx.send(outcome);
+    }
+    Ok(())
+}
+
 /// 终止正在进行的 AI 请求（前端"终止"按钮触发）。
 ///
 /// 取出 requestId 对应的后台任务 JoinHandle 调 `abort()`，整个 future 树
@@ -281,6 +320,30 @@ pub async fn ai_stop(
             ok: false,
             output: "请求已终止".into(),
             image: None,
+        });
+    }
+    // 2.6 ask_user_question（向用户提问）的等待同样按 requestId 清理：
+    //     发送「未回答」回执，让编排循环以取消结果收尾而不是挂到超时。
+    let ask_ids: Vec<String> = {
+        let map = state.pending_ask_user_calls.lock();
+        map.iter()
+            .filter(|(_, (req_id, _))| req_id == &request_id)
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    let mut ask_pending = Vec::new();
+    {
+        let mut map = state.pending_ask_user_calls.lock();
+        for id in &ask_ids {
+            if let Some((_, tx)) = map.remove(id) {
+                ask_pending.push(tx);
+            }
+        }
+    }
+    for tx in ask_pending {
+        let _ = tx.send(crate::ai::tools::AskUserOutcome {
+            answered: false,
+            answers: Vec::new(),
         });
     }
     // 3. 发射 ai:stopped 事件，前端据此统一收尾（标记 sending=false 等）。
@@ -372,11 +435,280 @@ pub fn set_workspace_dir(
 // 智能体编排循环
 // ===========================================================================
 
+/// 一轮中某个 tool_call 的预计算执行计划。
+///
+/// 所有决策（域分发 / 危险 / 白名单 / 自动放行 / SQL 模式拦截 / 可视化开关）在
+/// 进入并发阶段前一次性算好，便于把同一轮的多个调用**并行**确认与执行
+/// （借鉴 dsh `maxParallelToolCalls`）。`rejected` 非 None 的调用（如 SQL 模式
+/// 拦截）不进入确认/执行阶段，直接回填错误。
+struct PendingCall<'a> {
+    call: &'a crate::ai::tools::ToolCall,
+    domain: &'static str,
+    description: String,
+    dangerous: bool,
+    whitelisted: bool,
+    auto_run: bool,
+    visualization: bool,
+    /// 同轮需按原顺序串行执行的调用（当前仅可视化模式的 exec_ssh——写共享
+    /// PTY，忙锁忙时立即报错，并行会自相冲突）。编排层据此挂链式闸门，
+    /// 见 [`build_serial_gates`]。
+    serial: bool,
+    /// 预拒绝原因：非 None 时该调用不进入批准/执行阶段。
+    rejected: Option<String>,
+}
+
+impl std::fmt::Debug for PendingCall<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 只为测试断言提供可读输出（call 借用 ToolCall，不展开其内容）。
+        f.debug_struct("PendingCall")
+            .field("name", &self.call.name)
+            .field("domain", &self.domain)
+            .field("dangerous", &self.dangerous)
+            .field("whitelisted", &self.whitelisted)
+            .field("auto_run", &self.auto_run)
+            .field("visualization", &self.visualization)
+            .field("serial", &self.serial)
+            .field("rejected", &self.rejected)
+            .finish()
+    }
+}
+
+/// 一轮中单个 tool_call 的处置结果（预计算阶段产出，与调用**原始顺序**对位）。
+///
+/// `Rejected`：不进入确认/执行（未 advertised 的幻觉调用 / SQL 模式拦截 /
+/// ask_user_question 参数非法），轮末按原顺序回填错误；`Run`：进入
+/// 「emit 卡片 → 并发确认/执行」流程。
+///
+/// 之所以要对位记录而不是"预拒绝的先回填、执行的完成后回填"：role=tool
+/// 结果消息必须与 assistant(tool_calls) 里的调用顺序一致（部分兼容网关
+/// 会校验 tool 消息与 tool_calls 的对应顺序），分两段回填会把交错的原始
+/// 顺序重排成「先全部被拒、后全部执行」，可能 400，且干扰模型对
+/// "哪个结果属于哪次调用"的对应关系。
+enum RoundItem<'a> {
+    Rejected {
+        call: &'a crate::ai::tools::ToolCall,
+        msg: String,
+    },
+    Run(PendingCall<'a>),
+}
+
+/// 并发执行阶段的确认通道（轮初统一登记，批准可先于该调用的执行批次到达并
+/// 缓冲在通道里；轮到它时立即生效）。
+enum CallSlot {
+    /// 需要前端人工确认的工具调用（批准后再执行）。
+    Approval(tokio::sync::oneshot::Receiver<ToolApproval>),
+    /// 桌面工具的前端「批准 + 执行」一体回执（执行体在前端 RDP 会话）。
+    Desktop(tokio::sync::oneshot::Receiver<DesktopToolOutcome>),
+    /// 向用户提问的回执（ask_user_question，执行体在前端表单）。
+    AskUser(tokio::sync::oneshot::Receiver<crate::ai::tools::AskUserOutcome>),
+}
+
+/// 预计算单个 tool_call 的执行计划（纯函数，便于单元测试锁定安全门控逻辑）。
+///
+/// 返回 `Err(msg)` 表示该工具未 advertised（不在 `allowed` 内，模型幻觉调用），
+/// 调用方应直接回填该错误消息；`Ok(PendingCall)` 表示进入确认/执行阶段，其中
+/// `rejected` 非 None 的调用（SQL 模式拦截）只回填错误、不弹确认卡片。
+fn plan_call<'a>(
+    call: &'a crate::ai::tools::ToolCall,
+    allowed: &HashSet<String>,
+    ssh_cfg: &SshAgentSettings,
+    sql_cfg: &SqlAgentSettings,
+    file_workspace: Option<&std::path::Path>,
+) -> Result<PendingCall<'a>, String> {
+    // 上下文裁剪（块A）：若模型幻觉调用了未 advertised 的工具，直接拒绝并回填。
+    if !allowed.contains(&call.name) {
+        return Err(format!(
+            "工具 `{}` 在当前上下文不可用（未提供活动终端或数据库连接）",
+            call.name
+        ));
+    }
+    let dangerous = tools::is_dangerous(&call.name, &call.arguments, file_workspace);
+    let description = tools::describe_call(&call.name, &call.arguments);
+
+    // === 域分发：按工具名取对应配置 + 计算 whitelisted / auto_run ===
+    // exec_ssh：白名单判定 + ssh_cfg.run_mode 决定自动放行。
+    // exec_sql：先按 sql_mode 校验是否允许（不允许直接拒绝，不执行）；
+    //           只读查询（is_readonly_sql）视作"安全"（前端绿色卡片），
+    //           配合 sql_cfg.run_mode 决定自动放行。
+    // 文件工具（read_file/write_file/list_files）：启用后自动处理——
+    //           读/列自动执行，写文件仅覆盖已有文件（危险）时走确认。
+    // 其它工具（terminal_snapshot / list_db_tables / describe_table）：默认安全，
+    // 不走确认（auto_run = true，无副作用读操作）。
+    let domain = if call.name == "exec_ssh" {
+        "ssh"
+    } else if call.name == "exec_sql" {
+        "sql"
+    } else if matches!(
+        call.name.as_str(),
+        "read_file" | "write_file" | "list_files"
+    ) {
+        "file"
+    } else if tools::is_desktop_tool(&call.name) {
+        "desktop"
+    } else if call.name == "todo_write" {
+        "todo"
+    } else if call.name == "load_skill" {
+        "skill"
+    } else if call.name == "ask_user_question" {
+        "ask"
+    } else {
+        "other"
+    };
+
+    // exec_sql 模式校验：sql_mode 不允许的语句记入 rejected（稍后统一回填
+    // 错误，不进入确认/执行流程）。仍计入重复调用守卫计数——模型反复重试
+    // 同一被拒调用正是要打断的循环。
+    let mut rejected = None;
+    if domain == "sql" {
+        let sql_text = call
+            .arguments
+            .get("sql")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !tools::sql_allowed_by_mode(sql_text, &sql_cfg.sql_mode) {
+            rejected = Some(format!(
+                "当前 SQL 模式为 `{}`，不允许执行该语句（首个关键字被拦截）",
+                sql_cfg.sql_mode
+            ));
+        }
+    }
+    // ask_user_question 参数校验：问题结构非法（缺 id/文本、id 重复、选项空等）
+    // 直接预拒绝——前端不会渲染出畸形表单。
+    if domain == "ask" {
+        if let Err(e) = tools::validate_ask_user_questions(&call.arguments) {
+            rejected = Some(e);
+        }
+    }
+
+    // whitelisted / auto_run：按域 + 各自运行模式计算。
+    //   - ssh：命令命中 ssh 白名单即 whitelisted=true（前端绿色卡片）；
+    //          auto_run 按 ssh_cfg.run_mode：auto=全部自动 / whitelist=白名单
+    //          内且非危险 / manual=全部人工确认。
+    //   - sql：只读查询 whitelisted=true；auto_run 按 sql_cfg.run_mode：
+    //          auto=全部自动 / whitelist=只读且非危险 / manual=全部人工确认。
+    //   - file：启用即自动处理（读/列直接执行；写仅覆盖已有文件时确认）。
+    //   - 其它：无副作用读操作，whitelisted=false 但 auto_run=true（直接执行）。
+    //
+    // auto 模式放开"危险永远人工确认"的护栏（用户显式选择无人值守）：
+    // 危险操作也自动执行；manual / whitelist 模式下危险操作仍强制人工确认。
+    let (whitelisted, auto_run) = match domain {
+        "ssh" => {
+            let w = call
+                .arguments
+                .get("command")
+                .and_then(Value::as_str)
+                .map(|c| tools::is_whitelisted(c, &ssh_cfg.command_whitelist))
+                .unwrap_or(false);
+            let auto = match ssh_cfg.run_mode.as_str() {
+                RUN_MODE_AUTO => true,
+                RUN_MODE_WHITELIST => w && !dangerous,
+                _ => false, // manual：全部人工确认
+            };
+            (w, auto)
+        }
+        "sql" => {
+            let readonly = call
+                .arguments
+                .get("sql")
+                .and_then(Value::as_str)
+                .map(tools::is_readonly_sql)
+                .unwrap_or(false);
+            // 危险 SQL（DROP/TRUNCATE/无 WHERE DELETE）在 auto 模式下自动执行，
+            // manual / whitelist 模式下仍强制人工确认。
+            let auto = match sql_cfg.run_mode.as_str() {
+                RUN_MODE_AUTO => true,
+                RUN_MODE_WHITELIST => readonly && !dangerous,
+                _ => false, // manual：全部人工确认
+            };
+            (readonly, auto)
+        }
+        "file" => {
+            // 写文件若覆盖已有文件（dangerous）仍走确认，其余自动执行。
+            (false, call.name != "write_file" || !dangerous)
+        }
+        // 桌面工具：截图是纯读取且无副作用（前端收到即自动截图回传）；
+        // 点击/输入可能对远端造成副作用，一律人工确认。
+        "desktop" => (false, call.name == "desktop_screenshot"),
+        // 记账/只读工具（todo_write / load_skill / ask_user_question）：无副作用。
+        // ask_user_question 执行体在前端表单（用户必须人工回答），但**不弹确认
+        // 卡片**——提问卡片本身就是交互，auto_run=true 仅表示"无需二次确认"。
+        "todo" | "skill" | "ask" => (false, true),
+        _ => (false, true),
+    };
+
+    // 终端可视化模式：按工具域取各自的可视化开关。
+    // - exec_ssh：ssh_cfg.terminal_visualization（命令写进 PTY）
+    // - exec_sql：sql_cfg.terminal_visualization（SQL + 结果回显到 SQL 控制台）
+    // 两者独立设置，互不影响。
+    let visualization = match domain {
+        "ssh" => ssh_cfg.terminal_visualization,
+        "sql" => sql_cfg.terminal_visualization,
+        _ => false,
+    };
+
+    // 可视化模式的 exec_ssh 写的是**共享 PTY**（exec_ssh_visual 以
+    // mcp_terminal_busy try-lock 互斥，忙时立即报错而非排队）：同轮多条命令
+    // 若并行执行，除第一条外全部撞锁失败。标记 serial 交由编排层按原顺序
+    // 串行执行（见 build_serial_gates）。非可视化模式每次调用开独立 SSH
+    // 连接（exec_ssh → connect_direct），无共享状态，保持并行。
+    let serial = domain == "ssh" && ssh_cfg.terminal_visualization;
+
+    Ok(PendingCall {
+        call,
+        domain,
+        description,
+        dangerous,
+        whitelisted,
+        auto_run,
+        visualization,
+        serial,
+        rejected,
+    })
+}
+
+/// 为 serial 调用（同轮需串行执行的调用，当前仅可视化模式的 exec_ssh）构建
+/// 链式闸门。
+///
+/// serial 调用按出现顺序两两成链：前一个**完整结束**（确认等待 + 执行）后
+/// send，下一个开始前 await——保证同链调用严格按调用原顺序执行；链与非
+/// serial 调用之间、以及不同链之间（当前只有一条链）仍并行。
+///
+/// 返回 `(wait, signal)`，均与调用下标对位：`wait[i]` 是第 i 个调用的入口
+/// 闸门（None 表示无需等待），`signal[i]` 是出口通知（None 表示无人排队）。
+/// 非serial 调用两个位置恒为 None；链头只 signal、链尾只 wait。
+fn build_serial_gates(
+    serial: &[bool],
+) -> (
+    Vec<Option<tokio::sync::oneshot::Receiver<()>>>,
+    Vec<Option<tokio::sync::oneshot::Sender<()>>>,
+) {
+    let mut wait: Vec<Option<tokio::sync::oneshot::Receiver<()>>> =
+        (0..serial.len()).map(|_| None).collect();
+    let mut signal: Vec<Option<tokio::sync::oneshot::Sender<()>>> =
+        (0..serial.len()).map(|_| None).collect();
+    let serial_idx: Vec<usize> = serial
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| **s)
+        .map(|(i, _)| i)
+        .collect();
+    // 相邻 serial 调用（跳过中间穿插的非 serial 调用）两两连接。
+    for pair in serial_idx.windows(2) {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        signal[pair[0]] = Some(tx);
+        wait[pair[1]] = Some(rx);
+    }
+    (wait, signal)
+}
+
 /// 智能体多轮编排循环。
 ///
-/// 每一轮：调用 `chat_with_tools` → 若有 tool_calls 则逐个走"emit→等待确认→执行
-/// →emit 结果"流程 → 把结果回填 → 进入下一轮。直到模型给出无 tool_calls 的纯文本
-/// 回复（发射 `ai:done`），或达到 `max_tool_calls` 上限（也发射 `ai:done`）。
+/// 每一轮：调用 `chat_with_tools` → 若有 tool_calls 则预计算执行计划 → 被拦截的
+/// 调用（未 advertised 工具 / SQL 模式拒绝）直接回填 → 其余调用**全部先 emit
+/// `ai:tool_call`**（前端所有确认卡片同时出现）→ 确认通道轮初统一登记，按
+/// [`MAX_PARALLEL_TOOL_CALLS`] 限制并发「等待确认 + 执行」→ 按调用原顺序 emit
+/// `ai:tool_result` 并回填 → 进入下一轮。直到模型给出无 tool_calls 的纯文本回复
+/// （发射 `ai:done`），或达到 `max_tool_calls` 上限（也发射 `ai:done`）。
 ///
 /// `max_tool_calls` 与 `context_budget` 来自激活模型的配置（设置页可编辑）：
 /// - `max_tool_calls`：最大工具调用数，防止模型陷入工具调用死循环；
@@ -390,6 +722,7 @@ async fn run_agent_loop(
     ssh_cfg: SshAgentSettings,
     sql_cfg: SqlAgentSettings,
     file_cfg: FileAccessSettings,
+    has_skills: bool,
     max_tool_calls: usize,
     context_budget: usize,
 ) -> AppResult<()> {
@@ -398,6 +731,11 @@ async fn run_agent_loop(
     // 有活动内嵌 RDP 会话→桌面工具（多模态门控在 ai_chat 入口完成）；
     // 设置页开启「本地文件读写」→ 对 ssh/db 域追加文件工具（read_file/write_file/
     // list_files；桌面助手不暴露文件工具，保持工具集按域硬隔离）。
+    // 另外几个**始终下发**的工具（不依赖活动上下文）：
+    // - todo_write：任务清单记账（借鉴 dsh tool-todo，agent 模式无条件可用）；
+    // - load_skill：该域存在启用技能时下发（技能正文按需加载，见 skill_tool）；
+    // - ask_user_question：信息不足时向用户提问（借鉴 dsh tool-ask-user，
+    //   执行体在前端表单，agent 模式无条件可用）。
     let req_domain = req.domain.clone().unwrap_or_default();
     let mut tools = Vec::new();
     if req.agent_mode {
@@ -408,6 +746,11 @@ async fn run_agent_loop(
         ));
         if file_cfg.enabled && (req_domain == "ssh" || req_domain == "db") {
             tools.extend(tools::file_tools());
+        }
+        tools.push(tools::todo_tool());
+        tools.push(tools::ask_user_tool());
+        if has_skills {
+            tools.push(tools::skill_tool());
         }
     }
     // 文件工具按请求所属域取工作目录（未配置时执行器返回明确错误引导用户）。
@@ -427,6 +770,9 @@ async fn run_agent_loop(
     let mut tool_results: Vec<(String, ToolResult)> = Vec::new();
     let request_id = req.request_id.clone();
     let mut last_text = String::new();
+    // 重复工具调用守卫（借鉴 dsh repeat-tool-reminder）：跟踪连续相同调用，
+    // 达到阈值时向模型注入提醒，打断死循环。
+    let mut repeat_guard = RepeatCallGuard::new();
 
     for _iter in 0..max_tool_calls {
         // 调用 chat_with_tools，带有限重试（429/5xx/建连失败指数退避；上下文超限
@@ -468,334 +814,299 @@ async fn run_agent_loop(
             images: None,
         });
 
-        // 逐个工具调用：emit → 等待确认 → 执行 → emit 结果 → 回填进 messages。
+        // 一轮工具调用分四段处理：① 预计算每个调用的处置（同步，预拒绝只记录
+        // 不回填）→ ② Run 项先全部 emit ai:tool_call（前端所有确认卡片同时
+        // 出现）→ ③ 并发「等待确认 + 执行」（上限 MAX_PARALLEL_TOOL_CALLS，
+        // 确认通道轮初统一登记，批准先到先缓冲）→ ④ **按调用原始顺序**统一
+        // emit ai:tool_result 并回填（预拒绝的与执行完成的对位交织，见
+        // RoundItem 的顺序说明）。
         // 关键：每个 tool_call 的结果必须以 role=tool 消息紧跟在 assistant(tool_calls)
-        // 之后追加进 messages，否则 OpenAI/Anthropic 协议会以 400 拒绝
+        // 之后追加进 messages，否则 OpenAI 兼容协议会以 400 拒绝
         // （"assistant with tool_calls must be followed by tool messages"）。
         tool_results.clear();
+        // 本轮触发的重复调用提醒（轮末统一注入，避免插在 tool 消息序列中间）。
+        let mut reminders: Vec<String> = Vec::new();
+
+        // ---- ① 预计算处置（同步，不 await；预拒绝只记录，轮末统一回填）----
+        let mut items: Vec<RoundItem> = Vec::with_capacity(resp.tool_calls.len());
         for call in &resp.tool_calls {
-            // 上下文裁剪（块A）：若模型幻觉调用了未 advertised 的工具，直接拒绝并回填。
-            if !allowed.contains(&call.name) {
-                let msg = format!(
-                    "工具 `{}` 在当前上下文不可用（未提供活动终端或数据库连接）",
-                    call.name
-                );
-                events::emit(
-                    app,
-                    AI_TOOL_RESULT,
-                    AiToolResultEvent {
-                        request_id: request_id.clone(),
-                        tool_call_id: call.id.clone(),
-                        ok: false,
-                        output: msg.clone(),
-                    },
-                );
-                tool_results.push((
-                    call.id.clone(),
-                    ToolResult {
-                        ok: false,
-                        output: msg.clone(),
-                    },
-                ));
-                // 同样把结果作为 role=tool 消息追加进 messages（压缩后再入上下文，
-                // 完整内容已通过 ai:tool_result 事件原样推给前端）。
-                messages.push(ChatMessage {
-                    role: crate::ai::provider::Role::Tool,
-                    content: compress_tool_output_for_context(&msg),
-                    tool_calls: None,
-                    tool_call_id: Some(call.id.clone()),
-                    images: None,
-                });
-                continue;
+            // 重复调用守卫：先观察（被拒绝/被拦截的调用同样计数——模型反复重试
+            // 同一被拒调用正是要打断的循环，与 dsh 的 denied-calls-count 一致）。
+            if let Some(reminder) = repeat_guard.observe(&call.name, &call.arguments) {
+                reminders.push(reminder);
             }
-            let dangerous =
-                tools::is_dangerous(&call.name, &call.arguments, file_workspace.as_deref());
-            let description = tools::describe_call(&call.name, &call.arguments);
-
-            // === 域分发：按工具名取对应配置 + 计算 whitelisted / auto_run ===
-            // exec_ssh：白名单判定 + ssh_cfg.run_mode 决定自动放行。
-            // exec_sql：先按 sql_mode 校验是否允许（不允许直接拒绝，不执行）；
-            //           只读查询（is_readonly_sql）视作"安全"（前端绿色卡片），
-            //           配合 sql_cfg.run_mode 决定自动放行。
-            // 文件工具（read_file/write_file/list_files）：启用后自动处理——
-            //           读/列自动执行，写文件仅覆盖已有文件（危险）时走确认。
-            // 其它工具（terminal_snapshot / list_db_tables / describe_table）：默认安全，
-            // 不走确认（auto_run = true，无副作用读操作）。
-            let domain = if call.name == "exec_ssh" {
-                "ssh"
-            } else if call.name == "exec_sql" {
-                "sql"
-            } else if matches!(
-                call.name.as_str(),
-                "read_file" | "write_file" | "list_files"
-            ) {
-                "file"
-            } else if tools::is_desktop_tool(&call.name) {
-                "desktop"
-            } else {
-                "other"
-            };
-
-            // exec_sql 模式校验：sql_mode 不允许的语句直接回填错误，不进入确认/执行流程。
-            if domain == "sql" {
-                let sql_text = call
-                    .arguments
-                    .get("sql")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                if !tools::sql_allowed_by_mode(sql_text, &sql_cfg.sql_mode) {
-                    let msg = format!(
-                        "当前 SQL 模式为 `{}`，不允许执行该语句（首个关键字被拦截）",
-                        sql_cfg.sql_mode
-                    );
-                    events::emit(
-                        app,
-                        AI_TOOL_RESULT,
-                        AiToolResultEvent {
-                            request_id: request_id.clone(),
-                            tool_call_id: call.id.clone(),
-                            ok: false,
-                            output: msg.clone(),
-                        },
-                    );
-                    tool_results.push((
-                        call.id.clone(),
-                        ToolResult {
-                            ok: false,
-                            output: msg.clone(),
-                        },
-                    ));
-                    messages.push(ChatMessage {
-                        role: crate::ai::provider::Role::Tool,
-                        content: compress_tool_output_for_context(&msg),
-                        tool_calls: None,
-                        tool_call_id: Some(call.id.clone()),
-                        images: None,
-                    });
-                    continue;
-                }
+            // plan_call：allowed 校验（幻觉调用直接拒绝）+ 域分发 / SQL 模式拦截 /
+            // 白名单与运行模式判定（纯函数，决策逻辑独立于并发编排，见单元测试）。
+            match plan_call(call, &allowed, &ssh_cfg, &sql_cfg, file_workspace.as_deref()) {
+                // 上下文裁剪（块A）：未 advertised 的工具，记为预拒绝。
+                Err(msg) => items.push(RoundItem::Rejected { call, msg }),
+                Ok(pc) => match pc.rejected.clone() {
+                    // SQL 模式拦截 / ask_user 参数非法：同为预拒绝。
+                    Some(msg) => items.push(RoundItem::Rejected { call: pc.call, msg }),
+                    None => items.push(RoundItem::Run(pc)),
+                },
             }
+        }
 
-            // whitelisted / auto_run：按域 + 各自运行模式计算。
-            //   - ssh：命令命中 ssh 白名单即 whitelisted=true（前端绿色卡片）；
-            //          auto_run 按 ssh_cfg.run_mode：auto=全部自动 / whitelist=白名单
-            //          内且非危险 / manual=全部人工确认。
-            //   - sql：只读查询 whitelisted=true；auto_run 按 sql_cfg.run_mode：
-            //          auto=全部自动 / whitelist=只读且非危险 / manual=全部人工确认。
-            //   - file：启用即自动处理（读/列直接执行；写仅覆盖已有文件时确认）。
-            //   - 其它：无副作用读操作，whitelisted=false 但 auto_run=true（直接执行）。
-            //
-            // auto 模式放开"危险永远人工确认"的护栏（用户显式选择无人值守）：
-            // 危险操作也自动执行；manual / whitelist 模式下危险操作仍强制人工确认。
-            let (whitelisted, auto_run) = match domain {
-                "ssh" => {
-                    let w = call
-                        .arguments
-                        .get("command")
-                        .and_then(Value::as_str)
-                        .map(|c| tools::is_whitelisted(c, &ssh_cfg.command_whitelist))
-                        .unwrap_or(false);
-                    let auto = match ssh_cfg.run_mode.as_str() {
-                        RUN_MODE_AUTO => true,
-                        RUN_MODE_WHITELIST => w && !dangerous,
-                        _ => false, // manual：全部人工确认
-                    };
-                    (w, auto)
-                }
-                "sql" => {
-                    let readonly = call
-                        .arguments
-                        .get("sql")
-                        .and_then(Value::as_str)
-                        .map(tools::is_readonly_sql)
-                        .unwrap_or(false);
-                    // 危险 SQL（DROP/TRUNCATE/无 WHERE DELETE）在 auto 模式下自动执行，
-                    // manual / whitelist 模式下仍强制人工确认。
-                    let auto = match sql_cfg.run_mode.as_str() {
-                        RUN_MODE_AUTO => true,
-                        RUN_MODE_WHITELIST => readonly && !dangerous,
-                        _ => false, // manual：全部人工确认
-                    };
-                    (readonly, auto)
-                }
-                "file" => {
-                    // 写文件若覆盖已有文件（dangerous）仍走确认，其余自动执行。
-                    (false, call.name != "write_file" || !dangerous)
-                }
-                // 桌面工具：截图是纯读取且无副作用（前端收到即自动截图回传）；
-                // 点击/输入可能对远端造成副作用，一律人工确认。
-                "desktop" => (false, call.name == "desktop_screenshot"),
-                _ => (false, true),
-            };
+        // ---- ② 全部先 emit ai:tool_call（前端所有确认卡片同时出现）。----
+        let active: Vec<&PendingCall<'_>> = items
+            .iter()
+            .filter_map(|it| match it {
+                RoundItem::Run(pc) => Some(pc),
+                _ => None,
+            })
+            .collect();
+        for pc in &active {
             events::emit(
                 app,
                 AI_TOOL_CALL,
                 AiToolCallEvent {
                     request_id: request_id.clone(),
-                    tool_call_id: call.id.clone(),
-                    name: call.name.clone(),
-                    arguments: call.arguments.to_string(),
-                    description,
-                    dangerous,
-                    whitelisted,
-                    auto_approved: auto_run,
+                    tool_call_id: pc.call.id.clone(),
+                    name: pc.call.name.clone(),
+                    arguments: pc.call.arguments.to_string(),
+                    description: pc.description.clone(),
+                    dangerous: pc.dangerous,
+                    whitelisted: pc.whitelisted,
+                    auto_approved: pc.auto_run,
                     // 桌面工具：把请求发起时的活动桌面 id 带给前端执行器（防 agent
                     // 循环期间用户切换标签导致操作落到错误桌面）。
-                    desktop_id: if domain == "desktop" {
+                    desktop_id: if pc.domain == "desktop" {
                         req.active_desktop_id.clone()
                     } else {
                         None
                     },
                 },
             );
-
-            // 终端可视化模式：按工具域取各自的可视化开关。
-            // - exec_ssh：ssh_cfg.terminal_visualization（命令写进 PTY）
-            // - exec_sql：sql_cfg.terminal_visualization（SQL + 结果回显到 SQL 控制台）
-            // 两者独立设置，互不影响。
-            let visualization = match domain {
-                "ssh" => ssh_cfg.terminal_visualization,
-                "sql" => sql_cfg.terminal_visualization,
-                _ => false,
-            };
-
-            // 桌面工具（desktop_screenshot）成功回传的截图图片：协议规定 role=tool
-            // 消息不能携带图片，需要以紧随其后的 user 消息图片块回填给模型。
-            let mut screenshot_image: Option<crate::ai::provider::ImagePart> = None;
-
-            let result = if domain == "desktop" {
-                // 桌面工具的执行体在**前端**（IronRDP WASM 会话，后端桥接只透传字节）。
-                // 无论 auto_run（截图自动放行）与否，后端都必须登记 oneshot 等待前端
-                // 「批准 + 执行」一体回执：auto_approved 只决定前端是否弹出确认卡片，
-                // 不影响这里的等待机制。
+        }
+        // ---- ③ 并发「等待确认 + 执行」----
+        // 先为本轮**全部**调用预创建确认通道并登记 sender：用户可在任意时刻批准
+        // 任意卡片（包括还没轮到执行批次的），批准会缓冲在通道里，轮到该调用时
+        // 立即生效——否则在别的调用执行期间批准后面卡片的操作会被 ai_execute_tool
+        // 静默丢弃（sender 尚未登记），5 分钟后白白超时。
+        //
+        // 例外：serial 调用（可视化模式的 exec_ssh）写共享 PTY，忙锁是 try-acquire
+        // 语义、忙时立即报错——同轮并行会自相冲突（第一条之外的命令全部"终端被
+        // 占用"）。这些调用按原顺序串行执行（链式闸门见 build_serial_gates），
+        // 其余调用照常并行。
+        let mut slots: Vec<Option<CallSlot>> = Vec::with_capacity(active.len());
+        for pc in &active {
+            let slot = if pc.domain == "desktop" {
+                // 桌面工具：执行体在**前端**（IronRDP WASM 会话，后端桥接只透传
+                // 字节）。无论 auto_run（截图自动放行）与否都要等前端「批准 +
+                // 执行」一体回执——auto_approved 只决定前端是否弹确认卡片。
                 let (tx, rx) = tokio::sync::oneshot::channel::<DesktopToolOutcome>();
                 state
                     .pending_desktop_calls
                     .lock()
-                    .insert(call.id.clone(), (request_id.clone(), tx));
-
-                let outcome = tokio::time::timeout(APPROVAL_TIMEOUT, rx).await;
-                state.pending_desktop_calls.lock().remove(&call.id);
-
-                match outcome {
-                    Ok(Ok(out)) if out.approved => {
-                        screenshot_image = out.image;
-                        let r = ToolResult {
-                            ok: out.ok,
-                            output: out.output,
-                        };
-                        events::emit(
-                            app,
-                            AI_TOOL_RESULT,
-                            AiToolResultEvent {
-                                request_id: request_id.clone(),
-                                tool_call_id: call.id.clone(),
-                                ok: r.ok,
-                                output: r.output.clone(),
-                            },
-                        );
-                        r
-                    }
-                    _ => {
-                        // 用户拒绝 / 前端未回执（会话关闭等）/ 确认超时。
-                        events::emit(
-                            app,
-                            AI_TOOL_RESULT,
-                            AiToolResultEvent {
-                                request_id: request_id.clone(),
-                                tool_call_id: call.id.clone(),
-                                ok: false,
-                                output: "用户拒绝了该操作或确认超时".into(),
-                            },
-                        );
-                        ToolResult {
-                            ok: false,
-                            output: "用户拒绝了该操作或确认超时".into(),
-                        }
-                    }
-                }
-            } else if auto_run {
-                // 自动放行：不等待人工确认，直接执行。
-                let r =
-                    tools::execute_tool(app, &state, call, &allowed, visualization, file_domain)
-                        .await;
-                events::emit(
-                    app,
-                    AI_TOOL_RESULT,
-                    AiToolResultEvent {
-                        request_id: request_id.clone(),
-                        tool_call_id: call.id.clone(),
-                        ok: r.ok,
-                        output: r.output.clone(),
-                    },
-                );
-                r
-            } else {
+                    .insert(pc.call.id.clone(), (request_id.clone(), tx));
+                Some(CallSlot::Desktop(rx))
+            } else if pc.domain == "ask" {
+                // 提问（ask_user_question）：登记 oneshot 等待前端回答——执行体在
+                // 前端表单（用户必须人工回答），auto_run 只表示不弹二次确认卡片。
+                let (tx, rx) = tokio::sync::oneshot::channel::<crate::ai::tools::AskUserOutcome>();
+                state
+                    .pending_ask_user_calls
+                    .lock()
+                    .insert(pc.call.id.clone(), (request_id.clone(), tx));
+                Some(CallSlot::AskUser(rx))
+            } else if !pc.auto_run {
                 // 注册 oneshot 等待前端确认（带上 requestId，供 ai_stop 精确清理）。
                 let (tx, rx) = tokio::sync::oneshot::channel::<ToolApproval>();
                 state
                     .pending_tool_calls
                     .lock()
-                    .insert(call.id.clone(), (request_id.clone(), tx));
-
-                let approval = tokio::time::timeout(APPROVAL_TIMEOUT, rx).await;
-                state.pending_tool_calls.lock().remove(&call.id);
-
-                match approval {
-                    Ok(Ok(ToolApproval { approved: true })) => {
-                        let r = tools::execute_tool(
-                            app,
-                            &state,
-                            call,
-                            &allowed,
-                            visualization,
-                            file_domain,
-                        )
-                        .await;
-                        events::emit(
-                            app,
-                            AI_TOOL_RESULT,
-                            AiToolResultEvent {
-                                request_id: request_id.clone(),
-                                tool_call_id: call.id.clone(),
-                                ok: r.ok,
-                                output: r.output.clone(),
-                            },
-                        );
-                        r
-                    }
-                    _ => {
-                        // 拒绝或超时。
-                        events::emit(
-                            app,
-                            AI_TOOL_RESULT,
-                            AiToolResultEvent {
-                                request_id: request_id.clone(),
-                                tool_call_id: call.id.clone(),
-                                ok: false,
-                                output: "用户拒绝了该操作或确认超时".into(),
-                            },
-                        );
-                        ToolResult {
-                            ok: false,
-                            output: "用户拒绝了该操作或确认超时".into(),
+                    .insert(pc.call.id.clone(), (request_id.clone(), tx));
+                Some(CallSlot::Approval(rx))
+            } else {
+                // 自动放行：不等待人工确认，直接执行（无需通道）。
+                None
+            };
+            slots.push(slot);
+        }
+        // 所有调用的确认/执行共享同一截止时间（轮起点 + APPROVAL_TIMEOUT），
+        // 避免排在并发队列后面的调用额外获得更长的等待窗口。
+        let deadline = tokio::time::Instant::now() + APPROVAL_TIMEOUT;
+        // 并发上限：同一时刻最多 MAX_PARALLEL_TOOL_CALLS 个调用在等待确认/执行
+        // （防止大批调用同时打开 SSH 连接 / 确认卡片积压）。
+        let semaphore =
+            std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_PARALLEL_TOOL_CALLS));
+        // 串行闸门：serial 调用按出现顺序两两成链（链头无等待、链尾无通知）。
+        let (mut wait_gates, mut signal_gates) =
+            build_serial_gates(&active.iter().map(|pc| pc.serial).collect::<Vec<bool>>());
+        let futures = active.iter().enumerate().map(|(i, pc)| {
+            let request_id = request_id.clone();
+            let app = app.clone();
+            let state = state.clone();
+            let allowed = allowed.clone();
+            let semaphore = std::sync::Arc::clone(&semaphore);
+            let slot = slots[i].take();
+            let wait_gate = wait_gates[i].take();
+            let signal_gate = signal_gates[i].take();
+            let serial = pc.serial;
+            async move {
+                // 串行闸门：等链上上一个调用完整结束（确认 + 执行）再开始。前序
+                // future 被整体取消（ai_stop abort）时 sender 随之 drop，await
+                // 立即返回 Err 放行，不会死锁。
+                if let Some(gate) = wait_gate {
+                    let _ = gate.await;
+                }
+                // 串行链上的调用从「闸门打开时」起算独立的确认/执行窗口，与旧
+                // 串行实现语义一致——否则排在前面的命令会把后面调用的窗口挤占
+                // 掉（共享截止时间下，链条越靠后可用时间越少）。并行调用仍用
+                // 轮起点的共享截止。
+                let deadline = if serial {
+                    tokio::time::Instant::now() + APPROVAL_TIMEOUT
+                } else {
+                    deadline
+                };
+                // 等待并发名额（permit 持有到本调用结束）。闸门在名额之前：
+                // 串行链同一时刻至多占用一个名额，不挤占并行调用。
+                let _permit = semaphore.acquire().await.map_err(|_| ()).ok();
+                let mut screenshot_image: Option<crate::ai::provider::ImagePart> = None;
+                let result = match slot {
+                    Some(CallSlot::Desktop(rx)) => {
+                        let outcome = tokio::time::timeout_at(deadline, rx).await;
+                        state.pending_desktop_calls.lock().remove(&pc.call.id);
+                        match outcome {
+                            Ok(Ok(out)) if out.approved => {
+                                // 成功回传的截图：协议规定 role=tool 消息不能携带
+                                // 图片，由组装阶段以 user 消息图片块回填。
+                                screenshot_image = out.image;
+                                ToolResult {
+                                    ok: out.ok,
+                                    output: out.output,
+                                }
+                            }
+                            _ => {
+                                // 用户拒绝 / 前端未回执（会话关闭等）/ 确认超时。
+                                ToolResult {
+                                    ok: false,
+                                    output: "用户拒绝了该操作或确认超时".into(),
+                                }
+                            }
                         }
                     }
+                    Some(CallSlot::AskUser(rx)) => {
+                        let outcome = tokio::time::timeout_at(deadline, rx).await;
+                        state.pending_ask_user_calls.lock().remove(&pc.call.id);
+                        match outcome {
+                            Ok(Ok(out)) if out.answered => {
+                                // 用户的逐题回答（JSON），作为 tool 结果回填给模型。
+                                ToolResult {
+                                    ok: true,
+                                    output: crate::ai::tools::format_ask_user_answers(
+                                        &out.answers,
+                                    ),
+                                }
+                            }
+                            _ => {
+                                // 用户取消 / 请求被终止 / 确认超时。
+                                ToolResult {
+                                    ok: false,
+                                    output: "用户取消了提问或确认超时".into(),
+                                }
+                            }
+                        }
+                    }
+                    Some(CallSlot::Approval(rx)) => {
+                        let approval = tokio::time::timeout_at(deadline, rx).await;
+                        state.pending_tool_calls.lock().remove(&pc.call.id);
+                        match approval {
+                            Ok(Ok(ToolApproval { approved: true })) => {
+                                tools::execute_tool(
+                                    &app,
+                                    &state,
+                                    pc.call,
+                                    &allowed,
+                                    pc.visualization,
+                                    file_domain,
+                                    &request_id,
+                                )
+                                .await
+                            }
+                            _ => {
+                                // 拒绝或超时。
+                                ToolResult {
+                                    ok: false,
+                                    output: "用户拒绝了该操作或确认超时".into(),
+                                }
+                            }
+                        }
+                    }
+                    // 自动放行：不等待人工确认，直接执行。
+                    None => {
+                        tools::execute_tool(
+                            &app,
+                            &state,
+                            pc.call,
+                            &allowed,
+                            pc.visualization,
+                            file_domain,
+                            &request_id,
+                        )
+                        .await
+                    }
+                };
+                // 放行链上下一个调用（本调用的确认/执行已完整结束；结果 emit 由
+                // 轮末按原顺序统一处理，与此处无关）。
+                if let Some(tx) = signal_gate {
+                    let _ = tx.send(());
                 }
+                (pc.call.id.clone(), result, screenshot_image)
+            }
+        });
+        let outcomes: Vec<(
+            String,
+            ToolResult,
+            Option<crate::ai::provider::ImagePart>,
+        )> = futures::future::join_all(futures).await;
+
+        // ---- ④ 按调用原始顺序统一 emit 结果 + 回填 ----
+        // 协议要求 role=tool 消息紧跟 assistant(tool_calls) 且顺序与 tool_calls
+        // 一致（部分兼容网关会校验该对应关系，乱序可能 400）。预拒绝
+        // （Rejected）与执行完成（Run，outcomes 按 active 顺序对位）在这里按
+        // items 的原始顺序交织输出。
+        let mut outcome_iter = outcomes.into_iter();
+        for item in &items {
+            let (call_id, result, screenshot_image) = match item {
+                RoundItem::Rejected { call, msg } => (
+                    call.id.clone(),
+                    ToolResult {
+                        ok: false,
+                        output: msg.clone(),
+                    },
+                    None,
+                ),
+                // Run 项的结果已在 ③ 并发执行完成（outcomes 按 active 顺序对位）。
+                RoundItem::Run(_) => outcome_iter
+                    .next()
+                    .expect("outcomes 与 active 数量一致（同一来源过滤）"),
             };
-            tool_results.push((call.id.clone(), result.clone()));
-            // 把工具结果作为 role=tool 消息追加进 messages（紧跟 assistant(tool_calls)）。
-            // 入上下文前压缩到 8 KiB：完整内容已通过 ai:tool_result 事件推给前端展示，
-            // 模型只需要足够理解结果的头部，全量原文每轮重发会让成本复利放大。
+            events::emit(
+                app,
+                AI_TOOL_RESULT,
+                AiToolResultEvent {
+                    request_id: request_id.clone(),
+                    tool_call_id: call_id.clone(),
+                    ok: result.ok,
+                    output: result.output.clone(),
+                },
+            );
+            tool_results.push((call_id.clone(), result.clone()));
+            // 把工具结果作为 role=tool 消息追加进 messages（紧跟
+            // assistant(tool_calls)）。入上下文前压缩到 8 KiB：完整内容已通过
+            // ai:tool_result 事件推给前端展示，模型只需要足够理解结果的头部，
+            // 全量原文每轮重发会让成本复利放大。
             messages.push(ChatMessage {
                 role: crate::ai::provider::Role::Tool,
                 content: compress_tool_output_for_context(&result.output),
                 tool_calls: None,
-                tool_call_id: Some(call.id.clone()),
+                tool_call_id: Some(call_id),
                 images: None,
             });
-            // 截图回填：role=tool 消息不允许携带图片（OpenAI image_url / Claude
-            // image 块只能出现在 user 消息里），因此把 desktop_screenshot 捕获的
+            // 截图回填：role=tool 消息不允许携带图片（image_url 块只能出现在
+            // user 消息里），因此把 desktop_screenshot 捕获的
             // 截图作为紧随其后的 user 消息图片块交给多模态模型查看。
             if let Some(img) = screenshot_image {
                 messages.push(ChatMessage {
@@ -808,6 +1119,21 @@ async fn run_agent_loop(
                     images: Some(vec![img]),
                 });
             }
+        }
+        // 轮末注入重复调用提醒：作为 user 消息追加在 tool 结果序列之后（不破坏
+        // assistant(tool_calls) → tool 消息的协议顺序），下一轮模型即可看到；
+        // 同时 emit 一份给前端（灰色提示渲染），用户能感知模型在空转/已被纠偏。
+        for reminder in &reminders {
+            log::warn!("[ai:{request_id}] {reminder}");
+            events::emit(
+                app,
+                events::AI_SYSTEM_NOTE,
+                events::AiSystemNoteEvent {
+                    request_id: request_id.clone(),
+                    text: reminder.clone(),
+                },
+            );
+            messages.push(ChatMessage::new(Role::User, reminder.clone()));
         }
         // 早于最近 KEEP_FULL_TOOL_ROUNDS 轮的工具结果替换为一行摘要，从根源上
         // 削减「历史工具输出每轮全量重推」的上下文体积（对下一轮及后续都生效）。
@@ -851,18 +1177,17 @@ enum ChatErrorKind {
 /// 只能按已知格式匹配）。
 fn classify_chat_error(msg: &str) -> ChatErrorKind {
     let lower = msg.to_ascii_lowercase();
-    // HTTP 429 / 5xx（openai 系 "LLM 返回错误状态 {status}: ..."，
-    // claude 系 "Claude 返回错误状态 {status}: ..."）。
+    // HTTP 429 / 5xx（"LLM 返回错误状态 {status}: ..."）。
     if lower.contains("错误状态 429") || lower.contains("错误状态 5") {
         return ChatErrorKind::Retryable;
     }
     // 400 + 上下文关键词 → 上下文超限（OpenAI "maximum context length"、
-    // Claude "prompt is too long"、DeepSeek "超出长度" 等文案都覆盖）。
+    // DeepSeek "超出长度" 等文案都覆盖）。
     if lower.contains("错误状态 400") && is_context_error_body(&lower) {
         return ChatErrorKind::ContextTooLong;
     }
     // 建连失败（预流式）：DNS/连接/超时等，重试通常有效。
-    if lower.contains("连接 llm 服务失败") || lower.contains("连接 claude 服务失败") {
+    if lower.contains("连接 llm 服务失败") {
         return ChatErrorKind::Retryable;
     }
     ChatErrorKind::Fatal
@@ -1062,7 +1387,7 @@ fn estimate_tokens(text: &str) -> usize {
 /// - system 消息永远保留（携带系统指令）；
 /// - 从最旧的非 system 消息开始丢弃，直到估算总 tokens 不超过 `budget`；
 /// - 丢弃带 `tool_calls` 的 assistant 消息时，连带其后连续的 tool 结果消息一起丢弃，
-///   否则会残留"孤儿 tool 消息"——OpenAI/Anthropic 协议要求 tool 消息必须跟在
+///   否则会残留"孤儿 tool 消息"——OpenAI 兼容协议要求 tool 消息必须跟在
 ///   带 tool_calls 的 assistant 消息之后，否则以 400 拒绝；
 /// - 紧跟 assistant(tool_calls) 组之前的 user 消息不可单独丢弃：若丢，裁剪后首条
 ///   非 system 消息会变成 assistant(tool_calls)——协议同样以 400 拒绝，对话永久失败；
@@ -1131,10 +1456,108 @@ fn trim_history_for_context(messages: &mut Vec<ChatMessage>, budget: usize) {
 }
 
 // ===========================================================================
+// 重复工具调用守卫（借鉴 dsh repeat-tool-reminder）
+// ===========================================================================
+
+/// 重复工具调用守卫。
+///
+/// 观察 agent 循环里的工具调用流：以 `(工具名, 规范化参数)` 为链条键统计**连续**
+/// 相同调用次数，达到阈值时生成提醒文本（由编排层作为 user 消息注入 messages，
+/// 下一轮模型可见）。是建议性的循环打断器——不拦截、不改写任何调用，决定权
+/// 始终在模型：它可以选择换一种方式重试、收集更多信息或直接给出结论。
+///
+/// 与 dsh 的语义对齐：
+/// - 规范化参数：serde_json 默认 `Map` 是 `BTreeMap`，`to_string` 输出天然按键
+///   排序——参数对象仅属性顺序不同的调用视为相同；
+/// - 排除工具（记账/加载类）既不累计也不重置链条：`grep X → todo_write → grep X`
+///   仍算两次连续 `grep X`；
+/// - 被拒绝/被拦截的调用同样计数（模型反复重试同一被拒调用正是要打断的循环）；
+/// - 按请求实例隔离（每次 `run_agent_loop` 新建），无跨请求状态。
+struct RepeatCallGuard {
+    /// 上一次跟踪的调用键 `(工具名, 规范化参数)`。
+    last_key: Option<(String, String)>,
+    /// 连续相同调用次数。
+    consecutive: usize,
+    /// 已触发的阈值（每个阈值只提醒一次）。
+    fired: HashSet<usize>,
+}
+
+impl RepeatCallGuard {
+    /// 触发提醒的连续次数阈值（升序）。
+    const THRESHOLDS: [usize; 3] = [3, 5, 8];
+    /// 不参与链条跟踪的工具：记账/加载类调用穿插在循环里不该"洗白"链条，
+    /// 也不该自己触发提醒（见 dsh 的 exclude 语义）。
+    const EXCLUDED: [&'static str; 2] = ["todo_write", "load_skill"];
+    /// 详细提醒里引用的参数预览上限（字符）。
+    const ARGS_PREVIEW_CHARS: usize = 200;
+
+    fn new() -> Self {
+        Self {
+            last_key: None,
+            consecutive: 0,
+            fired: HashSet::new(),
+        }
+    }
+
+    /// 观察一次工具调用；命中阈值返回提醒文本，否则返回 None。
+    fn observe(&mut self, name: &str, arguments: &serde_json::Value) -> Option<String> {
+        if Self::EXCLUDED.contains(&name) {
+            return None;
+        }
+        let key = (name.to_string(), arguments.to_string());
+        if self.last_key.as_ref() == Some(&key) {
+            self.consecutive += 1;
+        } else {
+            // 链条重置：新的一串连续调用是新的循环（值得再次在阈值处提醒），
+            // 因此同时清空已触发的阈值集合。
+            self.last_key = Some(key);
+            self.consecutive = 1;
+            self.fired.clear();
+        }
+        // 阈值按连续次数触发，且每个阈值在一串连续调用内只提醒一次（避免每轮都啰嗦）。
+        let threshold = Self::THRESHOLDS.iter().copied().find(|&t| t == self.consecutive)?;
+        if !self.fired.insert(self.consecutive) {
+            return None;
+        }
+        Some(self.build_reminder(name, arguments, self.consecutive, threshold))
+    }
+
+    /// 生成提醒文本。首个阈值（3 次）用简短通用提醒；后续阈值带工具名、
+    /// 连续次数与参数预览（头截断，防止循环的巨型参数骑进提醒文本）。
+    fn build_reminder(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+        count: usize,
+        threshold: usize,
+    ) -> String {
+        if threshold == Self::THRESHOLDS[0] {
+            return format!(
+                "[重复调用提醒] 你已连续 {count} 次调用工具 `{name}` 且参数完全相同，\
+但结果并未改变。请停止重复相同调用：重新阅读上一次的工具结果，\
+要么改变策略后再调用，要么直接基于已有信息给出结论。"
+            );
+        }
+        let preview = arguments.to_string();
+        let preview = if preview.chars().count() > Self::ARGS_PREVIEW_CHARS {
+            let cut: String = preview.chars().take(Self::ARGS_PREVIEW_CHARS).collect();
+            format!("{cut}…（参数过长，已省略 {} 字符）", preview.chars().count() - Self::ARGS_PREVIEW_CHARS)
+        } else {
+            preview
+        };
+        format!(
+            "[重复调用提醒] 你已连续 {count} 次调用工具 `{name}` 且参数完全相同：{preview}\n\
+重复相同调用不会得到新信息。请重新阅读上一次的工具结果，换一种方式（调整参数、\
+拆分问题或换工具），或直接基于已有信息给出结论。"
+        )
+    }
+}
+
+// ===========================================================================
 // 对话历史持久化（独立 JSON 文件，按 domain 分文件）
 // ===========================================================================
 
-/// 可序列化的对话（持久化用）。只保留 id/title/messages，不含运行时状态
+/// 可序列化的对话（持久化用）。只保留 id/title/messages/todos，不含运行时状态
 /// （activeRequestId/sending 重启后恒为 null/false）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1142,6 +1565,9 @@ pub struct SerializableConversation {
     pub id: String,
     pub title: String,
     pub messages: Vec<Value>,
+    /// 智能体任务清单（todo_write 维护；旧文件无此字段 → 默认空）。
+    #[serde(default)]
+    pub todos: Vec<crate::events::AiTodoItem>,
 }
 
 /// 对话历史文件路径：`<app_data>/ai_conversations_<domain>.json`。
@@ -1349,7 +1775,7 @@ mod tests {
             ChatErrorKind::Retryable
         ));
         assert!(matches!(
-            classify_chat_error("Claude 返回错误状态 503 Service Unavailable: ..."),
+            classify_chat_error("LLM 返回错误状态 503 Service Unavailable: ..."),
             ChatErrorKind::Retryable
         ));
         assert!(matches!(
@@ -1357,7 +1783,7 @@ mod tests {
             ChatErrorKind::Retryable
         ));
         assert!(matches!(
-            classify_chat_error("Claude 返回错误状态 400 Bad Request: {\"message\":\"prompt is too long\"}"),
+            classify_chat_error("LLM 返回错误状态 400 Bad Request: {\"message\":\"request too large for model\"}"),
             ChatErrorKind::ContextTooLong
         ));
         assert!(matches!(
@@ -1372,5 +1798,401 @@ mod tests {
             classify_chat_error("LLM 返回错误状态 401 Unauthorized: ..."),
             ChatErrorKind::Fatal
         ));
+    }
+
+    // --- 重复工具调用守卫（RepeatCallGuard） ---
+
+    /// 参数对象仅属性顺序不同 → 规范化后视为相同调用（serde_json 的 Map 按键排序）。
+    #[test]
+    fn guard_canonicalizes_argument_order() {
+        let mut g = RepeatCallGuard::new();
+        let a = serde_json::json!({ "command": "df -h", "sessionId": "s1" });
+        let b = serde_json::json!({ "sessionId": "s1", "command": "df -h" });
+        // 第 1、2 次不触发（阈值 3）。
+        assert!(g.observe("exec_ssh", &a).is_none());
+        assert!(g.observe("exec_ssh", &b).is_none());
+        // 第 3 次（属性顺序不同但内容相同）触发提醒。
+        let r = g.observe("exec_ssh", &a).expect("应在第 3 次触发");
+        assert!(r.contains("连续 3 次"));
+        assert!(r.contains("exec_ssh"));
+    }
+
+    /// 阈值 [3, 5, 8]：每个阈值只提醒一次；中间穿插不同调用会重置链条。
+    #[test]
+    fn guard_fires_at_thresholds_and_resets_on_change() {
+        let mut g = RepeatCallGuard::new();
+        let args = serde_json::json!({ "sql": "SELECT 1" });
+        // 3 次连续 → 第 3 次触发（简短提醒，不含参数预览）。
+        assert!(g.observe("exec_sql", &args).is_none());
+        assert!(g.observe("exec_sql", &args).is_none());
+        let r3 = g.observe("exec_sql", &args).unwrap();
+        assert!(r3.contains("连续 3 次"));
+        assert!(!r3.contains("SELECT 1")); // 首个阈值是通用简短提醒
+        // 4、5 次：第 5 次触发详细提醒（含工具名 + 参数预览）。
+        assert!(g.observe("exec_sql", &args).is_none());
+        let r5 = g.observe("exec_sql", &args).unwrap();
+        assert!(r5.contains("连续 5 次"));
+        assert!(r5.contains("SELECT 1"));
+        // 同一阈值不重复提醒。
+        assert!(g.observe("exec_sql", &args).is_none());
+        assert!(g.observe("exec_sql", &args).is_none());
+        // 第 8 次触发（第二次进入详细提醒路径）。
+        let r8 = g.observe("exec_sql", &args).unwrap();
+        assert!(r8.contains("连续 8 次"));
+        // 之后不再提醒。
+        assert!(g.observe("exec_sql", &args).is_none());
+
+        // 换工具 → 链条重置（连续次数重新从 1 计，已触发阈值也重置——新的
+        // 一串连续调用是新循环，值得再次提醒）。
+        let other = serde_json::json!({ "path": "a.txt" });
+        assert!(g.observe("read_file", &other).is_none());
+        assert!(g.observe("read_file", &other).is_none());
+        // 同样内容换成另一个工具：也重置（键含工具名）。
+        assert!(g.observe("exec_sql", &args).is_none());
+        assert!(g.observe("exec_sql", &args).is_none());
+        assert!(g.observe("exec_sql", &args).unwrap().contains("连续 3 次"));
+    }
+
+    /// 排除工具（todo_write / load_skill）既不触发提醒也不重置链条：
+    /// grep X → todo_write → grep X 仍算两次连续 grep X。
+    #[test]
+    fn guard_excluded_tools_are_transparent() {
+        let mut g = RepeatCallGuard::new();
+        let grep = serde_json::json!({ "command": "grep error /var/log/app.log" });
+        let todo = serde_json::json!({ "todos": [] });
+        assert!(g.observe("exec_ssh", &grep).is_none());
+        // 记账调用穿插：不累计、不重置。
+        assert!(g.observe("todo_write", &todo).is_none());
+        assert!(g.observe("todo_write", &todo).is_none());
+        // 第 2 次 grep（中间隔了排除调用）→ 仍按连续第 2 次计。
+        assert!(g.observe("exec_ssh", &grep).is_none());
+        // 第 3 次 grep → 触发（链条未被 todo_write 洗白）。
+        assert!(g.observe("exec_ssh", &grep).unwrap().contains("连续 3 次"));
+    }
+
+    /// 参数预览截断：超长参数被截断并附省略说明，防止巨型参数骑进提醒文本。
+    /// （断言用字符数而非字节数：提醒正文为中文，UTF-8 下每字 3 字节。）
+    #[test]
+    fn guard_truncates_long_argument_preview() {
+        let mut g = RepeatCallGuard::new();
+        let big = serde_json::json!({ "command": "x".repeat(500) });
+        assert!(g.observe("exec_ssh", &big).is_none());
+        assert!(g.observe("exec_ssh", &big).is_none());
+        let r = g.observe("exec_ssh", &big).unwrap();
+        // 第 3 次是简短通用提醒（不含参数预览）。
+        assert!(r.contains("连续 3 次"));
+        assert!(!r.contains("xxx"));
+        // 再补两次到第 5 次：详细版应截断参数。
+        assert!(g.observe("exec_ssh", &big).is_none());
+        let r5 = g.observe("exec_ssh", &big).unwrap();
+        assert!(r5.contains("已省略"));
+        assert!(r5.chars().count() < 400);
+    }
+
+    // =========================================================================
+    // plan_call：单轮工具调用的执行计划（域分发 / SQL 模式拦截 / 运行模式门控）
+    // =========================================================================
+
+    fn tc(name: &str, args: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: "c1".into(),
+            name: name.into(),
+            arguments: args,
+        }
+    }
+
+    fn allowed(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn ssh_cfg(run_mode: &str) -> SshAgentSettings {
+        SshAgentSettings {
+            run_mode: run_mode.into(),
+            ..Default::default()
+        }
+    }
+
+    fn sql_cfg(run_mode: &str, sql_mode: &str) -> SqlAgentSettings {
+        SqlAgentSettings {
+            run_mode: run_mode.into(),
+            sql_mode: sql_mode.into(),
+            ..Default::default()
+        }
+    }
+
+    /// 未 advertised 工具（模型幻觉调用）→ Err（调用方直接回填拒绝）。
+    #[test]
+    fn plan_rejects_unadvertised_tool() {
+        let a = allowed(&["exec_sql"]);
+        let c = tc("exec_ssh", serde_json::json!({ "command": "df -h" }));
+        let err = plan_call(&c, &a, &ssh_cfg("manual"), &sql_cfg("manual", "readonly"), None)
+            .unwrap_err();
+        assert!(err.contains("不可用"));
+    }
+
+    /// 域分发：工具名 → 正确的域（决定确认/放行策略与配置来源）。
+    #[test]
+    fn plan_dispatches_domains() {
+        let a = allowed(&[
+            "exec_ssh",
+            "exec_sql",
+            "read_file",
+            "write_file",
+            "desktop_screenshot",
+            "desktop_click",
+            "todo_write",
+            "load_skill",
+            "ask_user_question",
+            "terminal_snapshot",
+        ]);
+        let cases: &[(&str, &str)] = &[
+            ("exec_ssh", "ssh"),
+            ("exec_sql", "sql"),
+            ("read_file", "file"),
+            ("write_file", "file"),
+            ("desktop_screenshot", "desktop"),
+            ("desktop_click", "desktop"),
+            ("todo_write", "todo"),
+            ("load_skill", "skill"),
+            ("ask_user_question", "ask"),
+            ("terminal_snapshot", "other"),
+        ];
+        for (name, domain) in cases {
+            let c = tc(name, serde_json::json!({}));
+            let p = plan_call(&c, &a, &ssh_cfg("manual"), &sql_cfg("manual", "readonly"), None)
+                .unwrap();
+            assert_eq!(p.domain, *domain, "工具 {name} 应属于域 {domain}");
+        }
+    }
+
+    /// SQL 模式拦截：readonly 下 UPDATE 被预拒绝；SELECT 放行（auto 模式直接执行）。
+    /// sql_mode 是硬边界——auto 模式也不能绕过。
+    #[test]
+    fn plan_sql_mode_gates_statements() {
+        let a = allowed(&["exec_sql"]);
+        let cfg = sql_cfg("auto", "readonly");
+        let c = tc("exec_sql", serde_json::json!({ "sql": "SELECT 1" }));
+        let p = plan_call(&c, &a, &ssh_cfg("manual"), &cfg, None).unwrap();
+        assert!(p.rejected.is_none(), "SELECT 不应被 readonly 拦截");
+        assert!(p.auto_run, "auto 模式 + 只读查询应自动执行");
+        let c = tc("exec_sql", serde_json::json!({ "sql": "UPDATE t SET a=1" }));
+        let p = plan_call(&c, &a, &ssh_cfg("manual"), &cfg, None).unwrap();
+        assert!(p.rejected.is_some(), "readonly 模式应拦截 UPDATE");
+        assert!(p.rejected.unwrap().contains("readonly"));
+    }
+
+    /// SQL 危险判定：full 模式放行 DELETE，但 manual 模式下仍强制人工确认。
+    #[test]
+    fn plan_sql_dangerous_stays_manual() {
+        let a = allowed(&["exec_sql"]);
+        let cfg = sql_cfg("manual", "full");
+        let c = tc("exec_sql", serde_json::json!({ "sql": "DELETE FROM users" }));
+        let p = plan_call(&c, &a, &ssh_cfg("manual"), &cfg, None).unwrap();
+        assert!(p.rejected.is_none(), "full 模式放行 DELETE");
+        assert!(p.dangerous, "无 WHERE DELETE 应标记危险");
+        assert!(!p.auto_run, "manual 模式下危险 SQL 必须人工确认");
+    }
+
+    /// SSH 运行模式门控：manual / whitelist / auto 三档的自动放行边界。
+    #[test]
+    fn plan_ssh_run_modes() {
+        let a = allowed(&["exec_ssh"]);
+        let base = ssh_cfg("manual");
+        // manual：白名单内命令也不自动（仍需人工确认）。
+        let cfg = SshAgentSettings {
+            run_mode: "manual".into(),
+            command_whitelist: vec!["df".into()],
+            ..base.clone()
+        };
+        let c = tc("exec_ssh", serde_json::json!({ "command": "df -h" }));
+        let p = plan_call(&c, &a, &cfg, &sql_cfg("manual", "readonly"), None).unwrap();
+        assert!(p.whitelisted, "命中白名单应标记 whitelisted");
+        assert!(!p.auto_run, "manual 模式一律人工确认");
+        // whitelist：白名单内且非危险 → 自动执行。
+        let cfg = SshAgentSettings {
+            run_mode: RUN_MODE_WHITELIST.into(),
+            command_whitelist: vec!["df".into()],
+            ..base.clone()
+        };
+        let c = tc("exec_ssh", serde_json::json!({ "command": "df -h" }));
+        let p = plan_call(&c, &a, &cfg, &sql_cfg("manual", "readonly"), None).unwrap();
+        assert!(p.whitelisted && p.auto_run, "白名单内非危险命令应自动执行");
+        // whitelist：危险命令即使命中白名单前缀也不自动。
+        let cfg = SshAgentSettings {
+            run_mode: RUN_MODE_WHITELIST.into(),
+            command_whitelist: vec!["shutdown".into()],
+            ..base.clone()
+        };
+        let c = tc("exec_ssh", serde_json::json!({ "command": "shutdown -h now" }));
+        let p = plan_call(&c, &a, &cfg, &sql_cfg("manual", "readonly"), None).unwrap();
+        assert!(p.dangerous, "shutdown 应标记危险");
+        assert!(!p.auto_run, "白名单内危险命令仍需确认");
+        // auto：全部自动执行（含白名单外命令）。
+        let cfg = SshAgentSettings {
+            run_mode: RUN_MODE_AUTO.into(),
+            command_whitelist: vec![],
+            ..base
+        };
+        let c = tc("exec_ssh", serde_json::json!({ "command": "df -h" }));
+        let p = plan_call(&c, &a, &cfg, &sql_cfg("manual", "readonly"), None).unwrap();
+        assert!(p.auto_run, "auto 模式全部自动执行");
+    }
+
+    /// 记账/只读工具（todo_write / load_skill）：无副作用，恒自动执行。
+    #[test]
+    fn plan_bookkeeping_tools_auto_run() {
+        let a = allowed(&["todo_write", "load_skill"]);
+        let c = tc("todo_write", serde_json::json!({ "todos": [] }));
+        let p = plan_call(&c, &a, &ssh_cfg("manual"), &sql_cfg("manual", "readonly"), None)
+            .unwrap();
+        assert!(p.auto_run);
+        assert_eq!(p.domain, "todo");
+        let c = tc("load_skill", serde_json::json!({ "name": "x" }));
+        let p = plan_call(&c, &a, &ssh_cfg("manual"), &sql_cfg("manual", "readonly"), None)
+            .unwrap();
+        assert!(p.auto_run);
+        assert_eq!(p.domain, "skill");
+    }
+
+    /// 可视化开启时 exec_ssh 写共享 PTY（忙锁 try-acquire 互斥）→ 标记 serial
+    /// 同轮串行；关闭时走独立 SSH 连接可并行；exec_sql 不受 ssh 可视化开关影响。
+    #[test]
+    fn plan_serializes_visual_ssh() {
+        let a = allowed(&["exec_ssh", "exec_sql"]);
+        let mut cfg = ssh_cfg("auto");
+        // 可视化开：exec_ssh 必须串行。
+        cfg.terminal_visualization = true;
+        let c = tc("exec_ssh", serde_json::json!({ "command": "df -h" }));
+        let p = plan_call(&c, &a, &cfg, &sql_cfg("manual", "readonly"), None).unwrap();
+        assert!(p.visualization);
+        assert!(p.serial, "可视化模式 exec_ssh 应串行");
+        // 可视化关：独立连接，无共享状态，可并行。
+        cfg.terminal_visualization = false;
+        let p = plan_call(&c, &a, &cfg, &sql_cfg("manual", "readonly"), None).unwrap();
+        assert!(!p.visualization);
+        assert!(!p.serial);
+        // exec_sql 走连接池，不受 ssh 可视化开关影响。
+        cfg.terminal_visualization = true;
+        let c = tc("exec_sql", serde_json::json!({ "sql": "SELECT 1" }));
+        let p = plan_call(&c, &a, &cfg, &sql_cfg("auto", "readonly"), None).unwrap();
+        assert!(!p.serial);
+    }
+
+    /// 串行闸门：serial 调用按出现顺序两两成链（跳过中间穿插的非 serial 调用），
+    /// 链头只 signal、链尾只 wait、非 serial 两个位置恒为 None。
+    #[test]
+    fn serial_gates_chain_in_order() {
+        // [ssh, sql, ssh, ssh, sql] → ssh 链 0 → 2 → 3。
+        let (wait, signal) = build_serial_gates(&[true, false, true, true, false]);
+        assert!(wait[0].is_none() && signal[0].is_some(), "链头只通知");
+        assert!(wait[1].is_none() && signal[1].is_none(), "非 serial 无闸门");
+        assert!(wait[2].is_some() && signal[2].is_some(), "链中既等又通知");
+        assert!(wait[3].is_some() && signal[3].is_none(), "链尾只等待");
+        assert!(wait[4].is_none() && signal[4].is_none());
+        // 至多一个 serial 调用：不成链（无闸门，等效并行/立即执行）。
+        let (wait, signal) = build_serial_gates(&[false, true, false]);
+        assert!(wait.iter().all(|g| g.is_none()));
+        assert!(signal.iter().all(|g| g.is_none()));
+        // 空轮：无闸门。
+        let (wait, signal) = build_serial_gates(&[]);
+        assert!(wait.is_empty() && signal.is_empty());
+    }
+
+    /// 提问工具：合法参数不弹确认卡片（auto_run），非法问题结构被预拒绝。
+    #[test]
+    fn plan_ask_user_gating() {
+        let a = allowed(&["ask_user_question"]);
+        // 合法：两个问题（id 唯一、带选项）→ 进入执行阶段，不弹二次确认。
+        let c = tc(
+            "ask_user_question",
+            serde_json::json!({
+                "questions": [
+                    { "id": "port", "question": "目标端口？", "options": [{ "label": "22" }] },
+                    { "id": "confirm", "question": "确认继续？" }
+                ]
+            }),
+        );
+        let p = plan_call(&c, &a, &ssh_cfg("manual"), &sql_cfg("manual", "readonly"), None)
+            .unwrap();
+        assert_eq!(p.domain, "ask");
+        assert!(p.rejected.is_none());
+        assert!(p.auto_run, "提问不弹二次确认卡片");
+        // 非法：id 重复 → 预拒绝（前端不渲染畸形表单）。
+        let c = tc(
+            "ask_user_question",
+            serde_json::json!({
+                "questions": [
+                    { "id": "q", "question": "a" },
+                    { "id": "q", "question": "b" }
+                ]
+            }),
+        );
+        let p = plan_call(&c, &a, &ssh_cfg("manual"), &sql_cfg("manual", "readonly"), None)
+            .unwrap();
+        assert!(p.rejected.is_some(), "重复 id 应被预拒绝");
+        assert!(p.rejected.unwrap().contains("重复"));
+    }
+
+    /// validate_ask_user_questions：边界校验（空问题 / 超 4 个 / 缺文本 / 空选项）。
+    #[test]
+    fn validate_ask_user_questions_edges() {
+        // 空 questions → 报错。
+        assert!(crate::ai::tools::validate_ask_user_questions(&serde_json::json!({ "questions": [] }))
+            .is_err());
+        // 5 个问题 → 超上限。
+        let many: Vec<serde_json::Value> = (0..5)
+            .map(|i| serde_json::json!({ "id": format!("q{i}"), "question": "x" }))
+            .collect();
+        let err = crate::ai::tools::validate_ask_user_questions(&serde_json::json!({ "questions": many }))
+            .unwrap_err();
+        assert!(err.contains("4"));
+        // 缺 question 文本 → 报错。
+        assert!(crate::ai::tools::validate_ask_user_questions(&serde_json::json!({
+            "questions": [{ "id": "q1" }]
+        }))
+        .is_err());
+        // 选项缺 label → 报错。
+        assert!(crate::ai::tools::validate_ask_user_questions(&serde_json::json!({
+            "questions": [{ "id": "q1", "question": "x", "options": [{ "description": "无 label" }] }]
+        }))
+        .is_err());
+        // 合法（含多选 + 选项说明）→ Ok，字段归一化正确。
+        let ok = crate::ai::tools::validate_ask_user_questions(&serde_json::json!({
+            "questions": [{
+                "id": "q1",
+                "question": "选择方案？",
+                "header": "方案",
+                "options": [{ "label": "A", "description": "方案 A" }],
+                "multi_select": true
+            }]
+        }))
+        .unwrap();
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].id, "q1");
+        assert!(ok[0].multi_select);
+        assert_eq!(ok[0].options[0].label, "A");
+    }
+
+    /// 回答格式化：与 dsh 规范一致（answers JSON，字段名 camelCase）。
+    #[test]
+    fn format_ask_user_answers_roundtrip() {
+        let out = crate::ai::tools::format_ask_user_answers(&[
+            crate::ai::tools::AskUserAnswer {
+                id: "q1".into(),
+                selected: vec!["22".into()],
+                custom: None,
+            },
+            crate::ai::tools::AskUserAnswer {
+                id: "q2".into(),
+                selected: vec![],
+                custom: Some("自由输入".into()),
+            },
+        ]);
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let answers = parsed["answers"].as_array().unwrap();
+        assert_eq!(answers.len(), 2);
+        assert_eq!(answers[0]["id"], "q1");
+        assert_eq!(answers[0]["selected"][0], "22");
+        assert_eq!(answers[1]["custom"], "自由输入");
     }
 }

@@ -1,5 +1,5 @@
 import { defineStore } from "pinia";
-import { ref } from "vue";
+import { reactive, ref } from "vue";
 import * as localApi from "@/api/local";
 import * as sessionApi from "@/api/session";
 import { AuthType, type Session } from "@/api/types";
@@ -14,7 +14,12 @@ import { isAuthError } from "@/utils/error";
  * 管理，不经过本 store。
  */
 export interface TerminalTab {
-  /** 后端终端实例 id（来自 connectSession 返回值）。 */
+  /** 稳定 tab 标识（创建时生成，永不变化）。
+   *
+   * Workspace 的 pane 以它为 key：重连/手动认证成功换新 instanceId 时
+   * pane 复用同一个 xterm 实例（scrollback 保留），只重绑数据流。 */
+  id: string;
+  /** 后端终端实例 id（来自 connectSession 返回值；重连会更换）。 */
   instanceId: string;
   /** 对应的会话配置。 */
   session: Session;
@@ -54,6 +59,11 @@ export const useTerminalsStore = defineStore("terminals", () => {
   const activeId = ref<string | null>(null);
   const manualAuth = ref<ManualAuthRequest | null>(null);
 
+  /** 生成稳定 tab id（与消息 id 同款格式，防碰撞）。 */
+  function genTabId() {
+    return `t-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+
   /**
    * 打开一个新终端 tab 并连接。
    *
@@ -74,22 +84,27 @@ export const useTerminalsStore = defineStore("terminals", () => {
         if (manualAuth.value?.tab === stale) manualAuth.value = null;
       }
     }
-    const tab: TerminalTab = {
+    // reactive 化后再 push：后续 tab.instanceId/connecting 等赋值走代理，
+    // 才能触发视图更新。直接 push 原始对象的话，闭包里的 tab 是 raw——
+    // 对 raw 的属性赋值不经过 Proxy 拦截、不触发响应，TabBar 的状态点
+    // 会滞留（连接完成仍橙色，直到下一次数组变更才"莫名"恢复）。
+    const tab = reactive<TerminalTab>({
+      id: genTabId(),
       instanceId: "",
       session,
       connecting: true,
       error: null,
       disconnected: false,
       reconnecting: false,
-    };
+    });
     tabs.value.push(tab);
     activeId.value = tab.instanceId; // 临时空，连接成功后更新
 
     try {
       const instanceId = await sessionApi.connectSession(session.id);
-      // 连接期间 tab 可能已被用户关闭（占位 tab 的 instanceId 为空，close("") 会
-      // 命中并移除它）。此时新实例在后端已经注册成功，必须立即断开，否则泄漏
-      // 一个无人管理的幽灵连接。
+      // 连接期间 tab 可能已被用户关闭（TabBar 用复合键 session.id 关闭占位
+      // tab，close 已移除它）。此时新实例在后端已经注册成功，必须立即断开，
+      // 否则泄漏一个无人管理的幽灵连接。
       if (!tabs.value.includes(tab)) {
         try {
           await sessionApi.disconnectSession(instanceId);
@@ -141,7 +156,11 @@ export const useTerminalsStore = defineStore("terminals", () => {
     }
   }
 
-  /** 合成占位会话（不来自 DB，仅承载 tab 展示信息）。 */
+  /** 合成占位会话（不来自 DB，仅承载 tab 展示信息）。
+   *
+   * 本地终端的 id 也必须唯一：它是 TabBar 复合键（instanceId || session.id）
+   * 在连接期间的取值——两个本地终端同时连接中若 id 都是空串，会出现 v-for
+   * key 冲突，且 close("")/setActive("") 会命中第一个占位 tab（关错/切错）。 */
   function placeholderSession(
     protocol: Session["protocol"],
     name: string,
@@ -149,7 +168,7 @@ export const useTerminalsStore = defineStore("terminals", () => {
     port: number,
   ): Session {
     return {
-      id: "",
+      id: `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       name,
       groupId: null,
       host,
@@ -182,22 +201,23 @@ export const useTerminalsStore = defineStore("terminals", () => {
    * （占位 tab、连接期间关闭则回收后端幽灵实例、失败移除 tab 并 re-throw）。
    */
   async function openLocal(shell?: string) {
-    const tab: TerminalTab = {
+    const tab = reactive<TerminalTab>({
+      id: genTabId(),
       instanceId: "",
       session: localPlaceholderSession(),
       connecting: true,
       error: null,
       disconnected: false,
       reconnecting: false,
-    };
+    });
     tabs.value.push(tab);
     activeId.value = tab.instanceId; // 临时空，连接成功后更新
 
     try {
       const instanceId = await localApi.connectLocalTerminal(shell);
-      // 连接期间 tab 可能已被用户关闭（占位 tab 的 instanceId 为空，close("") 会
-      // 命中并移除它）。此时新实例在后端已经注册成功，必须立即断开，否则泄漏
-      // 一个无人管理的幽灵连接。
+      // 连接期间 tab 可能已被用户关闭（TabBar 用复合键 session.id 关闭占位
+      // tab，close 已移除它）。此时新实例在后端已经注册成功，必须立即断开，
+      // 否则泄漏一个无人管理的幽灵连接。
       if (!tabs.value.includes(tab)) {
         try {
           await sessionApi.disconnectSession(instanceId);
@@ -236,8 +256,9 @@ export const useTerminalsStore = defineStore("terminals", () => {
    * 重连已断开的终端 tab。
    *
    * best-effort 断开旧实例 → 用同一会话配置重新连接 → 原地更新 instanceId。
-   * 注意：Workspace 的 TerminalPane 以 instanceId 为 key，更新 instanceId 会
-   * **重挂载组件、丢失 scrollback**（无后端缓冲回放）。这是当前接受的代价。
+   * Workspace 的 pane 以稳定 tab id 为 key，instanceId 更新只会触发 pane 内部
+   * 重绑数据流（见 TerminalPane 的 instanceId watch）——**xterm 实例与
+   * scrollback 完整保留**，不再有"重连丢回滚"的代价。
    * 连接等待期间 tab 被关闭则断开新实例并放弃重连（见函数体内检查）。
    */
   async function reconnect(instanceId: string) {
@@ -289,16 +310,34 @@ export const useTerminalsStore = defineStore("terminals", () => {
     }
   }
 
-  async function close(instanceId: string) {
-    const idx = tabs.value.findIndex((t) => t.instanceId === instanceId);
-    if (idx < 0) return;
+  /**
+   * 关闭 tab。返回是否找到并移除了目标（找不到由调用方提示）。
+   *
+   * key 可为 instanceId、session.id 或 TabBar 的复合键（instanceId || session.id）。
+   *
+   * 三种都兜底的原因：**连接完成的瞬间存在键竞态**——TabBar 渲染时 tab 还是
+   * 占位（key = session.id），用户点击关闭的刹那连接完成、instanceId 更新，
+   * 携带旧 key 的 close 若只按"instanceId 或复合键"匹配会两头落空（复合键
+   * 此时已是 instanceId ≠ session.id）→ 静默失败，表现为"橙色（连接中）的
+   * tab 点关闭没反应"。session.id 恒定不变，作为兜底匹配项可消除该竞态；
+   * 右键菜单捕获的 tab 对象过期（key 停留在点击渲染帧）同理被兜底覆盖。
+   */
+  async function close(key: string): Promise<boolean> {
+    const idx = tabs.value.findIndex(
+      (t) =>
+        t.instanceId === key ||
+        t.session.id === key ||
+        (t.instanceId || t.session.id) === key
+    );
+    if (idx < 0) return false;
     const [removed] = tabs.value.splice(idx, 1);
     // 弹窗引用的 tab 被关闭：一并关闭弹窗，避免指向已移除的 tab。
     if (manualAuth.value?.tab === removed) manualAuth.value = null;
     await stopBackend(removed);
-    if (activeId.value === instanceId) {
+    if (activeId.value === removed.instanceId) {
       activeId.value = tabs.value[idx]?.instanceId ?? tabs.value[idx - 1]?.instanceId ?? null;
     }
+    return true;
   }
 
   /**
@@ -390,20 +429,42 @@ export const useTerminalsStore = defineStore("terminals", () => {
     }
   }
 
-  function setActive(instanceId: string) {
-    activeId.value = instanceId;
+  /**
+   * 激活 tab。
+   *
+   * key 可为 instanceId、session.id 或 TabBar 的复合键（见 close 的键竞态说明
+   * ——session.id 兜底消除"连接完成的瞬间旧 key 落空"的问题）。占位 tab
+   * 解析回它的 instanceId（空串），保证 activeId 始终是某个 tab 的
+   * instanceId，内容区的 v-show 才能命中。
+   */
+  function setActive(key: string) {
+    const tab = tabs.value.find(
+      (t) =>
+        (t.instanceId || t.session.id) === key ||
+        t.instanceId === key ||
+        t.session.id === key
+    );
+    activeId.value = tab?.instanceId ?? key;
   }
 
   /**
-   * 移动 tab（拖拽排序）：把 fromId 移到 toId 之前/之后。
+   * 移动 tab（拖拽排序）：把 fromKey 移到 toKey 之前/之后。
    * 拖拽中会连续触发，若目标已被移动过则按当前索引重算，保持跟手。
+   * key 匹配含 session.id 兜底（见 close 的键竞态说明）。
    */
-  function moveTab(fromId: string, toId: string, before: boolean) {
-    const from = tabs.value.findIndex((t) => t.instanceId === fromId);
-    const to = tabs.value.findIndex((t) => t.instanceId === toId);
+  function moveTab(fromKey: string, toKey: string, before: boolean) {
+    const match = (k: string) =>
+      tabs.value.findIndex(
+        (t) =>
+          t.instanceId === k ||
+          t.session.id === k ||
+          (t.instanceId || t.session.id) === k
+      );
+    const from = match(fromKey);
+    const to = match(toKey);
     if (from < 0 || to < 0 || from === to) return;
     const [tab] = tabs.value.splice(from, 1);
-    let idx = tabs.value.findIndex((t) => t.instanceId === toId);
+    let idx = match(toKey);
     if (!before) idx += 1;
     tabs.value.splice(idx, 0, tab);
   }

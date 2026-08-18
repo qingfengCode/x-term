@@ -21,6 +21,7 @@ use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use sqlx::types::{Decimal, JsonValue};
 use sqlx::{Column, Connection, MySqlPool, Row};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::copy_bidirectional;
 use tokio::net::TcpListener;
 
@@ -297,6 +298,14 @@ pub struct QueryResult {
 // 连接
 // ===========================================================================
 
+/// 建立连接（含首条连接握手）的超时上限。
+///
+/// sqlx 的 `PoolOptions::connect` 受 `acquire_timeout` 约束，默认 30s：主机
+/// 不可达 / 防火墙丢包 / DNS 挂起时前端要干等 30s 才见到报错（表现为"展开
+/// 实例要等很久"）。这里收紧到 15s，与 SSH 默认连接超时（15s）一致；空闲
+/// pool 的运行时 acquire 不受影响（立即返回）。
+const MYSQL_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// 直连 MySQL。
 pub async fn connect_direct(
     host: &str,
@@ -308,8 +317,13 @@ pub async fn connect_direct(
     let url = build_mysql_url(host, port, username, password, database);
     let pool = MySqlPoolOptions::new()
         .max_connections(8)
+        .acquire_timeout(MYSQL_CONNECT_TIMEOUT)
         .connect(&url)
-        .await?;
+        .await
+        .map_err(|e| {
+            log::warn!("[connect_direct] 连接 MySQL 失败 ({}:{}): {}", host, port, e);
+            AppError::Storage(format!("连接 MySQL 失败（{}:{}，15 秒超时）：{e}", host, port))
+        })?;
     Ok(MySqlConn {
         pool,
         _tunnel_handle: None,
@@ -408,6 +422,7 @@ pub async fn connect_via_ssh(
     // SSH 隧道下限制 pool 大小，避免开过多 channel。
     let pool = match MySqlPoolOptions::new()
         .max_connections(2)
+        .acquire_timeout(MYSQL_CONNECT_TIMEOUT)
         .connect(&url)
         .await
     {
@@ -416,7 +431,16 @@ pub async fn connect_via_ssh(
             // 连接失败：必须 abort 隧道 accept 循环并断开 SSH，否则 accept 任务
             // 带着监听端口与 SSH handle 一直泄漏到进程退出。
             tunnel_handle.abort();
-            return Err(e.into());
+            log::warn!(
+                "[connect_via_ssh] 经隧道连接 MySQL 失败 ({}:{}): {}",
+                mysql_host,
+                mysql_port,
+                e
+            );
+            return Err(AppError::Storage(format!(
+                "经 SSH 隧道连接 MySQL 失败（{}:{}，15 秒超时）：{e}",
+                mysql_host, mysql_port
+            )));
         }
     };
 

@@ -2,7 +2,7 @@
 //!
 //! 本模块定义与具体厂商解耦的对话抽象：消息结构（[`Role`] / [`ChatMessage`]）、
 //! 厂商类型（[`ProviderKind`]）、配置结构（[`ProviderConfig`]）以及统一的
-//! [`LlmProvider`] trait。具体实现见 [`crate::ai::openai`] 与 [`crate::ai::claude`]。
+//! [`LlmProvider`] trait。具体实现见 [`crate::ai::openai`]（统一走 OpenAI 兼容协议）。
 //!
 //! 调用方典型流程：
 //! ```ignore
@@ -23,7 +23,7 @@ use crate::error::{AppError, AppResult};
 /// 对话消息的角色。
 ///
 /// 序列化后分别为字符串 `"system"` / `"user"` / `"assistant"` / `"tool"`，符合
-/// OpenAI 与 Claude 等主流厂商的 API 约定（`tool` 用于工具调用结果回填）。
+/// OpenAI 兼容系厂商的通用 API 约定（`tool` 用于工具调用结果回填）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -43,7 +43,7 @@ pub enum Role {
 ///
 /// 工具调用相关字段：
 /// - `tool_calls`：仅当 `role=Assistant` 且本轮模型请求了工具调用时存在。具体厂商
-///   （OpenAI / Claude）在序列化时会按各自协议转换格式。
+///   在序列化时按 OpenAI 兼容协议转换格式。
 /// - `tool_call_id`：仅当 `role=Tool` 时存在，用于把工具结果回填给对应的 tool_call。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -57,7 +57,7 @@ pub struct ChatMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
     /// 用户消息附带的多模态图片。非空时具体厂商实现会把 content 序列化为
-    /// 「文本 + 图片块」数组（OpenAI image_url / Claude image 块）。
+    /// 「文本 + 图片块」数组（OpenAI image_url 块）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub images: Option<Vec<ImagePart>>,
 }
@@ -78,7 +78,7 @@ impl ChatMessage {
 /// 一张多模态图片（用户消息附带）。
 ///
 /// 前端负责把图片文件读成 base64 后随消息传入；后端不做解码，仅按厂商协议
-/// 重新包装（OpenAI 拼 `data:{mime};base64,{data}` 的 image_url，Claude 拆成
+/// 重新包装（OpenAI 拼 `data:{mime};base64,{data}` 的 image_url；内部按
 /// `source {type: base64, media_type, data}`）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -98,11 +98,9 @@ pub struct ImagePart {
 /// - [`ProviderKind::OpenAi`]、[`ProviderKind::DeepSeek`]、[`ProviderKind::Zhipu`]、
 ///   [`ProviderKind::Ollama`]、[`ProviderKind::OpenAiCompatible`] 均使用 OpenAI
 ///   兼容协议，由 [`crate::ai::openai::OpenAiProvider`] 承载。
-/// - [`ProviderKind::Anthropic`] 使用 Claude 原生 Messages 协议，由
-///   [`crate::ai::claude::ClaudeProvider`] 承载。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 // 序列化值必须与前端 `src/api/types.ts` 的 `ProviderKind` 枚举字符串完全一致：
-// openai / anthropic / deepseek / zhipu / ollama / openai_compatible。
+// openai / deepseek / zhipu / ollama / openai_compatible。
 // 之前用 `rename_all = "lowercase"` 会把 OpenAiCompatible 序列化成 "openaicompatible"
 // （无分隔符），与前端 "openai_compatible" 对不上；而 `snake_case` 又会把 OpenAi
 // 转成 "open_ai"（识别大写边界）。因此改为逐变体显式 rename，确保精确匹配前端。
@@ -110,9 +108,6 @@ pub enum ProviderKind {
     /// OpenAI 官方（gpt-3.5/gpt-4 系列）。
     #[serde(rename = "openai")]
     OpenAi,
-    /// Anthropic Claude（原生 Messages API）。
-    #[serde(rename = "anthropic")]
-    Anthropic,
     /// DeepSeek（OpenAI 兼容协议）。
     #[serde(rename = "deepseek")]
     DeepSeek,
@@ -123,7 +118,16 @@ pub enum ProviderKind {
     #[serde(rename = "ollama")]
     Ollama,
     /// 任意 OpenAI 兼容端点（用户自填 base_url）。
-    #[serde(rename = "openai_compatible")]
+    ///
+    /// serde alias 兼容旧配置：应用早期支持过 Anthropic 原生协议（kind =
+    /// "anthropic"/"claude"），已移除——旧配置文件里的这些值统一按本变体
+    /// 加载（避免设置解析失败打不开应用），用户在设置页把该模型改为
+    /// OpenAI 兼容网关即可继续使用。
+    #[serde(
+        rename = "openai_compatible",
+        alias = "anthropic",
+        alias = "claude"
+    )]
     OpenAiCompatible,
 }
 
@@ -134,7 +138,6 @@ impl ProviderKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             ProviderKind::OpenAi => "openai",
-            ProviderKind::Anthropic => "anthropic",
             ProviderKind::DeepSeek => "deepseek",
             ProviderKind::Zhipu => "zhipu",
             ProviderKind::Ollama => "ollama",
@@ -150,7 +153,9 @@ impl ProviderKind {
     pub fn from_str(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "openai" => Some(ProviderKind::OpenAi),
-            "anthropic" | "claude" => Some(ProviderKind::Anthropic),
+            // Anthropic 原生协议已移除：旧值映射到 OpenAI 兼容（与 serde alias
+            // 一致，保证旧配置可加载；原生端点不兼容 OpenAI 协议，用户需改配）。
+            "anthropic" | "claude" => Some(ProviderKind::OpenAiCompatible),
             "deepseek" => Some(ProviderKind::DeepSeek),
             "zhipu" | "glm" => Some(ProviderKind::Zhipu),
             "ollama" => Some(ProviderKind::Ollama),
@@ -165,7 +170,6 @@ impl ProviderKind {
     pub fn default_base_url(&self) -> &'static str {
         match self {
             ProviderKind::OpenAi => "https://api.openai.com/v1",
-            ProviderKind::Anthropic => "https://api.anthropic.com",
             ProviderKind::DeepSeek => "https://api.deepseek.com/v1",
             ProviderKind::Zhipu => "https://open.bigmodel.cn/api/paas/v4",
             ProviderKind::Ollama => "http://localhost:11434/v1",
@@ -180,7 +184,7 @@ impl ProviderKind {
 // `rename_all = "camelCase"`：前端 (`src/api/types.ts` 的 `ProviderConfig`) 使用
 // baseUrl / apiKey（camelCase）。之前这里漏了 rename，导致后端期望 base_url/api_key
 // （snake_case），前端发来 baseUrl 时 serde 报 "missing field `base_url`"。
-/// 单次请求最大输出 tokens 的默认值（Claude 必传 max_tokens，其它厂商也发送）。
+/// 单次请求最大输出 tokens 的默认值（请求体 `max_tokens`，各兼容厂商通用）。
 const DEFAULT_MAX_OUTPUT: u32 = 16_000;
 /// 上下文窗口大小（tokens）默认值：超出部分的历史消息会在发送前被裁剪。
 const DEFAULT_CONTEXT_WINDOW: u32 = 184_000;
@@ -200,9 +204,9 @@ pub struct ProviderConfig {
     pub base_url: String,
     /// API Key（Ollama 等本地服务可留空）。
     pub api_key: String,
-    /// 模型名，如 `gpt-4o-mini`、`claude-3-5-sonnet-20241022`、`deepseek-chat`。
+    /// 模型名，如 `gpt-4o-mini`、`deepseek-chat`、`glm-4`。
     pub model: String,
-    /// 单次请求最大输出 tokens（请求体 `max_tokens`）。Claude 必传该字段。
+    /// 单次请求最大输出 tokens（请求体 `max_tokens`）。
     #[serde(default = "default_max_output")]
     pub max_output: u32,
     /// 上下文窗口大小（tokens）。发送前按 token 估算裁剪历史消息，超出部分丢弃最旧消息。
@@ -328,17 +332,13 @@ pub trait LlmProvider: Send + Sync {
 // 工厂函数
 // ===========================================================================
 
-/// 根据配置构造对应的 Provider 实现。
+/// 根据配置构造 Provider 实现。
 ///
-/// 路由规则：
-/// - `Anthropic` → [`crate::ai::claude::ClaudeProvider`]
-/// - 其它所有种类（OpenAi / DeepSeek / Zhipu / Ollama / OpenAiCompatible）
-///   → [`crate::ai::openai::OpenAiProvider`]（OpenAI 兼容协议）
+/// 所有种类（OpenAi / DeepSeek / Zhipu / Ollama / OpenAiCompatible）统一走
+/// [`crate::ai::openai::OpenAiProvider`]（OpenAI 兼容协议）；Anthropic 原生
+/// Messages 协议已移除。
 pub fn build_provider(cfg: &ProviderConfig) -> AppResult<Box<dyn LlmProvider>> {
-    match cfg.kind {
-        ProviderKind::Anthropic => Ok(Box::new(crate::ai::claude::ClaudeProvider::new(cfg))),
-        _ => Ok(Box::new(crate::ai::openai::OpenAiProvider::new(cfg))),
-    }
+    Ok(Box::new(crate::ai::openai::OpenAiProvider::new(cfg)))
 }
 
 /// 配置合法性检查的便捷入口（可选使用）。

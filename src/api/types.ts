@@ -70,7 +70,6 @@ export interface ForwardRule {
 
 export enum ProviderKind {
   OpenAi = "openai",
-  Anthropic = "anthropic",
   DeepSeek = "deepseek",
   Zhipu = "zhipu",
   Ollama = "ollama",

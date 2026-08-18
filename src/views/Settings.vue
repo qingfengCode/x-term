@@ -281,7 +281,6 @@ const providerRules: FormRules = {
 // ProviderKind 选项
 const providerKindOptions: { value: ProviderKindType; label: string }[] = [
   { value: ProviderKind.OpenAi, label: "OpenAI" },
-  { value: ProviderKind.Anthropic, label: "Anthropic" },
   { value: ProviderKind.DeepSeek, label: "DeepSeek" },
   { value: ProviderKind.Zhipu, label: "智谱 (Zhipu)" },
   { value: ProviderKind.Ollama, label: "Ollama" },
@@ -292,8 +291,6 @@ function defaultBaseUrl(kind: ProviderKindType): string {
   switch (kind) {
     case ProviderKind.OpenAi:
       return "https://api.openai.com/v1";
-    case ProviderKind.Anthropic:
-      return "https://api.anthropic.com";
     case ProviderKind.DeepSeek:
       return "https://api.deepseek.com/v1";
     case ProviderKind.Zhipu:

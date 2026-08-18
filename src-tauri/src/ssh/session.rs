@@ -85,6 +85,17 @@ impl OutputRing {
         self.total
     }
 
+    /// 取整个缓冲的**原始字节**快照与当前累计字节数（供前端 attach 回放）。
+    ///
+    /// 与 [`Self::snapshot`] 的区别：不经过 UTF-8 lossy 转换——终端输出是
+    /// 字节流（含 ANSI 转义/二进制），lossy 会破坏控制序列；`total` 与字节
+    /// 快照在同一锁内读取，二者原子一致（total 恰好覆盖快照的全部内容）。
+    /// 调用方（terminal_attach）把 total 作为基线返回，前端用它过滤掉
+    /// 基线之前已包含在快照里的重复事件块。
+    pub fn snapshot_raw_with_total(&self) -> (Vec<u8>, usize) {
+        (self.buf.iter().copied().collect(), self.total)
+    }
+
     /// 取最近 `max_bytes` 字节的快照（UTF-8 lossy 转 String）。
     pub fn snapshot(&self, max_bytes: usize) -> String {
         let take = max_bytes.min(self.buf.len());
@@ -416,6 +427,17 @@ impl SshSession {
         }
     }
 
+    /// 取原始字节快照 + 累计字节数（同一锁内，原子一致）。
+    ///
+    /// 供前端 attach 回放（terminal_attach 命令）：连接建立到前端监听注册
+    /// 之间的输出（SSH banner/MOTD/提示符）不在事件流里，由本快照补齐。
+    pub fn attach_snapshot(&self) -> (Vec<u8>, usize) {
+        match self.output_buffer.lock() {
+            Ok(buf) => buf.snapshot_raw_with_total(),
+            Err(_) => (Vec::new(), 0),
+        }
+    }
+
     /// 返回环形缓冲累计写入的字节数（不受环形截断影响）。
     ///
     /// 与 [`Self::output_offset`] 的区别：缓冲写满后 `output_offset` 恒等于
@@ -520,11 +542,13 @@ impl SshSession {
         let join = tokio::spawn(async move {
             let mut exit_code: Option<u32> = None;
 
-            // 把数据写入输出环形缓冲（如果锁可用）。
-            let record_output = |bytes: &[u8]| {
-                if let Ok(mut buf) = output_buffer.lock() {
+            // 把数据写入输出环形缓冲（如果锁可用），返回追加后的累计字节数
+            // （与事件一起 emit，前端 attach 回放的去重基线）。
+            let record_output = |bytes: &[u8]| -> Option<usize> {
+                output_buffer.lock().ok().map(|mut buf| {
                     buf.push(bytes);
-                }
+                    buf.total_bytes()
+                })
             };
 
             // 待写数据队列：远端窗口（flow control）耗尽时写入停在此处，
@@ -545,7 +569,7 @@ impl SshSession {
                     msg = channel.wait() => {
                         match msg {
                             Some(ChannelMsg::Data { ref data }) => {
-                                record_output(data.as_ref());
+                                let total = record_output(data.as_ref());
                                 let encoded = B64.encode(data);
                                 events::emit(
                                     &app,
@@ -553,11 +577,12 @@ impl SshSession {
                                     TerminalDataEvent {
                                         session_id: session_id.clone(),
                                         data: encoded,
+                                        total: total.unwrap_or(0),
                                     },
                                 );
                             }
                             Some(ChannelMsg::ExtendedData { ref data, .. }) => {
-                                record_output(data.as_ref());
+                                let total = record_output(data.as_ref());
                                 let encoded = B64.encode(data);
                                 events::emit(
                                     &app,
@@ -565,6 +590,7 @@ impl SshSession {
                                     TerminalDataEvent {
                                         session_id: session_id.clone(),
                                         data: encoded,
+                                        total: total.unwrap_or(0),
                                     },
                                 );
                             }

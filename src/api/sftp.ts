@@ -51,3 +51,12 @@ export function sftpUpload(params: UploadParams): Promise<void> {
 export function sftpClose(sftpId: string): Promise<void> {
   return invoke<void>("sftp_close", { sftpId });
 }
+
+/**
+ * 取消一个进行中的 SFTP 传输任务。
+ * 置位取消标志后立即返回；传输在下一个块边界（≤64 KiB）退出并清理半截文件
+ * （下载删本地、上传删远端）。任务已结束则幂等成功。
+ */
+export function sftpTransferCancel(taskId: string): Promise<void> {
+  return invoke<void>("sftp_transfer_cancel", { taskId });
+}

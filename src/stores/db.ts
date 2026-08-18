@@ -1,5 +1,5 @@
 import { defineStore } from "pinia";
-import { computed, ref } from "vue";
+import { computed, reactive, ref } from "vue";
 import * as dbApi from "@/api/db";
 import type { DbProfile } from "@/api/types";
 
@@ -91,7 +91,9 @@ export const useDbStore = defineStore("db", () => {
   }
 
   async function doOpen(profile: DbProfile, database: string | null): Promise<string> {
-    const tab: DbTab = {
+    // reactive 化后再 push（与 terminals store 同理：raw 对象的属性赋值
+    // 不触发响应，tab 的 connId/connecting/error 更新会滞留）。
+    const tab = reactive<DbTab>({
       id: genId(),
       connId: null,
       profileId: profile.id,
@@ -99,7 +101,7 @@ export const useDbStore = defineStore("db", () => {
       database,
       connecting: true,
       error: null,
-    };
+    });
     tabs.value.push(tab);
     activeTabId.value = tab.id;
 

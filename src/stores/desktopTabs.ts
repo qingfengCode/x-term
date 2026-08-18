@@ -1,5 +1,5 @@
 import { defineStore } from "pinia";
-import { ref } from "vue";
+import { reactive, ref } from "vue";
 import * as rdpApi from "@/api/rdp";
 import * as vncApi from "@/api/vnc";
 import type { Desktop } from "@/api/remote_desktop";
@@ -73,7 +73,9 @@ export const useDesktopTabsStore = defineStore("desktopTabs", () => {
       activeId.value = existed.instanceId;
       return;
     }
-    const tab: DesktopTab = {
+    // reactive 化后再 push（与 terminals store 同理：raw 对象的属性赋值
+    // 不触发响应，TabBar 状态点会滞留到下一次数组变更）。
+    const tab = reactive<DesktopTab>({
       instanceId: "",
       desktopId: desktop.id,
       name: desktop.name,
@@ -88,7 +90,7 @@ export const useDesktopTabsStore = defineStore("desktopTabs", () => {
       disconnected: false,
       reconnecting: false,
       desktopSize: desktop.desktopSize ?? undefined,
-    };
+    });
     tabs.value.push(tab);
     activeId.value = tab.instanceId; // 临时空，连接成功后更新
 
@@ -173,23 +175,44 @@ export const useDesktopTabsStore = defineStore("desktopTabs", () => {
     }
   }
 
-  async function close(instanceId: string) {
-    const idx = tabs.value.findIndex((t) => t.instanceId === instanceId);
-    if (idx < 0) return;
+  /**
+   * 关闭标签。返回是否找到并移除了目标（找不到由调用方提示）。
+   *
+   * key 可为 instanceId、desktopId 或 TabBar 的复合键（instanceId || desktopId）。
+   * desktopId 兜底消除"桥接完成的瞬间旧 key（desktopId）落空"的键竞态
+   * （与 terminals store 的 close 同理，见其注释）。
+   */
+  async function close(key: string): Promise<boolean> {
+    const idx = tabs.value.findIndex(
+      (t) =>
+        t.instanceId === key ||
+        t.desktopId === key ||
+        (t.instanceId || t.desktopId) === key
+    );
+    if (idx < 0) return false;
     const [removed] = tabs.value.splice(idx, 1);
     await stopBackend(removed);
-    if (activeId.value === instanceId) {
+    if (activeId.value === removed.instanceId) {
       activeId.value = tabs.value[idx]?.instanceId ?? tabs.value[idx - 1]?.instanceId ?? null;
     }
+    return true;
   }
 
-  /** 关闭除指定标签外的所有标签。 */
-  async function closeOthers(instanceId: string) {
-    const keep = tabs.value.find((t) => t.instanceId === instanceId);
-    const rest = tabs.value.filter((t) => t.instanceId !== instanceId);
+  /**
+   * 关闭除指定标签外的所有标签。
+   * key 可为 instanceId 或复合键（见 close）。
+   */
+  async function closeOthers(key: string) {
+    const keep = tabs.value.find(
+      (t) =>
+        t.instanceId === key ||
+        t.desktopId === key ||
+        (t.instanceId || t.desktopId) === key
+    );
+    const rest = tabs.value.filter((t) => t !== keep);
     tabs.value = keep ? [keep] : [];
     await Promise.all(rest.map((t) => stopBackend(t)));
-    activeId.value = instanceId;
+    activeId.value = keep?.instanceId ?? null;
   }
 
   /** 关闭所有标签。 */
@@ -204,11 +227,26 @@ export const useDesktopTabsStore = defineStore("desktopTabs", () => {
   async function closeByDesktopId(desktopId: string) {
     const matches = tabs.value.filter((t) => t.desktopId === desktopId);
     if (!matches.length) return;
-    for (const t of matches) await close(t.instanceId);
+    // 传复合键而非 instanceId：连接中的占位标签 instanceId 为空串，close("")
+    // 会命中**第一个**任意连接中的占位标签（可能是另一个桌面的），关错标签。
+    for (const t of matches) await close(t.instanceId || t.desktopId);
   }
 
-  function setActive(instanceId: string) {
-    activeId.value = instanceId;
+  /**
+   * 激活标签。
+   *
+   * key 可为 instanceId 或 TabBar 的复合键（instanceId || desktopId）。连接中
+   * 的占位标签点击时传入 desktopId，这里解析回它的 instanceId（空串），
+   * 保证 activeId 始终是某个标签的 instanceId，内容区的 v-show 才能命中。
+   */
+  function setActive(key: string) {
+    const tab = tabs.value.find(
+      (t) =>
+        (t.instanceId || t.desktopId) === key ||
+        t.instanceId === key ||
+        t.desktopId === key
+    );
+    activeId.value = tab?.instanceId ?? key;
   }
 
   /**
@@ -228,15 +266,23 @@ export const useDesktopTabsStore = defineStore("desktopTabs", () => {
   }
 
   /**
-   * 移动 tab（拖拽排序）：把 fromId 移到 toId 之前/之后。
+   * 移动 tab（拖拽排序）：把 fromKey 移到 toKey 之前/之后。
    * 拖拽中会连续触发，若目标已被移动过则按当前索引重算，保持跟手。
+   * key 可为 instanceId 或复合键（见 setActive）。
    */
-  function moveTab(fromId: string, toId: string, before: boolean) {
-    const from = tabs.value.findIndex((t) => t.instanceId === fromId);
-    const to = tabs.value.findIndex((t) => t.instanceId === toId);
+  function moveTab(fromKey: string, toKey: string, before: boolean) {
+    const match = (k: string) =>
+      tabs.value.findIndex(
+        (t) =>
+          t.instanceId === k ||
+          t.desktopId === k ||
+          (t.instanceId || t.desktopId) === k
+      );
+    const from = match(fromKey);
+    const to = match(toKey);
     if (from < 0 || to < 0 || from === to) return;
     const [tab] = tabs.value.splice(from, 1);
-    let idx = tabs.value.findIndex((t) => t.instanceId === toId);
+    let idx = match(toKey);
     if (!before) idx += 1;
     tabs.value.splice(idx, 0, tab);
   }

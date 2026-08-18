@@ -81,6 +81,14 @@ impl TerminalSession {
             TerminalSession::Local(s) => s.full_snapshot(),
         }
     }
+    /// 取原始字节快照 + 累计字节数（terminal_attach 命令用，前端 attach 回放）。
+    pub fn attach_snapshot(&self) -> (Vec<u8>, usize) {
+        match self {
+            TerminalSession::Ssh(s) => s.attach_snapshot(),
+            TerminalSession::Telnet(s) => s.attach_snapshot(),
+            TerminalSession::Local(s) => s.attach_snapshot(),
+        }
+    }
     /// 累计写入字节数（不受环形截断影响），判断"输出是否仍在增长"用。
     pub fn total_output_bytes(&self) -> usize {
         match self {
@@ -153,6 +161,12 @@ pub struct AppState {
     /// 需要在不长时间持锁的情况下取出引用。`SharedHandle` 用于关闭时 disconnect。
     pub sftp_sessions: Arc<Mutex<HashMap<String, (std::sync::Arc<SftpSession>, SharedHandle)>>>,
 
+    /// 进行中的 SFTP 传输任务：taskId -> 取消标志（前端"取消"按钮置位，
+    /// 传输循环在下一个块边界退出并清理半截文件）。任务结束（完成/失败/
+    /// 取消）后由命令层移除。
+    pub sftp_transfers:
+        Arc<Mutex<HashMap<String, crate::ssh::sftp::CancelFlag>>>,
+
     /// 正在运行的端口转发隧道：tunnelId -> Tunnel。
     pub tunnels: Arc<Mutex<HashMap<String, Tunnel>>>,
 
@@ -208,6 +222,24 @@ pub struct AppState {
         >,
     >,
 
+    /// 待前端回答的 AI 提问（ask_user_question）：toolCallId -> (requestId, oneshot)。
+    ///
+    /// 提问的执行体在**前端**（用户填写回答）——编排循环 emit `ai:tool_call` 后
+    /// 阻塞在此，等待前端通过 `ai_ask_user_respond` 命令回传答案。附带 requestId，
+    /// 使 `ai_stop` 能精确清理**属于被终止请求**的等待项（仿照
+    /// [`Self::pending_desktop_calls`]）。
+    pub pending_ask_user_calls: Arc<
+        Mutex<
+            HashMap<
+                String,
+                (
+                    String,
+                    tokio::sync::oneshot::Sender<crate::ai::tools::AskUserOutcome>,
+                ),
+            >,
+        >,
+    >,
+
     /// 正在运行的 AI 请求后台任务：requestId -> JoinHandle。
     ///
     /// `ai_chat` spawn 时登记，`ai_stop` 取出 handle 调 `abort()` 终止；
@@ -253,11 +285,14 @@ pub struct AppState {
     /// `rdp_bridge_start` 启动时登记，`rdp_bridge_stop` 移除（Drop 兜底回收）。
     pub rdp_bridges: Arc<Mutex<HashMap<String, crate::rdp::RdpBridge>>>,
 
-    /// 正被 MCP「终端绑定」执行占用的终端实例 id（并发保护）。
+    /// 正被 MCP「终端绑定」/ AI 可视化执行占用的终端实例 id（并发保护）。
     ///
-    /// 同一终端标签页同一时刻只允许一个 MCP 工具调用写入 PTY：多个并发写会
-    /// 导致输出交叉、哨兵检测互相干扰。执行结束（含超时/出错）后移除。
-    pub mcp_terminal_busy: Arc<tokio::sync::Mutex<HashMap<String, ()>>>,
+    /// 同一终端标签页同一时刻只允许一个调用写入 PTY：多个并发写会导致输出
+    /// 交叉、哨兵检测互相干扰。占用必须经 [`TerminalBusyGuard`] 释放——它的
+    /// Drop 保证 abort（ai_stop 终止 AI 请求会直接丢弃整个 future 树）与
+    /// panic 路径也能释放，否则占用永久残留、该终端后续所有命令永远报
+    /// "正被占用"，只能重启应用。
+    pub mcp_terminal_busy: Arc<Mutex<HashMap<String, ()>>>,
 
     /// settings.json 的路径（缓存的快捷访问）。
     pub settings_path: Arc<PathBuf>,
@@ -267,6 +302,46 @@ pub struct AppState {
     /// 终端/SFTP/隧道/AI 每次建立连接都会读设置（空闲断开、保活等），此前每次
     /// 都同步读盘 + 反序列化，会话并发时在 tokio worker 上造成 IO 抖动。
     pub settings_cache: Arc<parking_lot::RwLock<Option<crate::config::Settings>>>,
+}
+
+/// 终端忙锁（[`AppState::mcp_terminal_busy`]）的自动释放守卫。
+///
+/// 占用必须在调用结束时释放。手工在函数末尾 `remove` 的缺陷：调用方的
+/// future 可能被 **abort**（AI 请求点"终止"→ `ai_stop` → `join.abort()` 会
+/// 在 await 点直接丢弃整个 future 树；MCP 请求取消同理）——末尾代码永远
+/// 不执行，占用永久残留，该终端后续所有 AI 可视化命令 / MCP 终端命令
+/// 永远报"该终端正被占用"，只能重启应用。Drop 守卫保证任何退出路径
+/// （正常返回、错误、超时、abort、panic）都释放占用。
+///
+/// 锁用 parking_lot::Mutex：临界区只有 HashMap insert/remove（持锁期间无
+/// await），同步锁即可；parking_lot 无中毒语义，Drop 内 lock() 恒可用。
+pub struct TerminalBusyGuard {
+    map: Arc<Mutex<HashMap<String, ()>>>,
+    session_id: String,
+}
+
+impl Drop for TerminalBusyGuard {
+    fn drop(&mut self) {
+        self.map.lock().remove(&self.session_id);
+    }
+}
+
+impl AppState {
+    /// 尝试占用指定终端（忙锁）。已占用返回 `None`（调用方给"请稍后再试"类
+    /// 引导）；成功返回 Drop 自动释放的守卫——**必须绑定到变量**（如
+    /// `let _guard = ...`）持有到调用结束，`_`（不绑定）会立即 drop 失效。
+    pub fn try_lock_terminal(&self, session_id: &str) -> Option<TerminalBusyGuard> {
+        {
+            let mut busy = self.mcp_terminal_busy.lock();
+            if busy.insert(session_id.to_string(), ()).is_some() {
+                return None;
+            }
+        }
+        Some(TerminalBusyGuard {
+            map: self.mcp_terminal_busy.clone(),
+            session_id: session_id.to_string(),
+        })
+    }
 }
 
 impl AppState {
@@ -283,11 +358,13 @@ impl AppState {
             vault: Arc::new(RwLock::new(None)),
             terminals: Arc::new(Mutex::new(HashMap::new())),
             sftp_sessions: Arc::new(Mutex::new(HashMap::new())),
+            sftp_transfers: Arc::new(Mutex::new(HashMap::new())),
             tunnels: Arc::new(Mutex::new(HashMap::new())),
             file_backends: Arc::new(Mutex::new(HashMap::new())),
             mysql_conns: Arc::new(Mutex::new(HashMap::new())),
             pending_tool_calls: Arc::new(Mutex::new(HashMap::new())),
             pending_desktop_calls: Arc::new(Mutex::new(HashMap::new())),
+            pending_ask_user_calls: Arc::new(Mutex::new(HashMap::new())),
             pending_ai_tasks: Arc::new(Mutex::new(HashMap::new())),
             pending_auth_challenges: Arc::new(Mutex::new(HashMap::new())),
             pending_host_keys: Arc::new(Mutex::new(HashMap::new())),
@@ -295,7 +372,7 @@ impl AppState {
             approval_registry: Arc::new(crate::mcp::approval::ApprovalRegistry::new()),
             vnc_bridges: Arc::new(Mutex::new(HashMap::new())),
             rdp_bridges: Arc::new(Mutex::new(HashMap::new())),
-            mcp_terminal_busy: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            mcp_terminal_busy: Arc::new(Mutex::new(HashMap::new())),
             settings_path: Arc::new(settings_path),
             settings_cache: Arc::new(parking_lot::RwLock::new(None)),
         }

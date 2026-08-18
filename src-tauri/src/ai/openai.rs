@@ -153,6 +153,24 @@ struct ChatRequest<'a> {
 struct StreamChunk {
     #[serde(default)]
     choices: Vec<Choice>,
+    /// 用量统计（OpenAI 在流末尾带 finish_reason 的 chunk 上携带）。
+    /// 用 `Value` 容错接收：部分兼容服务器的 usage 格式不标准（缺字段/类型
+    /// 异常），强类型反序列化失败会连带丢掉整个 chunk 的**文本**——那是不可
+    /// 接受的。数字提取见 [`extract_usage`]。
+    #[serde(default)]
+    usage: Option<serde_json::Value>,
+}
+
+/// 从 OpenAI usage 字段手动提取 `(prompt_tokens, completion_tokens)`。
+/// 字段缺失按 0 计；两者都取不到（或均为 0）返回 None（不发事件）。
+fn extract_usage(u: &serde_json::Value) -> Option<(u64, u64)> {
+    let prompt = u.get("prompt_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let completion = u.get("completion_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0);
+    if prompt == 0 && completion == 0 {
+        None
+    } else {
+        Some((prompt, completion))
+    }
 }
 
 /// 单个 choice。
@@ -231,6 +249,10 @@ impl LlmProvider for OpenAiProvider {
         let mut stream = response.bytes_stream();
         let mut buffer: Vec<u8> = Vec::with_capacity(8 * 1024);
         let mut full_text = String::new();
+        // token 用量（token-meter）：兼容服务器可能在多个 chunk 携带 usage（中间
+        // 的可能是部分累计值），只保留**最后一次**、流结束时统一发射一次，避免
+        // 前端重复累计；不返回 usage 的服务器则完全不发。
+        let mut last_usage: Option<(u64, u64)> = None;
 
         while let Some(chunk_res) = stream.next().await {
             let chunk = match chunk_res {
@@ -262,6 +284,11 @@ impl LlmProvider for OpenAiProvider {
                     continue;
                 }
                 if payload == "[DONE]" {
+                    // 流结束：发射最后捕获的 usage 后收尾（直接 return，
+                    // 循环末尾的补发块不会执行）。
+                    if let Some((p, c)) = last_usage {
+                        emit_usage(&app, &request_id, p, c);
+                    }
                     emit_done(&app, &request_id, &full_text);
                     return Ok(full_text);
                 }
@@ -278,6 +305,13 @@ impl LlmProvider for OpenAiProvider {
                         continue;
                     }
                 };
+                // usage 只在流末尾的 chunk 出现（token-meter，借鉴 dsh llm/token-meter）。
+                // 用 Value 容错提取并记住最后一次，流结束时统一发射（见 [DONE] /
+                // 循环末尾），不在此处立即发射——兼容服务器可能多次携带 usage，
+                // 立即发射会导致前端重复累计。
+                if let Some(u) = parsed.usage.as_ref().and_then(extract_usage) {
+                    last_usage = Some(u);
+                }
                 if let Some(choice) = parsed.choices.into_iter().next() {
                     if let Some(delta) = choice.delta.content {
                         if !delta.is_empty() {
@@ -290,6 +324,10 @@ impl LlmProvider for OpenAiProvider {
         }
 
         // 流自然结束但未收到 [DONE]：只要已经产出内容，视为正常完成。
+        // （[DONE] 分支已直接 return，不存在双发。）
+        if let Some((p, c)) = last_usage {
+            emit_usage(&app, &request_id, p, c);
+        }
         emit_done(&app, &request_id, &full_text);
         Ok(full_text)
     }
@@ -393,6 +431,10 @@ impl LlmProvider for OpenAiProvider {
         // index → (id, name, arguments_buffer)
         let mut tool_buffers: BTreeMap<u32, ToolBuf> = BTreeMap::new();
         let mut finish_reason: Option<String> = None;
+        // token 用量（token-meter）：与 chat_stream 同策略——记住最后一次、
+        // 流结束时统一发射一次（兼容服务器可能多次携带 usage）。
+        let mut last_usage: Option<(u64, u64)> = None;
+        let mut usage_emitted = false;
         // [DONE] 是流结束标记，但只出现在某一行内：需跳出内层行循环后
         // 再跳出外层 chunk 循环，否则残留 buffer 会被继续解析。
         let mut done = false;
@@ -423,6 +465,12 @@ impl LlmProvider for OpenAiProvider {
                 }
                 if payload == "[DONE]" {
                     // 流结束。
+                    if !usage_emitted {
+                        if let Some((p, c)) = last_usage {
+                            emit_usage(&app, &request_id, p, c);
+                        }
+                        usage_emitted = true;
+                    }
                     done = true;
                     break;
                 }
@@ -437,6 +485,11 @@ impl LlmProvider for OpenAiProvider {
                         continue;
                     }
                 };
+                // token 用量（token-meter）：Value 容错提取 + 记住最后一次，
+                // 流结束时统一发射（见 [DONE] / 循环末尾）。
+                if let Some(u) = parsed.usage.as_ref().and_then(extract_usage) {
+                    last_usage = Some(u);
+                }
                 if let Some(choice) = parsed.choices.into_iter().next() {
                     if let Some(reason) = choice.finish_reason {
                         finish_reason = Some(reason);
@@ -469,6 +522,13 @@ impl LlmProvider for OpenAiProvider {
 
             if done {
                 break;
+            }
+        }
+
+        // 流自然结束（未收到 [DONE]）：补发 usage（若未发过）。
+        if !usage_emitted {
+            if let Some((p, c)) = last_usage {
+                emit_usage(&app, &request_id, p, c);
             }
         }
 
@@ -571,6 +631,19 @@ fn emit_error(app: &tauri::AppHandle, request_id: &str, message: &str) {
         AiErrorEvent {
             request_id: request_id.to_string(),
             message: message.to_string(),
+        },
+    );
+}
+
+/// 发射 ai:usage 事件（单次请求的 token 用量，前端按会话累计）。
+fn emit_usage(app: &tauri::AppHandle, request_id: &str, prompt_tokens: u64, completion_tokens: u64) {
+    events::emit(
+        app,
+        events::AI_USAGE,
+        crate::events::AiUsageEvent {
+            request_id: request_id.to_string(),
+            prompt_tokens,
+            completion_tokens,
         },
     );
 }
@@ -680,6 +753,9 @@ struct OpenAiFunction<'a> {
 struct StreamChunkTools {
     #[serde(default)]
     choices: Vec<ChoiceTools>,
+    /// 用量统计（流末尾 chunk 携带；Value 容错，同 [`StreamChunk::usage`]）。
+    #[serde(default)]
+    usage: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -788,5 +864,54 @@ mod tests {
         let json = serde_json::to_string(&body).unwrap();
         assert!(json.contains(r#""content":[{"type":"text""#), "{json}");
         assert!(json.contains(r#""type":"image_url""#), "{json}");
+    }
+
+    /// 流末尾 chunk 的 usage 可解析（token-meter 数据源）。
+    #[test]
+    fn parses_stream_usage() {
+        let json = r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":34,"total_tokens":46}}"#;
+        let parsed: StreamChunk = serde_json::from_str(json).unwrap();
+        let (p, c) = parsed.usage.as_ref().and_then(extract_usage).expect("usage 应被解析");
+        assert_eq!((p, c), (12, 34));
+    }
+
+    /// 厂商不返回 usage 时缺省为 None（不 panic、不报错）。
+    #[test]
+    fn stream_usage_optional() {
+        let json = r#"{"choices":[{"delta":{"content":"hi"}}]}"#;
+        let parsed: StreamChunk = serde_json::from_str(json).unwrap();
+        assert!(parsed.usage.is_none());
+    }
+
+    /// usage 格式异常（缺字段/类型不对）时**不影响文本 chunk 解析**（Value 容错），
+    /// 提取按缺省 0 计，全 0 时返回 None。
+    #[test]
+    fn malformed_usage_never_kills_chunk() {
+        // usage 是数组（完全非标准）：chunk 仍能解析出文本。
+        let json = r#"{"choices":[{"delta":{"content":"hi"}}],"usage":[1,2]}"#;
+        let parsed: StreamChunk = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.choices.len(), 1);
+        // usage 缺 completion_tokens：只提取到 prompt。
+        let parsed: StreamChunk = serde_json::from_str(
+            r#"{"choices":[],"usage":{"prompt_tokens":5}}"#,
+        ).unwrap();
+        assert_eq!(
+            parsed.usage.as_ref().and_then(extract_usage),
+            Some((5, 0))
+        );
+        // usage 为 null：视为无。
+        let parsed: StreamChunk = serde_json::from_str(r#"{"choices":[],"usage":null}"#).unwrap();
+        assert!(parsed.usage.is_none());
+    }
+
+    /// tools 版 chunk 同样携带 usage（agent 多轮场景的用量来源）。
+    #[test]
+    fn parses_stream_tools_usage() {
+        let json = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"x"}]}}],"usage":{"prompt_tokens":5,"completion_tokens":7}}"#;
+        let parsed: StreamChunkTools = serde_json::from_str(json).unwrap();
+        let (p, c) = parsed.usage.as_ref().and_then(extract_usage).expect("usage 应被解析");
+        assert_eq!((p, c), (5, 7));
+        // usage 在流末尾 chunk，与 choices 并存时互不影响。
+        assert_eq!(parsed.choices.len(), 1);
     }
 }
