@@ -2,9 +2,11 @@ import { defineStore } from "pinia";
 import { reactive, ref } from "vue";
 import * as localApi from "@/api/local";
 import * as sessionApi from "@/api/session";
+import * as terminalApi from "@/api/terminal";
 import { AuthType, type Session } from "@/api/types";
 import { useSettingsStore } from "@/stores/settings";
 import { isAuthError } from "@/utils/error";
+import { bytesToBase64 } from "@/utils/binary";
 
 /**
  * 打开的终端 Tab。
@@ -115,6 +117,9 @@ export const useTerminalsStore = defineStore("terminals", () => {
       }
       tab.instanceId = instanceId;
       activeId.value = instanceId;
+      // 启动脚本：连接成功后自动执行（此前该字段只有存储/编辑 UI，
+      // 从未被执行——用户填了脚本却静默无效）。
+      runStartupScript(instanceId, session.startupScript);
       // 记录最近成功连接的会话（供 Ctrl+T 快速重连 / 侧栏"最近"列表）。
       const settings = useSettingsStore();
       settings.recordRecentSession(session.id);
@@ -154,6 +159,21 @@ export const useTerminalsStore = defineStore("terminals", () => {
     } catch {
       /* 已断开或已被 close() 清理，忽略 */
     }
+  }
+
+  /**
+   * 执行会话配置的启动脚本（连接成功后调用）。
+   *
+   * 直接写入 PTY：tty 的输入队列会保留字节，shell 完成初始化（读取
+   * profile/banner）后按序消费，无需轮询提示符。末尾追加 CR 触发执行。
+   */
+  function runStartupScript(instanceId: string, script: string | null | undefined) {
+    const cmd = script?.trim();
+    if (!cmd || !instanceId) return;
+    const b64 = bytesToBase64(new TextEncoder().encode(cmd + "\r"));
+    terminalApi.terminalWrite(instanceId, b64).catch(() => {
+      /* 连接瞬间断开等：脚本执行失败不阻断会话 */
+    });
   }
 
   /** 合成占位会话（不来自 DB，仅承载 tab 展示信息）。
@@ -291,6 +311,8 @@ export const useTerminalsStore = defineStore("terminals", () => {
       tab.disconnected = false;
       tab.error = null;
       activeId.value = newId;
+      // 重连后同样执行启动脚本（与首次连接行为一致）。
+      runStartupScript(newId, tab.session.startupScript);
     } catch (e) {
       tab.error = String(e);
       if (isAuthError(e)) {
@@ -411,6 +433,7 @@ export const useTerminalsStore = defineStore("terminals", () => {
       tab.disconnected = false;
       tab.error = null;
       activeId.value = instanceId;
+      runStartupScript(instanceId, tab.session.startupScript);
       manualAuth.value = null;
       return true;
     } catch (e) {
@@ -426,6 +449,14 @@ export const useTerminalsStore = defineStore("terminals", () => {
       return false;
     } finally {
       req.busy = false;
+    }
+  }
+
+  /** 关闭某个会话配置对应的全部已开 tab（删除会话配置时调用）。 */
+  async function closeBySessionId(sessionId: string) {
+    const matches = tabs.value.filter((t) => t.session.id === sessionId);
+    for (const t of matches) {
+      await close(t.instanceId || t.session.id);
     }
   }
 
@@ -476,6 +507,7 @@ export const useTerminalsStore = defineStore("terminals", () => {
     open,
     openLocal,
     close,
+    closeBySessionId,
     setActive,
     markDisconnected,
     handleTerminalClosed,

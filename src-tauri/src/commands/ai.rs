@@ -50,6 +50,21 @@ use crate::state::AppState;
 /// 工具确认默认超时（5 分钟）。超时视为拒绝。
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// 确认/提问**超时**（区别于用户明确拒绝）时回填给模型的引导文案。
+///
+/// 超时意味着用户大概率离开/未注意——若与"拒绝"混为一谈（旧实现两种情况共用
+/// 一条文案），模型会把超时当作用户否决：道歉、换思路、重新规划、再次发起
+/// 调用……再次超时，形成"决策反刍"死循环（大量轮次/token 空转）。超时的正确
+/// 引导是**停止推进**：总结进度，或改用 ask_user_question 询问用户是否继续。
+const APPROVAL_TIMEOUT_FEEDBACK: &str = "确认超时（用户长时间未响应，可能已离开）。请勿重试该操作，也不要再发起任何需要确认的调用；请基于已有信息总结当前进度并结束，或调用 ask_user_question 询问用户是否继续。";
+
+/// 确认通道**异常关闭**（oneshot sender 在无用户操作时被 drop）时的回填文案。
+///
+/// 与超时区分：超时是用户 5 分钟未响应（正常路径）；通道关闭意味着注册的
+/// sender 被外部移除（请求终止/内部错误），等待会**立即**结束——旧实现与
+/// 超时共用文案，"卡片刚弹出就显示确认超时"的误导即来源于此。
+const APPROVAL_CHANNEL_CLOSED_FEEDBACK: &str = "确认通道异常关闭（请求可能已被终止或内部错误）。请重新发送请求；若持续出现，请重启应用。";
+
 /// 同一轮 tool_calls 的并发执行上限（借鉴 dsh `maxParallelToolCalls` 的默认 10，
 /// 取 6 兼顾"多命令并行提速"与"同时打开的 SSH 连接 / 确认卡片不过量"）。
 /// 超过上限的调用排队等待，前序调用结束后立即执行（信号量语义）。
@@ -183,10 +198,18 @@ pub async fn ai_chat(
 /// 确认执行某个工具调用（前端"批准"按钮触发）。
 #[tauri::command]
 pub async fn ai_execute_tool(tool_call_id: String, state: State<'_, AppState>) -> AppResult<()> {
-    if let Some((_, tx)) = state.pending_tool_calls.lock().remove(&tool_call_id) {
-        let _ = tx.send(ToolApproval { approved: true });
+    match state.pending_tool_calls.lock().remove(&tool_call_id) {
+        Some((_, tx)) => {
+            let _ = tx.send(ToolApproval { approved: true });
+            Ok(())
+        }
+        // 找不到等待项 = 僵尸卡片批准（轮次已超时/请求已终止/已处理过）。
+        // 旧实现静默 Ok：前端卡片进入"执行中"但命令根本不会执行，用户
+        // 对着永不变更的卡片干等。返回明确错误让前端提示重发请求。
+        None => Err(AppError::NotFound(
+            "该确认已过期（等待超时或请求已结束），命令未执行；请重新发送请求".into(),
+        )),
     }
-    Ok(())
 }
 
 /// 取消某个工具调用（前端"拒绝"按钮触发）。
@@ -832,8 +855,14 @@ async fn run_agent_loop(
         for call in &resp.tool_calls {
             // 重复调用守卫：先观察（被拒绝/被拦截的调用同样计数——模型反复重试
             // 同一被拒调用正是要打断的循环，与 dsh 的 denied-calls-count 一致）。
-            if let Some(reminder) = repeat_guard.observe(&call.name, &call.arguments) {
-                reminders.push(reminder);
+            match repeat_guard.observe(&call.name, &call.arguments) {
+                GuardAction::Allow => {}
+                GuardAction::Remind(reminder) => reminders.push(reminder),
+                // 强制拦截：直接记为预拒绝（拦截说明回填给模型），不再进入执行。
+                GuardAction::Block(msg) => {
+                    items.push(RoundItem::Rejected { call, msg });
+                    continue;
+                }
             }
             // plan_call：allowed 校验（幻觉调用直接拒绝）+ 域分发 / SQL 模式拦截 /
             // 白名单与运行模式判定（纯函数，决策逻辑独立于并发编排，见单元测试）。
@@ -924,9 +953,11 @@ async fn run_agent_loop(
             };
             slots.push(slot);
         }
-        // 所有调用的确认/执行共享同一截止时间（轮起点 + APPROVAL_TIMEOUT），
-        // 避免排在并发队列后面的调用额外获得更长的等待窗口。
-        let deadline = tokio::time::Instant::now() + APPROVAL_TIMEOUT;
+        // 确认等待窗口：每个调用**各自开始等待时**独立起算 APPROVAL_TIMEOUT
+        //（见下方 async 块里的 timeout 调用）。旧实现是"轮起点共享截止"——
+        // 多工具时前序调用的执行时间（长命令最多 180s）会挤占后续卡片的等待
+        // 窗口：用户盯着第 1 条执行完再点后面的卡片，早已过共享截止，表现为
+        // "卡片刚弹出来待确认就过期"。
         // 并发上限：同一时刻最多 MAX_PARALLEL_TOOL_CALLS 个调用在等待确认/执行
         // （防止大批调用同时打开 SSH 连接 / 确认卡片积压）。
         let semaphore =
@@ -943,7 +974,6 @@ async fn run_agent_loop(
             let slot = slots[i].take();
             let wait_gate = wait_gates[i].take();
             let signal_gate = signal_gates[i].take();
-            let serial = pc.serial;
             async move {
                 // 串行闸门：等链上上一个调用完整结束（确认 + 执行）再开始。前序
                 // future 被整体取消（ai_stop abort）时 sender 随之 drop，await
@@ -951,22 +981,13 @@ async fn run_agent_loop(
                 if let Some(gate) = wait_gate {
                     let _ = gate.await;
                 }
-                // 串行链上的调用从「闸门打开时」起算独立的确认/执行窗口，与旧
-                // 串行实现语义一致——否则排在前面的命令会把后面调用的窗口挤占
-                // 掉（共享截止时间下，链条越靠后可用时间越少）。并行调用仍用
-                // 轮起点的共享截止。
-                let deadline = if serial {
-                    tokio::time::Instant::now() + APPROVAL_TIMEOUT
-                } else {
-                    deadline
-                };
                 // 等待并发名额（permit 持有到本调用结束）。闸门在名额之前：
                 // 串行链同一时刻至多占用一个名额，不挤占并行调用。
                 let _permit = semaphore.acquire().await.map_err(|_| ()).ok();
                 let mut screenshot_image: Option<crate::ai::provider::ImagePart> = None;
                 let result = match slot {
                     Some(CallSlot::Desktop(rx)) => {
-                        let outcome = tokio::time::timeout_at(deadline, rx).await;
+                        let outcome = tokio::time::timeout(APPROVAL_TIMEOUT, rx).await;
                         state.pending_desktop_calls.lock().remove(&pc.call.id);
                         match outcome {
                             Ok(Ok(out)) if out.approved => {
@@ -978,17 +999,20 @@ async fn run_agent_loop(
                                     output: out.output,
                                 }
                             }
-                            _ => {
-                                // 用户拒绝 / 前端未回执（会话关闭等）/ 确认超时。
-                                ToolResult {
-                                    ok: false,
-                                    output: "用户拒绝了该操作或确认超时".into(),
-                                }
-                            }
+                            // 用户明确拒绝：如实回填，模型可调整方案。
+                            Ok(Ok(_)) => ToolResult {
+                                ok: false,
+                                output: "用户拒绝了该桌面操作".into(),
+                            },
+                            // 超时/前端未回执（会话关闭等）：引导停止而非重试。
+                            _ => ToolResult {
+                                ok: false,
+                                output: APPROVAL_TIMEOUT_FEEDBACK.into(),
+                            },
                         }
                     }
                     Some(CallSlot::AskUser(rx)) => {
-                        let outcome = tokio::time::timeout_at(deadline, rx).await;
+                        let outcome = tokio::time::timeout(APPROVAL_TIMEOUT, rx).await;
                         state.pending_ask_user_calls.lock().remove(&pc.call.id);
                         match outcome {
                             Ok(Ok(out)) if out.answered => {
@@ -1000,20 +1024,32 @@ async fn run_agent_loop(
                                     ),
                                 }
                             }
-                            _ => {
-                                // 用户取消 / 请求被终止 / 确认超时。
-                                ToolResult {
-                                    ok: false,
-                                    output: "用户取消了提问或确认超时".into(),
-                                }
-                            }
+                            // 用户明确取消提问：如实回填。
+                            Ok(Ok(_)) => ToolResult {
+                                ok: false,
+                                output: "用户取消了本次提问".into(),
+                            },
+                            // 超时/请求被终止：引导停止而非换方式再问。
+                            _ => ToolResult {
+                                ok: false,
+                                output: APPROVAL_TIMEOUT_FEEDBACK.into(),
+                            },
                         }
                     }
                     Some(CallSlot::Approval(rx)) => {
-                        let approval = tokio::time::timeout_at(deadline, rx).await;
+                        // 诊断计时：四种结局（批准/拒绝/超时/通道关闭）各记一条
+                        // 日志——"卡片刚弹出就失败"类问题靠它定位真实结局与耗时。
+                        let started = std::time::Instant::now();
+                        let approval = tokio::time::timeout(APPROVAL_TIMEOUT, rx).await;
+                        let waited = started.elapsed();
                         state.pending_tool_calls.lock().remove(&pc.call.id);
                         match approval {
                             Ok(Ok(ToolApproval { approved: true })) => {
+                                log::info!(
+                                    "[ai:{request_id}] 工具 {} 已批准（等待 {:?}）",
+                                    pc.call.name,
+                                    waited
+                                );
                                 tools::execute_tool(
                                     &app,
                                     &state,
@@ -1025,11 +1061,41 @@ async fn run_agent_loop(
                                 )
                                 .await
                             }
-                            _ => {
-                                // 拒绝或超时。
+                            // 用户明确拒绝：如实回填，模型可调整方案。
+                            Ok(Ok(_)) => {
+                                log::info!(
+                                    "[ai:{request_id}] 工具 {} 被拒绝（等待 {:?}）",
+                                    pc.call.name,
+                                    waited
+                                );
                                 ToolResult {
                                     ok: false,
-                                    output: "用户拒绝了该操作或确认超时".into(),
+                                    output: "用户拒绝执行该操作".into(),
+                                }
+                            }
+                            // 通道异常关闭（sender 被外部 drop，无用户操作）：
+                            // 等待立即结束——与超时区分，避免"刚弹出就超时"误导。
+                            Ok(Err(_)) => {
+                                log::warn!(
+                                    "[ai:{request_id}] 工具 {} 确认通道关闭（等待 {:?}，                                     sender 被外部移除——请求终止/内部错误）",
+                                    pc.call.name,
+                                    waited
+                                );
+                                ToolResult {
+                                    ok: false,
+                                    output: APPROVAL_CHANNEL_CLOSED_FEEDBACK.into(),
+                                }
+                            }
+                            // 真超时（用户 5 分钟未响应）：引导停止而非重试。
+                            Err(_) => {
+                                log::info!(
+                                    "[ai:{request_id}] 工具 {} 确认超时（等待 {:?}）",
+                                    pc.call.name,
+                                    waited
+                                );
+                                ToolResult {
+                                    ok: false,
+                                    output: APPROVAL_TIMEOUT_FEEDBACK.into(),
                                 }
                             }
                         }
@@ -1259,6 +1325,19 @@ async fn chat_with_tools_with_retry(
                         log::warn!(
                             "[ai:{request_id}] 第 {attempt} 次调用失败，{delay:?} 后重试: {msg}"
                         );
+                        // 通知前端"刚才的报错会被自动重试"：provider 内部已 emit
+                        // 过 ai:error，前端按错误收尾了会话；不通知的话重试成功后
+                        // 的输出全部落在已结束的会话上，用户看不到结果。
+                        events::emit(
+                            app,
+                            events::AI_RETRYING,
+                            events::AiRetryingEvent {
+                                request_id: request_id.to_string(),
+                                attempt: attempt as u32,
+                                max_attempts: MAX_ATTEMPTS as u32,
+                                reason: msg.clone(),
+                            },
+                        );
                         tokio::time::sleep(delay).await;
                     }
                     ChatErrorKind::ContextTooLong if !degraded => {
@@ -1268,6 +1347,16 @@ async fn chat_with_tools_with_retry(
                         log::warn!(
                             "[ai:{request_id}] 上下文超限（{msg}），预算降至 {} 并摘要化旧轮次工具结果后重试",
                             context_budget
+                        );
+                        events::emit(
+                            app,
+                            events::AI_RETRYING,
+                            events::AiRetryingEvent {
+                                request_id: request_id.to_string(),
+                                attempt: attempt as u32,
+                                max_attempts: MAX_ATTEMPTS as u32,
+                                reason: "上下文超限，已自动压缩历史后重试".into(),
+                            },
                         );
                     }
                     _ => return Err(e),
@@ -1473,6 +1562,19 @@ fn trim_history_for_context(messages: &mut Vec<ChatMessage>, budget: usize) {
 ///   仍算两次连续 `grep X`；
 /// - 被拒绝/被拦截的调用同样计数（模型反复重试同一被拒调用正是要打断的循环）；
 /// - 按请求实例隔离（每次 `run_agent_loop` 新建），无跨请求状态。
+/// 守卫对一次调用的处置。
+#[derive(Debug)]
+pub(crate) enum GuardAction {
+    /// 放行（正常执行）。
+    Allow,
+    /// 注入提醒文本（轮末作为 user 消息，建议性打断）。
+    Remind(String),
+    /// 强制拦截：该调用不再执行，拦截说明直接作为 tool 结果回填。
+    /// 旧实现只有 Remind 且 8 次后彻底静默——模型可以无限重复同一调用
+    /// （如反复 terminal_snapshot 轮询）直到 200 轮上限，token 海量空转。
+    Block(String),
+}
+
 struct RepeatCallGuard {
     /// 上一次跟踪的调用键 `(工具名, 规范化参数)`。
     last_key: Option<(String, String)>,
@@ -1485,6 +1587,8 @@ struct RepeatCallGuard {
 impl RepeatCallGuard {
     /// 触发提醒的连续次数阈值（升序）。
     const THRESHOLDS: [usize; 3] = [3, 5, 8];
+    /// 强制拦截的连续次数上限：达到后每次都拦截（不再放行），彻底终止循环。
+    const HARD_LIMIT: usize = 10;
     /// 不参与链条跟踪的工具：记账/加载类调用穿插在循环里不该"洗白"链条，
     /// 也不该自己触发提醒（见 dsh 的 exclude 语义）。
     const EXCLUDED: [&'static str; 2] = ["todo_write", "load_skill"];
@@ -1499,10 +1603,10 @@ impl RepeatCallGuard {
         }
     }
 
-    /// 观察一次工具调用；命中阈值返回提醒文本，否则返回 None。
-    fn observe(&mut self, name: &str, arguments: &serde_json::Value) -> Option<String> {
+    /// 观察一次工具调用，给出处置（放行 / 提醒 / 强制拦截）。
+    fn observe(&mut self, name: &str, arguments: &serde_json::Value) -> GuardAction {
         if Self::EXCLUDED.contains(&name) {
-            return None;
+            return GuardAction::Allow;
         }
         let key = (name.to_string(), arguments.to_string());
         if self.last_key.as_ref() == Some(&key) {
@@ -1514,12 +1618,23 @@ impl RepeatCallGuard {
             self.consecutive = 1;
             self.fired.clear();
         }
-        // 阈值按连续次数触发，且每个阈值在一串连续调用内只提醒一次（避免每轮都啰嗦）。
-        let threshold = Self::THRESHOLDS.iter().copied().find(|&t| t == self.consecutive)?;
-        if !self.fired.insert(self.consecutive) {
-            return None;
+        // 硬拦截：连续相同调用达到上限说明模型已彻底卡死（提醒无效），
+        // 放行只会继续空转——每次都拦截并明确告知"必须停止"。
+        if self.consecutive >= Self::HARD_LIMIT {
+            return GuardAction::Block(format!(
+                "该调用已连续重复 {} 次（工具与参数完全相同），系统已强制拦截，                 本次不会再执行。请立即停止重复：基于已有工具结果给出最终总结；                 若任务无法继续，说明原因并结束。",
+                self.consecutive
+            ));
         }
-        Some(self.build_reminder(name, arguments, self.consecutive, threshold))
+        // 阈值按连续次数触发，且每个阈值在一串连续调用内只提醒一次（避免每轮都啰嗦）。
+        let Some(threshold) = Self::THRESHOLDS.iter().copied().find(|&t| t == self.consecutive)
+        else {
+            return GuardAction::Allow;
+        };
+        if !self.fired.insert(self.consecutive) {
+            return GuardAction::Allow;
+        }
+        GuardAction::Remind(self.build_reminder(name, arguments, self.consecutive, threshold))
     }
 
     /// 生成提醒文本。首个阈值（3 次）用简短通用提醒；后续阈值带工具名、
@@ -1809,10 +1924,13 @@ mod tests {
         let a = serde_json::json!({ "command": "df -h", "sessionId": "s1" });
         let b = serde_json::json!({ "sessionId": "s1", "command": "df -h" });
         // 第 1、2 次不触发（阈值 3）。
-        assert!(g.observe("exec_ssh", &a).is_none());
-        assert!(g.observe("exec_ssh", &b).is_none());
+        assert!(matches!(g.observe("exec_ssh", &a), GuardAction::Allow));
+        assert!(matches!(g.observe("exec_ssh", &b), GuardAction::Allow));
         // 第 3 次（属性顺序不同但内容相同）触发提醒。
-        let r = g.observe("exec_ssh", &a).expect("应在第 3 次触发");
+        let r = match g.observe("exec_ssh", &a) {
+            GuardAction::Remind(r) => r,
+            other => panic!("应在第 3 次触发提醒，实际 {other:?}"),
+        };
         assert!(r.contains("连续 3 次"));
         assert!(r.contains("exec_ssh"));
     }
@@ -1823,34 +1941,46 @@ mod tests {
         let mut g = RepeatCallGuard::new();
         let args = serde_json::json!({ "sql": "SELECT 1" });
         // 3 次连续 → 第 3 次触发（简短提醒，不含参数预览）。
-        assert!(g.observe("exec_sql", &args).is_none());
-        assert!(g.observe("exec_sql", &args).is_none());
-        let r3 = g.observe("exec_sql", &args).unwrap();
+        assert!(matches!(g.observe("exec_sql", &args), GuardAction::Allow));
+        assert!(matches!(g.observe("exec_sql", &args), GuardAction::Allow));
+        let r3 = match g.observe("exec_sql", &args) {
+            GuardAction::Remind(r) => r,
+            other => panic!("应在第 3 次触发提醒，实际 {other:?}"),
+        };
         assert!(r3.contains("连续 3 次"));
         assert!(!r3.contains("SELECT 1")); // 首个阈值是通用简短提醒
         // 4、5 次：第 5 次触发详细提醒（含工具名 + 参数预览）。
-        assert!(g.observe("exec_sql", &args).is_none());
-        let r5 = g.observe("exec_sql", &args).unwrap();
+        assert!(matches!(g.observe("exec_sql", &args), GuardAction::Allow));
+        let r5 = match g.observe("exec_sql", &args) {
+            GuardAction::Remind(r) => r,
+            other => panic!("应在第 5 次触发提醒，实际 {other:?}"),
+        };
         assert!(r5.contains("连续 5 次"));
         assert!(r5.contains("SELECT 1"));
         // 同一阈值不重复提醒。
-        assert!(g.observe("exec_sql", &args).is_none());
-        assert!(g.observe("exec_sql", &args).is_none());
+        assert!(matches!(g.observe("exec_sql", &args), GuardAction::Allow));
+        assert!(matches!(g.observe("exec_sql", &args), GuardAction::Allow));
         // 第 8 次触发（第二次进入详细提醒路径）。
-        let r8 = g.observe("exec_sql", &args).unwrap();
+        let r8 = match g.observe("exec_sql", &args) {
+            GuardAction::Remind(r) => r,
+            other => panic!("应在第 8 次触发提醒，实际 {other:?}"),
+        };
         assert!(r8.contains("连续 8 次"));
-        // 之后不再提醒。
-        assert!(g.observe("exec_sql", &args).is_none());
+        // 第 9 次不再提醒（阈值已用尽，硬拦截在第 10 次）。
+        assert!(matches!(g.observe("exec_sql", &args), GuardAction::Allow));
 
         // 换工具 → 链条重置（连续次数重新从 1 计，已触发阈值也重置——新的
         // 一串连续调用是新循环，值得再次提醒）。
         let other = serde_json::json!({ "path": "a.txt" });
-        assert!(g.observe("read_file", &other).is_none());
-        assert!(g.observe("read_file", &other).is_none());
+        assert!(matches!(g.observe("read_file", &other), GuardAction::Allow));
+        assert!(matches!(g.observe("read_file", &other), GuardAction::Allow));
         // 同样内容换成另一个工具：也重置（键含工具名）。
-        assert!(g.observe("exec_sql", &args).is_none());
-        assert!(g.observe("exec_sql", &args).is_none());
-        assert!(g.observe("exec_sql", &args).unwrap().contains("连续 3 次"));
+        assert!(matches!(g.observe("exec_sql", &args), GuardAction::Allow));
+        assert!(matches!(g.observe("exec_sql", &args), GuardAction::Allow));
+        assert!(match g.observe("exec_sql", &args) {
+            GuardAction::Remind(r) => r.contains("连续 3 次"),
+            _ => false,
+        });
     }
 
     /// 排除工具（todo_write / load_skill）既不触发提醒也不重置链条：
@@ -1860,14 +1990,17 @@ mod tests {
         let mut g = RepeatCallGuard::new();
         let grep = serde_json::json!({ "command": "grep error /var/log/app.log" });
         let todo = serde_json::json!({ "todos": [] });
-        assert!(g.observe("exec_ssh", &grep).is_none());
+        assert!(matches!(g.observe("exec_ssh", &grep), GuardAction::Allow));
         // 记账调用穿插：不累计、不重置。
-        assert!(g.observe("todo_write", &todo).is_none());
-        assert!(g.observe("todo_write", &todo).is_none());
+        assert!(matches!(g.observe("todo_write", &todo), GuardAction::Allow));
+        assert!(matches!(g.observe("todo_write", &todo), GuardAction::Allow));
         // 第 2 次 grep（中间隔了排除调用）→ 仍按连续第 2 次计。
-        assert!(g.observe("exec_ssh", &grep).is_none());
+        assert!(matches!(g.observe("exec_ssh", &grep), GuardAction::Allow));
         // 第 3 次 grep → 触发（链条未被 todo_write 洗白）。
-        assert!(g.observe("exec_ssh", &grep).unwrap().contains("连续 3 次"));
+        assert!(match g.observe("exec_ssh", &grep) {
+            GuardAction::Remind(r) => r.contains("连续 3 次"),
+            _ => false,
+        });
     }
 
     /// 参数预览截断：超长参数被截断并附省略说明，防止巨型参数骑进提醒文本。
@@ -1876,17 +2009,51 @@ mod tests {
     fn guard_truncates_long_argument_preview() {
         let mut g = RepeatCallGuard::new();
         let big = serde_json::json!({ "command": "x".repeat(500) });
-        assert!(g.observe("exec_ssh", &big).is_none());
-        assert!(g.observe("exec_ssh", &big).is_none());
-        let r = g.observe("exec_ssh", &big).unwrap();
+        assert!(matches!(g.observe("exec_ssh", &big), GuardAction::Allow));
+        assert!(matches!(g.observe("exec_ssh", &big), GuardAction::Allow));
+        let r = match g.observe("exec_ssh", &big) {
+            GuardAction::Remind(r) => r,
+            other => panic!("应在第 3 次触发提醒，实际 {other:?}"),
+        };
         // 第 3 次是简短通用提醒（不含参数预览）。
         assert!(r.contains("连续 3 次"));
         assert!(!r.contains("xxx"));
         // 再补两次到第 5 次：详细版应截断参数。
-        assert!(g.observe("exec_ssh", &big).is_none());
-        let r5 = g.observe("exec_ssh", &big).unwrap();
+        assert!(matches!(g.observe("exec_ssh", &big), GuardAction::Allow));
+        let r5 = match g.observe("exec_ssh", &big) {
+            GuardAction::Remind(r) => r,
+            other => panic!("应在第 5 次触发提醒，实际 {other:?}"),
+        };
         assert!(r5.contains("已省略"));
         assert!(r5.chars().count() < 400);
+    }
+
+    /// 硬拦截：连续相同调用达到 HARD_LIMIT 后每次都 Block（拦截说明含次数
+    /// 与"必须停止"指令），彻底切断无限重复循环；换参数（新链条）恢复放行。
+    #[test]
+    fn guard_blocks_after_hard_limit() {
+        let mut g = RepeatCallGuard::new();
+        let args = serde_json::json!({ "sessionId": "s1" });
+        // 前 9 次：Allow / Remind 混合（阈值提醒），无 Block。
+        for i in 1..=9 {
+            assert!(
+                !matches!(g.observe("terminal_snapshot", &args), GuardAction::Block(_)),
+                "第 {i} 次不应拦截"
+            );
+        }
+        // 第 10 次起：每次都强制拦截。
+        for n in 10..=12 {
+            match g.observe("terminal_snapshot", &args) {
+                GuardAction::Block(msg) => {
+                    assert!(msg.contains("强制拦截"), "{msg}");
+                    assert!(msg.contains(&n.to_string()), "应含次数 {n}: {msg}");
+                }
+                other => panic!("第 {n} 次应强制拦截，实际 {other:?}"),
+            }
+        }
+        // 换参数（新链条）→ 恢复放行。
+        let other = serde_json::json!({ "sessionId": "s2" });
+        assert!(matches!(g.observe("terminal_snapshot", &other), GuardAction::Allow));
     }
 
     // =========================================================================

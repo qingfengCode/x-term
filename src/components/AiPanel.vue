@@ -279,6 +279,60 @@ function cancelRename() {
 // --- 智能体上下文 --------------------------------------------------------
 /** agent 模式当前可用的活动终端 instanceId。 */
 const activeTerminalId = computed(() => terminals.activeId);
+
+// --- 会话级终端绑定（手动指定 AI 操作哪台终端） ----------------------------
+// 痛点：默认跟随"当前活动终端"——对话期间切换终端 tab，AI 的操作对象跟着
+// 漂移（上一条命令在 A 执行、下一条跑到了 B）。绑定后整个会话固定操作该
+// 终端，不随 tab 切换变化；"auto" = 维持跟随行为。
+// 按对话独立记忆（组件内存，不持久化——重启后回到跟随模式）。
+const AUTO_TERMINAL = "auto";
+const boundTerminals = ref<Record<string, string>>({});
+
+/**
+ * 当前对话的绑定值（"auto" 或终端 tab 的**稳定 id**）。
+ * 用 tab.id 而非 instanceId：重连会更换 instanceId，稳定 id 让绑定在
+ * 断开→重连后依然有效；tab 被关闭后才回退 auto。断开状态允许绑定
+ * （重连后继续生效，选项上标记）。
+ */
+const boundTerminalId = computed(() => {
+  const bound = boundTerminals.value[ai.activeCid ?? ""];
+  if (bound && bound !== AUTO_TERMINAL) {
+    if (terminals.tabs.some((t) => t.id === bound)) return bound;
+  }
+  return AUTO_TERMINAL;
+});
+
+/** 绑定 / 跟随的目标 tab（绑定 tab 未连接时为 null——instanceId 还没有）。 */
+const resolvedTerminalTab = computed(() => {
+  if (boundTerminalId.value === AUTO_TERMINAL) {
+    const id = activeTerminalId.value;
+    return id ? terminals.tabs.find((t) => t.instanceId === id) ?? null : null;
+  }
+  return terminals.tabs.find((t) => t.id === boundTerminalId.value) ?? null;
+});
+
+/** 可绑定的终端选项（所有 tab；断开的标记，重连后绑定自动恢复）。 */
+const terminalOptions = computed(() =>
+  terminals.tabs.map((t, i) => ({
+    id: t.id,
+    label:
+      (terminalOptions_dup(t.session.name) ? `${t.session.name} #${i + 1}` : t.session.name) +
+      (t.disconnected ? "（已断开）" : t.instanceId ? "" : "（连接中…）"),
+  })),
+);
+function terminalOptions_dup(name: string): boolean {
+  return terminals.tabs.filter((t) => t.session.name === name).length > 1;
+}
+
+function setBoundTerminal(v: string) {
+  const cid = ai.activeCid;
+  if (!cid) return;
+  if (v === AUTO_TERMINAL) delete boundTerminals.value[cid];
+  else boundTerminals.value[cid] = v;
+}
+
+/** 发送时实际使用的终端 instanceId：绑定优先（需已连接），未绑定跟随活动终端。 */
+const resolvedTerminalId = computed(() => resolvedTerminalTab.value?.instanceId || null);
 /** agent 模式当前可用的活动内嵌 RDP 会话（仅 rdp 协议；VNC 不注册控制句柄）。 */
 const activeDesktopId = computed(() => {
   const tab = desktopTabs.tabs.find((t) => t.instanceId === desktopTabs.activeId);
@@ -289,9 +343,15 @@ const contextTip = computed(() => {
   if (mode.value !== "agent") return "";
   const parts: string[] = [];
   if (props.domain === "ssh") {
-    if (activeTerminalId.value) {
-      const tab = terminals.tabs.find((t) => t.instanceId === activeTerminalId.value);
-      if (tab) parts.push(`终端: ${tab.session.name}`);
+    if (resolvedTerminalId.value) {
+      const tab = terminals.tabs.find((t) => t.instanceId === resolvedTerminalId.value);
+      if (tab) {
+        parts.push(
+          boundTerminalId.value === AUTO_TERMINAL
+            ? `附加终端: ${tab.session.name}（跟随当前）`
+            : `附加终端: ${tab.session.name}（已绑定）`,
+        );
+      }
     }
   } else if (props.domain === "db") {
     if (db.activeConnId) {
@@ -314,7 +374,7 @@ const contextTip = computed(() => {
   }
   if (props.domain === "ssh") {
     return parts.length
-      ? `已附加: ${parts.join("、")}`
+      ? parts.join("、")
       : "未选择活动终端，请先连接后 AI 才能操作";
   }
   if (props.domain === "db") {
@@ -780,13 +840,20 @@ function buildSendContext(agent: boolean): {
   let activeDb: string | undefined;
   let activeDesktop: string | undefined;
   if (props.domain === "ssh") {
-    if (activeTerminalId.value) {
-      const tab = terminals.tabs.find((t) => t.instanceId === activeTerminalId.value);
+    if (resolvedTerminalId.value) {
+      const tab = terminals.tabs.find((t) => t.instanceId === resolvedTerminalId.value);
       const name = tab?.session.name ?? "未命名";
+      // 用户手动绑定的终端在整个会话期间固定（对话/切 tab 不漂移）。
+      const bindNote =
+        boundTerminalId.value === AUTO_TERMINAL ? "当前活动" : "用户指定";
       ctxParts.push(
-        `当前活动 SSH 终端：sessionId="${activeTerminalId.value}"（${name}）。调用 exec_ssh / terminal_snapshot 时直接用这个 sessionId。`
+        `${bindNote} SSH 终端：sessionId="${resolvedTerminalId.value}"（${name}）。调用 exec_ssh / terminal_snapshot 时直接用这个 sessionId。`
       );
-      activeTerminal = activeTerminalId.value;
+      activeTerminal = resolvedTerminalId.value;
+    } else if (boundTerminalId.value !== AUTO_TERMINAL) {
+      ctxParts.push(
+        "用户绑定的终端尚未连接完成（或已断开未重连）。请告诉用户：绑定的终端未就绪，稍候重试或重新选择终端。不要调用任何工具。"
+      );
     } else {
       ctxParts.push(
         "当前没有活动终端。请直接告诉用户：请先连接终端后再让我操作。不要调用任何工具。"
@@ -1088,7 +1155,12 @@ async function regenerateMessage(m: AiMessage) {
 
 async function approveTool(tool: ToolCallItem) {
   if (tool.status !== "pending") return;
-  await ai.approveToolCall(tool.toolCallId);
+  const ok = await ai.approveToolCall(tool.toolCallId);
+  if (!ok) {
+    // 僵尸卡片（轮次已超时/请求已结束）：命令不会执行，明确告知而非让用户
+    // 对着"执行中"的卡片干等。
+    ElMessage.warning("该确认已超过 5 分钟等待上限（或请求已结束），命令未执行；请重新发送请求");
+  }
 }
 
 /** 加入白名单并执行：把命令前缀持久化到白名单，然后正常 approve。 */
@@ -1466,6 +1538,22 @@ marked.setOptions({
 });
 
 const renderedCache = new Map<string, string>();
+/**
+ * 是否为流式消息中**正在增长**的文本段（流式中 + 末段文本）。
+ * 该段用纯文本渲染（见模板）：流式期间每个 delta 都以"全新全文"为 key，
+ * markdown 缓存永远不命中——每个 chunk 都重跑 marked + DOMPurify 并整体
+ * 重建 innerHTML，O(n²) 开销让回复越长越卡（提交后长时间无响应的元凶）。
+ * 纯文本插值开销低两个数量级；流结束（streaming=false）自动恢复 markdown，
+ * 历史消息与已完成段落不受影响。
+ */
+function isGrowingPart(
+  m: AiMessage,
+  part: { kind: "text"; text: string } | { kind: "tool"; item: ToolCallItem },
+  pIdx: number,
+): boolean {
+  return m.streaming && part.kind === "text" && pIdx === (m.parts?.length ?? 0) - 1;
+}
+
 function renderMarkdown(text: string): string {
   if (!text) return "";
   // 流式过程中同一段文本会被反复渲染，缓存避免重复解析。
@@ -1676,12 +1764,16 @@ function renderMarkdown(text: string): string {
                 正文中间的真实位置（如「说要做X → 工具卡片 → 总结」），而非全堆顶部。
               -->
               <template v-for="(part, pIdx) in (m.parts ?? [])" :key="pIdx">
-                <!-- 文本段：markdown 渲染（空段不输出占位） -->
-                <div
-                  v-if="part.kind === 'text' && part.text"
-                  class="md"
-                  v-html="renderMarkdown(part.text)"
-                />
+                <!-- 文本段：已完成的走 markdown（有缓存）；流式中的增长段走
+                     纯文本（isGrowingPart 说明），流结束后自动切回 markdown。 -->
+                <div v-if="part.kind === 'text' && part.text" class="md">
+                  <template v-if="isGrowingPart(m, part, pIdx)">
+                    <span class="md-raw">{{ part.text }}</span><span class="stream-cursor" />
+                  </template>
+                  <template v-else>
+                    <div v-html="renderMarkdown(part.text)" />
+                  </template>
+                </div>
                 <!-- 工具调用卡片：item 与 m.toolCalls 内为同一引用，状态自动同步 -->
                 <div
                   v-else-if="part.kind === 'tool'"
@@ -1696,10 +1788,27 @@ function renderMarkdown(text: string): string {
                   <div class="tool-head" @click="toggleExpand(part.item.toolCallId)">
                     <el-icon class="tool-icon"><Tools /></el-icon>
                     <span class="tool-desc">{{ part.item.description }}</span>
-                    <!-- 记账/技能/提问工具：专用 tag 区分"已自动执行"的普通卡片 -->
+                    <!-- 头部状态 tag：**生命周期状态优先**于固有属性标签——
+                         批准（approved）/拒绝（rejected）/完成（done）后，卡片
+                         不能再顶着"需确认"（固有属性 dangerous/whitelisted 不随
+                         用户操作变化，折叠态下头部 tag 是唯一可见状态）。 -->
                     <el-tag v-if="part.item.name === 'todo_write'" type="primary" size="small" effect="dark">任务清单</el-tag>
                     <el-tag v-else-if="part.item.name === 'load_skill'" type="info" size="small" effect="plain">技能</el-tag>
-                    <el-tag v-else-if="part.item.name === 'ask_user_question'" type="warning" size="small" effect="plain">提问</el-tag>
+                    <el-tag
+                      v-else-if="part.item.name === 'ask_user_question'"
+                      :type="part.item.status === 'rejected' ? 'info' : 'warning'"
+                      size="small"
+                      effect="plain"
+                    >
+                      {{ part.item.status === "rejected" ? "已取消" : part.item.status === "approved" ? "已提交" : "提问" }}
+                    </el-tag>
+                    <el-tag v-else-if="part.item.status === 'done'" type="success" size="small" effect="plain">已执行</el-tag>
+                    <el-tag v-else-if="part.item.status === 'rejected'" type="danger" size="small" effect="plain">已拒绝</el-tag>
+                    <!-- approved 拆分：自动放行（白名单/只读）没有任何人"确认"过，
+                         显示"已确认"与底部"已自动执行"自相矛盾；人工确认的才叫已确认。 -->
+                    <el-tag v-else-if="part.item.status === 'approved' && part.item.autoApproved" type="success" size="small" effect="plain">自动执行中</el-tag>
+                    <el-tag v-else-if="part.item.status === 'approved'" type="primary" size="small" effect="plain">已确认 · 执行中</el-tag>
+                    <!-- pending：按固有属性展示（危险/自动执行/白名单/需确认）。 -->
                     <el-tag v-else-if="part.item.dangerous" type="danger" size="small" effect="dark">危险</el-tag>
                     <el-tag v-else-if="part.item.autoApproved" type="success" size="small" effect="dark">已自动执行</el-tag>
                     <el-tag v-else-if="part.item.whitelisted" type="success" size="small" effect="plain">白名单</el-tag>
@@ -1830,12 +1939,16 @@ function renderMarkdown(text: string): string {
                     "
                     class="tool-actions"
                   >
+                    <!-- 文案精简：面板宽度有限，长文案会把"拒绝"挤出可视区；
+                         完整语义放 title 悬停提示（危险属性卡片头部已有红色
+                         "危险"标记，按钮红色即可，无需文案复述）。 -->
                     <el-button
                       size="small"
                       :type="part.item.dangerous ? 'danger' : 'primary'"
+                      :title="part.item.dangerous ? '确认执行该危险操作' : '确认执行'"
                       @click.stop="approveTool(part.item)"
                     >
-                      {{ part.item.dangerous ? '确认执行危险操作' : part.item.whitelisted ? '执行' : '确认执行' }}
+                      执行
                     </el-button>
                     <!-- 加入白名单并执行：仅 exec_ssh 非危险非白名单时显示 -->
                     <el-button
@@ -1843,15 +1956,24 @@ function renderMarkdown(text: string): string {
                       size="small"
                       type="success"
                       plain
+                      title="把该命令前缀加入白名单并执行，以后同类命令自动放行"
                       @click.stop="addToWhitelistAndRun(part.item)"
                     >
-                      加入白名单并执行
+                      白名单执行
                     </el-button>
-                    <el-button size="small" @click.stop="rejectTool(part.item)">拒绝</el-button>
+                    <el-button size="small" title="拒绝执行该操作" @click.stop="rejectTool(part.item)">拒绝</el-button>
                   </div>
                   <div v-else-if="part.item.status === 'approved' && part.item.name === 'ask_user_question'" class="tool-status">已提交，等待模型继续</div>
                   <div v-else-if="part.item.status === 'approved' && !part.item.autoApproved" class="tool-status">执行中…</div>
-                  <div v-else-if="part.item.status === 'approved' && part.item.autoApproved" class="tool-status">已自动执行</div>
+                  <div v-else-if="part.item.status === 'approved' && part.item.autoApproved" class="tool-status">自动执行中…</div>
+                  <!-- done：结果已回填（展开可见），底部给出明确终态，避免空白无下文。 -->
+                  <div
+                    v-else-if="part.item.status === 'done'"
+                    class="tool-status"
+                    :class="{ 'tool-status-fail': part.item.result && !part.item.result.ok }"
+                  >
+                    {{ part.item.result && !part.item.result.ok ? "执行失败（展开查看）" : "已完成" }}
+                  </div>
                   <div v-else-if="part.item.status === 'rejected'" class="tool-status">
                     {{ part.item.name === 'ask_user_question' ? '已取消' : '已拒绝' }}
                   </div>
@@ -1904,7 +2026,42 @@ function renderMarkdown(text: string): string {
               :value="opt.value"
             />
           </el-select>
-          <span v-if="mode === 'agent' && !configBlocked" class="ctx-tip-inline">
+          <!-- ssh 域：提示条即终端绑定入口（点击弹出终端菜单，选择结果体现在
+               提示文案"终端: xxx（已绑定/跟随当前）"里）——不额外占用工具栏宽度。 -->
+          <el-dropdown
+            v-if="props.domain === 'ssh' && mode === 'agent' && !configBlocked"
+            trigger="click"
+            popper-class="ai-term-bind-dropdown"
+            @command="setBoundTerminal"
+          >
+            <span class="ctx-tip-inline ctx-tip-link" title="点击选择 AI 固定操作的终端">
+              <el-icon><Connection /></el-icon>
+              <span>{{ contextTip }}</span>
+              <el-icon class="ctx-caret"><ArrowDown /></el-icon>
+            </span>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item
+                  :command="AUTO_TERMINAL"
+                  :class="{ 'is-active-bind': boundTerminalId === AUTO_TERMINAL }"
+                >
+                  跟随当前终端
+                </el-dropdown-item>
+                <el-dropdown-item
+                  v-for="t in terminalOptions"
+                  :key="t.id"
+                  :command="t.id"
+                  :class="{ 'is-active-bind': boundTerminalId === t.id }"
+                >
+                  {{ t.label }}
+                </el-dropdown-item>
+                <div v-if="terminalOptions.length === 0" class="term-bind-empty">
+                  暂无已打开的终端
+                </div>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
+          <span v-else-if="mode === 'agent' && !configBlocked" class="ctx-tip-inline">
             <el-icon><Connection /></el-icon>
             <span>{{ contextTip }}</span>
           </span>
@@ -2233,6 +2390,16 @@ function renderMarkdown(text: string): string {
 }
 
 /* 顶部"更多"下拉（element-plus 下拉挂 body，需全局样式而非 scoped） */
+/* 终端绑定下拉（挂 body，全局样式）：当前绑定项高亮 */
+:global(.ai-term-bind-dropdown .el-dropdown-menu__item.is-active-bind) {
+  color: var(--el-color-primary);
+  font-weight: 600;
+}
+:global(.ai-term-bind-dropdown .term-bind-empty) {
+  padding: 6px 16px;
+  font-size: 12px;
+  color: var(--el-text-color-placeholder);
+}
 :global(.ai-header-dropdown .el-dropdown-menu__item .el-icon) {
   margin-right: 6px;
 }
@@ -2415,6 +2582,25 @@ function renderMarkdown(text: string): string {
 .error-text {
   font-weight: 600;
   margin-top: 4px;
+}
+.md-raw {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+/* 流式光标：随纯文本增长的末尾闪烁条 */
+.stream-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: -0.15em;
+  background: var(--el-color-primary);
+  animation: stream-blink 1s steps(1) infinite;
+}
+@keyframes stream-blink {
+  50% {
+    opacity: 0;
+  }
 }
 /* 系统注入的提醒（重复调用守卫等）：全宽灰色居中提示，与用户/助手气泡区分开 */
 .system-note {
@@ -2706,6 +2892,21 @@ function renderMarkdown(text: string): string {
   width: auto;
   min-width: 96px;
 }
+/* 可点击的上下文提示（ssh 域 = 终端绑定入口）：hover 提示可交互 */
+.ctx-tip-link {
+  cursor: pointer;
+  border-radius: 3px;
+  padding: 1px 4px;
+  margin-left: -4px;
+}
+.ctx-tip-link:hover {
+  background: var(--el-fill-color);
+  color: var(--el-color-primary);
+}
+.ctx-caret {
+  font-size: 10px;
+  color: var(--el-text-color-placeholder);
+}
 .ctx-tip-inline {
   display: inline-flex;
   align-items: center;
@@ -2872,13 +3073,22 @@ function renderMarkdown(text: string): string {
 }
 .tool-actions {
   display: flex;
-  gap: 6px;
+  flex-wrap: wrap;
+  gap: 4px;
   padding: 4px 8px 6px;
+}
+/* Element Plus 相邻按钮自带 margin-left:12px，与 gap 叠加后实际间距 18px——
+   窄面板下三个按钮放不下，"拒绝"被挤出可视区。间距统一交给上面的 gap。 */
+.tool-actions .el-button + .el-button {
+  margin-left: 0;
 }
 .tool-status {
   padding: 4px 8px 6px;
   font-size: 11px;
   color: var(--el-text-color-secondary);
+}
+.tool-status-fail {
+  color: var(--el-color-danger);
 }
 /* ask_user_question 问题表单：问题卡片化（序号/标题/多选标记），选项为可点选
    卡片（原生 input 视觉隐藏 + 自绘单选圆点/多选方框），提交后整体置灰并显示

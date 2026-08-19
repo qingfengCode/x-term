@@ -138,6 +138,8 @@ async function openLocalTerminal() {
   try {
     await terminals.openLocal();
   } catch (e) {
+    // "连接已取消"（连接期间关闭 tab）静默——不是失败。
+    if (String(e).includes("连接已取消")) return;
     ElMessage.error(String(e));
   }
 }
@@ -327,6 +329,12 @@ onBeforeUnmount(() => {
             <div v-if="tab.disconnected" class="reconnect-overlay">
               <div class="reconnect-card">
                 <div class="reconnect-title">连接已断开</div>
+                <!-- 最近一次重连失败的原因（reconnect 失败写入 tab.error；pane
+                     已挂载时错误分支显示不到，不在 overlay 上展示用户就无从
+                     知道为什么连不上）。 -->
+                <div v-if="tab.error" class="reconnect-error" :title="tab.error">
+                  {{ tab.error }}
+                </div>
                 <el-button
                   type="primary"
                   :icon="Refresh"
@@ -543,6 +551,25 @@ onBeforeUnmount(() => {
   background: rgba(0, 0, 0, 0.35);
   backdrop-filter: blur(2px);
   z-index: 20;
+  /* 遮罩放行鼠标事件：断开后终端输出仍可选中/复制/滚动（排障刚需——
+     拿不到最后几行日志就没法定位问题）；只有中央卡片拦截点击。 */
+  pointer-events: none;
+}
+.reconnect-card {
+  pointer-events: auto;
+}
+.reconnect-error {
+  max-width: 320px;
+  margin-bottom: 10px;
+  font-size: 12px;
+  color: var(--el-color-danger);
+  text-align: center;
+  line-height: 1.5;
+  word-break: break-all;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 .reconnect-card {
   display: flex;

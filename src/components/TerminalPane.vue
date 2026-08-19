@@ -69,9 +69,11 @@ async function attachSession(instanceId: string) {
     const bytes = base64ToBytes(snap.data);
     if (bytes.length) feedOutput(bytes);
   } catch {
-    /* 会话已不存在（连接瞬间失败等）：无基线，缓存事件全量放行。
-       同样要防旧代复活——gen 不匹配直接放弃。 */
+    /* 会话已不存在（连接瞬间失败/挂载前恰好断开）：无基线，缓存事件全量
+       放行；同时给出一行提示——否则 pane 白屏且无人补发"已断开"事件
+       （terminal:closed 在挂载前到达时无人接收）。 */
     if (unmounted || gen !== attachGen) return;
+    term?.write("\r\n\x1b[31m[终端会话已结束或已断开，可点击工具栏重连]\x1b[0m\r\n");
   }
   attachDone = true;
   for (const p of pendingData.splice(0)) {

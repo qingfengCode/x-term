@@ -62,6 +62,15 @@ pub const AI_TODO: &str = "ai:todo";
 /// 厂商不返回 usage 时不发该事件。
 pub const AI_USAGE: &str = "ai:usage";
 
+/// AI 请求自动重试中。payload: [`AiRetryingEvent`]。
+///
+/// 可重试错误（建连失败/429/5xx）发生时 provider 内部已 emit 过 ai:error，
+/// 前端会按错误收尾（sending=false 等）；随后编排层退避重试。重试开始时
+/// emit 本事件，前端据此**恢复**会话的进行中状态——否则重试成功后的
+/// 全部输出（chunk/done/工具事件）虽然仍在发送，但会话已被标记结束，
+/// 用户体验上等于"报错了但其实又在跑"，结果凭空丢失。
+pub const AI_RETRYING: &str = "ai:retrying";
+
 /// 系统注入的编排层提示（如重复调用守卫的提醒）。payload: [`AiSystemNoteEvent`]。
 ///
 /// 后端把它作为 user 消息注入模型上下文的同时 emit 一份给前端，前端以灰色
@@ -273,6 +282,19 @@ pub struct AiUsageEvent {
     pub prompt_tokens: u64,
     /// 输出 token 数（completion / output tokens）。
     pub completion_tokens: u64,
+}
+
+/// AI 请求自动重试事件。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiRetryingEvent {
+    pub request_id: String,
+    /// 第几次尝试（含首次失败的这轮，从 1 起）。
+    pub attempt: u32,
+    /// 最大尝试次数。
+    pub max_attempts: u32,
+    /// 重试原因（简短错误摘要，供前端提示）。
+    pub reason: String,
 }
 
 /// 系统注入的编排层提示（重复调用守卫提醒等）。

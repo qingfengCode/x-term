@@ -103,6 +103,9 @@ async function connectSession(s: Session) {
     if (ok) ElMessage.success(`已连接 ${s.name}`);
   } catch (e) {
     msg.close();
+    // "连接已取消"不是失败：连接等待期间用户关闭了 tab（含快速双击会话时
+    // 旧占位被新打开替换的场景）——弹"连接失败"是刺眼误报，静默即可。
+    if (String(e).includes("连接已取消")) return;
     ElMessage.error("连接失败: " + String(e));
   }
 }
@@ -164,6 +167,9 @@ async function confirmDeleteSession(s: Session) {
   }
   try {
     await sessionsStore.removeSession(s.id);
+    // 关闭该会话已开的终端 tab：否则 tab 悬空（重连/重试都会因配置
+    // 不存在而失败，用户对着无法恢复的终端）。
+    await terminalsStore.closeBySessionId(s.id);
     ElMessage.success("已删除");
   } catch (e) {
     ElMessage.error("删除失败: " + String(e));

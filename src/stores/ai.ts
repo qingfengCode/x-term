@@ -382,10 +382,21 @@ export const makeAiStore = (id: string) =>
     return conversations.value.find((c) => c.id === cid) ?? null;
   }
 
-  /** 找到该会话当前最后一条 assistant 消息（流式目标）。 */
+  /** 找到该会话当前最后一条 assistant 消息（流式目标 / 工具卡片宿主）。
+   *
+   * 从尾部**向前**搜索，而不是只看最后一条：assistant 占位消息之后可能
+   * 追加了其它角色的消息——系统注入的重复调用提醒（onSystemNote 的 user
+   * 消息，轮末到达）就是典型。只看最后一条时，提醒之后到达的
+   * onDelta/onToolCall/onToolResult 会因找不到 assistant 宿主而**静默丢弃**：
+   * 表现为卡片永停"已确认 · 执行中"（结果路由失败）、后续轮次的文本与
+   * 确认卡片凭空消失。向前搜索保证无论尾部插了什么，始终命中正确的
+   * assistant 消息（一轮请求期间不会产生新的 assistant 消息）。 */
   function lastAssistant(conv: Conversation): AiMessage | null {
-    const m = conv.messages[conv.messages.length - 1];
-    return m && m.role === "assistant" ? m : null;
+    for (let i = conv.messages.length - 1; i >= 0; i--) {
+      const m = conv.messages[i];
+      if (m.role === "assistant") return m;
+    }
+    return null;
   }
 
   /** 往助手消息追加一段文本：content 与 parts 双写保持同步（模板只渲染 parts）。 */
@@ -438,8 +449,29 @@ export const makeAiStore = (id: string) =>
     }
     conv.sending = false;
     conv.activeRequestId = null;
-    requestToCid.delete(requestId);
+    // 路由用 TTL 延迟清理而不是立即删：可重试错误（建连失败/429/5xx）发生时
+    // 后端会自动退避重试，重试成功后的 chunk/done/工具事件仍以同一
+    // requestId 发送——立即删会让它们全部静默丢失（"报错了但其实又跑完
+    // 了"，token 白花）。onRetrying 会恢复会话状态；最终失败时 error 已展示。
+    scheduleRequestCleanup(requestId);
     persist();
+  }
+
+  /**
+   * 自动重试通知（ai:retrying 事件）：可重试错误触发退避重试时后端发出。
+   * 恢复会话的"进行中"状态（onError 已按错误收尾过）——清错误标记、
+   * 重置 streaming/sending，重试成功后的输出继续正常流入。
+   */
+  function onRetrying(requestId: string) {
+    const conv = convForRequest(requestId);
+    if (!conv) return;
+    const m = lastAssistant(conv);
+    if (m) {
+      m.streaming = true;
+      m.error = undefined;
+    }
+    conv.sending = true;
+    conv.activeRequestId = requestId;
   }
 
   /** AI 请求被用户终止（后端 ai:stopped 事件）。 */
@@ -640,9 +672,19 @@ export const makeAiStore = (id: string) =>
       return;
     }
     updateToolCallStatus(toolCallId, "approved");
-    await dbApi.aiExecuteTool(toolCallId).catch(() => {
-      /* ignore */
-    });
+    // 批准下发失败（僵尸卡片：轮次已超时/请求已结束）：回滚状态并告知调用方，
+    // 由 UI 提示——否则卡片停在"执行中"但命令永远不会执行。
+    const ok = await dbApi
+      .aiExecuteTool(toolCallId)
+      .then(
+        () => true,
+        () => false,
+      );
+    if (!ok) {
+      updateToolCallStatus(toolCallId, "pending");
+      return false;
+    }
+    return true;
   }
 
   /** 用户点击"加入白名单并执行"：先把命令前缀加入白名单（持久化），再正常 approve。
@@ -828,6 +870,7 @@ export const makeAiStore = (id: string) =>
     onTodo,
     onUsage,
     onSystemNote,
+    onRetrying,
     approveToolCall,
     addToWhitelistAndApprove,
     rejectToolCall,

@@ -1100,8 +1100,9 @@ async fn exec_ssh_visual_unlocked(state: &AppState, session_id: &str, command: &
             };
             let cleaned = strip_ansi(&window);
             let mut result = format!(
-                "命令已写入终端执行，但 30 秒内未检测到执行完成（命令可能仍在运行、\
-                 等待输入，或终端当前不在 shell 提示符）。\n目前捕获到的输出：\n{}\n\
+                "命令已写入终端执行，但 180 秒内未检测到执行完成（命令可能仍在运行、\
+                 等待输入，或终端当前不在 shell 提示符）。**不要盲目重发同一命令**\
+                 （命令可能仍在终端里跑，重发会重复执行）。\n目前捕获到的输出：\n{}\n\
                  （如需终端当前完整输出，可调用 terminal_snapshot）",
                 truncate_output(&cleaned, MAX_EXEC_OUTPUT_BYTES)
             );

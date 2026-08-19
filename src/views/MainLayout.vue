@@ -217,6 +217,17 @@ onMounted(async () => {
       }
     ),
   );
+  // 订阅自动重试事件（可重试错误后端退避重试时恢复会话状态，多分发）。
+  await track(
+    listen<{ requestId: string; attempt: number; maxAttempts: number; reason: string }>(
+      "ai:retrying",
+      (e) => {
+        aiSsh.onRetrying(e.payload.requestId);
+        aiDb.onRetrying(e.payload.requestId);
+        aiDesktop.onRetrying(e.payload.requestId);
+      }
+    ),
+  );
   // 订阅编排层系统提示（重复调用守卫提醒等；前端灰色提示渲染，多分发）。
   await track(
     listen<{ requestId: string; text: string }>("ai:system_note", (e) => {

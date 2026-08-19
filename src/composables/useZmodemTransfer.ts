@@ -102,8 +102,14 @@ export function useZmodemTransfer(
       defaultPath: name,
     });
     if (!path) {
-      // 用户取消：跳过该文件，远端继续下一个或结束会话。
+      // 用户取消：跳过该文件，远端继续下一个或结束会话。对端若就此发
+      // ZFIN 结束，同样需要我方回 ZFIN 握手，否则 sz 挂起不退回提示符。
       offer.skip();
+      try {
+        await withTimeout(sess.close(), 15_000);
+      } catch {
+        /* 还有后续 offer 时 close 会被拒绝/挂起到超时，均忽略 */
+      }
       return;
     }
 
@@ -174,6 +180,17 @@ export function useZmodemTransfer(
         ElMessage.warning(`下载已中止：${name}`);
       } else {
         ElMessage.success(`已下载：${name}`);
+      }
+      // ZFIN 收尾握手（与上传路径的 sess.close() 对称）：ZEOF 只表示数据发完，
+      // 远端 sz 要收到我方 ZFIN 才会退出。缺这一步 sz 永久等待，终端停在
+      // "**B00000000000000"（sz 的 ZFIN 帧文本）不回 shell 提示符。
+      // 对端无响应时 15s 超时兜底，避免挂起。
+      if (!sess.aborted()) {
+        try {
+          await withTimeout(sess.close(), 15_000);
+        } catch {
+          /* 已结束/重复关闭等，忽略 */
+        }
       }
     } catch (err) {
       if (!sess.aborted()) {
