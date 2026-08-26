@@ -84,14 +84,27 @@ pub struct TerminalAttachResult {
 /// （SSH banner/MOTD、telnet 登录提示、本地 shell 提示符）会整体丢失，表现
 /// 为终端开出来是空白屏。前端在注册监听**之后**调用本命令：
 /// 1. 先把监听期收到的事件缓存起来（不渲染）；
-/// 2. 本命令原子返回「缓冲快照 + 累计基线」（同一锁内读取）；
+/// 2. 本命令先冲刷 reader 的输出批次（SSH/Telnet 批量 emit），再原子返回
+///    「缓冲快照 + 累计基线」（同一锁内读取），保证快照与事件流的 total 一致；
 /// 3. 写入快照，再按事件的 `total` 字段过滤缓存（≤ 基线的已含在快照里），
 ///    既不丢字节也不重复渲染。
 #[tauri::command]
-pub fn terminal_attach(
+pub async fn terminal_attach(
     instance_id: String,
     state: State<'_, AppState>,
 ) -> AppResult<TerminalAttachResult> {
+    // 先冲刷输出批次（async 等待 reader 处理，不持有 std Mutex 跨 await）。
+    let flush_rx = {
+        let terminals = state.terminals.lock();
+        match terminals.get(&instance_id) {
+            Some(s) => s.flush_output(),
+            None => return Err(AppError::NotFound(format!("终端 {} 不存在", instance_id))),
+        }
+    };
+    if let Some(rx) = flush_rx {
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), rx).await;
+    }
+
     let terminals = state.terminals.lock();
     let session = terminals
         .get(&instance_id)

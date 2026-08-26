@@ -11,7 +11,7 @@ use base64::Engine;
 use tauri::AppHandle;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::error::{AppError, AppResult};
@@ -40,10 +40,17 @@ const OPT_NAWS: u8 = 31;
 
 const OUTPUT_BUFFER_CAP: usize = 64 * 1024;
 
+/// 终端输出批量 emit 间隔（毫秒，与 SSH 会话一致）。
+const TERMINAL_BATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+/// 终端输出批量 emit 大小阈值（字节）。
+const TERMINAL_BATCH_MAX_BYTES: usize = 64 * 1024;
+
 /// 输入消息（与 SshSession 的 InputMsg 对齐）。
 enum TelnetInput {
     Write(Vec<u8>),
     Resize { cols: u16, rows: u16 },
+    /// 立即冲刷输出批次（terminal_attach 前调用，见 SshSession::flush_output）。
+    FlushOutput(oneshot::Sender<()>),
 }
 
 pub struct TelnetSession {
@@ -118,6 +125,14 @@ impl TelnetSession {
             .map_err(|_| AppError::Ssh("Telnet reader 已退出".into()))
     }
 
+    /// 通知 reader 立即冲刷输出批次（attach 快照前调用，见 SshSession::flush_output）。
+    pub fn flush_output(&self) -> Option<oneshot::Receiver<()>> {
+        let tx = self.input_tx.as_ref()?;
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let _ = tx.send(TelnetInput::FlushOutput(ack_tx));
+        Some(ack_rx)
+    }
+
     pub fn resize(&self, cols: u32, rows: u32) -> AppResult<()> {
         let tx = self
             .input_tx
@@ -151,35 +166,80 @@ impl TelnetSession {
             // 发送初始 NAWS。
             let _ = send_naws(&mut write_half, cols, rows).await;
 
+            // 输出批次缓冲（批量 emit 策略与 SSH 一致：16ms/64KiB 冲刷）。
+            let mut batch: Vec<u8> = Vec::with_capacity(4096);
+            // 批次首字节对应的累计字节数（半开区间起点，供 attach 去重切片）。
+            let mut batch_start_total: usize = 0;
+            let mut batch_total: usize = 0;
+            let mut batch_deadline: Option<tokio::time::Instant> = None;
+
+            let flush_batch =
+                |batch: &mut Vec<u8>, start_total: usize, end_total: usize| {
+                    if batch.is_empty() {
+                        return;
+                    }
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(batch.as_slice());
+                    emit(
+                        &app,
+                        TERMINAL_DATA,
+                        TerminalDataEvent {
+                            session_id: session_id.clone(),
+                            data: b64,
+                            start_total,
+                            total: end_total,
+                        },
+                    );
+                    batch.clear();
+                };
+
             loop {
+                let flush_fut = async {
+                    match batch_deadline {
+                        Some(dl) => tokio::time::sleep_until(dl).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
+
                 tokio::select! {
-                    // 远端 → 前端。
+                    // 远端 → 前端（先累积进批次）。
                     // 注意：不能用 biased —— 远端持续输出时会饿死输入分支，
                     // 用户按键（含 Ctrl+C 等中断）得不到处理。
+                    _ = flush_fut, if !batch.is_empty() => {
+                        flush_batch(&mut batch, batch_start_total, batch_total);
+                        batch_deadline = None;
+                    }
                     n = read_half.read(&mut buf) => {
                         match n {
-                            Ok(0) | Err(_) => break, // 连接关闭
+                            Ok(0) | Err(_) => {
+                                // 连接关闭：先冲刷残留批次，避免尾部输出丢失。
+                                flush_batch(&mut batch, batch_start_total, batch_total);
+                                break;
+                            }
                             Ok(len) => {
                                 let data = &buf[..len];
                                 let clean = process_iac(&mut parser, data, &mut write_half).await;
                                 if !clean.is_empty() {
+                                    if batch.is_empty() {
+                                        batch_start_total = batch_total;
+                                    }
                                     // 写入输出缓冲（锁内取追加后的累计字节数，
-                                    // 随事件 emit 供前端 attach 回放去重）。
-                                    let total = output_buffer.lock().ok().map(|mut ob| {
+                                    // 随批次事件 emit 供前端 attach 回放去重）。
+                                    if let Some(total) = output_buffer.lock().ok().map(|mut ob| {
                                         ob.push(&clean);
                                         ob.total_bytes()
-                                    });
-                                    // emit 给前端（base64）。
-                                    let b64 = base64::engine::general_purpose::STANDARD.encode(&clean);
-                                    emit(
-                                        &app,
-                                        TERMINAL_DATA,
-                                        TerminalDataEvent {
-                                            session_id: session_id.clone(),
-                                            data: b64,
-                                            total: total.unwrap_or(0),
-                                        },
-                                    );
+                                    }) {
+                                        batch_total = total;
+                                    }
+                                    batch.extend_from_slice(&clean);
+                                    if batch_deadline.is_none() {
+                                        batch_deadline = Some(
+                                            tokio::time::Instant::now() + TERMINAL_BATCH_INTERVAL,
+                                        );
+                                    }
+                                    if batch.len() >= TERMINAL_BATCH_MAX_BYTES {
+                                        flush_batch(&mut batch, batch_start_total, batch_total);
+                                        batch_deadline = None;
+                                    }
                                 }
                             }
                         }
@@ -189,6 +249,8 @@ impl TelnetSession {
                         match inp {
                             Some(TelnetInput::Write(data)) => {
                                 if write_half.write_all(&data).await.is_err() {
+                                    // 写失败 = 连接已断：冲刷残留批次再退出。
+                                    flush_batch(&mut batch, batch_start_total, batch_total);
                                     break;
                                 }
                                 let _ = write_half.flush().await;
@@ -198,7 +260,15 @@ impl TelnetSession {
                                 rows = r;
                                 let _ = send_naws(&mut write_half, cols, rows).await;
                             }
-                            None => break,
+                            Some(TelnetInput::FlushOutput(ack)) => {
+                                flush_batch(&mut batch, batch_start_total, batch_total);
+                                batch_deadline = None;
+                                let _ = ack.send(());
+                            }
+                            None => {
+                                flush_batch(&mut batch, batch_start_total, batch_total);
+                                break;
+                            }
                         }
                     }
                 }

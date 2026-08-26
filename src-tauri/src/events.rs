@@ -115,14 +115,22 @@ pub const FORWARD_STATE: &str = "forward:state";
 ///
 /// `data` 使用 base64 字符串而不是原始 `Vec<u8>`，以避免 JSON 将字节序列化为 number[]
 /// 带来的体积膨胀。
+///
+/// 批量 emit 时事件可能包含多个 TCP 块的拼接，`data` 对应输出缓冲中的
+/// 半开区间 `[start_total, total)`：前端按快照基线 `b` 去重时——
+/// - `total <= b`：整段已含在快照里，跳过；
+/// - `start_total < b < total`：只取尾部 `total - b` 字节；
+/// - `start_total >= b`：整段渲染。
+/// 这保证了「快照与批次跨界」时既不丢字节也不重复（见 terminal_attach）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalDataEvent {
     pub session_id: String,
     pub data: String,
-    /// 追加本块之后的累计输出字节数（环形缓冲的单调计数，含已被截断的头部）。
-    /// 前端 attach 回放（terminal_attach 命令）用它去重：快照基线之前的事件块
-    /// 已包含在快照里，直接跳过——"先监听后快照"的窗口期既不丢字节也不重复。
+    /// `data` 首字节对应的累计输出字节数（半开区间起点）。
+    #[serde(default)]
+    pub start_total: usize,
+    /// `data` 末字节追加后的累计输出字节数（半开区间终点，单调递增）。
     #[serde(default)]
     pub total: usize,
 }

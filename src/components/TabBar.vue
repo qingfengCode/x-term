@@ -205,23 +205,40 @@ defineExpose({ closeMenu });
   height: 0;
 }
 .tab {
+  position: relative;
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 4px 10px;
-  margin-right: 2px;
-  border-radius: 4px 4px 0 0;
+  gap: 7px;
+  height: 26px;
+  padding: 0 10px;
+  margin-right: 4px;
+  border-radius: 6px;
   cursor: pointer;
-  font-size: 13px;
-  color: var(--el-text-color-regular);
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
   max-width: 200px;
+  user-select: none;
+  transition: background-color 0.15s ease, color 0.15s ease;
 }
 .tab:hover {
   background: var(--el-fill-color-light);
+  color: var(--el-text-color-primary);
 }
 .tab.active {
-  background: var(--el-bg-color-page);
+  background: var(--el-color-primary-light-9);
   color: var(--el-color-primary);
+  font-weight: 500;
+}
+/* 激活 tab 顶部高光线 */
+.tab.active::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 10px;
+  right: 10px;
+  height: 2px;
+  border-radius: 0 0 2px 2px;
+  background: var(--el-color-primary);
 }
 .tab .title {
   overflow: hidden;
@@ -229,14 +246,24 @@ defineExpose({ closeMenu });
   white-space: nowrap;
 }
 .tab .dot {
-  width: 6px;
-  height: 6px;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   background: var(--el-color-success);
   flex-shrink: 0;
 }
 .tab .dot.connecting {
   background: var(--el-color-warning);
+  animation: tab-dot-pulse 1.1s ease-in-out infinite;
+}
+@keyframes tab-dot-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.25;
+  }
 }
 .tab .dot.dead {
   background: var(--el-color-danger);
@@ -245,18 +272,44 @@ defineExpose({ closeMenu });
 .tab.dragging {
   opacity: 0.5;
 }
+/* 关闭按钮：悬浮/激活时才显示（Chrome/VS Code 惯例），悬停红色警示 */
 .tab .close {
   font-size: 12px;
   padding: 2px;
-  border-radius: 2px;
+  border-radius: 4px;
+  color: var(--el-text-color-placeholder);
+  opacity: 0;
+  transition:
+    opacity 0.15s ease,
+    background-color 0.15s ease,
+    color 0.15s ease;
+}
+.tab:hover .close,
+.tab.active .close {
+  opacity: 1;
 }
 .tab .close:hover {
-  background: var(--el-fill-color-dark);
+  background: var(--el-color-danger-light-9);
+  color: var(--el-color-danger);
 }
+/* Ctrl 序号：等宽小徽标 */
 .tab-idx {
-  font-size: 10px;
+  min-width: 15px;
+  height: 15px;
+  line-height: 15px;
+  padding: 0 3px;
+  border-radius: 4px;
+  background: var(--el-fill-color-dark);
   color: var(--el-text-color-placeholder);
-  margin-right: 2px;
+  font-family: var(--app-font-mono);
+  font-size: 10px;
+  text-align: center;
+  flex-shrink: 0;
+  margin-right: 1px;
+}
+.tab.active .tab-idx {
+  background: var(--el-color-primary-light-8);
+  color: var(--el-color-primary);
 }
 .tab-hint {
   font-size: 12px;
@@ -267,21 +320,25 @@ defineExpose({ closeMenu });
 /* --- Tab 右键菜单（fixed 浮层） --- */
 .tab-menu {
   position: fixed;
-  min-width: 140px;
+  min-width: 148px;
   background: var(--el-bg-color-overlay);
-  border: 1px solid var(--el-border-color);
-  border-radius: 6px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
-  padding: 4px 0;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 8px;
+  box-shadow:
+    0 8px 24px rgba(0, 0, 0, 0.16),
+    0 2px 8px rgba(0, 0, 0, 0.08);
+  padding: 4px;
   /* 统一浮层层级（与 SqlConsoleView 菜单一致；高于 el-dialog 遮罩 2000+，
      低于右侧终端右键菜单被浮层遮挡的问题不复存在）。 */
   z-index: 3000;
 }
 .tab-menu-item {
-  padding: 6px 14px;
+  padding: 6px 10px;
+  border-radius: 5px;
   font-size: 13px;
   color: var(--el-text-color-primary);
   cursor: pointer;
+  transition: background-color 0.12s ease, color 0.12s ease;
 }
 .tab-menu-item:hover {
   background: var(--el-color-primary-light-9);
@@ -290,6 +347,6 @@ defineExpose({ closeMenu });
 .tab-menu-sep {
   height: 1px;
   background: var(--el-border-color-lighter);
-  margin: 4px 0;
+  margin: 4px 6px;
 }
 </style>

@@ -440,9 +440,11 @@ onMounted(async () => {
 
 <template>
   <div class="instance-panel">
+    <!-- 服务配置 -->
     <div class="form-card">
-      <div class="card-title">
-        {{ title }}
+      <div class="card-head">
+        <span class="card-ico"><el-icon><Setting /></el-icon></span>
+        <span class="card-title-text">服务配置</span>
         <HelpTip :content="toolHint" />
       </div>
 
@@ -574,7 +576,7 @@ onMounted(async () => {
             监听地址
             <HelpTip content="默认 127.0.0.1（仅本机）。可改为 0.0.0.0 或局域网 IP（如 192.168.x.x），供局域网内其他机器连接。" />
           </label>
-          <el-input v-model="config.host" placeholder="127.0.0.1" class="field-control" @change="onFieldChange" />
+          <el-input v-model="config.host" placeholder="127.0.0.1" class="field-control mono-input" @change="onFieldChange" />
         </div>
         <div class="field-row port-field">
           <label class="field-label">端口</label>
@@ -596,9 +598,10 @@ onMounted(async () => {
 
     <!-- 运行状态 + 启停 -->
     <div class="form-card">
-      <div class="card-title-row">
-        <div class="card-title">运行状态</div>
-        <div class="actions">
+      <div class="card-head">
+        <span class="card-ico"><el-icon><SwitchButton /></el-icon></span>
+        <span class="card-title-text">运行状态</span>
+        <div class="head-actions">
           <el-button :icon="Refresh" size="small" @click="mcp.refresh(kind)">刷新</el-button>
           <el-button
             v-if="!status.running"
@@ -608,7 +611,7 @@ onMounted(async () => {
             :loading="loading"
             @click="start"
           >
-            启动
+            启动服务
           </el-button>
           <el-button
             v-else
@@ -623,44 +626,49 @@ onMounted(async () => {
         </div>
       </div>
 
-      <div class="status-line">
-        <span class="status-label">状态</span>
-        <el-tag :type="status.running ? 'success' : 'info'" effect="dark" size="small">
-          {{ status.running ? "运行中" : "已停止" }}
-        </el-tag>
-        <template v-if="status.running && clientMode">
-          <span class="status-label">模式</span>
-          <span class="bound-name">客户端直连（未绑定）</span>
-        </template>
-        <template v-else-if="status.running && boundResourceName">
-          <span class="status-label">绑定</span>
-          <span class="bound-name">{{ boundResourceName }}</span>
-        </template>
+      <!-- 状态 hero：运行/停止 + 绑定摘要 -->
+      <div class="status-hero" :class="status.running ? 'is-on' : 'is-off'">
+        <span class="hero-dot" />
+        <div class="hero-text">
+          <span class="hero-state">{{ status.running ? "运行中" : "已停止" }}</span>
+          <span class="hero-desc">
+            <template v-if="status.running">
+              {{ clientMode ? "客户端直连模式 · 未绑定实例" : `已绑定 · ${boundResourceName || "—"}` }}
+            </template>
+            <template v-else>完成配置后点击「启动服务」对外提供调用</template>
+          </span>
+        </div>
       </div>
-      <div v-if="status.running" class="status-line">
-        <span class="status-label">SSE 端点</span>
-        <code class="endpoint">{{ status.endpoint }}</code>
-        <el-button :icon="CopyDocument" link size="small" @click="copy(fullUrl, '已复制端点地址')" />
+
+      <!-- 端点地址 -->
+      <div v-if="status.running" class="endpoint-row">
+        <span class="endpoint-tag">SSE</span>
+        <code class="endpoint-url">{{ fullUrl }}</code>
+        <el-tooltip content="复制端点地址" placement="top">
+          <el-button :icon="CopyDocument" link size="small" @click="copy(fullUrl, '已复制端点地址')" />
+        </el-tooltip>
       </div>
 
       <!-- 自动放行开关 -->
       <div class="switch-row">
-        <div class="switch-label">
-          <div>
+        <div class="switch-info">
+          <div class="switch-title">
             自动放行（免确认）
             <HelpTip :content="autoApproveHint" />
           </div>
+          <div class="switch-desc">外部客户端的调用请求不再弹窗确认，直接执行</div>
         </div>
         <el-switch v-model="config.autoApprove" @change="saveAutoApprove" />
       </div>
 
       <!-- 执行日志开关 -->
       <div class="switch-row">
-        <div class="switch-label">
-          <div>
+        <div class="switch-info">
+          <div class="switch-title">
             记录执行日志
             <HelpTip :content="logHint" />
           </div>
+          <div class="switch-desc">每次调用的时间、命令与结果写入本地日志文件</div>
         </div>
         <el-switch v-model="config.enableLog" @change="onFieldChange" />
       </div>
@@ -668,9 +676,9 @@ onMounted(async () => {
 
     <!-- 访问令牌 -->
     <div class="form-card">
-      <div class="card-title">
-        <el-icon><Key /></el-icon>
-        访问令牌 (Token)
+      <div class="card-head">
+        <span class="card-ico"><el-icon><Key /></el-icon></span>
+        <span class="card-title-text">访问令牌 (Token)</span>
         <HelpTip>
           <template #content>
             外部客户端请求时需在 Header 携带
@@ -689,13 +697,17 @@ onMounted(async () => {
         <el-button v-if="config.token" :icon="CopyDocument" @click="copy(config.token, '已复制 token')">复制</el-button>
       </div>
       <!-- 安全警告：保持直接展示，不收进 tooltip -->
-      <div class="token-warn">⚠ 妥善保管 token：任何持有该 token 的客户端均可调用本服务执行操作。</div>
+      <div class="token-warn">
+        <el-icon class="warn-ico"><WarningFilled /></el-icon>
+        <span>妥善保管 token：任何持有该 token 的客户端均可调用本服务执行操作。</span>
+      </div>
     </div>
 
     <!-- 客户端配置示例 -->
     <div class="form-card">
-      <div class="card-title">
-        客户端配置示例
+      <div class="card-head">
+        <span class="card-ico"><el-icon><Document /></el-icon></span>
+        <span class="card-title-text">客户端配置示例</span>
         <HelpTip content="将以下配置加入 Claude Desktop 的 claude_desktop_config.json（或 Cursor 的 MCP 设置）。需先启动服务并生成 token。" />
       </div>
       <div v-if="!status.running || !config.token" class="config-empty">
@@ -703,12 +715,16 @@ onMounted(async () => {
           请先完成配置（{{ clientMode ? "直连模式无需绑定实例" : "绑定资源" }}）、生成 token 并启动服务，配置将自动生成。
         </el-alert>
       </div>
-      <template v-else>
+      <div v-else class="json-block">
+        <div class="json-head">
+          <span class="json-dots"><i class="jd-r" /><i class="jd-y" /><i class="jd-g" /></span>
+          <span class="json-name">mcp-client-config.json</span>
+          <el-button :icon="CopyDocument" size="small" text bg @click="copy(clientConfig, '已复制配置 JSON')">
+            复制配置
+          </el-button>
+        </div>
         <pre class="config-json">{{ clientConfig }}</pre>
-        <el-button :icon="CopyDocument" size="small" @click="copy(clientConfig, '已复制配置 JSON')">
-          复制配置
-        </el-button>
-      </template>
+      </div>
     </div>
   </div>
 </template>
@@ -717,32 +733,53 @@ onMounted(async () => {
 .instance-panel {
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 12px;
+  padding: 2px 2px 8px;
 }
+
+/* --- 卡片 --- */
 .form-card {
   background: var(--el-bg-color-overlay);
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 8px;
-  padding: 16px;
-}
-.card-title {
-  font-size: 14px;
-  font-weight: 600;
-  margin-bottom: 6px;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-.card-title-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 12px;
-}
-.card-title-row .card-title {
-  margin-bottom: 0;
+  border-radius: 10px;
+  padding: 14px 16px 16px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
 }
 
+/* 卡片头：图标徽标 + 标题（+ 右侧动作） */
+.card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 10px;
+  margin-bottom: 14px;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+}
+.card-ico {
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  flex-shrink: 0;
+  color: var(--el-color-primary);
+  background: var(--el-color-primary-light-9);
+}
+.card-title-text {
+  font-size: 13.5px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  color: var(--el-text-color-primary);
+}
+.head-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+}
+
+/* --- 表单字段 --- */
 .field-row {
   display: flex;
   flex-direction: column;
@@ -750,15 +787,22 @@ onMounted(async () => {
   margin-bottom: 14px;
 }
 .field-label {
-  font-size: 13px;
+  font-size: 12.5px;
   color: var(--el-text-color-regular);
   font-weight: 500;
+  display: flex;
+  align-items: center;
+  gap: 4px;
 }
 .required {
   color: var(--el-color-danger);
 }
 .field-control {
   width: 100%;
+}
+.mono-input :deep(input) {
+  font-family: var(--app-font-mono);
+  font-size: 12.5px;
 }
 .addr-row {
   display: flex;
@@ -767,9 +811,13 @@ onMounted(async () => {
 .addr-row .flex1 {
   flex: 1;
 }
+.addr-row .field-row {
+  margin-bottom: 10px;
+}
 .port-field {
   max-width: 160px;
 }
+
 .client-mode-alert {
   font-size: 12px;
   line-height: 1.8;
@@ -778,11 +826,11 @@ onMounted(async () => {
   background: var(--el-fill-color-light);
   padding: 1px 4px;
   border-radius: 3px;
+  font-family: var(--app-font-mono);
 }
 .hint-text {
   font-size: 12px;
   color: var(--el-text-color-secondary);
-  margin-top: -6px;
   margin-bottom: 4px;
 }
 .warn-inline {
@@ -794,33 +842,122 @@ onMounted(async () => {
   margin-bottom: 14px;
 }
 
-.actions {
-  display: flex;
-  gap: 8px;
-}
-.status-line {
+/* --- 状态 hero --- */
+.status-hero {
   display: flex;
   align-items: center;
-  gap: 10px;
-  margin-bottom: 10px;
-  flex-wrap: wrap;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  margin-bottom: 12px;
+  border: 1px solid var(--el-border-color-lighter);
+  background: var(--el-fill-color-light);
+  transition: background 0.25s, border-color 0.25s;
 }
-.status-label {
-  font-size: 13px;
-  color: var(--el-text-color-secondary);
-  min-width: 56px;
+.status-hero.is-on {
+  border-color: var(--el-color-success-light-7);
+  background: var(--el-color-success-light-9);
 }
-.bound-name {
-  font-weight: 500;
+.hero-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--el-text-color-disabled);
+  flex-shrink: 0;
+}
+.is-on .hero-dot {
+  background: var(--el-color-success);
+  animation: hero-pulse 2s ease-out infinite;
+}
+@keyframes hero-pulse {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--el-color-success) 45%, transparent); }
+  70% { box-shadow: 0 0 0 8px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+.hero-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.hero-state {
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.2;
   color: var(--el-text-color-primary);
 }
-.endpoint {
-  font-family: "Cascadia Code", Consolas, monospace;
-  font-size: 13px;
-  color: var(--el-color-primary);
-  word-break: break-all;
+.is-on .hero-state {
+  color: var(--el-color-success);
+}
+.hero-desc {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
+/* --- 端点行 --- */
+.endpoint-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 14px;
+  min-width: 0;
+}
+.endpoint-tag {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  flex-shrink: 0;
+  font-family: var(--app-font-mono);
+  color: var(--el-color-primary);
+  background: var(--el-color-primary-light-9);
+  border: 1px solid var(--el-color-primary-light-8);
+  user-select: none;
+}
+.endpoint-url {
+  font-family: var(--app-font-mono);
+  font-size: 12.5px;
+  color: var(--el-color-primary);
+  word-break: break-all;
+  min-width: 0;
+}
+
+/* --- 开关行 --- */
+.switch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 11px 0;
+  border-top: 1px dashed var(--el-border-color-lighter);
+}
+.switch-row:first-of-type {
+  border-top: none;
+}
+.switch-info {
+  min-width: 0;
+}
+.switch-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--el-text-color-primary);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.switch-desc {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  margin-top: 2px;
+  line-height: 1.4;
+}
+
+/* --- 令牌 --- */
 .token-row {
   display: flex;
   gap: 8px;
@@ -828,40 +965,90 @@ onMounted(async () => {
 }
 .token-input {
   flex: 1;
+  min-width: 0;
+}
+.token-input :deep(input) {
+  font-family: var(--app-font-mono);
+  font-size: 12.5px;
 }
 .token-warn {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
   margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: 6px;
   font-size: 12px;
   line-height: 1.6;
-  color: var(--el-color-danger);
+  color: var(--el-color-warning);
+  background: var(--el-color-warning-light-9);
+  border: 1px solid var(--el-color-warning-light-8);
+}
+.warn-ico {
+  font-size: 14px;
+  flex-shrink: 0;
+  margin-top: 2px;
 }
 
+/* --- 客户端配置 JSON 块（迷你终端窗口） --- */
 .config-empty {
   margin-top: 4px;
 }
-.config-json {
-  background: var(--el-fill-color-dark);
-  color: var(--el-color-success);
-  padding: 12px;
-  border-radius: 6px;
-  font-size: 12px;
-  overflow: auto;
-  margin: 8px 0;
-  font-family: "Cascadia Code", Consolas, monospace;
+.json-block {
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid #2a3442;
+  margin-top: 2px;
 }
-
-.switch-row {
+.json-head {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding-top: 12px;
-  margin-top: 12px;
-  border-top: 1px solid var(--el-border-color-lighter);
+  gap: 8px;
+  padding: 6px 10px;
+  background: #1c2330;
+  border-bottom: 1px solid #2a3442;
 }
-.switch-label > div:first-child {
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--el-text-color-primary);
+.json-dots {
+  display: inline-flex;
+  gap: 5px;
+  flex-shrink: 0;
+}
+.json-dots i {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+}
+.jd-r { background: #ff5f57; }
+.jd-y { background: #febc2e; }
+.jd-g { background: #28c840; }
+.json-name {
+  font-family: var(--app-font-mono);
+  font-size: 11px;
+  color: #7d8590;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.json-head .el-button {
+  margin-left: auto;
+  color: #adbac7;
+  background: #2a3442;
+  border-color: #3a4656;
+}
+.json-head .el-button:hover {
+  color: #e6edf3;
+  background: #344050;
+  border-color: #46536a;
+}
+.config-json {
+  background: #161b22;
+  color: #7ee787;
+  padding: 12px 14px;
+  font-size: 12px;
+  line-height: 1.6;
+  overflow: auto;
+  margin: 0;
+  max-height: 260px;
+  font-family: var(--app-font-mono);
 }
 </style>

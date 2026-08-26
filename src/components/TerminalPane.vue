@@ -13,6 +13,7 @@ import { useSettingsStore } from "@/stores/settings";
 import { matchesCombo } from "@/utils/shortcut";
 import { base64ToBytes, bytesToBase64 } from "@/utils/binary";
 import { formatSize } from "@/utils/format";
+import { resolveScheme } from "@/utils/terminalThemes";
 import { useZmodemTransfer } from "@/composables/useZmodemTransfer";
 import "@xterm/xterm/css/xterm.css";
 
@@ -33,11 +34,12 @@ let unmounted = false;
 // --- attach 回放状态（首屏输出不丢；重连换 instanceId 时重置复用同一 xterm）---
 // 后端 reader 在 connect 返回前就开始推 terminal:data，监听注册之前的输出会丢。
 // 流程：监听先注册（期间事件缓存 pendingData，不渲染）→ terminal_attach 取
-// 「缓冲快照 + 累计基线」→ 快照先入终端 → 缓存事件按 total 基线去重后放行
-// （≤ 基线的块已含在快照里）。attach 完成后 live 事件直通。
+// 「缓冲快照 + 累计基线」→ 快照先入终端 → 缓存事件按 [startTotal,total) 区间
+// 对基线精确去重后放行（整段 ≤ 基线已含在快照里；跨界的只取基线之后的部分）。
+// attach 完成后 live 事件同样按区间处理（批量 emit 的事件可能与快照跨界）。
 let attachDone = false;
 let attachBaseline = 0;
-let pendingData: { bytes: Uint8Array; total: number }[] = [];
+let pendingData: { bytes: Uint8Array; startTotal: number; total: number }[] = [];
 // attach 代际：连续快速重连（重连→立刻再重连）时旧的 attach 尚在 await 中，
 // 新的已重置状态——旧代返回后必须丢弃，否则会把旧实例的快照写进新会话。
 let attachGen = 0;
@@ -45,6 +47,22 @@ let attachGen = 0;
 /** 把字节喂给渲染链（ZMODEM Sentry → 终端），快照与事件统一走这一入口。 */
 function feedOutput(bytes: Uint8Array) {
   zmodemFeed(bytes);
+}
+
+/**
+ * 按快照基线处理一段输出区间 [start, end)：整段已在快照里则跳过；
+ * 跨界则只取基线之后的尾部字节；否则整段渲染。
+ */
+function dedupOutput(start: number, end: number, bytes: Uint8Array) {
+  if (!(end > 0) || end <= attachBaseline) return; // 整段已含在快照里
+  if (start < attachBaseline) {
+    // 跨界：快照含 [start, baseline)，只渲染 [baseline, end)。
+    const drop = attachBaseline - start;
+    if (drop >= bytes.length) return;
+    feedOutput(bytes.subarray(drop));
+  } else {
+    feedOutput(bytes);
+  }
 }
 
 /**
@@ -77,7 +95,7 @@ async function attachSession(instanceId: string) {
   }
   attachDone = true;
   for (const p of pendingData.splice(0)) {
-    if (p.total > attachBaseline) feedOutput(p.bytes);
+    dedupOutput(p.startTotal, p.total, p.bytes);
   }
 }
 
@@ -134,23 +152,11 @@ function buildOptions() {
     lineHeight: t.lineHeight,
     scrollback: t.scrollback,
     cursorBlink: true,
-    theme: t.theme === "dark" ? DARK_THEME : LIGHT_THEME,
+    // 完整 ANSI 16 色配色方案（旧配置空值按明暗回退 Catppuccin）。
+    theme: resolveScheme(t.colorScheme, t.theme).theme,
     allowProposedApi: true,
   };
 }
-
-const DARK_THEME = {
-  background: "#1e1e2e",
-  foreground: "#cdd6f4",
-  cursor: "#f5e0dc",
-  selectionBackground: "#585b7088",
-};
-const LIGHT_THEME = {
-  background: "#ffffff",
-  foreground: "#1e1e2e",
-  cursor: "#1e1e2e",
-  selectionBackground: "#c0caf588",
-};
 
 // --- 剪贴板（webview2 支持 navigator.clipboard；失败静默降级） ---
 async function copyText(text: string) {
@@ -217,13 +223,10 @@ onMounted(async () => {
       if (e.payload.sessionId !== props.instanceId) return;
       const bytes = base64ToBytes(e.payload.data);
       if (!attachDone) {
-        pendingData.push({ bytes, total: e.payload.total ?? 0 });
+        pendingData.push({ bytes, startTotal: e.payload.startTotal ?? 0, total: e.payload.total ?? 0 });
         return;
       }
-      // attach 快照基线之前的块已包含在快照里，跳过避免重复渲染。
-      const total = e.payload.total ?? 0;
-      if (total > 0 && total <= attachBaseline) return;
-      feedOutput(bytes);
+      dedupOutput(e.payload.startTotal ?? 0, e.payload.total ?? 0, bytes);
     }),
   );
 
@@ -271,8 +274,39 @@ onMounted(async () => {
   });
 
   resizeObs = new ResizeObserver(() => {
+    // 隐藏/半隐藏（v-show 切走、布局未完成）时不 fit：此时字符测量失效，
+    // fit 会算出**偏小的 cols** 并停在这个错值——PTY/bash 仍按真实列宽输出，
+    // readline 局部重绘按两套列宽定位，跨列边界的行错位出"提示符后缀残影"
+    //（短主机名不跨界故无症状）。clientWidth/Height 双重校验挡住 0 与半布局。
+    const el = containerRef.value;
+    if (!el || el.clientWidth === 0 || el.clientHeight === 0) return;
     try {
       fitAddon?.fit();
+      // 容器从隐藏（切走 tab，v-show display:none）恢复可见时：
+      // 1. 全量重绘视口——隐藏期间的渲染不落盘，渲染层保留旧画面；
+      // 2. 向 PTY 重发一次 window_change（即使尺寸未变）——SSH 照发
+      //    SIGWINCH，远端 shell/readline 会**重绘当前提示符行**。
+      // 残影的根因在数据层：切换期间 readline 的局部重绘与终端状态错位，
+      // 最后一行 buffer 里就带着残缺片段（"root@… ~]# hanzy ~]#"），
+      // refresh 治不了 buffer——SIGWINCH 触发的 shell 重绘才是正解
+      //（与"按回车残影消失"同机制，但无需用户敲键）。
+      term?.refresh(0, (term?.rows ?? 1) - 1);
+      if (term) {
+        // 视口对齐：v-show 隐藏（高度 0）→ 恢复的过程中，xterm viewport 的
+        // 滚动位置会错位——底部露出半行旧内容（形如提示符后缀残影），
+        // refresh 治不了（行渲染本身是对的，错的是滚动偏移）。若切换前
+        // 就停在底部，这里重新对齐到缓冲区末尾；正在向上翻阅历史的
+        // 不打扰。
+        const buf = term.buffer.active;
+        if (buf.baseY + term.rows >= buf.length) {
+          term.scrollToBottom();
+        }
+        terminalApi
+          .terminalResize(props.instanceId, term.cols, term.rows)
+          .catch(() => {
+            /* 会话已断开等场景忽略 */
+          });
+      }
     } catch {
       /* 容器隐藏时 fit 会抛错，忽略 */
     }
@@ -368,6 +402,14 @@ function zoomFont(delta: number) {
   }
 }
 
+/** Ctrl + 滚轮缩放字号（VS Code 惯例）；不写全局设置，仅作用于本面板。 */
+function onCtrlWheel(e: WheelEvent) {
+  if (!e.ctrlKey) return;
+  e.preventDefault();
+  const delta = e.deltaY < 0 ? 1 : -1;
+  if (term) zoomFont(delta);
+}
+
 /** 重置本面板字号覆盖，回到全局设置值。 */
 function resetZoom() {
   fontSizeOverride = null;
@@ -401,7 +443,7 @@ watch(
       term.options.fontSize = fontSizeOverride ?? t.fontSize;
       term.options.lineHeight = t.lineHeight;
       term.options.scrollback = t.scrollback;
-      term.options.theme = t.theme === "dark" ? DARK_THEME : LIGHT_THEME;
+      term.options.theme = resolveScheme(t.colorScheme, t.theme).theme;
       try {
         fitAddon?.fit();
       } catch {
@@ -429,6 +471,12 @@ const MENU_W = 160;
 const MENU_H = 200;
 function onContextMenu(e: MouseEvent) {
   e.preventDefault();
+  // 右键粘贴模式（PuTTY 风格，快捷键设置里开关）：右键直接粘贴剪贴板，
+  // 不弹菜单——高频粘贴操作少一次菜单往返。
+  if (settings.terminal.rightClickPaste) {
+    void menuPaste();
+    return;
+  }
   menuX.value = Math.min(e.clientX, window.innerWidth - MENU_W - 8);
   menuY.value = Math.min(e.clientY, window.innerHeight - MENU_H - 8);
   menuVisible.value = true;
@@ -440,6 +488,7 @@ async function menuCopy() {
   const sel = term?.getSelection() ?? "";
   if (sel) await copyText(sel);
   closeMenu();
+  term?.focus();
 }
 async function menuPaste() {
   // ZMODEM 传输期间不粘贴，避免污染协议字节流。
@@ -450,14 +499,20 @@ async function menuPaste() {
     terminalApi.terminalWrite(props.instanceId, b64).catch(() => {});
   }
   closeMenu();
+  // 粘贴走 terminalWrite API 而非键盘路径，焦点不会自动回到 xterm 的
+  // textarea（readClipboard 的异步/权限交互还会把焦点带走）——失焦状态下
+  // xterm 光标隐藏，表现为"粘贴后光标消失，要再点一下终端才有"。显式还焦。
+  term?.focus();
 }
 function menuSelectAll() {
   term?.selectAll();
   closeMenu();
+  term?.focus();
 }
 function menuClear() {
   term?.clear();
   closeMenu();
+  term?.focus();
 }
 function menuSearch() {
   closeMenu();
@@ -489,7 +544,28 @@ function runSearch(dir: "next" | "prev") {
 }
 const searchInputRef = ref<HTMLInputElement | null>(null);
 
+  /**
+   * 外部触发的重新适配（切回 tab 布局稳定后调用）：走与 ResizeObserver
+   * 相同的守卫逻辑，纠正"恢复瞬间首次 fit 取到失效测量"造成的 cols 偏差。
+   */
+  function refit() {
+    const el = containerRef.value;
+    if (!el || el.clientWidth === 0 || el.clientHeight === 0) return;
+    try {
+      fitAddon?.fit();
+      term?.refresh(0, (term?.rows ?? 1) - 1);
+      if (term) {
+        terminalApi
+          .terminalResize(props.instanceId, term.cols, term.rows)
+          .catch(() => {});
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
 defineExpose({
+  refit,
   search: (keyword: string) => searchAddon?.findNext(keyword),
   findNext: (keyword: string) => searchAddon?.findNext(keyword),
   findPrevious: (keyword: string) => searchAddon?.findPrevious(keyword),
@@ -533,6 +609,7 @@ defineExpose({
       class="xterm-pane"
       @contextmenu.prevent="onContextMenu"
       @click="closeMenu"
+      @wheel="onCtrlWheel"
     />
 
     <!-- 搜索浮层 -->
@@ -613,10 +690,12 @@ defineExpose({
   align-items: center;
   gap: 4px;
   background: var(--el-bg-color-overlay);
-  border: 1px solid var(--el-border-color);
-  border-radius: 6px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 8px;
   padding: 4px 6px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  box-shadow:
+    0 8px 24px rgba(0, 0, 0, 0.16),
+    0 2px 8px rgba(0, 0, 0, 0.08);
   z-index: 10;
 }
 .term-search-input {
@@ -634,9 +713,10 @@ defineExpose({
   color: var(--el-text-color-secondary);
   cursor: pointer;
   padding: 2px 6px;
-  border-radius: 3px;
+  border-radius: 4px;
   font-size: 13px;
   line-height: 1;
+  transition: background-color 0.15s ease, color 0.15s ease;
 }
 .term-search-btn:hover,
 .term-search-close:hover {
@@ -653,20 +733,24 @@ defineExpose({
 /* 右键菜单 */
 .term-menu {
   position: fixed;
-  min-width: 140px;
+  min-width: 148px;
   background: var(--el-bg-color-overlay);
-  border: 1px solid var(--el-border-color);
-  border-radius: 6px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
-  padding: 4px 0;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 8px;
+  box-shadow:
+    0 8px 24px rgba(0, 0, 0, 0.16),
+    0 2px 8px rgba(0, 0, 0, 0.08);
+  padding: 4px;
   /* 与共享 TabBar 菜单统一层级（避免被后开的浮层/菜单遮挡）。 */
   z-index: 3000;
 }
 .term-menu-item {
-  padding: 6px 14px;
+  padding: 6px 10px;
+  border-radius: 5px;
   font-size: 13px;
   color: var(--el-text-color-primary);
   cursor: pointer;
+  transition: background-color 0.12s ease, color 0.12s ease;
 }
 .term-menu-item:hover {
   background: var(--el-color-primary-light-9);
@@ -675,7 +759,7 @@ defineExpose({
 .term-menu-sep {
   height: 1px;
   background: var(--el-border-color-lighter);
-  margin: 4px 0;
+  margin: 4px 6px;
 }
 
 /* ZMODEM 传输进度浮层 */
@@ -691,9 +775,9 @@ defineExpose({
 .zmodem-card {
   pointer-events: auto;
   background: var(--el-bg-color-overlay);
-  border: 1px solid var(--el-border-color);
-  border-radius: 8px;
-  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.18);
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
   padding: 10px 12px;
 }
 .zmodem-head {

@@ -297,6 +297,10 @@ enum InputMsg {
     },
     /// 调整终端窗口大小。
     Resize { cols: u32, rows: u32 },
+    /// 立即冲刷输出批次（terminal_attach 前调用）：把 reader 内积压的批量
+    /// 输出 emit 掉，保证 attach 快照与事件流的 `total` 基线一致（否则快照
+    /// 与稍后 flush 的批次可能包含同一段字节，前端重复渲染）。
+    FlushOutput(oneshot::Sender<()>),
     /// 关闭会话。reader 收到后退出循环并关闭 channel。
     Close(oneshot::Sender<()>),
 }
@@ -347,6 +351,12 @@ const DISCONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 /// `Channel::data` 在远端窗口耗尽（对端不读 stdin 的流控）或连接任务卡死时
 /// 会无限阻塞；写入按此超时兜底，超时视为连接已坏、退出 reader 循环。
 const CHANNEL_WRITE_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 终端输出批量 emit 间隔（毫秒）。远端输出先累积进批次，到点才 emit 一次；
+/// 兼顾交互延迟（16ms ≈ 1 帧）与 IPC 次数（高吞吐下降 1~2 个数量级）。
+const TERMINAL_BATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+/// 终端输出批量 emit 大小阈值（字节）：积满即冲刷，避免超大事件卡住 IPC。
+const TERMINAL_BATCH_MAX_BYTES: usize = 64 * 1024;
 
 impl SshSession {
     /// 打开一个新的交互式终端会话。
@@ -504,6 +514,18 @@ impl SshSession {
         Ok(ack_rx)
     }
 
+    /// 通知 reader 立即冲刷输出批次，返回完成信号（调用方 await）。
+    ///
+    /// 供 `terminal_attach` 在取快照前调用：批量化后批次里可能积压了快照
+    /// 已包含的字节（同一段数据既在快照里又在稍后 flush 的事件里），
+    /// 先冲刷再快照可让事件 `total` 基线 ≥ 快照基线，前端去重不会重复渲染。
+    pub fn flush_output(&self) -> Option<oneshot::Receiver<()>> {
+        let tx = self.input_tx.as_ref()?;
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let _ = tx.send(InputMsg::FlushOutput(ack_tx));
+        Some(ack_rx)
+    }
+
     /// 通知远程终端窗口大小变化。
     pub fn resize(&self, cols: u32, rows: u32) -> AppResult<()> {
         let tx = self
@@ -551,10 +573,40 @@ impl SshSession {
                 })
             };
 
+            // 批量 emit：远端输出先累积成批，按时间(16ms)/大小(64KiB)冲刷，
+            // 把 IPC 事件数降 1~2 个数量级（cat 大文件/tail -f 高吞吐场景）。
+            // 事件携带半开区间 [start_total, total)，前端按快照基线精确去重
+            // （跨界的批次只取基线之后的部分，不丢也不重复）。
+            let flush_batch =
+                |batch: &mut Vec<u8>, start_total: usize, end_total: usize| {
+                    if batch.is_empty() {
+                        return;
+                    }
+                    let encoded = B64.encode(batch.as_slice());
+                    events::emit(
+                        &app,
+                        TERMINAL_DATA,
+                        TerminalDataEvent {
+                            session_id: session_id.clone(),
+                            data: encoded,
+                            start_total,
+                            total: end_total,
+                        },
+                    );
+                    batch.clear();
+                };
+
             // 待写数据队列：远端窗口（flow control）耗尽时写入停在此处，
             // 由循环顶部/尾部的按窗口冲刷逻辑在窗口恢复后继续写入。
             let mut pending_writes: VecDeque<(Vec<u8>, Option<oneshot::Sender<()>>)> =
                 VecDeque::new();
+
+            // 输出批次缓冲。
+            let mut batch: Vec<u8> = Vec::with_capacity(4096);
+            // 批次首字节对应的累计字节数（半开区间起点）。
+            let mut batch_start_total: usize = 0;
+            let mut batch_total: usize = 0;
+            let mut batch_deadline: Option<tokio::time::Instant> = None;
 
             loop {
                 // 先冲刷积压写入（窗口可用时）。返回 false 表示写失败/连接卡死。
@@ -562,43 +614,67 @@ impl SshSession {
                     break;
                 }
 
+                // 批次冲刷定时器：有积压数据时到点触发；无积压则永远 pending
+                // （该 select 分支同时带 guard，避免空转）。
+                let flush_fut = async {
+                    match batch_deadline {
+                        Some(dl) => tokio::time::sleep_until(dl).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
+
                 tokio::select! {
-                    // 远程 → 前端：channel 输出。
+                    // 远程 → 前端：channel 输出（先累积进批次，按时间/大小冲刷）。
                     // 注意：不能用 biased —— 高吞吐输出流会持续占用第一分支，
                     // 导致输入分支（用户按键/Ctrl+C）被饿死。
+                    _ = flush_fut, if !batch.is_empty() => {
+                        flush_batch(&mut batch, batch_start_total, batch_total);
+                        batch_deadline = None;
+                    }
                     msg = channel.wait() => {
                         match msg {
                             Some(ChannelMsg::Data { ref data }) => {
-                                let total = record_output(data.as_ref());
-                                let encoded = B64.encode(data);
-                                events::emit(
-                                    &app,
-                                    TERMINAL_DATA,
-                                    TerminalDataEvent {
-                                        session_id: session_id.clone(),
-                                        data: encoded,
-                                        total: total.unwrap_or(0),
-                                    },
-                                );
+                                if batch.is_empty() {
+                                    // 批次起点 = 本块写入前的累计字节数（上批终点）。
+                                    batch_start_total = batch_total;
+                                }
+                                if let Some(total) = record_output(data.as_ref()) {
+                                    batch_total = total;
+                                }
+                                batch.extend_from_slice(data);
+                                if batch_deadline.is_none() {
+                                    batch_deadline = Some(tokio::time::Instant::now() + TERMINAL_BATCH_INTERVAL);
+                                }
+                                if batch.len() >= TERMINAL_BATCH_MAX_BYTES {
+                                    flush_batch(&mut batch, batch_start_total, batch_total);
+                                    batch_deadline = None;
+                                }
                             }
                             Some(ChannelMsg::ExtendedData { ref data, .. }) => {
-                                let total = record_output(data.as_ref());
-                                let encoded = B64.encode(data);
-                                events::emit(
-                                    &app,
-                                    TERMINAL_DATA,
-                                    TerminalDataEvent {
-                                        session_id: session_id.clone(),
-                                        data: encoded,
-                                        total: total.unwrap_or(0),
-                                    },
-                                );
+                                if batch.is_empty() {
+                                    batch_start_total = batch_total;
+                                }
+                                if let Some(total) = record_output(data.as_ref()) {
+                                    batch_total = total;
+                                }
+                                batch.extend_from_slice(data);
+                                if batch_deadline.is_none() {
+                                    batch_deadline = Some(tokio::time::Instant::now() + TERMINAL_BATCH_INTERVAL);
+                                }
+                                if batch.len() >= TERMINAL_BATCH_MAX_BYTES {
+                                    flush_batch(&mut batch, batch_start_total, batch_total);
+                                    batch_deadline = None;
+                                }
                             }
                             Some(ChannelMsg::ExitStatus { exit_status }) => {
                                 exit_code = Some(exit_status);
                                 // 不立刻 break：可能仍有未读完的数据。
                             }
-                            Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                            Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
+                                // 退出前冲刷残留批次，避免尾部输出丢失。
+                                flush_batch(&mut batch, batch_start_total, batch_total);
+                                break;
+                            }
                             Some(_) => {}
                         }
                     }
@@ -620,7 +696,14 @@ impl SshSession {
                                 )
                                 .await;
                             }
+                            Some(InputMsg::FlushOutput(ack)) => {
+                                flush_batch(&mut batch, batch_start_total, batch_total);
+                                batch_deadline = None;
+                                let _ = ack.send(());
+                            }
                             Some(InputMsg::Close(ack)) => {
+                                // 关闭前冲刷残留批次，避免尾部输出丢失。
+                                flush_batch(&mut batch, batch_start_total, batch_total);
                                 // eof/close 同样可能被卡死的连接挂起：加超时兜底。
                                 let _ = tokio::time::timeout(
                                     CHANNEL_WRITE_STALL_TIMEOUT,

@@ -34,6 +34,10 @@ import {
   EditPen,
   QuestionFilled,
   Close,
+  ArrowDown,
+  Clock,
+  Fold,
+  Expand,
 } from "@element-plus/icons-vue";
 import {
   dbDeleteProfile,
@@ -53,6 +57,7 @@ import { useAiDbStore } from "@/stores/ai";
 import { useDbStore, type DbTab } from "@/stores/db";
 import { useSettingsStore } from "@/stores/settings";
 import { useCodeMirror } from "@/composables/useCodeMirror";
+import ResultTableV2 from "@/components/ResultTableV2.vue";
 import { stripLeadingComments, useSqlConsole } from "@/composables/useSqlConsole";
 
 // KeepAlive 按 name 匹配缓存本组件（保留 DB 助手面板状态）。
@@ -766,40 +771,35 @@ const activeResultIsSelect = computed(() => {
   return !!r && r.columns.length > 0;
 });
 
-// --- 标签栏交互（参考终端 Workspace） ------------------------------------------
-const tabMenu = ref<{ x: number; y: number; tab: DbTab | null }>({ x: 0, y: 0, tab: null });
-function openTabMenu(tab: DbTab, e: MouseEvent) {
-  tabMenu.value = { x: e.clientX, y: e.clientY, tab };
-}
-function closeTabMenu() {
-  tabMenu.value.tab = null;
-}
-function onTabMenuCommand(cmd: string) {
-  const t = tabMenu.value.tab;
-  closeTabMenu();
-  if (!t) return;
-  switch (cmd) {
-    case "close":
-      void db.closeTab(t.id);
-      break;
-    case "closeOthers":
-      for (const x of [...db.tabs]) {
-        if (x.id !== t.id) void db.closeTab(x.id);
-      }
-      break;
-    case "closeAll":
-      for (const x of [...db.tabs]) void db.closeTab(x.id);
-      break;
-  }
+// --- 代码模式结果区高度测量（el-table-v2 需要确定 px 高度） ---
+// 结果区是 flex 子项高度自适应，ResizeObserver 跟随容器实际高度喂给虚拟表。
+// 结果区仅在代码模式渲染，DOM 晚于 onMounted 出现 → watch 挂 ref 后再观察。
+const codeResultBodyRef = ref<HTMLElement | null>(null);
+const resultBodyHeight = ref(240);
+let resultBodyObs: ResizeObserver | null = null;
+watch(codeResultBodyRef, (el) => {
+  resultBodyObs?.disconnect();
+  if (!el) return;
+  resultBodyObs = new ResizeObserver((entries) => {
+    for (const en of entries) {
+      resultBodyHeight.value = Math.max(120, Math.floor(en.contentRect.height));
+    }
+  });
+  resultBodyObs.observe(el);
+});
+onBeforeUnmount(() => {
+  resultBodyObs?.disconnect();
+  resultBodyObs = null;
+});
+
+// --- 标签管理（横向标签栏） ----------------------------------------------
+/** 标签标题：库名（未绑定库时为 profile 名）。 */
+function tabTitle(tab: DbTab) {
+  return tab.database ?? tab.profileName;
 }
 
-/** 中键点击标签：关闭（并阻止中键自动滚动）。 */
-function onTabAuxClick(tab: DbTab, e: MouseEvent) {
-  if (e.button === 1) {
-    e.preventDefault();
-    if (tab.id) void db.closeTab(tab.id);
-  }
-}
+/** 标签区 DOM 引用（滚动控制用）。 */
+const dbTabsRef = ref<HTMLElement | null>(null);
 
 /** 标签区滚轮：纵向滚动转为横向滚动。 */
 function onTabsWheel(e: WheelEvent) {
@@ -807,32 +807,18 @@ function onTabsWheel(e: WheelEvent) {
   el.scrollLeft += e.deltaY;
 }
 
-/** 拖拽排序标签（HTML5 DnD，dragover 时按过半即换位）。 */
-const dragTabId = ref<string | null>(null);
-function onTabDragStart(e: DragEvent, id: string) {
-  dragTabId.value = id;
-  if (e.dataTransfer) {
-    e.dataTransfer.effectAllowed = "move";
-    e.dataTransfer.setData("text/plain", id);
-  }
-}
-function onTabDragOver(e: DragEvent, targetId: string) {
-  const from = dragTabId.value;
-  if (!from || from === targetId) return;
-  e.preventDefault();
-  if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
-  const el = e.currentTarget as HTMLElement;
-  const before = e.offsetX < el.clientWidth / 2;
-  db.moveTab(from, targetId, before);
-}
-function onTabDragEnd() {
-  dragTabId.value = null;
-}
-
-/** 标签标题：库名（未绑定库时为 profile 名）。 */
-function tabTitle(tab: DbTab) {
-  return tab.database ?? tab.profileName;
-}
+/** 把激活标签滚入视野（标签超出可视区时自动定位，VS Code 溢出策略）。
+    scrollIntoView({ inline: "nearest" }) 只在标签不可见时滚动，无跳动。 */
+watch(
+  () => db.activeTabId,
+  async () => {
+    await nextTick();
+    const wrap = dbTabsRef.value;
+    if (!wrap) return;
+    const active = wrap.querySelector(".db-tab.active");
+    active?.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "smooth" });
+  },
+);
 
 /** "+" 下拉：选 profile 开新标签 / 新建连接。 */
 async function onAddTabCommand(command: string | number | object) {
@@ -844,21 +830,41 @@ async function onAddTabCommand(command: string | number | object) {
   if (profile) await openTabForProfile(profile);
 }
 
+// --- 标签右键菜单（关闭/关闭其他/关闭全部） --------------------------------
+
+const tabMenu = ref<{ x: number; y: number; tab: DbTab | null }>({ x: 0, y: 0, tab: null });
+
+function openTabMenu(tab: DbTab, e: MouseEvent) {
+  tabMenu.value = { x: e.clientX, y: e.clientY, tab };
+}
+
+function closeTabMenu() {
+  tabMenu.value.tab = null;
+}
+
+function onTabMenuCommand(cmd: "close" | "closeOthers" | "closeAll") {
+  const t = tabMenu.value.tab;
+  closeTabMenu();
+  if (!t) return;
+  if (cmd === "close") {
+    void db.closeTab(t.id);
+  } else if (cmd === "closeOthers") {
+    for (const x of [...db.tabs]) {
+      if (x.id !== t.id) void db.closeTab(x.id);
+    }
+  } else {
+    for (const x of [...db.tabs]) void db.closeTab(x.id);
+  }
+}
+
 /** 工具栏"断开"：关闭当前标签。 */
 async function closeActiveTab() {
   if (db.activeTabId) await db.closeTab(db.activeTabId);
 }
 
-// 当前活动标签的 profile 展示名。
-const activeProfileLabel = computed(() => {
-  const tab = db.activeTab;
-  if (!tab) return "";
-  const p = profiles.value.find((x) => x.id === tab.profileId);
-  return p ? `${p.name} (${p.host}:${p.port})` : tab.profileName;
-});
-
-// 左侧数据库树宽度（可拖拽调整）。
+// 左侧数据库树宽度（可拖拽调整）与收起状态（收起后编辑区占满全宽）。
 const sidebarWidth = ref(200);
+const treeCollapsed = ref(false);
 function startResize(e: MouseEvent) {
   e.preventDefault();
   const startX = e.clientX;
@@ -1167,9 +1173,18 @@ let unlistenSqlResult: (() => void) | null = null;
 let unmounted = false;
 
 // --- 生命周期 ---------------------------------------------------------------
+// 标签右键菜单：点击任意处 / Esc 关闭（挂 window，随组件生命周期注销）。
+function onWindowClick() {
+  closeTabMenu();
+}
+function onWindowKeydown(e: KeyboardEvent) {
+  if (e.key === "Escape") closeTabMenu();
+}
+
 onMounted(async () => {
   await loadProfiles();
-  window.addEventListener("click", closeTabMenu);
+  window.addEventListener("click", onWindowClick);
+  window.addEventListener("keydown", onWindowKeydown);
   // 订阅 ai:sql_result（exec_sql 终端可视化回显到活动标签）。
   try {
     const fn = await listen<AiSqlResultEvent>("ai:sql_result", (e) => {
@@ -1187,7 +1202,8 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   unmounted = true;
-  window.removeEventListener("click", closeTabMenu);
+  window.removeEventListener("click", onWindowClick);
+  window.removeEventListener("keydown", onWindowKeydown);
   if (unlistenSqlResult) {
     unlistenSqlResult();
     unlistenSqlResult = null;
@@ -1204,72 +1220,33 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="sql-console">
-    <!-- 顶部工具栏 -->
-    <div class="toolbar">
-      <div class="toolbar-left">
-        <template v-if="db.activeTab">
-          <el-tag type="success" effect="dark" size="small" round>
-            {{ activeProfileLabel }}
-          </el-tag>
-          <el-tag v-if="db.activeDatabase" type="warning" effect="plain" size="small" round>
-            <el-icon><Coin /></el-icon>
-            {{ db.activeDatabase }}
-          </el-tag>
-          <el-button :icon="VideoPause" size="small" type="warning" plain @click="closeActiveTab">
-            断开
-          </el-button>
-        </template>
-        <span v-else class="conn-hint">展开左侧实例或点 + 新建标签</span>
-      </div>
+    <!-- 主栏（始终显示）：树开关 + 库标签 + 新建 …… 断开 / 帮助 / 只读读写；
+         命令行模式下模式切换、表结构与图标操作也并入本行（两行合一） -->
+    <div class="main-bar">
+      <el-tooltip :content="treeCollapsed ? '展开数据库树' : '收起数据库树'" placement="bottom">
+        <button class="tree-toggle" @click="treeCollapsed = !treeCollapsed">
+          <el-icon><component :is="treeCollapsed ? Expand : Fold" /></el-icon>
+        </button>
+      </el-tooltip>
 
-      <div class="toolbar-right">
-        <span class="mode-label">模式</span>
-        <el-radio-group v-model="readOnlyModel" size="small" :disabled="!db.activeTab">
-          <el-radio-button :value="true">只读</el-radio-button>
-          <el-radio-button :value="false">读写</el-radio-button>
-        </el-radio-group>
-      </div>
-    </div>
-
-    <!-- DB 标签栏（参考终端多标签：标题=库名） -->
-    <div class="db-tabbar">
-      <div class="tabs-scroll" @wheel="onTabsWheel">
+      <div ref="dbTabsRef" class="db-tabs" @wheel="onTabsWheel">
         <div
           v-for="(tab, i) in db.tabs"
           :key="tab.id"
-          class="tab"
-          :class="{ active: tab.id === db.activeTabId, dragging: dragTabId === tab.id }"
-          draggable="true"
+          class="db-tab"
+          :class="{ active: tab.id === db.activeTabId }"
           :title="tab.database ? `${tab.profileName} · ${tab.database}` : tab.profileName"
           @click="db.setActive(tab.id)"
-          @auxclick="(e: MouseEvent) => onTabAuxClick(tab, e)"
-          @mousedown.middle.prevent
-          @contextmenu.prevent="(e: MouseEvent) => openTabMenu(tab, e)"
-          @dragstart="(e: DragEvent) => onTabDragStart(e, tab.id)"
-          @dragover="(e: DragEvent) => onTabDragOver(e, tab.id)"
-          @dragend="onTabDragEnd"
+          @mousedown.middle.prevent="db.closeTab(tab.id)"
+          @contextmenu.prevent="openTabMenu(tab, $event)"
         >
           <span class="dot" :class="{ connecting: tab.connecting }" />
-          <span class="tab-idx" v-if="i < 9">{{ i + 1 }}</span>
+          <span v-if="i < 9" class="tab-idx">{{ i + 1 }}</span>
           <span class="title">{{ tabTitle(tab) }}</span>
-          <el-icon class="close" @click.stop="db.closeTab(tab.id)"><Close /></el-icon>
+          <el-icon class="close" title="关闭" @click.stop="db.closeTab(tab.id)"><Close /></el-icon>
         </div>
-        <el-dropdown trigger="click" @command="onAddTabCommand" class="tab-add-wrap">
-          <div class="tab-add" title="新建标签"><el-icon><Plus /></el-icon></div>
-          <template #dropdown>
-            <el-dropdown-menu>
-              <el-dropdown-item v-for="p in profiles" :key="p.id" :command="p.id">
-                {{ p.name }}（{{ p.host }}:{{ p.port }}）
-              </el-dropdown-item>
-              <el-dropdown-item command="__new_profile__" :icon="Plus" divided>
-                新建连接…
-              </el-dropdown-item>
-            </el-dropdown-menu>
-          </template>
-        </el-dropdown>
-        <div v-if="db.tabs.length === 0" class="tab-hint">展开左侧实例或点 + 新建标签</div>
       </div>
-      <!-- Tab 右键菜单（fixed 浮层） -->
+      <!-- 标签右键菜单（fixed 浮层，视口钳制） -->
       <div
         v-if="tabMenu.tab"
         class="tab-menu"
@@ -1280,12 +1257,92 @@ onBeforeUnmount(() => {
         <div class="tab-menu-item" @click="onTabMenuCommand('closeOthers')">关闭其他</div>
         <div class="tab-menu-item" @click="onTabMenuCommand('closeAll')">关闭全部</div>
       </div>
+      <el-dropdown trigger="click" @command="onAddTabCommand">
+        <div class="tab-add" title="新建标签"><el-icon><Plus /></el-icon></div>
+        <template #dropdown>
+          <el-dropdown-menu>
+            <el-dropdown-item v-for="p in profiles" :key="p.id" :command="p.id">
+              {{ p.name }}（{{ p.host }}:{{ p.port }}）
+            </el-dropdown-item>
+            <el-dropdown-item command="__new_profile__" :icon="Plus" divided>
+              新建连接…
+            </el-dropdown-item>
+          </el-dropdown-menu>
+        </template>
+      </el-dropdown>
+
+      <div class="main-bar-right">
+        <!-- 命令行模式：模式切换 + 表结构 + 图标操作并入本行 -->
+        <template v-if="activeState && activeState.editorMode.value === 'console'">
+          <el-radio-group v-model="editorModeModel" size="small">
+            <el-radio-button value="console">命令行</el-radio-button>
+            <el-radio-button value="code">代码</el-radio-button>
+          </el-radio-group>
+          <el-tooltip :content="activeSelectedTable ? `表结构: ${activeSelectedTable}` : '选中表后可查看表结构'" placement="bottom">
+            <el-button
+              size="small"
+              link
+              :icon="Coin"
+              :disabled="!activeSelectedTable"
+              @click="showStructure"
+            >
+              表结构
+            </el-button>
+          </el-tooltip>
+          <el-divider direction="vertical" />
+          <el-tooltip content="清屏" placement="bottom">
+            <el-button :icon="Delete" size="small" link @click="activeState.console.clear()" />
+          </el-tooltip>
+          <el-tooltip content="AI 优化" placement="bottom">
+            <el-button :icon="MagicStick" size="small" link @click="aiOptimize" />
+          </el-tooltip>
+          <el-tooltip content="AI 解释" placement="bottom">
+            <el-button :icon="View" size="small" link @click="aiExplain" />
+          </el-tooltip>
+          <el-tooltip content="历史" placement="bottom">
+            <el-button :icon="Clock" size="small" link @click="historyDrawerModel = true" />
+          </el-tooltip>
+        </template>
+
+        <div class="bar-flex" />
+
+        <!-- 断开当前标签 -->
+        <el-tooltip v-if="db.activeTab" content="断开当前标签" placement="bottom">
+          <el-button :icon="VideoPause" size="small" type="warning" plain @click="closeActiveTab" />
+        </el-tooltip>
+        <!-- 帮助：悬浮显示使用指南 -->
+        <el-popover placement="bottom-end" :width="380" trigger="hover">
+          <template #reference>
+            <el-button :icon="QuestionFilled" size="small" link class="help-btn" title="使用指南" />
+          </template>
+          <div class="help-content">
+            <div class="help-title">SQL 控制台使用指南</div>
+            <ul class="help-list">
+              <li>每个标签绑定一个库：点击左侧<b>库名</b>会打开/切换到该库的标签并自动 <b>USE</b>，之后 SQL 无需带库前缀（如 <b>SELECT * FROM `表名`</b>）</li>
+              <li>点击左侧<b>表名</b>：自动填入 SELECT 模板并加载表结构（当前库的表不带前缀）</li>
+              <li>输入 SQL 后按 <b>Enter</b> 执行，<b>Shift+Enter</b> 换行；执行后语句置顶、结果向下展开</li>
+              <li><b>↑ / ↓</b> 浏览历史命令（↑ 取上一条，↓ 回最新，可循环翻找）</li>
+              <li>顶部<b>标签栏</b>可切换库标签；中键或 × 可关闭标签；<b>+</b> 新建标签</li>
+              <li><b>表结构</b>：查看当前选中表的字段定义</li>
+              <li><b>清屏</b>：清空输出流；<b>AI 优化 / AI 解释</b>：把当前 SQL 发给右侧 AI 助手</li>
+              <li><b>历史</b>：打开查询历史抽屉，点击条目回填执行</li>
+              <li><b>只读模式</b>下写操作（INSERT/UPDATE 等）会被拦截，需切换到读写模式</li>
+              <li>DROP / TRUNCATE 及无 WHERE 的 DELETE 需二次确认后才执行</li>
+            </ul>
+          </div>
+        </el-popover>
+        <span class="mode-label">模式</span>
+        <el-radio-group v-model="readOnlyModel" size="small" :disabled="!db.activeTab">
+          <el-radio-button :value="true">只读</el-radio-button>
+          <el-radio-button :value="false">读写</el-radio-button>
+        </el-radio-group>
+      </div>
     </div>
 
     <!-- 主体：始终显示 -->
     <div class="console-body">
-      <!-- 左侧：数据库树（宽度可拖拽） -->
-      <aside class="table-list" :style="{ width: sidebarWidth + 'px' }">
+      <!-- 左侧：数据库树（宽度可拖拽；收起后不占布局空间） -->
+      <aside v-if="!treeCollapsed" class="table-list" :style="{ width: sidebarWidth + 'px' }">
         <div class="list-header">
           <span>数据库</span>
           <div class="list-header-actions">
@@ -1357,8 +1414,8 @@ onBeforeUnmount(() => {
         </div>
       </aside>
 
-      <!-- 拖拽分隔条 -->
-      <div class="sidebar-resizer" @mousedown="startResize"></div>
+      <!-- 拖拽分隔条（收起时隐藏） -->
+      <div v-if="!treeCollapsed" class="sidebar-resizer" @mousedown="startResize"></div>
 
       <!-- 右侧：编辑器 + 结果 -->
       <section class="editor-area sql-console-area">
@@ -1367,67 +1424,8 @@ onBeforeUnmount(() => {
           <el-empty description="展开左侧数据库实例，或点 + 新建标签" :image-size="80" />
         </div>
         <template v-else>
-        <!-- 顶部小工具栏 -->
-        <div class="console-toolbar">
-          <span class="console-prompt">
-            <el-icon><Connection /></el-icon>
-            {{ activeProfileLabel }}
-            <template v-if="db.activeDatabase">
-              <el-icon class="prompt-db"><Coin /></el-icon>
-              <span class="prompt-db-text">{{ db.activeDatabase }}</span>
-            </template>
-          </span>
-          <!-- 模式切换：命令行 / 代码 -->
-          <el-radio-group v-model="editorModeModel" size="small">
-            <el-radio-button value="console">命令行</el-radio-button>
-            <el-radio-button value="code">代码</el-radio-button>
-          </el-radio-group>
-          <!-- 表结构按钮（有选中表时可点，弹出展示） -->
-          <el-button
-            size="small"
-            link
-            :icon="Coin"
-            :disabled="!activeSelectedTable"
-            @click="showStructure"
-          >
-            表结构{{ activeSelectedTable ? `: ${activeSelectedTable}` : "" }}
-          </el-button>
-        </div>
-
         <!-- ============ 命令行模式（mysql CLI 风格：输入在结果流末尾） ============ -->
         <template v-if="activeState.editorMode.value === 'console'">
-        <!-- 命令行模式辅助操作行（与代码模式位置一致：工作区上方） -->
-        <div class="console-action-bar">
-          <!-- 帮助：悬浮显示使用指南 -->
-          <el-popover
-            placement="bottom-start"
-            :width="380"
-            trigger="hover"
-          >
-            <template #reference>
-              <el-button :icon="QuestionFilled" size="small" link class="help-btn">帮助</el-button>
-            </template>
-            <div class="help-content">
-              <div class="help-title">SQL 控制台使用指南</div>
-              <ul class="help-list">
-                <li>每个标签绑定一个库：点击左侧<b>库名</b>会打开/切换到该库的标签并自动 <b>USE</b>，之后 SQL 无需带库前缀（如 <b>SELECT * FROM `表名`</b>）</li>
-                <li>点击左侧<b>表名</b>：自动填入 SELECT 模板并加载表结构（当前库的表不带前缀）</li>
-                <li>输入 SQL 后按 <b>Enter</b> 执行，<b>Shift+Enter</b> 换行；执行后语句置顶、结果向下展开</li>
-                <li><b>↑ / ↓</b> 浏览历史命令（↑ 取上一条，↓ 回最新，可循环翻找）</li>
-                <li>标签标题 = 库名；点 <b>+</b> 新建标签；右键标签可<b>关闭 / 关闭其他 / 关闭全部</b>，也可拖拽排序</li>
-                <li><b>表结构</b>：查看当前选中表的字段定义</li>
-                <li><b>清屏</b>：清空输出流；<b>AI 优化 / AI 解释</b>：把当前 SQL 发给右侧 AI 助手</li>
-                <li><b>历史</b>：打开查询历史抽屉，点击条目回填执行</li>
-                <li><b>只读模式</b>下写操作（INSERT/UPDATE 等）会被拦截，需切换到读写模式</li>
-                <li>DROP / TRUNCATE 及无 WHERE 的 DELETE 需二次确认后才执行</li>
-              </ul>
-            </div>
-          </el-popover>
-          <el-button :icon="Delete" size="small" link @click="activeState.console.clear()">清屏</el-button>
-          <el-button :icon="MagicStick" size="small" link @click="aiOptimize">AI 优化</el-button>
-          <el-button :icon="View" size="small" link @click="aiExplain">AI 解释</el-button>
-          <el-button :icon="Plus" size="small" link @click="historyDrawerModel = true">历史</el-button>
-        </div>
         <!-- 单一输出流（顶部输入式终端）：
              输入框常驻内容区顶部（始终可见）；历史输出在输入框上方（溢出内容区，
              靠负滚动 / 向上滚轮回看）；当前内容区始终展示最新一条输出。 -->
@@ -1443,19 +1441,9 @@ onBeforeUnmount(() => {
               <span class="entry-sql-text">{{ e.sql }}</span>
               <el-icon v-if="e.status === 'running'" class="is-loading entry-spin"><Refresh /></el-icon>
             </div>
-            <!-- 表格结果 -->
+            <!-- 表格结果（虚拟滚动：大结果集只渲染可视行） -->
             <div v-else-if="e.kind === 'table'" class="entry entry-table">
-              <el-table :data="e.rows" border stripe size="small" class="result-table" max-height="400">
-                <el-table-column type="index" label="#" width="50" fixed />
-                <el-table-column
-                  v-for="(c, i) in e.columns"
-                  :key="i"
-                  :prop="String(i)"
-                  :label="c"
-                  min-width="120"
-                  show-overflow-tooltip
-                />
-              </el-table>
+              <ResultTableV2 :rows="e.rows" :columns="e.columns" :height="400" />
               <div class="entry-meta">{{ e.rows.length }} 行{{ e.elapsedMs ? ` · ${e.elapsedMs}ms` : "" }}</div>
             </div>
             <!-- 非查询成功 -->
@@ -1491,13 +1479,37 @@ onBeforeUnmount(() => {
             <el-button type="primary" size="small" :icon="CaretRight" :loading="activeExecuting" @click="execute">
               执行
             </el-button>
+            <!-- 模式切换：命令行 / 代码 + 表结构（位于清空左侧） -->
+            <el-radio-group v-model="editorModeModel" size="small">
+              <el-radio-button value="console">命令行</el-radio-button>
+              <el-radio-button value="code">代码</el-radio-button>
+            </el-radio-group>
+            <el-tooltip :content="activeSelectedTable ? `表结构: ${activeSelectedTable}` : '选中表后可查看表结构'" placement="bottom">
+              <el-button
+                size="small"
+                link
+                :icon="Coin"
+                :disabled="!activeSelectedTable"
+                @click="showStructure"
+              >
+                表结构
+              </el-button>
+            </el-tooltip>
             <el-button size="small" :icon="ClearIcon" @click="clearSql">清空</el-button>
-            <!-- 辅助操作：从顶部工具栏移到执行行右侧 -->
+            <!-- 辅助操作：从顶部工具栏移到执行行右侧（仅图标） -->
             <div class="code-toolbar-right">
-              <el-button :icon="Delete" size="small" link @click="activeState.console.clear()">清屏</el-button>
-              <el-button :icon="MagicStick" size="small" link @click="aiOptimize">AI 优化</el-button>
-              <el-button :icon="View" size="small" link @click="aiExplain">AI 解释</el-button>
-              <el-button :icon="Plus" size="small" link @click="historyDrawerModel = true">历史</el-button>
+              <el-tooltip content="清屏" placement="bottom">
+                <el-button :icon="Delete" size="small" link @click="activeState.console.clear()" />
+              </el-tooltip>
+              <el-tooltip content="AI 优化" placement="bottom">
+                <el-button :icon="MagicStick" size="small" link @click="aiOptimize" />
+              </el-tooltip>
+              <el-tooltip content="AI 解释" placement="bottom">
+                <el-button :icon="View" size="small" link @click="aiExplain" />
+              </el-tooltip>
+              <el-tooltip content="历史" placement="bottom">
+                <el-button :icon="Clock" size="small" link @click="historyDrawerModel = true" />
+              </el-tooltip>
             </div>
           </div>
           <!-- 复用同一个 CodeMirror 实例：命令行/代码模式共享 sqlEditorRef。
@@ -1515,28 +1527,15 @@ onBeforeUnmount(() => {
                 <el-button size="small" link @click="exportJson">复制 JSON</el-button>
               </div>
             </div>
-            <div v-loading="activeExecuting" class="code-result-body">
+            <div ref="codeResultBodyRef" v-loading="activeExecuting" class="code-result-body">
               <div v-if="!activeLastResult" class="empty-tip">尚未执行查询</div>
               <el-alert v-else-if="activeLastResult.error" :title="activeLastResult.error" type="error" show-icon :closable="false" />
-              <el-table
+              <ResultTableV2
                 v-else-if="activeResultIsSelect"
-                :data="activeLastResult.rows"
-                border
-                stripe
-                size="small"
-                height="100%"
-                class="result-table"
-              >
-                <el-table-column type="index" label="#" width="50" fixed />
-                <el-table-column
-                  v-for="(c, i) in activeLastResult.columns"
-                  :key="i"
-                  :prop="String(i)"
-                  :label="c"
-                  min-width="120"
-                  show-overflow-tooltip
-                />
-              </el-table>
+                :rows="activeLastResult.rows"
+                :columns="activeLastResult.columns"
+                :height="resultBodyHeight"
+              />
               <el-alert
                 v-else
                 :title="`执行成功，影响 ${activeLastResult.affected} 行（${activeLastResult.elapsedMs} ms）`"
@@ -1620,106 +1619,139 @@ onBeforeUnmount(() => {
   overflow: hidden;
 }
 
-/* 工具栏 */
-.toolbar {
+/* --- 主栏：树开关 + 库标签 + 新建 …… 断开 / 帮助 / 只读读写（命令行模式含模式切换与图标操作） --- */
+.main-bar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 10px 16px;
+  gap: 6px;
+  height: 40px;
+  padding: 0 10px;
   border-bottom: 1px solid var(--el-border-color-lighter);
   background: var(--el-bg-color-overlay);
   flex-shrink: 0;
 }
-.toolbar-left,
-.toolbar-right {
+/* 树开关按钮 */
+.tree-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--el-text-color-secondary);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+.tree-toggle:hover {
+  color: var(--el-color-primary);
+  background: var(--el-fill-color-light);
+}
+/* 右侧控制组 */
+.main-bar-right {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-shrink: 0;
+}
+/* 弹性占位（把控制组推到最右） */
+.bar-flex {
+  flex: 1;
 }
 .mode-label {
   font-size: 13px;
   color: var(--el-text-color-secondary);
 }
 
-/* DB 标签栏（参考终端 Workspace 的 tab-bar） */
-.db-tabbar {
+/* --- 库标签 --- */
+.db-tabs {
   display: flex;
   align-items: center;
-  height: 34px;
-  background: var(--el-bg-color-overlay);
-  border-bottom: 1px solid var(--el-border-color-lighter);
-  padding: 0 4px;
-  flex-shrink: 0;
-}
-.tabs-scroll {
-  display: flex;
-  align-items: center;
+  gap: 4px;
   flex: 1;
-  min-width: 0;
+  min-width: 60px;
   overflow-x: auto;
+  /* 滚动条平时隐藏（视觉干净），悬停标签区时渐显细滚动条提示可横滑看更多 */
+  scrollbar-width: thin;
+  scrollbar-gutter: stable;
 }
-.tabs-scroll::-webkit-scrollbar {
-  height: 0;
+.db-tabs::-webkit-scrollbar {
+  height: 3px;
 }
-.tab {
+.db-tabs::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 2px;
+  transition: background 0.2s ease;
+}
+.db-tabs:hover::-webkit-scrollbar-thumb {
+  background: var(--el-border-color);
+}
+.db-tab {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 4px 10px;
-  margin-right: 2px;
-  border-radius: 4px 4px 0 0;
+  height: 26px;
+  padding: 0 8px;
+  border-radius: 6px;
   cursor: pointer;
-  font-size: 13px;
+  font-size: 12.5px;
   color: var(--el-text-color-regular);
-  max-width: 200px;
   flex-shrink: 0;
+  max-width: 200px;
+  transition: background-color 0.15s ease, color 0.15s ease;
 }
-.tab:hover {
+.db-tab:hover {
   background: var(--el-fill-color-light);
 }
-.tab.active {
-  background: var(--el-bg-color-page);
+.db-tab.active {
+  background: var(--el-color-primary-light-9);
   color: var(--el-color-primary);
+  font-weight: 500;
 }
-.tab .title {
+.db-tab .title {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.tab .dot {
+.db-tab .dot {
   width: 6px;
   height: 6px;
   border-radius: 50%;
   background: var(--el-color-success);
   flex-shrink: 0;
 }
-.tab .dot.connecting {
+.db-tab .dot.connecting {
   background: var(--el-color-warning);
 }
-.tab-idx {
+.db-tab .tab-idx {
   font-size: 10px;
   color: var(--el-text-color-placeholder);
-  margin-right: 2px;
+  min-width: 9px;
+  text-align: center;
+  flex-shrink: 0;
 }
-.tab .close {
+.db-tab.active .tab-idx {
+  color: var(--el-color-primary);
+}
+.db-tab .close {
   font-size: 12px;
   padding: 2px;
-  border-radius: 2px;
+  border-radius: 3px;
   color: var(--el-text-color-secondary);
+  opacity: 0;
   flex-shrink: 0;
+  transition: opacity 0.15s ease;
 }
-.tab .close:hover {
+.db-tab:hover .close,
+.db-tab.active .close {
+  opacity: 1;
+}
+.db-tab .close:hover {
   color: var(--el-color-danger);
   background: var(--el-fill-color);
-}
-.tab.dragging {
-  opacity: 0.5;
-}
-.tab-add-wrap {
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
 }
 .tab-add {
   display: flex;
@@ -1727,22 +1759,17 @@ onBeforeUnmount(() => {
   justify-content: center;
   width: 22px;
   height: 22px;
-  border-radius: 4px;
+  border-radius: 5px;
   cursor: pointer;
   color: var(--el-text-color-secondary);
   font-size: 14px;
+  flex-shrink: 0;
 }
 .tab-add:hover {
   color: var(--el-color-primary);
   background: var(--el-fill-color);
 }
-.tab-hint {
-  font-size: 12px;
-  color: var(--el-text-color-placeholder);
-  margin-left: 8px;
-  white-space: nowrap;
-}
-/* Tab 右键菜单（fixed 浮层，与终端右键菜单同一套样式惯例） */
+/* 标签右键菜单（fixed 浮层） */
 .tab-menu {
   position: fixed;
   z-index: 3000;
@@ -1782,12 +1809,6 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: center;
-}
-
-/* 工具栏连接提示 */
-.conn-hint {
-  font-size: 12px;
-  color: var(--el-text-color-placeholder);
 }
 
 /* 主体布局 */
@@ -1958,26 +1979,6 @@ onBeforeUnmount(() => {
   background: var(--el-bg-color-overlay);
   flex-shrink: 0;
 }
-.console-prompt {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--el-color-success);
-  margin-right: auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.console-prompt .prompt-db,
-.console-prompt .prompt-db-text {
-  color: var(--el-color-warning);
-}
-.console-prompt .prompt-db {
-  margin-left: 4px;
-}
 /* 输出区 */
 .console-output {
   flex: 1;
@@ -2124,21 +2125,6 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: 4px;
-}
-/* 命令行模式辅助操作行（与代码模式执行行同位：工作区上方） */
-.console-action-bar {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 2px;
-  padding: 4px 12px;
-  border-bottom: 1px solid var(--el-border-color-lighter);
-  background: var(--el-bg-color-overlay);
-  flex-shrink: 0;
-}
-/* 帮助按钮固定在最左侧，其余按钮靠右 */
-.console-action-bar .help-btn {
-  margin-right: auto;
 }
 /* 代码模式（多行编辑器 + 结果区） */
 .code-editor-toolbar {

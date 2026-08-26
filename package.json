@@ -1,6 +1,6 @@
 {
   "name": "x-term",
-  "version": "0.1.36",
+  "version": "0.1.41",
   "description": "X-Term - 现代化运维终端客户端",
   "type": "module",
   "scripts": {
@@ -23,8 +23,8 @@
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-dialog": "^2.7.2",
     "@tauri-apps/plugin-fs": "^2.5.1",
-    "@tauri-apps/plugin-os": "^2.3.2",
     "@tauri-apps/plugin-log": "^2.0.0",
+    "@tauri-apps/plugin-os": "^2.3.2",
     "@tauri-apps/plugin-shell": "^2.3.5",
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/addon-search": "^0.15.0",

@@ -615,8 +615,13 @@ export const makeAiStore = (id: string) =>
     if (!m || !m.toolCalls) return;
     const item = m.toolCalls.find((t) => t.toolCallId === payload.toolCallId);
     if (item) {
-      item.status = "done";
+      // 用户已明确拒绝（rejected）的卡片保持"已拒绝"终态：tool_result 回填
+      // 只补充原因（展开可见），不把状态覆盖为 done——否则拒绝后卡片又变回
+      // "已完成"，与用户操作矛盾。
       item.result = { ok: payload.ok, output: payload.output };
+      if (item.status !== "rejected") {
+        item.status = "done";
+      }
     }
   }
 
@@ -794,6 +799,24 @@ export const makeAiStore = (id: string) =>
   }
 
   /**
+   * 删除一条消息（用户请求或助手响应均支持）。
+   * 发送中的会话不可删（流式事件仍在写入该会话，mid-flight 变更消息列表
+   * 会让事件路由与持久化快照不一致）；流式中的消息本身也由调用方 UI 隐藏删除入口。
+   * @returns 是否删除成功（找不到消息或会话发送中返回 false，UI 据此提示）。
+   */
+  function deleteMessage(messageId: string): boolean {
+    for (const conv of conversations.value) {
+      if (conv.sending) continue;
+      const idx = conv.messages.findIndex((m) => m.id === messageId);
+      if (idx < 0) continue;
+      conv.messages.splice(idx, 1);
+      persist();
+      return true;
+    }
+    return false;
+  }
+
+  /**
    * 重命名对话（手动覆盖自动标题）。
    * 由于 send 自动标题仅在 title==="新对话" 时触发，手动重命名后不会被覆盖。
    */
@@ -879,6 +902,7 @@ export const makeAiStore = (id: string) =>
     setDesktopToolExecutor,
     clear,
     renameConversation,
+    deleteMessage,
     regenerate,
     loadPersisted,
   };

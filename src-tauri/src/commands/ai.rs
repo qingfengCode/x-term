@@ -200,7 +200,14 @@ pub async fn ai_chat(
 pub async fn ai_execute_tool(tool_call_id: String, state: State<'_, AppState>) -> AppResult<()> {
     match state.pending_tool_calls.lock().remove(&tool_call_id) {
         Some((_, tx)) => {
-            let _ = tx.send(ToolApproval { approved: true });
+            // sender 存在但接收端（run_agent_loop 的确认等待）已 drop——请求已
+            // 结束/通道已关闭（僵尸确认）：send 失败必须上报，否则前端卡片停在
+            // "执行中"但命令永远不会执行，用户对着永不变更的卡片干等。
+            if tx.send(ToolApproval { approved: true }).is_err() {
+                return Err(AppError::NotFound(
+                    "该确认已失效（请求已结束），命令未执行；请重新发送请求".into(),
+                ));
+            }
             Ok(())
         }
         // 找不到等待项 = 僵尸卡片批准（轮次已超时/请求已终止/已处理过）。

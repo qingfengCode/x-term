@@ -39,7 +39,7 @@ const navItems = [
   { key: "terminals", label: "终端", icon: "Monitor" },
   { key: "sftp", label: "SFTP", icon: "FolderOpened" },
   { key: "files", label: "文件", icon: "Files" },
-  { key: "sql", label: "SQL", icon: "Coin" },
+  { key: "sql", label: "DB", icon: "Coin" },
   { key: "forward", label: "转发", icon: "Connection" },
   { key: "remote", label: "桌面", icon: "Platform" },
   { key: "keys", label: "密钥", icon: "Key" },
@@ -329,6 +329,12 @@ useAppShortcuts({
 });
 
 // --- 会话侧栏宽度拖拽（写法沿用 SQL 控制台左侧树 sidebar-resizer 惯例） ---
+/** 切换会话侧栏展开/收起（默认展开；状态持久化，重启后保持）。 */
+function toggleSidebar() {
+  settings.toggleSidebar();
+  void settings.save().catch(() => {});
+}
+
 function startSidebarResize(e: MouseEvent) {
   e.preventDefault();
   const startX = e.clientX;
@@ -379,7 +385,6 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onNumberKeydown));
   <div class="main-layout">
     <!-- 左侧导航栏 -->
     <aside class="nav-rail">
-      <div class="nav-logo">X</div>
       <!-- 中间导航项：超高时可滚动 -->
       <div class="nav-items" role="navigation" aria-label="主导航">
         <div
@@ -423,21 +428,31 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onNumberKeydown));
       </div>
     </aside>
 
-    <!-- 会话侧栏（仅终端页显示） -->
+    <!-- 会话侧栏（仅终端页显示）：支持展开/收起，默认展开。收起时不占布局空间 -->
     <SessionSidebar
-      v-if="activeNav === 'terminals'"
+      v-if="activeNav === 'terminals' && !settings.sidebarCollapsed"
       ref="sidebarRef"
       :style="{ width: settings.sidebarWidth + 'px' }"
+      @collapse="toggleSidebar"
     />
     <!-- 侧栏拖拽分隔条 -->
     <div
-      v-if="activeNav === 'terminals'"
+      v-if="activeNav === 'terminals' && !settings.sidebarCollapsed"
       class="sidebar-resizer"
       @mousedown="startSidebarResize"
     />
 
     <!-- 主内容 -->
     <main class="main-content">
+      <!-- 收起状态：展开按钮悬浮在内容区左上角，不占布局空间 -->
+      <button
+        v-if="activeNav === 'terminals' && settings.sidebarCollapsed"
+        class="sidebar-expand-btn floating"
+        title="展开侧栏"
+        @click="toggleSidebar"
+      >
+        <el-icon><DArrowRight /></el-icon>
+      </button>
       <!-- KeepAlive 缓存终端页/SQL 页/桌面页：保留 AI 助手面板的滚动位置/输入草稿，
            且桌面页已连接的 VNC/RDP 会话在切走再切回时不中断（store 单例常驻 + 组件不卸载）。 -->
       <router-view v-slot="{ Component }">
@@ -462,15 +477,15 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onNumberKeydown));
   background: var(--el-bg-color);
 }
 .nav-rail {
-  width: 60px;
+  width: 64px;
   background: var(--el-bg-color-overlay);
   border-right: 1px solid var(--el-border-color-lighter);
   display: flex;
   flex-direction: column;
   align-items: center;
-  padding: 8px 0 0;
+  padding: 10px 0 0;
   /* 兜底滚动：页面缩放极大（Ctrl+滚轮/触摸板捏合）时视口 CSS 高度被除以缩放
-     倍数，logo+底部固定项本身可能超出栏高，被 main-layout 的 overflow:hidden
+     值数，导航项+底部固定项本身可能超出栏高，被 main-layout 的 overflow:hidden
      裁掉且无处可滚（设置图标"永久消失"）。整栏允许滚动后：空间充足时中间区
      flex:1 内部滚动、固定项仍贴底（与原行为一致）；空间极度不足时整栏可滚到
      底部，固定项始终可达。 */
@@ -488,7 +503,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onNumberKeydown));
   overflow-y: auto;
   scrollbar-width: thin;
 }
-/* 窄栏用细滚动条，避免挤占 60px 宽度（nav-rail 与 nav-items 一致） */
+/* 窄栏用细滚动条，避免挤占栏宽（nav-rail 与 nav-items 一致） */
 .nav-rail::-webkit-scrollbar,
 .nav-items::-webkit-scrollbar {
   width: 4px;
@@ -511,35 +526,54 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onNumberKeydown));
   padding-top: 12px;
   margin-bottom: 0;
 }
-.nav-logo {
-  font-size: 22px;
-  font-weight: bold;
-  /* 跟随主题主色，而非硬编码品牌蓝 */
-  color: var(--el-color-primary);
-  margin: 4px 0 12px;
-}
 .nav-item {
-  width: 48px;
-  padding: 10px 0;
+  position: relative;
+  width: 52px;
+  padding: 8px 0;
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 2px;
+  gap: 3px;
   cursor: pointer;
-  border-radius: 6px;
+  border-radius: 8px;
   font-size: 11px;
-  color: var(--el-text-color-regular);
+  color: var(--el-text-color-secondary);
   margin-bottom: 2px;
+  transition: background-color 0.15s ease, color 0.15s ease;
 }
 .nav-item:hover {
   background: var(--el-fill-color-light);
+  color: var(--el-text-color-primary);
 }
 .nav-item.active {
   background: var(--el-color-primary-light-9);
   color: var(--el-color-primary);
+  font-weight: 600;
+}
+/* 激活项左侧指示条（VS Code 风格） */
+.nav-item.active::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 3px;
+  height: 18px;
+  border-radius: 2px;
+  background: var(--el-color-primary);
+}
+/* 键盘焦点环（click 由背景反馈，focus-visible 用内描边） */
+.nav-item:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--el-color-primary-light-5);
 }
 .nav-item .el-icon {
-  font-size: 18px;
+  font-size: 19px;
+  transition: color 0.15s ease, transform 0.1s ease;
+}
+/* 按下微缩反馈 */
+.nav-item:active .el-icon {
+  transform: scale(0.92);
 }
 .main-content {
   flex: 1;
@@ -547,6 +581,8 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onNumberKeydown));
   overflow: hidden;
   display: flex;
   flex-direction: column;
+  /* 锚定收起状态下悬浮的展开按钮 */
+  position: relative;
 }
 /* 会话侧栏拖拽分隔条 */
 .sidebar-resizer {
@@ -558,5 +594,29 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onNumberKeydown));
 }
 .sidebar-resizer:hover {
   background: var(--el-color-primary);
+}
+/* 展开按钮（收起状态）：悬浮在内容区左上角，不占布局空间 */
+.sidebar-expand-btn.floating {
+  position: absolute;
+  left: 8px;
+  top: 6px;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 6px;
+  background: var(--el-bg-color-overlay);
+  color: var(--el-text-color-secondary);
+  cursor: pointer;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+  transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+.sidebar-expand-btn.floating:hover {
+  color: var(--el-color-primary);
+  border-color: var(--el-color-primary-light-5);
+  background: var(--el-color-primary-light-9);
 }
 </style>

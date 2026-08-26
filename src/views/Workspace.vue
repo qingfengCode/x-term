@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onActivated, onBeforeUnmount, onDeactivated, reactive, ref } from "vue";
+import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, reactive, ref } from "vue";
 import { useTerminalsStore, type TerminalTab } from "@/stores/terminals";
 import { useSettingsStore } from "@/stores/settings";
 import TerminalPane from "@/components/TerminalPane.vue";
@@ -283,7 +283,18 @@ onBeforeUnmount(() => {
         :tabs="tabItems"
         :active-key="terminals.activeId"
         empty-hint="从左侧会话树双击连接"
-        @select="(k) => terminals.setActive(k)"
+        @select="
+          (k) => {
+            terminals.setActive(k);
+            // 切 tab 后把焦点交给新活动终端：否则焦点留在隐藏的旧 pane 的
+            // textarea 上，新终端光标不显示（要再点一下才有）。
+            void nextTick(() => activePaneRef?.focus());
+            // 二次校验列宽：恢复可见瞬间的首次 fit 可能取到半布局的失效
+            // 测量（cols 偏小且停留），与 PTY 列宽不一致会让 shell 局部重绘
+            // 错位出残影。布局稳定后由 pane 重新对齐一次。
+            void nextTick(() => activePaneRef?.refit());
+          }
+        "
         @close="(k) => void terminals.close(k)"
         @move="(from, to, before) => terminals.moveTab(from, to, before)"
         @command="onTabMenuCommand"
@@ -481,32 +492,34 @@ onBeforeUnmount(() => {
 .tab-bar {
   display: flex;
   align-items: center;
-  height: 34px;
+  height: 38px;
   background: var(--el-bg-color-overlay);
   border-bottom: 1px solid var(--el-border-color-lighter);
-  padding: 0 4px;
+  padding: 0 8px;
   flex-shrink: 0;
 }
-/* 本地终端按钮：tab 栏右侧常驻。 */
+/* 本地终端按钮：tab 栏右侧常驻（描边按钮，悬停主色化）。 */
 .local-term-btn {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 5px;
   height: 26px;
-  padding: 0 10px;
-  margin-left: 4px;
-  border: none;
-  border-radius: 4px;
-  background: transparent;
-  color: var(--el-text-color-secondary);
+  padding: 0 12px;
+  margin-left: 6px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 6px;
+  background: var(--el-fill-color-blank);
+  color: var(--el-text-color-regular);
   font-size: 12px;
   cursor: pointer;
   flex-shrink: 0;
   white-space: nowrap;
+  transition: border-color 0.15s ease, color 0.15s ease, background-color 0.15s ease;
 }
 .local-term-btn:hover {
-  background: var(--el-fill-color-light);
+  border-color: var(--el-color-primary-light-5);
   color: var(--el-color-primary);
+  background: var(--el-color-primary-light-9);
 }
 .term-toolbar {
   display: flex;
@@ -518,11 +531,14 @@ onBeforeUnmount(() => {
   flex-shrink: 0;
 }
 .tool-btn {
-  padding: 4px;
+  padding: 5px;
+  border-radius: 6px;
   color: var(--el-text-color-secondary);
+  transition: background-color 0.15s ease, color 0.15s ease;
 }
 .tool-btn:hover {
   color: var(--el-color-primary);
+  background: var(--el-fill-color-light);
 }
 .workspace-body {
   flex: 1;
@@ -549,7 +565,7 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: center;
   background: rgba(0, 0, 0, 0.35);
-  backdrop-filter: blur(2px);
+  backdrop-filter: blur(3px);
   z-index: 20;
   /* 遮罩放行鼠标事件：断开后终端输出仍可选中/复制/滚动（排障刚需——
      拿不到最后几行日志就没法定位问题）；只有中央卡片拦截点击。 */
@@ -557,10 +573,19 @@ onBeforeUnmount(() => {
 }
 .reconnect-card {
   pointer-events: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 24px 32px;
+  background: var(--el-bg-color-overlay);
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 12px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.22);
 }
 .reconnect-error {
   max-width: 320px;
-  margin-bottom: 10px;
+  margin-bottom: 2px;
   font-size: 12px;
   color: var(--el-color-danger);
   text-align: center;
@@ -571,26 +596,35 @@ onBeforeUnmount(() => {
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
-.reconnect-card {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 12px;
-  padding: 20px 28px;
-  background: var(--el-bg-color-overlay);
-  border-radius: 8px;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
-}
 .reconnect-title {
   font-size: 14px;
-  color: var(--el-text-color-secondary);
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  color: var(--el-text-color-primary);
 }
 .pane-status {
   display: flex;
   align-items: center;
   justify-content: center;
+  gap: 8px;
   height: 100%;
+  font-size: 13px;
   color: var(--el-text-color-secondary);
+}
+/* 连接中：主色旋转指示环 */
+.pane-status:not(.error)::before {
+  content: "";
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid var(--el-border-color-light);
+  border-top-color: var(--el-color-primary);
+  animation: pane-spin 0.8s linear infinite;
+}
+@keyframes pane-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 .pane-status.error {
   color: var(--el-color-danger);
@@ -632,7 +666,7 @@ onBeforeUnmount(() => {
   height: 22px;
   margin-left: 6px;
   border: 1px dashed var(--el-border-color);
-  border-radius: 4px;
+  border-radius: 6px;
   background: transparent;
   color: var(--el-text-color-secondary);
   font-size: 14px;
@@ -715,8 +749,8 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 6px;
   padding: 3px 10px;
-  border: 1px solid var(--el-border-color);
-  border-radius: 4px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 6px;
   background: var(--el-fill-color-blank);
   color: var(--el-text-color-regular);
   font-size: 12px;
@@ -725,7 +759,7 @@ onBeforeUnmount(() => {
   transition: all 0.15s;
 }
 .sc-btn:hover {
-  border-color: var(--el-color-primary);
+  border-color: var(--el-color-primary-light-5);
   color: var(--el-color-primary);
   background: var(--el-color-primary-light-9);
 }
@@ -733,14 +767,15 @@ onBeforeUnmount(() => {
   transform: translateY(1px);
 }
 .sc-label {
-  font-family: var(--el-font-family-mono, "Cascadia Code", Consolas, monospace);
+  font-family: var(--app-font-mono);
 }
 .sc-key {
   font-size: 10px;
   padding: 1px 4px;
-  border-radius: 3px;
+  border-radius: 4px;
   background: var(--el-fill-color-dark);
   color: var(--el-text-color-secondary);
+  font-family: var(--app-font-mono);
 }
 
 /* --- 添加命令弹窗 --- */

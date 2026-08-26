@@ -19,6 +19,9 @@ pub struct TerminalSettings {
     /// 主题名："dark" | "light" | "solarized-dark" | ...
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// 终端配色方案 id（前端预设）。空 = 按主题明暗回退默认配色。
+    #[serde(default)]
+    pub color_scheme: String,
     /// 字体族。
     #[serde(default = "default_font_family")]
     pub font_family: String,
@@ -34,6 +37,9 @@ pub struct TerminalSettings {
     /// 选中即复制。
     #[serde(default = "default_copy_on_select")]
     pub copy_on_select: bool,
+    /// 右键直接粘贴（PuTTY 风格；关闭时右键弹出上下文菜单）。
+    #[serde(default)]
+    pub right_click_paste: bool,
     /// 是否启用 Webgl 渲染。
     #[serde(default = "default_enable_webgl")]
     pub enable_webgl: bool,
@@ -143,11 +149,13 @@ impl Default for TerminalSettings {
     fn default() -> Self {
         Self {
             theme: default_theme(),
+            color_scheme: String::new(),
             font_family: default_font_family(),
             font_size: default_font_size(),
             line_height: default_line_height(),
             scrollback: default_scrollback(),
             copy_on_select: default_copy_on_select(),
+            right_click_paste: false,
             enable_webgl: default_enable_webgl(),
             ssh_idle_timeout_minutes: default_ssh_idle_timeout_minutes(),
             ssh_keepalive_secs: default_ssh_keepalive_secs(),
@@ -575,6 +583,9 @@ pub struct Settings {
     /// 会话侧栏宽度（px）。拖拽调整后持久化；老配置缺失时按 240（前端兜底）。
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: f32,
+    /// 会话侧栏是否收起（收起后仅剩窄条展开按钮）。默认 false（展开）。
+    #[serde(default)]
+    pub sidebar_collapsed: bool,
     /// 最近成功连接的会话 id（最近的在前，最多保留 10 个）。
     #[serde(default)]
     pub recent_session_ids: Vec<String>,

@@ -297,11 +297,13 @@ impl LocalSession {
                         let data = &buf[..n];
                         // 写入输出环形缓冲（锁内取追加后的累计字节数，随事件
                         // emit 供前端 attach 回放去重；如果锁不可用则计 0）。
-                        let total = output_buffer.lock().ok().map(|mut ob| {
+                        let end = output_buffer.lock().ok().map(|mut ob| {
                             ob.push(data);
                             ob.total_bytes()
                         });
-                        // emit 给前端（base64，与 SSH / Telnet 一致）。
+                        // emit 给前端（base64；本地逐块 emit，区间 [start,end)）。
+                        let end = end.unwrap_or(0);
+                        let start = end.saturating_sub(n);
                         let b64 = base64::engine::general_purpose::STANDARD.encode(data);
                         emit(
                             &app,
@@ -309,7 +311,8 @@ impl LocalSession {
                             TerminalDataEvent {
                                 session_id: session_id.clone(),
                                 data: b64,
-                                total: total.unwrap_or(0),
+                                start_total: start,
+                                total: end,
                             },
                         );
                     }

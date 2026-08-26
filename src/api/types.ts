@@ -110,11 +110,15 @@ export interface ProviderConfig {
 
 export interface TerminalSettings {
   theme: string;
+  /** 终端配色方案 id（utils/terminalThemes 预设）；未配置时按 theme 明暗回退默认。 */
+  colorScheme: string;
   fontFamily: string;
   fontSize: number;
   lineHeight: number;
   scrollback: number;
   copyOnSelect: boolean;
+  /** 右键直接粘贴（PuTTY 风格）；关闭时右键弹出上下文菜单。 */
+  rightClickPaste: boolean;
   enableWebgl: boolean;
   /** SSH 空闲断开时间（分钟），0 = 永不自动断开。 */
   sshIdleTimeoutMinutes: number;
@@ -338,6 +342,8 @@ export interface Settings {
   firstRun: boolean;
   /** 会话侧栏宽度（px）。 */
   sidebarWidth: number;
+  /** 会话侧栏是否收起（收起后仅剩窄条展开按钮）。默认 false（展开）。 */
+  sidebarCollapsed: boolean;
   /** 最近成功连接的会话 id（最近的在前）。 */
   recentSessionIds: string[];
   /** 是否启用锁定功能（导航栏显示「锁定」按钮）。默认 true。 */

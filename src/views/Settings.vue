@@ -24,6 +24,7 @@ import { useSettingsStore } from "@/stores/settings";
 import { useUpdateStore } from "@/stores/update";
 import { useVaultStore } from "@/stores/vault";
 import { useMcpStore } from "@/stores/mcp";
+import { TERMINAL_COLOR_SCHEMES, defaultSchemeFor } from "@/utils/terminalThemes";
 import { ProviderKind, PROVIDER_DEFAULTS } from "@/api/types";
 import {
   APP_SHORTCUT_METAS,
@@ -152,6 +153,14 @@ function onRecordKeydown(e: KeyboardEvent) {
 }
 
 /** 保存应用快捷键。 */
+/** 终端操作开关（快捷键 tab）：即时写回 store 并保存。 */
+function setTermOp(key: "copyOnSelect" | "rightClickPaste", v: boolean) {
+  settings.setTerminal({ [key]: v });
+  void settings.save().catch(() => {
+    /* 保存失败不阻断开关效果（内存已生效），下次保存会补写 */
+  });
+}
+
 async function saveAppShortcuts() {
   // 冲突提示（不阻断保存，仅提醒）。
   const conflicts = appRows.value.filter((r) => r.conflict);
@@ -443,8 +452,14 @@ async function setActive(p: ProviderConfig) {
 // 终端主题切换：实时切换 documentElement 的 dark class（预览效果）
 watch(
   () => termForm.theme,
-  (val) => {
+  (val, old) => {
     toggleDarkClass(val);
+    // 明暗切换时，配色方案跟随调整：未选或与切换前明暗同组的方案换成新明暗的默认。
+    if (val === old) return;
+    const cur = TERMINAL_COLOR_SCHEMES.find((s) => s.id === termForm.colorScheme);
+    if (!cur || cur.scheme === old) {
+      termForm.colorScheme = defaultSchemeFor(val);
+    }
   },
 );
 
@@ -558,11 +573,6 @@ function onShortcutKeyCapture(sc: ShortcutCommand, e: KeyboardEvent) {
   e.preventDefault();
   e.stopPropagation();
   sc.shortcut = parts.join("+");
-}
-
-function truncate(s: string, n = 36): string {
-  if (!s) return "-";
-  return s.length > n ? s.slice(0, n) + "…" : s;
 }
 
 onMounted(async () => {
@@ -900,6 +910,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
   <div class="settings-view">
     <div class="header">
       <h2><el-icon><Setting /></el-icon> 设置</h2>
+      <span class="header-sub">应用偏好与配置管理</span>
     </div>
 
     <el-tabs v-model="activeTab" ref="tabsRef" class="settings-tabs">
@@ -913,6 +924,39 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
                 <el-select v-model="termForm.theme" style="width: 160px">
                   <el-option label="深色 (dark)" value="dark" />
                   <el-option label="浅色 (light)" value="light" />
+                </el-select>
+              </el-form-item>
+
+              <el-form-item>
+                <template #label>
+                  <HelpTip content="终端 ANSI 16 色配色方案，影响 ls / vim 等彩色输出。留空按明暗主题用默认（Catppuccin）">配色方案</HelpTip>
+                </template>
+                <el-select
+                  v-model="termForm.colorScheme"
+                  placeholder="跟随主题"
+                  clearable
+                  style="width: 220px"
+                >
+                  <el-option-group
+                    v-for="g in [{ label: '深色', scheme: 'dark' }, { label: '浅色', scheme: 'light' }]"
+                    :key="g.scheme"
+                    :label="g.label"
+                  >
+                    <el-option
+                      v-for="s in TERMINAL_COLOR_SCHEMES.filter((x) => x.scheme === g.scheme)"
+                      :key="s.id"
+                      :label="s.label"
+                      :value="s.id"
+                    >
+                      <span class="scheme-name">{{ s.label }}</span>
+                      <span
+                        v-for="c in [s.theme.red, s.theme.green, s.theme.yellow, s.theme.blue, s.theme.magenta, s.theme.cyan]"
+                        :key="c"
+                        class="scheme-dot"
+                        :style="{ background: c }"
+                      />
+                    </el-option>
+                  </el-option-group>
                 </el-select>
               </el-form-item>
 
@@ -954,7 +998,10 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
           <div class="form-card">
             <div class="card-title">连接</div>
             <el-form :model="termForm" label-width="100px" label-position="right">
-              <el-form-item label="SSH 空闲断开">
+              <el-form-item>
+                <template #label>
+                  <HelpTip content="0 表示永不自动断开">SSH 空闲断开</HelpTip>
+                </template>
                 <el-input-number
                   v-model="termForm.sshIdleTimeoutMinutes"
                   :min="0"
@@ -962,10 +1009,12 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
                   controls-position="right"
                 />
                 <span class="unit-hint">分钟</span>
-                <HelpTip content="0 表示永不自动断开" />
               </el-form-item>
 
-              <el-form-item label="SSH 保活间隔">
+              <el-form-item>
+                <template #label>
+                  <HelpTip content="0 表示不发送保活包（建议保持默认 30）">SSH 保活间隔</HelpTip>
+                </template>
                 <el-input-number
                   v-model="termForm.sshKeepaliveSecs"
                   :min="0"
@@ -973,10 +1022,12 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
                   controls-position="right"
                 />
                 <span class="unit-hint">秒</span>
-                <HelpTip content="0 表示不发送保活包（建议保持默认 30）" />
               </el-form-item>
 
-              <el-form-item label="SSH 连接超时">
+              <el-form-item>
+                <template #label>
+                  <HelpTip content="0 表示永不超时">SSH 连接超时</HelpTip>
+                </template>
                 <el-input-number
                   v-model="termForm.sshConnectTimeoutSecs"
                   :min="0"
@@ -984,10 +1035,12 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
                   controls-position="right"
                 />
                 <span class="unit-hint">秒</span>
-                <HelpTip content="0 表示永不超时" />
               </el-form-item>
 
-              <el-form-item label="本地终端默认 Shell">
+              <el-form-item>
+                <template #label>
+                  <HelpTip content="「本地终端」按钮默认启动的 Shell（本机不可用的 Shell 不显示）">本地终端 Shell</HelpTip>
+                </template>
                 <el-select v-model="termForm.localShell" style="width: 160px">
                   <el-option
                     v-for="s in localShellOptions"
@@ -996,10 +1049,12 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
                     :value="s.id"
                   />
                 </el-select>
-                <HelpTip content="「本地终端」按钮默认启动的 Shell（本机不可用的 Shell 不显示）" />
               </el-form-item>
 
-              <el-form-item label="VNC 客户端">
+              <el-form-item>
+                <template #label>
+                  <HelpTip content="程序内嵌：终端页标签页内打开（无需安装客户端）；系统客户端：调用本机 vncviewer">VNC 客户端</HelpTip>
+                </template>
                 <el-select v-model="termForm.desktopClients.vnc" style="width: 160px">
                   <el-option
                     v-for="m in DESKTOP_CLIENT_MODE_OPTIONS"
@@ -1008,10 +1063,12 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
                     :value="m.value"
                   />
                 </el-select>
-                <HelpTip content="程序内嵌：终端页标签页内打开（无需安装客户端）；系统客户端：调用本机 vncviewer" />
               </el-form-item>
 
-              <el-form-item label="RDP 客户端">
+              <el-form-item>
+                <template #label>
+                  <HelpTip content="程序内嵌：终端页标签页内打开（需用户名和密码）；系统客户端：调用 Windows 自带 mstsc">RDP 客户端</HelpTip>
+                </template>
                 <el-select v-model="termForm.desktopClients.rdp" style="width: 160px">
                   <el-option
                     v-for="m in DESKTOP_CLIENT_MODE_OPTIONS"
@@ -1020,12 +1077,13 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
                     :value="m.value"
                   />
                 </el-select>
-                <HelpTip content="程序内嵌：终端页标签页内打开（需用户名和密码）；系统客户端：调用 Windows 自带 mstsc" />
               </el-form-item>
 
-              <el-form-item label="RDP 证书校验">
+              <el-form-item>
+                <template #label>
+                  <HelpTip content="程序内嵌连接时是否校验服务器证书链（严格模式用系统信任根验证）。默认关闭，与官方 mstsc 直连行为一致">RDP 证书校验</HelpTip>
+                </template>
                 <el-switch v-model="termForm.rdpVerifyCert" />
-                <HelpTip content="程序内嵌连接时是否校验服务器证书链（严格模式用系统信任根验证）。默认关闭，与官方 mstsc 直连行为一致" />
               </el-form-item>
             </el-form>
           </div>
@@ -1039,78 +1097,74 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
       <!-- ============ 快捷命令 / 快捷键 ============ -->
       <el-tab-pane name="shortcuts">
         <template #label>
-          快捷命令
-          <HelpTip :size="12">
+          <HelpTip>
+            <span>快捷命令</span>
             <template #content>
               配置终端底部快捷命令栏与全局快捷键。点击按钮或按下快捷键即向当前活动终端发送命令。
               <br />支持占位符：<code>{"{host}"}</code>、<code>{"{user}"}</code>、<code>{"{port}"}</code>（按当前会话替换）。
             </template>
           </HelpTip>
         </template>
-          <div class="shortcut-list">
-            <template v-for="gv in shortcutGroupsView" :key="gv.group || '__default__'">
-              <div class="shortcut-group-title">{{ gv.group || "默认" }}</div>
-              <div
-                v-for="sc in gv.items"
-                :key="sc.id"
-                class="shortcut-row"
-              >
-              <el-input
-                v-model="sc.label"
-                placeholder="显示名称"
-                size="small"
-                style="width: 120px"
-              />
-              <el-input
-                v-model="sc.command"
-                placeholder="命令（不含换行）"
-                size="small"
-                style="flex: 1"
-                class="mono"
-              />
-              <el-input
-                v-model="sc.shortcut"
-                placeholder="如 Ctrl+1（可选）"
-                size="small"
-                style="width: 130px"
-                @keydown="onShortcutKeyCapture(sc, $event)"
-              />
-              <el-select
-                v-model="sc.group"
-                placeholder="分组"
-                size="small"
-                style="width: 110px"
-                clearable
-                filterable
-                allow-create
-                default-first-option
-                @change="(val: string) => onGroupChange(sc, val)"
-              >
-                <el-option
-                  v-for="g in settings.shortcutGroups"
-                  :key="g"
-                  :label="g"
-                  :value="g"
-                />
-              </el-select>
-              <el-button
-                type="danger"
-                size="small"
-                link
-                @click="removeShortcut(sc.id)"
-              >
-                <el-icon><Delete /></el-icon>
-              </el-button>
+          <!-- 快捷命令表：名称 / 命令 / 快捷键 / 分组 / 操作 -->
+          <div class="sc-cmd-list">
+            <div class="sc-cmd-row sc-cmd-head">
+              <div>名称</div>
+              <div>命令</div>
+              <div>快捷键</div>
+              <div>分组</div>
+              <div class="sc-op-col">操作</div>
             </div>
+            <template v-for="gv in shortcutGroupsView" :key="gv.group || '__default__'">
+              <div v-if="gv.group" class="sc-cmd-group">{{ gv.group }}</div>
+              <div v-for="sc in gv.items" :key="sc.id" class="sc-cmd-row">
+                <el-input v-model="sc.label" placeholder="显示名称" class="sc-name" />
+                <el-input
+                  v-model="sc.command"
+                  placeholder="命令（不含换行）"
+                  class="sc-command mono"
+                />
+                <el-input
+                  v-model="sc.shortcut"
+                  placeholder="如 Ctrl+1（可选）"
+                  class="sc-key"
+                  @keydown="onShortcutKeyCapture(sc, $event)"
+                />
+                <el-select
+                  v-model="sc.group"
+                  placeholder="分组"
+                  class="sc-group"
+                  clearable
+                  filterable
+                  allow-create
+                  default-first-option
+                  @change="(val: string) => onGroupChange(sc, val)"
+                >
+                  <el-option
+                    v-for="g in settings.shortcutGroups"
+                    :key="g"
+                    :label="g"
+                    :value="g"
+                  />
+                </el-select>
+                <el-button
+                  class="sc-op-col"
+                  type="danger"
+                  link
+                  title="删除"
+                  @click="removeShortcut(sc.id)"
+                >
+                  <el-icon><Delete /></el-icon>
+                </el-button>
+              </div>
             </template>
             <div v-if="settings.shortcuts.length === 0" class="empty-tip">
-              暂无快捷命令。
+              暂无快捷命令，点击右下角「新增快捷命令」添加
             </div>
           </div>
 
-          <div class="shortcut-actions">
-            <el-button size="small" :icon="Plus" @click="addShortcut">新增快捷命令</el-button>
-            <el-button size="small" type="primary" @click="saveShortcuts">
+          <div class="table-actions">
+            <el-button :icon="Plus" @click="addShortcut">新增快捷命令</el-button>
+            <el-button type="primary" @click="saveShortcuts">
               保存快捷命令
             </el-button>
           </div>
@@ -1119,26 +1173,30 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
       <!-- ============ 快捷命令 / 快捷键 ============ -->
       <el-tab-pane name="appShortcuts">
         <template #label>
-          快捷键
-          <HelpTip :size="12">
+          <HelpTip>
+            <span>快捷键</span>
             <template #content>
               自定义应用级快捷键。点击右侧输入框开始录制，按下组合键即可绑定；
               <b>Esc</b> 取消录制，<b>Backspace</b> 清除当前绑定。冲突会高亮提示。
             </template>
           </HelpTip>
         </template>
+          <!-- 快捷键表：三列（标题 / 描述 / 快捷键），卡片化表格 -->
           <div class="app-shortcut-list">
+            <div class="app-shortcut-row app-shortcut-head">
+              <div class="sc-col-label">标题</div>
+              <div class="sc-col-desc">描述</div>
+              <div class="sc-col-key">快捷键</div>
+            </div>
             <div
               v-for="row in appRows"
               :key="row.action"
               class="app-shortcut-row"
               :class="{ conflict: row.conflict }"
             >
-              <div class="app-shortcut-info">
-                <div class="app-shortcut-label">{{ row.label }}</div>
-                <div class="app-shortcut-desc">{{ row.description }}</div>
-              </div>
-              <div class="app-shortcut-key">
+              <div class="sc-col-label app-shortcut-label">{{ row.label }}</div>
+              <div class="sc-col-desc app-shortcut-desc">{{ row.description }}</div>
+              <div class="sc-col-key">
                 <div
                   class="key-input"
                   :class="{ recording: recordingAction === row.action }"
@@ -1164,34 +1222,58 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
                 >
                   清除
                 </el-button>
+                <div v-if="row.conflict" class="conflict-tip">冲突</div>
               </div>
-              <div v-if="row.conflict" class="conflict-tip">与其他绑定冲突</div>
             </div>
           </div>
 
-          <div class="shortcut-actions">
-            <el-button size="small" :icon="Refresh" @click="resetAppShortcuts">
+          <div class="table-actions">
+            <el-button :icon="Refresh" @click="resetAppShortcuts">
               恢复默认
             </el-button>
-            <el-button size="small" type="primary" @click="saveAppShortcuts">
+            <el-button type="primary" @click="saveAppShortcuts">
               保存快捷键
             </el-button>
+          </div>
+
+          <!-- 终端操作行为（鼠标类"快捷操作"，与键位绑定同区管理）：
+               即时生效并保存，无需点上面的"保存快捷键"。 -->
+          <div class="form-card term-op-card">
+            <div class="card-title">终端操作</div>
+            <div class="term-op-row">
+              <div class="app-shortcut-info">
+                <div class="app-shortcut-label">左键选择即复制</div>
+                <div class="app-shortcut-desc">在终端中选中文字后立即复制到剪贴板，无需再按复制键</div>
+              </div>
+              <el-switch
+                :model-value="settings.terminal.copyOnSelect"
+                @update:model-value="setTermOp('copyOnSelect', $event as boolean)"
+              />
+            </div>
+            <div class="term-op-row">
+              <div class="app-shortcut-info">
+                <div class="app-shortcut-label">右键粘贴</div>
+                <div class="app-shortcut-desc">右键单击直接粘贴剪贴板内容（PuTTY 风格）；关闭时右键弹出上下文菜单</div>
+              </div>
+              <el-switch
+                :model-value="settings.terminal.rightClickPaste"
+                @update:model-value="setTermOp('rightClickPaste', $event as boolean)"
+              />
+            </div>
           </div>
       </el-tab-pane>
 
       <!-- ============ AI 助手 ============ -->
       <el-tab-pane label="AI 助手" name="ai" class="ai-pane">
-        <el-alert
-          class="ai-tip"
-          type="warning"
-          :closable="false"
-          show-icon
-          title="AI 数据会上传到所选模型服务，请勿输入敏感信息"
-        />
-
         <div class="form-card no-pad span-full">
           <div class="table-head">
-            <span class="table-title">模型列表</span>
+            <div class="table-head-left">
+              <span class="table-title">模型列表</span>
+              <span class="table-warn-tip">
+                <el-icon><WarningFilled /></el-icon>
+                AI 数据会上传到所选模型服务，请勿输入敏感信息
+              </span>
+            </div>
             <el-button size="small" type="primary" plain :icon="Plus" @click="openProviderDialog">
               添加 Provider
             </el-button>
@@ -1199,41 +1281,14 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
           <el-table
             :data="settings.aiProviders"
             empty-text="尚未添加任何 provider"
-            stripe
             max-height="460"
           >
-            <el-table-column label="类型" width="160">
-              <template #default="{ row }">{{ kindLabel(row.kind) }}</template>
-            </el-table-column>
-
-            <el-table-column label="Base URL" min-width="220">
-              <template #default="{ row }">
-                <span class="mono">{{ truncate(row.baseUrl) }}</span>
-              </template>
-            </el-table-column>
-
-            <el-table-column label="模型" min-width="160">
+            <el-table-column label="模型" min-width="200">
               <template #default="{ row }">
                 <span class="mono">{{ row.model }}</span>
                 <el-tag v-if="row.multimodal" type="warning" size="small" effect="plain" class="mm-tag">
                   多模态
                 </el-tag>
-              </template>
-            </el-table-column>
-
-            <el-table-column label="参数" min-width="220">
-              <template #default="{ row }">
-                <span class="muted mono">
-                  输出 {{ row.maxOutput ?? 16000 }} · 窗口 {{ row.contextWindow ?? 184000 }} ·
-                  工具 {{ row.maxToolCalls ?? 200 }} 次
-                  <template v-if="row.temperature != null"> · 温度 {{ row.temperature }}</template>
-                </span>
-              </template>
-            </el-table-column>
-
-            <el-table-column label="API Key" width="120">
-              <template #default>
-                <span class="secret">***</span>
               </template>
             </el-table-column>
 
@@ -1275,14 +1330,12 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
         <!-- SSH 智能体配置 -->
         <div class="form-card">
           <div class="card-title">
-            SSH 智能体（终端命令执行）
-            <HelpTip content="控制 AI 在 SSH 终端上执行命令的行为：运行模式、白名单、可视化。" />
+            <HelpTip content="控制 AI 在 SSH 终端上执行命令的行为：运行模式、白名单、可视化。">SSH 智能体（终端命令执行）</HelpTip>
           </div>
           <div class="switch-row">
             <div class="switch-label">
               <div>
-                运行模式
-                <HelpTip :content="sshRunModeHint" />
+                <HelpTip :content="sshRunModeHint">运行模式</HelpTip>
               </div>
             </div>
             <el-select
@@ -1301,20 +1354,17 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
           <div class="switch-row">
             <div class="switch-label">
               <div>
-                终端可视化执行
-                <HelpTip content="开启后，AI 执行的命令会写入活动终端，命令和输出实时显示在终端窗口（像 AI 在终端里敲命令）。关闭则走后台独立执行，输出只在 AI 面板。" />
+                <HelpTip content="开启后，AI 执行的命令会写入活动终端，命令和输出实时显示在终端窗口（像 AI 在终端里敲命令）。关闭则走后台独立执行，输出只在 AI 面板。">终端可视化执行</HelpTip>
               </div>
             </div>
             <el-switch v-model="settings.sshAgent.terminalVisualization" @change="saveSshSwitches" />
           </div>
-          <div class="card-title" style="margin-top: 16px; font-size: 13px">
-            命令白名单
-            <HelpTip content="允许 AI 在服务器上免确认执行的命令前缀（每行一条）。" />
+          <div class="card-title sub">
+            <HelpTip content="允许 AI 在服务器上免确认执行的命令前缀（每行一条）。">命令白名单</HelpTip>
           </div>
           <!-- 安全规则：保持直接展示，不收进 tooltip -->
           <div class="card-desc warn">
-            注意：含 shell 元字符（<code>; &amp; | &gt; &lt; ` $()</code>）的命令
-            <strong>永不</strong>算白名单内——防止 <code>ls; rm -rf /</code> 绕过。
+            含元字符（<code>; &amp; | &gt; &lt; ` $()</code>）的命令 永不算白名单内——防止 <code>ls; rm -rf /</code> 绕过
           </div>
           <el-input
             v-model="whitelistText"
@@ -1323,7 +1373,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
             placeholder="每行一个命令前缀，例如：&#10;df&#10;free&#10;ps&#10;systemctl status"
             style="margin-top: 8px"
           />
-          <div style="margin-top: 10px; display: flex; gap: 8px">
+          <div class="table-actions">
             <el-button type="primary" @click="saveWhitelist">保存白名单</el-button>
             <el-button @click="resetWhitelist">恢复默认</el-button>
           </div>
@@ -1332,14 +1382,12 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
         <!-- SQL 智能体配置 -->
         <div class="form-card">
           <div class="card-title">
-            SQL 智能体（数据库语句执行）
-            <HelpTip content="控制 AI 在 MySQL 上执行 SQL 的行为：执行模式与运行模式。" />
+            <HelpTip content="控制 AI 在 MySQL 上执行 SQL 的行为：执行模式与运行模式。">SQL 智能体（数据库语句执行）</HelpTip>
           </div>
             <div class="switch-row">
               <div class="switch-label">
                 <div>
-                  运行模式
-                  <HelpTip :content="sqlRunModeHint" />
+                  <HelpTip :content="sqlRunModeHint">运行模式</HelpTip>
                 </div>
               </div>
               <el-select
@@ -1358,8 +1406,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
             <div class="switch-row">
               <div class="switch-label">
                 <div>
-                  终端可视化执行
-                  <HelpTip content="开启后，AI 执行的 SQL 及其结果回显到 SQL 控制台（命令行模式），就像你手动执行一样。关闭则结果只在 AI 面板。与终端助手的可视化独立设置。" />
+                  <HelpTip content="开启后，AI 执行的 SQL 及其结果回显到 SQL 控制台（命令行模式），就像你手动执行一样。关闭则结果只在 AI 面板。与终端助手的可视化独立设置。">终端可视化执行</HelpTip>
                 </div>
               </div>
               <el-switch v-model="settings.sqlAgent.terminalVisualization" @change="saveSqlSwitches" />
@@ -1367,8 +1414,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
             <div class="switch-row">
               <div class="switch-label">
                 <div>
-                  SQL 执行模式
-                  <HelpTip :content="sqlModeHint" />
+                  <HelpTip :content="sqlModeHint">SQL 执行模式</HelpTip>
                 </div>
               </div>
               <el-select
@@ -1389,14 +1435,12 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
         <!-- 本地文件读写 -->
         <div class="form-card span-full">
           <div class="card-title">
-            本地文件读写
-            <HelpTip content="开启后，AI 可在各助手的工作目录内自动读写文件（读取数据文件、导出查询结果为 CSV/SQL 等）。AI 只能访问工作目录及子目录（沙箱），写文件覆盖已有文件仍需人工确认。关闭时 AI 无法访问本地文件。" />
+            <HelpTip content="开启后，AI 可在各助手的工作目录内自动读写文件（读取数据文件、导出查询结果为 CSV/SQL 等）。AI 只能访问工作目录及子目录（沙箱），写文件覆盖已有文件仍需人工确认。关闭时 AI 无法访问本地文件。">本地文件读写</HelpTip>
           </div>
           <div class="switch-row">
             <div class="switch-label">
               <div>
-                启用本地文件读写
-                <HelpTip content="关闭时 AI 行为与之前完全一致。" />
+                <HelpTip content="关闭时 AI 行为与之前完全一致。">启用本地文件读写</HelpTip>
               </div>
             </div>
             <el-switch v-model="settings.fileAccess.enabled" @change="saveFileAccessSwitch" />
@@ -1409,8 +1453,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
             >
               <div class="switch-label">
                 <div>
-                  {{ d === "ssh" ? "终端助手" : "数据库助手" }}工作目录
-                  <HelpTip content="AI 读写文件的根目录（可读写其子目录）。未设置时 AI 无法使用文件工具。" />
+                  <HelpTip content="AI 读写文件的根目录（可读写其子目录）。未设置时 AI 无法使用文件工具。">{{ d === "ssh" ? "终端助手" : "数据库助手" }}工作目录</HelpTip>
                 </div>
               </div>
               <div class="workspace-picker">
@@ -1483,8 +1526,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
             <div class="provider-params-grid">
               <el-form-item prop="contextWindow">
                 <template #label>
-                  上下文大小
-                  <HelpTip content="tokens，超出部分的历史消息会被裁剪" />
+                  <HelpTip content="tokens，超出部分的历史消息会被裁剪">上下文大小</HelpTip>
                 </template>
                 <el-input-number
                   v-model="providerForm.contextWindow"
@@ -1498,8 +1540,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
 
               <el-form-item prop="maxOutput">
                 <template #label>
-                  最大输出
-                  <HelpTip content="tokens（请求体 max_tokens）" />
+                  <HelpTip content="tokens（请求体 max_tokens）">最大输出</HelpTip>
                 </template>
                 <el-input-number
                   v-model="providerForm.maxOutput"
@@ -1513,8 +1554,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
 
               <el-form-item prop="maxToolCalls">
                 <template #label>
-                  工具调用数
-                  <HelpTip content="智能体模式单次对话的最大工具调用数" />
+                  <HelpTip content="智能体模式单次对话的最大工具调用数">工具调用数</HelpTip>
                 </template>
                 <el-input-number
                   v-model="providerForm.maxToolCalls"
@@ -1527,8 +1567,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
 
               <el-form-item prop="temperature">
                 <template #label>
-                  温度
-                  <HelpTip content="采样温度，留空表示不发送" />
+                  <HelpTip content="采样温度，留空表示不发送">温度</HelpTip>
                 </template>
                 <el-input-number
                   v-model="providerForm.temperature"
@@ -1544,8 +1583,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
 
               <el-form-item prop="connectTimeoutSecs">
                 <template #label>
-                  建连超时
-                  <HelpTip content="秒，DNS 解析/建连最长等待" />
+                  <HelpTip content="秒，DNS 解析/建连最长等待">建连超时</HelpTip>
                 </template>
                 <el-input-number
                   v-model="providerForm.connectTimeoutSecs"
@@ -1558,8 +1596,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
 
               <el-form-item prop="readTimeoutSecs">
                 <template #label>
-                  读取超时
-                  <HelpTip content="秒，流式响应间隔最长等待；长思考模型需调大" />
+                  <HelpTip content="秒，流式响应间隔最长等待；长思考模型需调大">读取超时</HelpTip>
                 </template>
                 <el-input-number
                   v-model="providerForm.readTimeoutSecs"
@@ -1585,14 +1622,12 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
       <el-tab-pane label="安全" name="security">
         <div class="form-card">
           <div class="card-title">
-            保险库与锁定
-            <HelpTip content="凭据保险库用主密码保护所有保存的密码与私钥，解锁状态保存在应用进程内。" />
+            <HelpTip content="凭据保险库用主密码保护所有保存的密码与私钥，解锁状态保存在应用进程内。">保险库与锁定</HelpTip>
           </div>
           <div class="switch-row">
             <div class="switch-label">
               <div>
-                启用锁定功能
-                <HelpTip content="开启后，左侧导航栏底部显示「锁定」按钮。点击锁定即清除内存中的主密钥，需重新输入主密码才能解锁。已建立的连接（终端 / SFTP / 隧道 / 数据库）不受影响，可继续使用。" />
+                <HelpTip content="开启后，左侧导航栏底部显示「锁定」按钮。点击锁定即清除内存中的主密钥，需重新输入主密码才能解锁。已建立的连接（终端 / SFTP / 隧道 / 数据库）不受影响，可继续使用。">启用锁定功能</HelpTip>
               </div>
             </div>
             <el-switch v-model="settings.vaultLockEnabled" @change="saveSecuritySwitches" />
@@ -1611,8 +1646,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
           <!-- 导出 -->
           <div class="form-card">
             <div class="card-title">
-              导出加密备份
-              <HelpTip content="将会话、数据库连接、凭据（密码/私钥）、TOTP、转发规则、桌面连接、文件账号、应用设置与 MCP 配置导出为加密备份文件（.xtermbackup）。文件使用独立的备份密码（Argon2id + AES-256-GCM）加密，可安全转移到其他机器。" />
+              <HelpTip content="将会话、数据库连接、凭据（密码/私钥）、TOTP、转发规则、桌面连接、文件账号、应用设置与 MCP 配置导出为加密备份文件（.xtermbackup）。文件使用独立的备份密码（Argon2id + AES-256-GCM）加密，可安全转移到其他机器。">导出加密备份</HelpTip>
             </div>
             <div class="backup-pwd-row">
               <el-input
@@ -1644,8 +1678,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
           <!-- 导入 -->
           <div class="form-card">
             <div class="card-title">
-              从备份导入
-              <HelpTip content="选择之前导出的加密备份文件并输入对应的备份密码。合并导入按 id 覆盖同名条目、保留本机其他数据；覆盖导入会先清空本机相关数据再完整恢复（同一事务，失败自动回滚）。" />
+              <HelpTip content="选择之前导出的加密备份文件并输入对应的备份密码。合并导入按 id 覆盖同名条目、保留本机其他数据；覆盖导入会先清空本机相关数据再完整恢复（同一事务，失败自动回滚）。">从备份导入</HelpTip>
             </div>
             <div class="backup-pwd-row">
               <el-input
@@ -1779,24 +1812,48 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
 </template>
 
 <style scoped>
+/* ============ 页面骨架：浅底衬托卡片，头部 + 顶部 Tab + 滚动内容 ============ */
 .settings-view {
-  padding: 20px 24px;
+  padding: 18px 28px 0;
   display: flex;
   flex-direction: column;
-  gap: 16px;
   height: 100%;
   box-sizing: border-box;
   overflow: hidden;
+  background: var(--el-bg-color-page);
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  padding-bottom: 14px;
+  margin-bottom: 2px;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+  flex-shrink: 0;
 }
 
 .header h2 {
   margin: 0;
-  font-size: 20px;
+  font-size: 19px;
   font-weight: 600;
+  letter-spacing: 0.3px;
   color: var(--el-text-color-primary);
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
+}
+
+.header h2 .el-icon {
+  font-size: 21px;
+  color: var(--el-color-primary);
+}
+
+.header-sub {
+  margin-left: 14px;
+  padding-left: 14px;
+  border-left: 1px solid var(--el-border-color-lighter);
+  font-size: 12px;
+  color: var(--el-text-color-placeholder);
 }
 
 /* 顶部 Tab 导航 + 下方内容区滚动 */
@@ -1806,22 +1863,61 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
   display: flex;
 }
 .settings-tabs :deep(.el-tabs__header) {
-  margin: 0;
+  margin: 0 0 14px;
   flex-shrink: 0;
+}
+.settings-tabs :deep(.el-tabs__nav-wrap::after) {
+  height: 1px;
+  background-color: var(--el-border-color-lighter);
+}
+.settings-tabs :deep(.el-tabs__item) {
+  height: 38px;
+  line-height: 38px;
+  padding: 0 20px;
+  font-size: 13.5px;
+  color: var(--el-text-color-secondary);
+  transition: color 0.15s ease;
+}
+.settings-tabs :deep(.el-tabs__item:hover) {
+  color: var(--el-text-color-primary);
+}
+.settings-tabs :deep(.el-tabs__item.is-active) {
+  color: var(--el-color-primary);
+  font-weight: 600;
+}
+.settings-tabs :deep(.el-tabs__active-bar) {
+  height: 3px;
+  border-radius: 3px 3px 0 0;
 }
 .settings-tabs :deep(.el-tabs__content) {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 0 4px;
+  padding: 0 6px 36px 0;
+}
+/* 内容限宽：宽屏下表单不至于被拉得稀疏 */
+.settings-tabs :deep(.el-tab-pane) {
+  max-width: 1080px;
+}
+.settings-tabs :deep(.el-tabs__content)::-webkit-scrollbar {
+  width: 8px;
+}
+.settings-tabs :deep(.el-tabs__content)::-webkit-scrollbar-thumb {
+  background: var(--el-border-color-light);
+  border-radius: 4px;
+}
+.settings-tabs :deep(.el-tabs__content)::-webkit-scrollbar-track {
+  background: transparent;
 }
 
+/* 卡片：浅底页面上的浮层卡片，轻投影 + 圆角 */
 .form-card {
   background: var(--el-bg-color-overlay);
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 8px;
-  padding: 20px;
+  border-radius: 10px;
+  padding: 18px 22px 20px;
   margin-bottom: 16px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
 }
 
 /* 多卡片网格布局（两列并排，窄屏回退单列）。AI 助手 Tab 复用同一网格。 */
@@ -1838,15 +1934,42 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
 .ai-pane .form-card {
   margin-bottom: 0;
 }
+/* 操作按钮行：右对齐（应用/重置类动作惯例） */
 .card-actions {
   display: flex;
+  justify-content: flex-end;
   gap: 8px;
+  padding-top: 4px;
+}
+
+/* 卡片标题：独立分区头（标题 + 细分隔线） */
+.card-title {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  color: var(--el-text-color-primary);
+  padding-bottom: 10px;
+  margin-bottom: 14px;
+  border-bottom: 1px solid var(--el-border-color-extra-light);
+}
+/* 卡片内的二级标题（如命令白名单） */
+.card-title.sub {
+  margin-top: 18px;
+}
+
+/* 表单：统一行距与标签字色，控件宽度视觉对齐 */
+.form-card :deep(.el-form-item) {
+  margin-bottom: 16px;
+}
+.form-card :deep(.el-form-item:last-child) {
+  margin-bottom: 0;
+}
+.form-card :deep(.el-form-item__label) {
+  font-size: 13px;
+  color: var(--el-text-color-regular);
 }
 
 /* AI 助手 Tab：SSH / SQL 配置卡片两列并排，其余横跨整行 */
-.ai-pane .ai-tip {
-  margin-bottom: 0;
-}
 .ai-pane .span-full {
   grid-column: 1 / -1;
 }
@@ -1856,21 +1979,56 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
   overflow: hidden;
 }
 
-.ai-tip {
-  margin-bottom: 16px;
-}
-
 /* 表格卡片头部（标题 + 操作按钮） */
 .table-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 12px 16px;
+  padding: 14px 16px;
   border-bottom: 1px solid var(--el-border-color-lighter);
 }
 .table-title {
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 600;
+  letter-spacing: 0.5px;
+  color: var(--el-text-color-primary);
+}
+/* 表头左侧：标题 + 内联提示 */
+.table-head-left {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+}
+/* 标题右侧的警示提示（替代原独立 alert 条） */
+.table-warn-tip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: normal;
+  color: var(--el-color-warning);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.table-warn-tip .el-icon {
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+/* 模型列表表格：表头浅底、行悬停反馈 */
+.form-card :deep(.el-table) {
+  --el-table-header-bg-color: var(--el-fill-color-lighter);
+  --el-table-row-hover-bg-color: var(--el-fill-color-light);
+}
+.form-card :deep(.el-table th.el-table__cell) {
+  font-weight: 600;
+  color: var(--el-text-color-regular);
+}
+.form-card :deep(.el-table .el-table__cell) {
+  padding: 10px 0;
 }
 
 .mono {
@@ -1928,11 +2086,20 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
   font-size: 13px;
 }
 
-.card-title {
-  font-size: 14px;
-  font-weight: 600;
-  margin-bottom: 4px;
+/* 配色方案下拉项：名称 + 6 色预览点 */
+.scheme-name {
+  margin-right: 10px;
 }
+.scheme-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin-right: 3px;
+  vertical-align: -1px;
+  border: 1px solid rgba(0, 0, 0, 0.15);
+}
+
 .card-desc {
   font-size: 12px;
   line-height: 1.6;
@@ -1977,7 +2144,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 12px 0;
+  padding: 13px 2px;
 }
 /* 分隔线只出现在相邻开关行之间（卡片标题后的首行无线） */
 .switch-row + .switch-row {
@@ -1986,6 +2153,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
 .switch-label > div:first-child {
   font-size: 13px;
   font-weight: 500;
+  color: var(--el-text-color-primary);
 }
 
 /* 本地文件读写：工作目录选择行 */
@@ -2019,75 +2187,123 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
   white-space: nowrap;
 }
 
-/* --- 快捷命令 tab --- */
-.shortcut-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin: 12px 0;
+/* --- 表格类列表（快捷命令 / 快捷键 共用视觉）：单卡片 + 分隔线 + 整行 hover --- */
+.sc-cmd-list,
+.app-shortcut-list {
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 10px;
+  background: var(--el-bg-color-overlay);
+  overflow: hidden;
 }
-.shortcut-group-title {
+.sc-cmd-row,
+.app-shortcut-row {
+  display: grid;
+  align-items: center;
+  gap: 14px;
+  padding: 9px 18px;
+  transition: background-color 0.12s ease;
+}
+.sc-cmd-row + .sc-cmd-row,
+.app-shortcut-row + .app-shortcut-row,
+.sc-cmd-group + .sc-cmd-row {
+  border-top: 1px solid var(--el-border-color-lighter);
+}
+.sc-cmd-row:not(.sc-cmd-head):hover,
+.app-shortcut-row:not(.app-shortcut-head):hover {
+  background: var(--el-fill-color-light);
+}
+/* 表头行 */
+.sc-cmd-row.sc-cmd-head,
+.app-shortcut-row.app-shortcut-head {
+  padding: 8px 18px;
+  background: var(--el-fill-color-lighter);
   font-size: 12px;
   font-weight: 600;
   color: var(--el-text-color-secondary);
-  margin: 12px 0 2px;
-  padding-left: 2px;
+  letter-spacing: 0.5px;
 }
-.shortcut-group-title:first-child {
-  margin-top: 0;
+/* 快捷命令表列宽：名称 / 命令 / 快捷键 / 分组 / 操作 */
+.sc-cmd-row {
+  grid-template-columns: 150px minmax(0, 1fr) 140px 120px 40px;
 }
-.shortcut-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+/* 分组分隔行 */
+.sc-cmd-group {
+  padding: 6px 18px;
+  background: var(--el-fill-color-lighter);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--el-text-color-secondary);
+  border-top: 1px solid var(--el-border-color-lighter);
 }
-.shortcut-row .mono :deep(input) {
+.sc-op-col {
+  justify-self: center;
+}
+.sc-command :deep(input) {
   font-family: var(--el-font-family-mono, "Cascadia Code", Consolas, monospace);
 }
-.shortcut-actions {
+/* 表格底部操作行：右对齐（与终端 tab 的应用/重置一致） */
+.table-actions {
   display: flex;
+  justify-content: flex-end;
   gap: 8px;
-  margin-top: 8px;
+  margin-top: 12px;
 }
 .empty-tip {
-  padding: 16px;
+  padding: 26px 18px;
   text-align: center;
   color: var(--el-text-color-secondary);
   font-size: 13px;
 }
 
 /* --- 应用级快捷键 tab --- */
-.app-shortcut-list {
+.term-op-card {
+  margin-top: 16px;
+}
+.term-op-row {
   display: flex;
-  flex-direction: column;
-  gap: 6px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 0;
+}
+.term-op-row + .term-op-row {
+  border-top: 1px dashed var(--el-border-color-lighter);
+}
+/* --- 快捷键表（容器/行/表头视觉见上方共用规则） --- */
+.app-shortcut-list {
   margin-top: 8px;
 }
+/* 快捷键表列宽：标题 / 描述 / 快捷键 */
 .app-shortcut-row {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  align-items: center;
-  gap: 12px;
-  padding: 8px 10px;
-  border: 1px solid var(--el-border-color-lighter);
-  border-radius: 6px;
-  position: relative;
+  grid-template-columns: 180px minmax(0, 1fr) auto;
+  gap: 16px;
 }
+/* 冲突行：左侧色条 + 浅黄底 */
 .app-shortcut-row.conflict {
-  border-color: var(--el-color-warning);
   background: var(--el-color-warning-light-9);
+  box-shadow: inset 3px 0 0 var(--el-color-warning);
 }
-.app-shortcut-info {
-  min-width: 0;
+.app-shortcut-row.conflict:hover {
+  background: var(--el-color-warning-light-8);
+}
+/* 各列 */
+.sc-col-key {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-self: end;
 }
 .app-shortcut-label {
   font-size: 13px;
   font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .app-shortcut-desc {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--el-text-color-secondary);
-  margin-top: 2px;
+  line-height: 1.5;
 }
 .app-shortcut-key {
   display: flex;
@@ -2096,22 +2312,24 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
 }
 .key-input {
   min-width: 160px;
-  height: 30px;
+  height: 28px;
   padding: 0 10px;
   display: flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid var(--el-border-color);
-  border-radius: 4px;
+  border: 1px dashed var(--el-border-color);
+  border-radius: 6px;
   cursor: pointer;
   font-size: 12px;
   color: var(--el-text-color-regular);
-  background: var(--el-fill-color-blank);
+  background: transparent;
   outline: none;
   user-select: none;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
 }
 .key-input:hover {
   border-color: var(--el-color-primary);
+  border-style: solid;
 }
 .key-input.recording {
   border-color: var(--el-color-primary);
@@ -2135,10 +2353,9 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
   color: var(--el-text-color-placeholder);
 }
 .conflict-tip {
-  grid-column: 1 / -1;
   font-size: 11px;
   color: var(--el-color-warning);
-  margin-top: 4px;
+  white-space: nowrap;
 }
 
 /* --- 关于页 --- */

@@ -90,7 +90,8 @@ async function submit() {
   display: flex;
   align-items: center;
   justify-content: center;
-  height: 100vh;
+  /* 父级 .app-body 已扣除自绘标题栏高度，不能用 100vh（会溢出 36px） */
+  height: 100%;
   background: var(--el-bg-color-page);
 }
 .unlock-card {

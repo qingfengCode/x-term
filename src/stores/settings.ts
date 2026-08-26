@@ -32,11 +32,15 @@ const defaultFileAccess: FileAccessSettings = {
 
 const defaultTerminal: TerminalSettings = {
   theme: "dark",
+  /** 空 = 未选择，按应用明暗回退默认配色（Catppuccin）。 */
+  colorScheme: "",
   fontFamily: "Consolas, 'Cascadia Code', 'Courier New', monospace",
   fontSize: 14,
   lineHeight: 1.2,
   scrollback: 10000,
   copyOnSelect: true,
+  /** 右键直接粘贴（PuTTY 风格）；关闭时右键弹出上下文菜单。 */
+  rightClickPaste: false,
   enableWebgl: true,
   sshIdleTimeoutMinutes: 30,
   sshKeepaliveSecs: 30,
@@ -68,6 +72,8 @@ export const useSettingsStore = defineStore("settings", () => {
   const appShortcuts = ref<AppShortcuts>(defaultAppShortcuts());
   /** 会话侧栏宽度（px），拖拽调整后持久化。 */
   const sidebarWidth = ref(240);
+  /** 会话侧栏是否收起（终端页），持久化。默认展开。 */
+  const sidebarCollapsed = ref(false);
   /** 最近成功连接的会话 id（最近的在前，最多 10 个）。 */
   const recentSessionIds = ref<string[]>([]);
   /** 是否启用锁定功能（导航栏显示「锁定」按钮）。 */
@@ -127,6 +133,7 @@ export const useSettingsStore = defineStore("settings", () => {
     // 旧配置文件没有这些字段（或后端默认 0）时回退默认值。
     sidebarWidth.value =
       typeof s.sidebarWidth === "number" && s.sidebarWidth >= 120 ? s.sidebarWidth : 240;
+    sidebarCollapsed.value = s.sidebarCollapsed ?? false;
     recentSessionIds.value = s.recentSessionIds ?? [];
     // 兼容旧配置文件无该字段（默认开启锁定功能）。
     vaultLockEnabled.value = s.vaultLockEnabled ?? true;
@@ -152,6 +159,7 @@ export const useSettingsStore = defineStore("settings", () => {
       },
       firstRun: false,
       sidebarWidth: sidebarWidth.value,
+      sidebarCollapsed: sidebarCollapsed.value,
       recentSessionIds: recentSessionIds.value,
       vaultLockEnabled: vaultLockEnabled.value,
     };
@@ -181,6 +189,11 @@ export const useSettingsStore = defineStore("settings", () => {
   /** 设置会话侧栏宽度（调用方负责 save() 持久化）。 */
   function setSidebarWidth(w: number) {
     sidebarWidth.value = Math.round(w);
+  }
+
+  /** 切换会话侧栏展开/收起（调用方负责 save() 持久化）。 */
+  function toggleSidebar() {
+    sidebarCollapsed.value = !sidebarCollapsed.value;
   }
 
   /** 记录一次成功连接：去重置顶，最多保留 10 个（调用方负责 save() 持久化）。 */
@@ -272,6 +285,7 @@ export const useSettingsStore = defineStore("settings", () => {
     shortcutBarExpanded,
     appShortcuts,
     sidebarWidth,
+    sidebarCollapsed,
     recentSessionIds,
     vaultLockEnabled,
     loaded,
@@ -279,6 +293,7 @@ export const useSettingsStore = defineStore("settings", () => {
     save,
     setTerminal,
     setSidebarWidth,
+    toggleSidebar,
     recordRecentSession,
     addShortcut,
     updateShortcut,

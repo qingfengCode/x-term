@@ -89,6 +89,17 @@ impl TerminalSession {
             TerminalSession::Local(s) => s.attach_snapshot(),
         }
     }
+
+    /// 通知 reader 立即冲刷输出批次（attach 快照前调用，保证快照与事件流
+    /// 的 `total` 基线一致）。SSH/Telnet 有批量 emit，需冲刷；本地会话
+    /// 逐块 emit，无需冲刷，返回 None。
+    pub fn flush_output(&self) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        match self {
+            TerminalSession::Ssh(s) => s.flush_output(),
+            TerminalSession::Telnet(s) => s.flush_output(),
+            TerminalSession::Local(_) => None,
+        }
+    }
     /// 累计写入字节数（不受环形截断影响），判断"输出是否仍在增长"用。
     pub fn total_output_bytes(&self) -> usize {
         match self {

@@ -18,7 +18,7 @@
 //! 本模块按行解析，逐段把 `delta.content` 通过 `ai:chunk` 事件推给前端，
 //! 直到读到 `[DONE]` 标记为止。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -533,9 +533,22 @@ impl LlmProvider for OpenAiProvider {
         }
 
         // 4. 构造 tool_calls（arguments 解析为 JSON Value）。
+        // 确认通道（pending_tool_calls）以 tool_call id 为 key，LLM 流式响应
+        // 可能为不同 index 返回相同 id（部分厂商并行 tool_call 的已知问题）：
+        // 重复 id 会把先登记的 oneshot sender 覆盖掉，批准/拒绝信号会投递到
+        // 错误的卡片，表现为"拒绝第一条命令后剩余命令无法执行"。这里强制去重：
+        // 重复 id 重新生成 uuid，保证每条命令的确认通道相互独立。
         let mut tool_calls: Vec<ToolCall> = Vec::new();
+        let mut used_ids: HashSet<String> = HashSet::new();
         for (_, buf) in tool_buffers {
-            let id = buf.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let id = match buf.id {
+                Some(id) if used_ids.insert(id.clone()) => id,
+                _ => {
+                    let uid = uuid::Uuid::new_v4().to_string();
+                    used_ids.insert(uid.clone());
+                    uid
+                }
+            };
             let name = buf.name.unwrap_or_default();
             let arguments = if buf.arguments.is_empty() {
                 serde_json::Value::Object(serde_json::Map::new())

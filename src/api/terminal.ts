@@ -8,11 +8,14 @@ export function terminalResize(instanceId: string, cols: number, rows: number): 
   return invoke<void>("terminal_resize", { instanceId, cols, rows });
 }
 
-/** terminal:data 事件载荷（data 为 base64 字节，total 为追加后的累计字节数）。 */
+/** terminal:data 事件载荷（data 为 base64 字节；[startTotal,total) 为半开区间，
+ *  批量 emit 时一段数据可能含多个 TCP 块，按该区间对快照基线做精确去重）。 */
 export interface TerminalDataPayload {
   sessionId: string;
   data: string;
-  /** 追加本块后的累计输出字节数（attach 回放去重基线；旧事件无此字段为 0）。 */
+  /** data 首字节对应的累计输出字节数（区间起点；旧事件无此字段为 0）。 */
+  startTotal?: number;
+  /** data 末字节追加后的累计输出字节数（区间终点，单调递增）。 */
   total?: number;
 }
 

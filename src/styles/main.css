@@ -1,12 +1,71 @@
+/* ==========================================================================
+   X-Term 全局样式 —— 设计令牌 + 基础重置
+   ========================================================================== */
+
+/* --- 排版基础 --- */
 :root {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue",
-    Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+  --app-font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", Roboto,
+    "Helvetica Neue", Arial, "PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei",
+    sans-serif;
+  --app-font-mono: "JetBrains Mono", "Cascadia Code", "Fira Code", "SF Mono",
+    Consolas, Menlo, "Courier New", monospace;
+
+  font-family: var(--app-font-ui);
   font-size: 14px;
   line-height: 1.5;
+  color-scheme: light;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+
+  /* Element Plus 组件字体族同步 */
+  --el-font-family: var(--app-font-ui);
+
+  /* 实心主色背景上的前景色（自绘元素使用，如 AI 用户气泡） */
+  --app-accent-contrast: #ffffff;
 }
 
+.dark {
+  color-scheme: dark;
+  --app-accent-contrast: #062e2a;
+}
+
+/* --- 品牌主色：终端青（Teal） ----------------------------------------------
+   覆盖 Element Plus primary 全色阶：浅色主题向白混合、深色主题向底色混合，
+   与 Element Plus 官方色阶生成规则一致，保证按钮/链接/高亮观感统一。 */
+:root {
+  --el-color-primary: #0d9488;
+  --el-color-primary-light-3: #56b4ac;
+  --el-color-primary-light-5: #86cac4;
+  --el-color-primary-light-7: #b6dedb;
+  --el-color-primary-light-8: #cee9e7;
+  --el-color-primary-light-9: #e6f4f3;
+  --el-color-primary-dark-2: #0a766d;
+}
+.dark {
+  --el-color-primary: #2dd4bf;
+  --el-color-primary-light-3: #259a8c;
+  --el-color-primary-light-5: #21746a;
+  --el-color-primary-light-7: #1b4d47;
+  --el-color-primary-light-8: #193a36;
+  --el-color-primary-light-9: #172725;
+  --el-color-primary-dark-2: #57dccb;
+
+  /* 深色底色微调为冷灰调，比纯中性黑更有层次 */
+  --el-bg-color: #141518;
+  --el-bg-color-page: #0d0e10;
+  --el-bg-color-overlay: #1b1d21;
+}
+
+/* 深色主题下实心主色按钮改用深色文字（亮青底 + 白字对比度不足）。
+   排除 plain/text/link 变体：它们自带独立配色且背景非实心主色。 */
+.dark .el-button--primary:not(.is-plain):not(.is-text):not(.is-link) {
+  --el-button-text-color: var(--app-accent-contrast);
+  --el-button-hover-text-color: var(--app-accent-contrast);
+  --el-button-active-text-color: var(--app-accent-contrast);
+}
+
+/* --- 重置 --- */
 * {
   box-sizing: border-box;
 }
@@ -21,24 +80,36 @@ body,
   overflow: hidden;
 }
 
+body {
+  background: var(--el-bg-color);
+}
+
 #app {
   display: flex;
   flex-direction: column;
 }
 
-/* 滚动条统一样式 */
+/* 文本选区：主色浅底 */
+::selection {
+  background: var(--el-color-primary-light-7);
+}
+
+/* --- 滚动条（统一样式，主题感知） --- */
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(128, 128, 128, 0.4);
+  background: rgba(128, 128, 128, 0.35); /* 不支持 color-mix 的引擎兜底 */
+  background: color-mix(in srgb, var(--el-text-color-primary) 18%, transparent);
   border-radius: 4px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(128, 128, 128, 0.6);
+  background: rgba(128, 128, 128, 0.55);
+  background: color-mix(in srgb, var(--el-text-color-primary) 34%, transparent);
 }
-::-webkit-scrollbar-track {
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
   background: transparent;
 }
 
@@ -51,11 +122,25 @@ body,
 /* 工作区无标签时占位 */
 .workspace-empty {
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
+  gap: 12px;
   height: 100%;
+  padding: 0 24px;
   color: var(--el-text-color-secondary);
   font-size: 13px;
+  text-align: center;
+  user-select: none;
+}
+/* 终端提示符图形（>_），低对比装饰 */
+.workspace-empty::before {
+  content: ">_";
+  font-family: var(--app-font-mono);
+  font-size: 44px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--el-border-color);
   user-select: none;
 }
 

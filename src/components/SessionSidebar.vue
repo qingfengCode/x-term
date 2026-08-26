@@ -9,6 +9,9 @@ import SessionDialog from "./SessionDialog.vue";
 const sessionsStore = useSessionsStore();
 const terminalsStore = useTerminalsStore();
 
+/** 收起侧栏（由 MainLayout 处理：隐藏侧栏并显示窄条展开按钮）。 */
+const emit = defineEmits<{ (e: "collapse"): void }>();
+
 // --- 过滤 ---------------------------------------------------------------
 const filter = ref("");
 const filterText = computed(() => filter.value.trim().toLowerCase());
@@ -309,6 +312,9 @@ async function onNodeDrop(
     <header class="sidebar-header">
       <span class="title">会话</span>
       <div class="actions">
+        <el-tooltip content="收起侧栏" placement="bottom">
+          <el-button circle size="small" :icon="'DArrowLeft'" @click="emit('collapse')" />
+        </el-tooltip>
         <el-tooltip content="新建会话" placement="bottom">
           <el-button
             circle
@@ -481,7 +487,7 @@ async function onNodeDrop(
   /* 宽度由父级 inline style 控制（MainLayout 拖拽调整） */
   flex-shrink: 0;
   height: 100%;
-  padding: 8px;
+  padding: 10px;
   background: var(--el-bg-color-overlay);
   border-right: 1px solid var(--el-border-color-light);
   box-sizing: border-box;
@@ -492,14 +498,15 @@ async function onNodeDrop(
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 4px 4px 8px;
+  padding: 2px 4px 10px;
 }
 
+/* 分区标题：小字号 + 字距，贴近专业工具侧栏惯例 */
 .title {
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 600;
-  color: var(--el-text-color-primary);
-  letter-spacing: 0.5px;
+  color: var(--el-text-color-secondary);
+  letter-spacing: 1px;
 }
 
 .actions {
@@ -508,12 +515,12 @@ async function onNodeDrop(
 }
 
 .search-wrap {
-  padding: 0 4px 8px;
+  padding: 0 2px 10px;
 }
 
 /* --- 最近连接 --- */
 .recent-section {
-  padding: 2px 4px 6px;
+  padding: 2px 4px 8px;
   margin-bottom: 4px;
   border-bottom: 1px solid var(--el-border-color-lighter);
 }
@@ -521,10 +528,10 @@ async function onNodeDrop(
   display: flex;
   align-items: center;
   gap: 4px;
-  padding: 2px 4px 4px;
+  padding: 2px 4px 6px;
   font-size: 11px;
   color: var(--el-text-color-placeholder);
-  letter-spacing: 0.5px;
+  letter-spacing: 1px;
 }
 .recent-icon {
   font-size: 12px;
@@ -532,8 +539,10 @@ async function onNodeDrop(
 .recent-item {
   display: flex;
   align-items: center;
-  height: 26px;
-  border-radius: 4px;
+  height: 28px;
+  padding: 0 2px;
+  border-radius: 6px;
+  transition: background-color 0.15s ease;
 }
 .recent-item:hover {
   background: var(--el-fill-color-light);
@@ -549,6 +558,10 @@ async function onNodeDrop(
   color: var(--el-text-color-primary);
   padding: 2px 6px;
   border-left: 3px solid transparent;
+  transition: color 0.15s ease;
+}
+.recent-item:hover .recent-name {
+  color: var(--el-color-primary);
 }
 .recent-menu {
   display: none;
@@ -575,9 +588,11 @@ async function onNodeDrop(
   padding: 0 4px;
 }
 
-/* el-tree 节点高度统一 28px */
+/* el-tree 节点高度统一 28px，圆角行 + 平滑过渡 */
 .tree-wrap :deep(.el-tree-node__content) {
   height: 28px;
+  border-radius: 6px;
+  transition: background-color 0.15s ease;
 }
 
 .tree-wrap :deep(.el-tree-node__content:hover) {
@@ -585,7 +600,10 @@ async function onNodeDrop(
 }
 
 .tree-wrap :deep(.el-tree-node.is-current > .el-tree-node__content) {
-  background: var(--el-fill-color);
+  background: var(--el-color-primary-light-9);
+}
+.tree-wrap :deep(.el-tree-node.is-current > .el-tree-node__content .node-label) {
+  color: var(--el-color-primary);
 }
 
 .tree-node {
@@ -640,7 +658,7 @@ async function onNodeDrop(
 .node-menu-icon {
   font-size: 14px;
   color: var(--el-text-color-secondary);
-  border-radius: 4px;
+  border-radius: 5px;
 }
 
 .node-menu-icon:hover {
@@ -655,12 +673,12 @@ async function onNodeDrop(
   align-items: center;
   justify-content: center;
   gap: 10px;
-  padding: 40px 16px;
+  padding: 48px 16px;
   color: var(--el-text-color-secondary);
 }
 
 .empty-icon {
-  font-size: 36px;
+  font-size: 40px;
   color: var(--el-text-color-placeholder);
 }
 

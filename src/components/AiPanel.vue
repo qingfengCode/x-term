@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { ElMessage, ElMessageBox, ElNotification } from "element-plus";
-import { Promotion, Delete, ChatDotRound, DArrowRight, Connection, Tools, ArrowDown, ArrowUp, Plus, Close, CopyDocument, RefreshRight, VideoPause, Document, Loading, Download, MagicStick, Collection, Picture, CircleCheckFilled, Clock, Odometer, MoreFilled } from "@element-plus/icons-vue";
+import { Promotion, Delete, ChatDotRound, DArrowRight, Connection, Tools, ArrowDown, ArrowUp, Plus, Close, CopyDocument, RefreshRight, VideoPause, Document, Loading, Download, MagicStick, Collection, Picture, CircleCheckFilled, Clock, Odometer, MoreFilled, Lock, Key, Lightning } from "@element-plus/icons-vue";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 import { open, save } from "@tauri-apps/plugin-dialog";
@@ -18,7 +18,8 @@ import type { AskUserAnswer } from "@/api/db";
 import { executeDesktopTool, aiDesktopToolRespond, getDesktopControl } from "@/api/desktopControl";
 import type { ToolCallItem } from "@/stores/ai";
 import { bytesToBase64 } from "@/utils/binary";
-import type { ImagePart } from "@/api/types";
+import type { ImagePart, ToolRunMode } from "@/api/types";
+import { RUN_MODE_OPTIONS } from "@/api/types";
 import SkillDialog from "@/components/SkillDialog.vue";
 import SkillManagerDialog from "@/components/SkillManagerDialog.vue";
 import type { SkillConfig } from "@/api/types";
@@ -421,6 +422,73 @@ const configTip = computed(() => {
   return "";
 });
 
+// --- 底部工具行：模型选择 + 模式选择 + 执行模式 ------------------------------
+/** 模型下拉选项：只显示模型名（协议类型对使用者无意义，设置页可查）。 */
+const modelOptions = computed(() =>
+  settings.aiProviders.map((p) => ({
+    value: `${p.kind}:${p.model}`,
+    label: p.model,
+  })),
+);
+
+/** 本域可用技能列表（技能按钮下拉用；启用+禁用都列出，禁用项灰色标注）。 */
+const domainSkills = computed(() => settings.skills.filter((s) => s.domain === props.domain));
+
+// --- 执行模式图标（面板过窄时选择框只显示图标，title 提示全名） ----------------
+/** 三种执行模式的图标：手动=锁（逐条解锁确认），白名单=钥匙（放行名单内命令），自动=闪电（全自动直通）。 */
+const RUN_MODE_ICONS = {
+  manual: Lock,
+  whitelist: Key,
+  auto: Lightning,
+} as const;
+/** 面板过窄（< 360px）时执行模式选择框切到纯图标显示，省出横向空间防换行。 */
+const compactRunMode = computed(() => panelWidth.value < 360);
+/** 当前执行模式全名（图标模式下的 title 提示）。 */
+const runModeLabel = computed(
+  () => RUN_MODE_OPTIONS.find((o) => o.value === runMode.value)?.label ?? "",
+);
+
+/** 已选技能（输入框上方简短显示，随问题一起发给 AI；可单个移除）。 */
+const selectedSkills = ref<SkillConfig[]>([]);
+
+/** 下拉选择：已选过则忽略，未选则追加到已选列表（不插入输入框文本）。 */
+function toggleSkill(s: SkillConfig) {
+  const i = selectedSkills.value.findIndex((x) => x.id === s.id);
+  if (i >= 0) {
+    selectedSkills.value.splice(i, 1);
+  } else {
+    selectedSkills.value.push(s);
+  }
+}
+
+function removeSelectedSkill(id: string) {
+  selectedSkills.value = selectedSkills.value.filter((x) => x.id !== id);
+}
+
+/** 当前激活模型 key（`${kind}:${model}`）。 */
+const activeModel = computed({
+  get: () => settings.aiActive,
+  set: async (v: string | null) => {
+    if (!v) return;
+    settings.aiActive = v;
+    await settings.save().catch(() => {});
+  },
+});
+
+/** 本域的执行模式绑定（ssh 域 → sshAgent.runMode；db 域 → sqlAgent.runMode）。
+ *  desktop 域无后端执行工具，不显示。切换即时持久化。 */
+const runModeTarget =
+  props.domain === "ssh" ? settings.sshAgent : props.domain === "db" ? settings.sqlAgent : null;
+const showRunMode = computed(() => runModeTarget !== null);
+const runMode = computed({
+  get: () => runModeTarget?.runMode ?? "manual",
+  set: async (v: ToolRunMode) => {
+    if (!runModeTarget) return;
+    runModeTarget.runMode = v;
+    await settings.save().catch(() => {});
+  },
+});
+
 // --- 多模态（图片输入） ---------------------------------------------------
 /** 当前激活模型（按 `${kind}:${model}` 匹配）。 */
 const activeProvider = computed(
@@ -800,8 +868,25 @@ function moveCursorToEnd(el: HTMLTextAreaElement | null) {
 /** 切换对话：切到目标会话并滚到底部（避免残留上一个会话的滚动位置）。 */
 function onSwitchConversation(cid: string) {
   ai.switchConversation(cid);
+  // 切换会话重置折叠（新会话从底部看最新内容）。
+  olderExpanded.value = false;
   void scrollToBottom();
 }
+
+// --- 长对话折叠：只渲染最新 N 条，更早的消息折叠为一条提示 ----------
+// 长对话 DOM 数百条（每条含 markdown/工具卡片）导致滚动与流式更新卡顿；
+// 折叠后旧消息不进 DOM，展开按钮可临时查看全部（切换会话/发送新消息自动折叠）。
+const KEEP_RECENT = 8;
+const olderExpanded = ref(false);
+/** 折叠时可见的窗口起点；-1 = 全量展示（消息不足或已展开）。 */
+const visibleStart = computed(() => {
+  if (olderExpanded.value) return -1;
+  return Math.max(0, ai.messages.length - KEEP_RECENT);
+});
+/** 实际渲染的消息（折叠时只取最新 KEEP_RECENT 条）。 */
+const visibleMessages = computed(() =>
+  visibleStart.value < 0 ? ai.messages : ai.messages.slice(visibleStart.value),
+);
 
 /** 按 agent / 非 agent 模式构建系统提示与发送选项。
  *  handleSend 与 regenerateMessage 共用，保证"重新生成"的上下文与首次发送一致
@@ -961,14 +1046,17 @@ async function handleSend() {
   }
   inputText.value = "";
   recordHistory(text);
+  // 发送新消息回到最新窗口：旧消息重新折叠（用户关注新回复）。
+  olderExpanded.value = false;
   const ctx = buildSendContext(mode.value === "agent");
   await ai.send(text, ctx.prompt, { ...ctx.opts, images });
   // 发送后强制跟随滚动到底部（用户主动发送，应看到自己的消息与回复开始；
   // 若此刻正在上翻浏览，也以发送为准回到最新位置）。
   void scrollToBottom();
-  // 发送后清空附加表与图片（下次提问重新拖/选）。
+  // 发送后清空附加表、图片与已选技能（下次提问重新拖/选）。
   clearAttachedTables();
   attachedImages.value = [];
+  selectedSkills.value = [];
 }
 
 /** 拼接附加表的 DDL 段落（用于注入 system prompt）。无附加表返回空串。 */
@@ -984,28 +1072,49 @@ function buildAttachedDdlSection(): string {
 
 /** 拼接已启用的 skill 段落（注入 system prompt）。无启用 skill 返回空串。
  *
- * 借鉴 deepseek-harness 的 tool-skill：**agent 模式**只注入目录摘要（标题 +
- * 内容开头预览），完整正文由模型按需调用 load_skill 工具加载——技能多了之后
- * 全量注入会持续膨胀每轮请求的上下文；**非 agent 模式**（无工具可调）保持
- * 全量注入，保证技能内容对模型可见可用。 */
+ * 用户在下拉中显式选择的技能（selectedSkills）总是注入；其余已启用技能：
+ * agent 模式只注入目录摘要（借鉴 deepseek-harness 的 tool-skill，技能多了
+ * 之后全量注入会持续膨胀上下文，完整正文由模型按需调 load_skill 加载）；
+ * 非 agent 模式（无工具可调）全量注入，保证技能内容对模型可见可用。 */
 function buildSkillsSection(agent: boolean): string {
-  const skills = settings.skills.filter((s) => s.domain === props.domain && s.enabled);
-  if (skills.length === 0) return "";
-  if (!agent) {
-    const blocks = skills.map((s) => `【${s.title}】\n${s.content}`);
-    return "\n\n=== 可复用技能（来自历史总结，处理同类任务时请遵循）===\n" + blocks.join("\n\n");
-  }
-  // 目录摘要：标题 + 内容开头（≤120 字），配合 load_skill 按需加载全文。
-  const entries = skills.map((s) => {
-    const preview = s.content.length > 120 ? s.content.slice(0, 120) + "…" : s.content;
-    return `- ${s.title}：${preview}`;
-  });
-  return (
-    "\n\n=== 可用技能（来自历史总结，处理同类任务时请遵循）===\n" +
-    entries.join("\n") +
-    "\n需要某条技能的完整步骤/命令细节时，调用 load_skill 工具（name 用上述标题，必须完全一致）" +
-    "加载全文；目录摘要已足够理解任务时不必加载，且不要重复加载同一技能。"
+  // 显式选择的技能优先（即使全局 enabled=false 也注入——用户手动勾选即意图）。
+  const picked = selectedSkills.value.filter((s) => s.domain === props.domain);
+  const rest = settings.skills.filter(
+    (s) =>
+      s.domain === props.domain &&
+      s.enabled &&
+      !picked.some((p) => p.id === s.id),
   );
+  if (picked.length === 0 && rest.length === 0) return "";
+  const fullInject = (list: SkillConfig[]) =>
+    list.map((s) => `【${s.title}】\n${s.content}`).join("\n\n");
+  if (!agent) {
+    // 非 agent：全部全量注入（无工具可调）。
+    return (
+      "\n\n=== 可复用技能（来自历史总结，处理同类任务时请遵循）===\n" +
+      fullInject([...picked, ...rest])
+    );
+  }
+  const parts: string[] = [];
+  if (picked.length > 0) {
+    parts.push(
+      "\n\n=== 用户指定技能（处理本次任务时必须遵循）===\n" + fullInject(picked),
+    );
+  }
+  if (rest.length > 0) {
+    // 目录摘要：标题 + 内容开头（≤120 字），配合 load_skill 按需加载全文。
+    const entries = rest.map((s) => {
+      const preview = s.content.length > 120 ? s.content.slice(0, 120) + "…" : s.content;
+      return `- ${s.title}：${preview}`;
+    });
+    parts.push(
+      "\n\n=== 可用技能（来自历史总结，处理同类任务时请遵循）===\n" +
+        entries.join("\n") +
+        "\n需要某条技能的完整步骤/命令细节时，调用 load_skill 工具（name 用上述标题，必须完全一致）" +
+        "加载全文；目录摘要已足够理解任务时不必加载，且不要重复加载同一技能。",
+    );
+  }
+  return parts.join("");
 }
 
 // --- skill 总结与管理 -----------------------------------------------------
@@ -1153,8 +1262,39 @@ async function regenerateMessage(m: AiMessage) {
   }
 }
 
+/** 删除一条消息（用户请求或助手响应）。删除后从持久化历史中移除，
+ *  后续请求重建上下文时不再包含该消息。 */
+async function deleteMessage(m: AiMessage) {
+  if (ai.sending || m.streaming) return;
+  // 确认文案按消息角色区分，删除不可恢复需用户显式确认。
+  const roleText = m.role === "user" ? "这条请求消息" : "这条响应消息";
+  try {
+    await ElMessageBox.confirm(`确定删除${roleText}？删除后不可恢复。`, "删除消息", {
+      type: "warning",
+      confirmButtonText: "删除",
+      cancelButtonText: "取消",
+    });
+  } catch {
+    return;
+  }
+  if (ai.deleteMessage(m.id)) {
+    ElMessage.success("已删除");
+  } else {
+    ElMessage.warning("会话发送中，暂不能删除消息");
+  }
+}
+
 async function approveTool(tool: ToolCallItem) {
-  if (tool.status !== "pending") return;
+  if (tool.status !== "pending") {
+    // 点击时卡片已不是"待确认"（被终止/已处理）：明确告知而非静默无反应，
+    // 否则用户会以为"点确定没反应"。
+    ElMessage.warning(
+      tool.status === "rejected"
+        ? "该命令已被拒绝或请求已终止，无法再执行；请重新发送请求"
+        : "该命令当前状态不可执行（可能已在执行或已结束）"
+    );
+    return;
+  }
   const ok = await ai.approveToolCall(tool.toolCallId);
   if (!ok) {
     // 僵尸卡片（轮次已超时/请求已结束）：命令不会执行，明确告知而非让用户
@@ -1738,8 +1878,14 @@ function renderMarkdown(text: string): string {
           </template>
           <template v-else>暂无对话。选择模式后输入你的问题。</template>
         </div>
+        <!-- 长对话折叠条：更早的消息未渲染，点击展开全部（性能：旧消息不进 DOM） -->
+        <div v-if="visibleStart >= 0" class="older-fold">
+          <el-button size="small" text bg @click="olderExpanded = true">
+            展开更早的 {{ visibleStart }} 条消息
+          </el-button>
+        </div>
         <div
-          v-for="m in ai.messages"
+          v-for="m in visibleMessages"
           :key="m.id"
           class="msg"
           :class="m.role === 'user' ? 'msg-user' : 'msg-ai'"
@@ -1756,6 +1902,13 @@ function renderMarkdown(text: string): string {
                 placement="top"
               >
                 <el-icon class="msg-action" @click="regenerateMessage(m)"><RefreshRight /></el-icon>
+              </el-tooltip>
+              <!-- 删除消息：请求/响应均可删（生成中的消息不显示操作条，天然禁删） -->
+              <el-tooltip content="删除" placement="top">
+                <el-icon
+                  class="msg-action msg-action-danger"
+                  @click="deleteMessage(m)"
+                ><Delete /></el-icon>
               </el-tooltip>
             </div>
             <template v-if="m.role === 'assistant'">
@@ -2016,16 +2169,8 @@ function renderMarkdown(text: string): string {
         @dragover="onComposerDragOver"
         @dragleave="onComposerDragLeave"
       >
-        <!-- 输入框上方的工具栏：模式选择 + 智能体上下文（已附加终端） -->
+        <!-- 输入框上方的信息栏：智能体上下文（已附加终端）+ token 用量 -->
         <div class="composer-toolbar">
-          <el-select v-model="mode" size="small" class="mode-select">
-            <el-option
-              v-for="opt in MODE_OPTIONS"
-              :key="opt.value"
-              :label="opt.label"
-              :value="opt.value"
-            />
-          </el-select>
           <!-- ssh 域：提示条即终端绑定入口（点击弹出终端菜单，选择结果体现在
                提示文案"终端: xxx（已绑定/跟随当前）"里）——不额外占用工具栏宽度。 -->
           <el-dropdown
@@ -2074,6 +2219,17 @@ function renderMarkdown(text: string): string {
             <el-icon><Odometer /></el-icon>
             {{ formatTokens(activeUsage.prompt + activeUsage.completion) }} tokens
           </span>
+          <!-- 图片上传（仅多模态模型显示）：置于工具栏最右，点击选图，也可直接粘贴/拖入 -->
+          <el-button
+            v-if="multimodalEnabled"
+            link
+            :icon="Picture"
+            class="attach-img-btn"
+            :disabled="ai.sending || configBlocked"
+            :loading="imageReading"
+            title="附带图片（也可直接粘贴或拖入）"
+            @click="pickImage"
+          />
         </div>
         <!-- 已附加的表（拖入后显示，结构会随问题一起发给 AI） -->
         <div v-if="attachedTables.length > 0" class="attached-tables">
@@ -2121,18 +2277,26 @@ function renderMarkdown(text: string): string {
             清空
           </el-button>
         </div>
+        <!-- 已选技能（输入框上方简短显示，随问题一起发给 AI） -->
+        <div v-if="selectedSkills.length > 0" class="selected-skills">
+          <span class="attached-label">
+            <el-icon><Collection /></el-icon>
+            技能:
+          </span>
+          <el-tag
+            v-for="s in selectedSkills"
+            :key="s.id"
+            closable
+            size="small"
+            @close="removeSelectedSkill(s.id)"
+          >
+            {{ s.title }}
+          </el-tag>
+          <el-button link size="small" class="attached-clear" @click="selectedSkills = []">
+            清空
+          </el-button>
+        </div>
         <div class="composer-row">
-          <!-- 图片上传入口：仅激活模型开启多模态时显示 -->
-          <el-button
-            v-if="multimodalEnabled"
-            link
-            :icon="Picture"
-            class="attach-img-btn"
-            :disabled="ai.sending || configBlocked"
-            :loading="imageReading"
-            title="附带图片（也可直接粘贴或拖入）"
-            @click="pickImage"
-          />
           <div class="input-wrap">
             <el-input
               ref="inputRef"
@@ -2157,24 +2321,125 @@ function renderMarkdown(text: string): string {
               @keydown="onKeydown"
               @paste="onComposerPaste"
             />
-            <!-- 发送 / 终止：输入框内右下角悬浮图标，发送中变为红色终止图标 -->
-            <el-button
-              v-if="!ai.sending"
-              link
-              :icon="Promotion"
-              :disabled="(!inputText.trim() && attachedImages.length === 0) || configBlocked"
-              class="send-inner-btn"
-              title="发送 (Enter)"
-              @click="handleSend"
-            />
-            <el-button
-              v-else
-              link
-              :icon="VideoPause"
-              class="send-inner-btn stop-btn"
-              title="终止生成"
-              @click="handleStop"
-            />
+            <!-- 输入框内底部工具行：左=技能/模式/执行模式，右=模型选择+发送（同一行） -->
+            <div class="composer-inline-bar">
+              <!-- 技能按钮（+）：下拉勾选本域技能，已选的在输入框上方显示（向上弹出） -->
+              <el-dropdown
+                trigger="click"
+                popper-class="ai-skill-dropdown"
+                placement="top-start"
+                @command="(cmd: string) => (cmd === '__manage__' ? (skillManagerVisible = true) : toggleSkill(domainSkills.find((s) => s.id === cmd)!))"
+              >
+                <button class="skill-btn" title="选择技能">
+                  <el-icon><Plus /></el-icon>
+                </button>
+                <template #dropdown>
+                  <el-dropdown-menu>
+                    <el-dropdown-item
+                      v-for="s in domainSkills"
+                      :key="s.id"
+                      :command="s.id"
+                      :title="s.content"
+                    >
+                      <span class="skill-item-title">{{ s.title }}</span>
+                      <el-icon v-if="selectedSkills.some((x) => x.id === s.id)" class="skill-check">
+                        <CircleCheckFilled />
+                      </el-icon>
+                    </el-dropdown-item>
+                    <div v-if="domainSkills.length === 0" class="skill-empty">
+                      暂无技能，可从「总结成技能」生成
+                    </div>
+                    <el-dropdown-item divided command="__manage__">
+                      <el-icon><Collection /></el-icon>管理技能
+                    </el-dropdown-item>
+                  </el-dropdown-menu>
+                </template>
+              </el-dropdown>
+              <el-select
+                v-model="mode"
+                size="small"
+                placement="top-start"
+                popper-class="composer-pop"
+                class="inline-select inline-mode-select"
+              >
+                <el-option
+                  v-for="opt in MODE_OPTIONS"
+                  :key="opt.value"
+                  :label="opt.label"
+                  :value="opt.value"
+                />
+              </el-select>
+              <!-- 执行模式（智能体模式才有工具执行；ssh→命令、db→SQL）
+                   面板过窄时切为纯图标显示：手动=锁 / 白名单=钥匙 / 自动=闪电 -->
+              <el-select
+                v-if="showRunMode && mode === 'agent'"
+                v-model="runMode"
+                size="small"
+                placement="top-start"
+                :offset="88"
+                popper-class="composer-pop runmode-pop"
+                class="inline-select inline-runmode-select"
+                :class="[`runmode-${runMode}`, { 'is-compact': compactRunMode }]"
+                :title="`执行模式：${runModeLabel}`"
+              >
+                <template #label>
+                  <span v-if="compactRunMode" class="runmode-icon-label">
+                    <el-icon :size="14">
+                      <component :is="RUN_MODE_ICONS[runMode]" />
+                    </el-icon>
+                  </span>
+                  <template v-else>{{ runModeLabel }}</template>
+                </template>
+                <el-option
+                  v-for="opt in RUN_MODE_OPTIONS"
+                  :key="opt.value"
+                  :value="opt.value"
+                  :label="opt.label"
+                >
+                  <div class="runmode-option">
+                    <span>{{ opt.label }}</span>
+                    <span class="runmode-desc">{{ opt.desc }}</span>
+                  </div>
+                </el-option>
+              </el-select>
+              <span class="inline-spacer" />
+              <!-- 模型选择：只显示模型名（top-end 右对齐，防超出窗口右缘） -->
+              <el-select
+                v-model="activeModel"
+                size="small"
+                filterable
+                :disabled="modelOptions.length === 0"
+                placement="top-end"
+                popper-class="composer-pop"
+                class="inline-select inline-model-select"
+                title="当前模型"
+              >
+                <el-option
+                  v-for="m in modelOptions"
+                  :key="m.value"
+                  :value="m.value"
+                  :label="m.label"
+                />
+              </el-select>
+              <!-- 发送 / 终止：发送中变为红色终止图标 -->
+              <el-button
+                v-if="!ai.sending"
+                link
+                :icon="Promotion"
+                :disabled="(!inputText.trim() && attachedImages.length === 0) || configBlocked"
+                class="inline-send-btn"
+                title="发送 (Enter)"
+                @click="handleSend"
+              />
+              <el-button
+                v-else
+                link
+                :icon="VideoPause"
+                class="inline-send-btn stop-btn"
+                title="终止生成"
+                @click="handleStop"
+              />
+            </div>
           </div>
         </div>
       </div>
@@ -2400,6 +2665,43 @@ function renderMarkdown(text: string): string {
   font-size: 12px;
   color: var(--el-text-color-placeholder);
 }
+
+/* 输入框内工具行的下拉（挂 body，全局样式）：限制宽度/高度，
+   弹出方向由各 select 的 placement 属性控制（向上弹）。 */
+:global(.composer-pop) {
+  max-width: 280px;
+}
+:global(.composer-pop .el-select-dropdown__list) {
+  max-height: 220px;
+}
+/* 执行模式下拉项是两行内容（标签+说明）：覆盖默认 34px 定高/nowrap 裁切 */
+:global(.runmode-pop .el-select-dropdown__item) {
+  height: auto;
+  line-height: 1.4;
+  white-space: normal;
+  padding: 4px 20px;
+}
+/* 执行模式下拉收窄：上浮到输入框上方后不宜过宽，说明文字自然换行 */
+:global(.runmode-pop) {
+  max-width: 210px;
+}
+/* "/技能"下拉（挂 body，全局样式）：限宽 + 技能名截断 */
+:global(.ai-skill-dropdown) {
+  max-width: 280px;
+}
+:global(.ai-skill-dropdown .el-dropdown-menu__item) {
+  max-width: 260px;
+}
+:global(.ai-skill-dropdown .skill-item-title) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+:global(.ai-skill-dropdown .skill-empty) {
+  padding: 8px 16px;
+  font-size: 12px;
+  color: var(--el-text-color-placeholder);
+}
 :global(.ai-header-dropdown .el-dropdown-menu__item .el-icon) {
   margin-right: 6px;
 }
@@ -2427,6 +2729,12 @@ function renderMarkdown(text: string): string {
   font-size: 13px;
   text-align: center;
   margin-top: 32px;
+}
+/* 长对话折叠条（居中弱化，点击展开全部旧消息） */
+.older-fold {
+  display: flex;
+  justify-content: center;
+  padding: 6px 0 10px;
 }
 /* --- 智能体任务清单条（todo_write 维护） --- */
 .todo-strip {
@@ -2514,7 +2822,7 @@ function renderMarkdown(text: string): string {
   margin-bottom: 12px;
   position: relative;
 }
-/* 悬停操作条（复制/重生） */
+/* 悬停操作条（复制/重生/删除） */
 .msg-actions {
   position: absolute;
   top: -4px;
@@ -2548,6 +2856,10 @@ function renderMarkdown(text: string): string {
   background: var(--el-fill-color);
   color: var(--el-color-primary);
 }
+/* 删除按钮：悬停红色以示破坏性操作 */
+.msg-action-danger:hover {
+  color: var(--el-color-danger);
+}
 .msg-user {
   justify-content: flex-end;
 }
@@ -2565,7 +2877,8 @@ function renderMarkdown(text: string): string {
 }
 .msg-user .bubble {
   background: var(--el-color-primary);
-  color: #fff;
+  /* 深色主题主色为亮青，白字对比度不足，用主题化对比色（见 main.css） */
+  color: var(--app-accent-contrast, #fff);
   border-bottom-right-radius: 2px;
 }
 .msg-ai .bubble {
@@ -2787,6 +3100,18 @@ function renderMarkdown(text: string): string {
   border-radius: 4px;
   font-size: 12px;
 }
+/* 已选技能标签条（输入框上方简短显示，复用附加表视觉）。 */
+.selected-skills {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  margin-bottom: 6px;
+  padding: 4px 6px;
+  background: var(--el-fill-color-light);
+  border-radius: 4px;
+  font-size: 12px;
+}
 .attached-label {
   display: inline-flex;
   align-items: center;
@@ -2846,16 +3171,18 @@ function renderMarkdown(text: string): string {
   color: var(--el-text-color-secondary);
   font-size: 11px;
 }
-/* 输入框左侧的图片上传按钮。 */
+/* 图片上传按钮（信息栏最右侧，终端选择右边）：仅多模态模型显示。 */
 .attach-img-btn {
-  font-size: 17px;
-  color: var(--el-color-primary);
-  padding: 6px;
-  margin-bottom: 2px;
+  font-size: 15px;
+  color: var(--el-text-color-secondary);
+  padding: 2px;
+  height: 22px;
+  margin-left: auto; /* 靠右贴边 */
   border-radius: 4px;
   flex-shrink: 0;
 }
 .attach-img-btn:hover:not(:disabled) {
+  color: var(--el-color-primary);
   background: var(--el-fill-color-light);
 }
 /* 用户消息中的图片：限制最大宽高（宽 220 / 高 160），按原比例完整展示、
@@ -2880,17 +3207,13 @@ function renderMarkdown(text: string): string {
   transform: scale(1.03);
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
 }
-/* 输入框上方工具栏：模式选择在左，智能体上下文（已附加终端）在右 */
+/* 输入框上方信息栏：智能体上下文（已附加终端）在左，token 用量在右 */
 .composer-toolbar {
   display: flex;
   align-items: center;
   gap: 8px;
   margin-bottom: 6px;
   min-height: 24px;
-}
-.composer-toolbar .mode-select {
-  width: auto;
-  min-width: 96px;
 }
 /* 可点击的上下文提示（ssh 域 = 终端绑定入口）：hover 提示可交互 */
 .ctx-tip-link {
@@ -2939,36 +3262,148 @@ function renderMarkdown(text: string): string {
   display: flex;
   align-items: flex-end;
 }
-/* 输入框容器：发送图标悬浮在右下角（不占布局空间） */
+/* 输入框容器：工具行悬浮在内部底部 */
 .input-wrap {
   position: relative;
   flex: 1;
 }
 .composer-row :deep(.el-textarea__inner) {
   resize: none;
-  /* 右下角给悬浮图标留出空间，避免文字被遮挡 */
-  padding-right: 36px;
+  /* 底部给内嵌工具行（模式/执行模式/模型/发送）留出空间 */
+  padding-bottom: 38px;
 }
-/* 输入框内右下角的纯图标发送/终止按钮（link 无边框背景） */
-.send-inner-btn {
+/* --- 输入框内底部工具行：左=模式/执行模式，右=模型+发送，同一行 ---
+   面板过窄时 flex-wrap 自动换行（模型+发送掉到第二行），不溢出。 */
+.composer-inline-bar {
   position: absolute;
-  right: 4px;
-  bottom: 4px;
+  left: 5px;
+  right: 5px;
+  bottom: 5px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+/* 中部弹性占位：把模型选择+发送推到右侧 */
+.inline-spacer {
+  flex: 1;
+}
+/* 技能按钮（+）：与 select 同高的无边框图标按钮 */
+.skill-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: var(--el-border-radius-base);
+  background: transparent;
+  color: var(--el-text-color-secondary);
+  font-size: 14px;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+.skill-btn:hover {
+  background: var(--el-fill-color);
+  color: var(--el-color-primary);
+}
+/* 下拉中已选技能项的对勾 */
+:global(.ai-skill-dropdown .skill-check) {
+  color: var(--el-color-primary);
+  margin-left: auto;
+}
+/* 选择框统一尺寸：small 高度 + 紧凑内边距；无边框融入输入框 */
+.inline-select :deep(.el-select__wrapper) {
+  min-height: 24px;
+  padding: 0 2px 0 4px;
+  gap: 2px;
+  background: transparent;
+  box-shadow: none !important;
+  border-radius: var(--el-border-radius-base);
+  transition: background-color 0.15s ease;
+}
+.inline-select :deep(.el-select__wrapper:hover),
+.inline-select :deep(.el-select__wrapper.is-hovering) {
+  background: var(--el-fill-color);
+}
+.inline-select :deep(.el-select__wrapper.is-focused) {
+  background: var(--el-fill-color-light);
+}
+.inline-select :deep(.el-select__caret) {
+  font-size: 12px;
+}
+/* 模式选择：紧凑定宽（最长选项"智能体"三字 + 箭头） */
+.inline-mode-select {
+  width: 72px;
+  flex-shrink: 0;
+}
+/* 执行模式：与模式选择同宽（最长选项"白名单运行"五字收窄内边距后可容纳） */
+.inline-runmode-select {
+  width: 76px;
+  flex-shrink: 0;
+}
+/* 面板过窄时执行模式切为纯图标：收窄为图标+箭头位宽并居中 */
+.inline-runmode-select.is-compact {
+  width: 34px;
+}
+.inline-runmode-select.is-compact :deep(.el-select__wrapper) {
+  padding: 0 3px;
+  justify-content: center;
+}
+.runmode-icon-label {
+  display: inline-flex;
+  align-items: center;
+}
+/* 模型选择：固定小宽度（面板默认 340px 时整行放得下），模型名超长省略 */
+.inline-model-select {
+  width: 104px;
+  flex-shrink: 0;
+}
+.inline-model-select :deep(.el-select__selected-item) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 执行模式按当前值着色：白名单=主色、自动=警示橙（手动=默认色） */
+.inline-runmode-select.runmode-whitelist :deep(.el-select__wrapper) {
+  color: var(--el-color-primary);
+}
+.inline-runmode-select.runmode-auto :deep(.el-select__wrapper) {
+  color: var(--el-color-warning);
+  font-weight: 600;
+}
+/* 发送/终止按钮：工具行内的紧凑图标按钮 */
+.inline-send-btn {
   font-size: 16px;
   color: var(--el-color-primary);
-  padding: 3px;
+  padding: 2px;
   border-radius: 4px;
+  flex-shrink: 0;
 }
-.send-inner-btn:disabled {
+.inline-send-btn:disabled {
   color: var(--el-text-color-placeholder);
   background: transparent;
   cursor: not-allowed;
 }
-.send-inner-btn:hover:not(:disabled) {
+.inline-send-btn:hover:not(:disabled) {
   background: var(--el-fill-color-light);
 }
-.send-inner-btn.stop-btn {
+.inline-send-btn.stop-btn {
   color: var(--el-color-danger);
+}
+/* --- 下拉项：执行模式（标签 + 简短说明纵向两行） ----------------------------
+   el-option 插槽内容由本组件渲染，scoped 可命中；popper 挂 body 的部分用 :global。 */
+.runmode-option {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.4;
+  padding: 4px 0;
+}
+.runmode-option .runmode-desc {
+  font-size: 11px;
+  color: var(--el-text-color-placeholder);
 }
 
 /* --- 智能体上下文提示（已合并进 composer-toolbar，见 .ctx-tip-inline） --- */

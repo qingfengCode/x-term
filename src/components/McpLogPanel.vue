@@ -128,11 +128,12 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="log-panel">
-    <!-- 面板头 -->
+    <!-- 面板头（终端窗口铬：红黄绿圆点 + 标题 + LIVE 徽标 + 工具按钮） -->
     <div class="log-head">
       <div class="head-left">
-        <span class="live-dot" :class="{ on: live }" />
+        <span class="mac-dots"><i class="md-r" /><i class="md-y" /><i class="md-g" /></span>
         <span class="head-title">执行日志</span>
+        <span v-if="live" class="live-badge">LIVE</span>
         <span v-if="log.exists" class="head-file">{{ log.filename }}</span>
       </div>
       <div class="head-right">
@@ -196,21 +197,24 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   height: 100%;
-  border: 1px solid var(--el-border-color-lighter);
-  border-radius: 8px;
+  border: 1px solid #2a3442;
+  border-radius: 10px;
   overflow: hidden;
   background: #161b22;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
 }
 
-/* 头部 */
+/* 头部（mac 窗口铬） */
 .log-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
   padding: 8px 10px;
   background: #1c2330;
   border-bottom: 1px solid #2a3442;
   flex-shrink: 0;
+  user-select: none;
 }
 .head-left {
   display: flex;
@@ -218,31 +222,58 @@ onBeforeUnmount(() => {
   gap: 8px;
   min-width: 0;
 }
-.live-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: #57606a;
+.mac-dots {
+  display: inline-flex;
+  gap: 6px;
   flex-shrink: 0;
+  margin-right: 2px;
 }
-.live-dot.on {
-  background: #3fb950;
-  box-shadow: 0 0 6px rgba(63, 185, 80, 0.8);
-  animation: pulse 1.6s ease-in-out infinite;
+.mac-dots i {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
 }
-@keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.45; }
-}
+.md-r { background: #ff5f57; }
+.md-y { background: #febc2e; }
+.md-g { background: #28c840; }
 .head-title {
   font-size: 13px;
   font-weight: 600;
   color: #e6edf3;
+  white-space: nowrap;
+}
+/* LIVE 徽标：绿色胶囊 + 呼吸圆点 */
+.live-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  color: #3fb950;
+  background: rgba(63, 185, 80, 0.12);
+  border: 1px solid rgba(63, 185, 80, 0.35);
+  padding: 1px 7px;
+  border-radius: 10px;
+  font-family: var(--app-font-mono);
+  flex-shrink: 0;
+}
+.live-badge::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #3fb950;
+  animation: badge-pulse 1.6s ease-in-out infinite;
+}
+@keyframes badge-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
 }
 .head-file {
   font-size: 11px;
   color: #7d8590;
-  font-family: "Cascadia Code", Consolas, monospace;
+  font-family: var(--app-font-mono);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -260,13 +291,21 @@ onBeforeUnmount(() => {
   --el-button-hover-border-color: #46536a;
   --el-button-hover-text-color: #e6edf3;
 }
+.log-head :deep(.el-button--primary) {
+  --el-button-bg-color: #1f6f45;
+  --el-button-border-color: #2ea36a;
+  --el-button-text-color: #e6ffef;
+  --el-button-hover-bg-color: #27855a;
+  --el-button-hover-border-color: #3cc284;
+  --el-button-hover-text-color: #ffffff;
+}
 
 /* 滚动区 */
 .log-scroller {
   flex: 1;
   overflow-y: auto;
   padding: 10px 12px 16px;
-  font-family: "Cascadia Code", Consolas, "Courier New", monospace;
+  font-family: var(--app-font-mono);
   font-size: 12px;
   line-height: 1.7;
 }
@@ -323,8 +362,9 @@ onBeforeUnmount(() => {
 .log-line {
   display: flex;
   gap: 10px;
-  padding: 1px 0;
-  border-radius: 3px;
+  padding: 1px 4px;
+  margin: 0 -4px;
+  border-radius: 4px;
   transition: background 0.15s;
 }
 .log-line:hover {
