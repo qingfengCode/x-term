@@ -10,7 +10,7 @@
  * 最大化（zoomId）时：包含目标窗格的分支只保留对应孩子占满空间，其余
  * 孩子与分隔条隐藏（display:none，窗格仍挂载、持续接收数据）。
  */
-import { ref } from "vue";
+import { onBeforeUnmount, ref } from "vue";
 import type { SplitBranchNode, SplitNode } from "@/utils/splitLayout";
 import { subtreeHas } from "@/utils/splitLayout";
 
@@ -43,6 +43,9 @@ function childStyle(idx: 0 | 1): Record<string, string> {
   return { flex: "1 1 0%", minWidth: "0", minHeight: "0" };
 }
 
+/** 拖拽进行中的清理函数（卸载兜底：拖拽中组件被销毁时移除 window 监听）。 */
+let stopDrag: (() => void) | null = null;
+
 /** 拖拽分隔条：按鼠标位置重算 ratio（钳制 0.1 ~ 0.9）并上报。 */
 function startDrag(e: MouseEvent) {
   const node = props.node;
@@ -65,10 +68,18 @@ function startDrag(e: MouseEvent) {
     document.body.style.cursor = "";
     window.removeEventListener("mousemove", move);
     window.removeEventListener("mouseup", up);
+    stopDrag = null;
   };
   window.addEventListener("mousemove", move);
   window.addEventListener("mouseup", up);
+  stopDrag = up;
 }
+
+onBeforeUnmount(() => {
+  // 拖拽中组件被卸载（如父级布局树变更）：移除残留的 window 监听并复位
+  // body 上的拖拽光标/禁选样式，否则监听器泄漏且光标样式卡死。
+  stopDrag?.();
+});
 </script>
 
 <template>
@@ -90,7 +101,7 @@ function startDrag(e: MouseEvent) {
   </div>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .split-leaf {
   width: 100%;
   height: 100%;

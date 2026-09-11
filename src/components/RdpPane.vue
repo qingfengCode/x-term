@@ -863,7 +863,7 @@ const desktopControl = {
   </div>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .rdp-pane {
   position: absolute;
   inset: 0;

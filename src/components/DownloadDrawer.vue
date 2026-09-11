@@ -10,16 +10,20 @@
 // 路径右侧有「在文件管理器中显示」按钮（揭示 localPath）。
 // ----------------------------------------------------------------------------
 import { computed } from "vue";
-import { Delete, Download, Folder, FolderOpened, Position } from "@element-plus/icons-vue";
 import { ElMessage } from "element-plus";
 import { useTransferStore, type TransferTask } from "@/stores/transfer";
+import {
+  transferPercent as percent,
+  transferProgressStatus as progressStatus,
+  transferStatusText as statusText,
+} from "@/stores/transfer";
 import { useSettingsStore } from "@/stores/settings";
 import { zmodemPickFolder } from "@/api/terminal";
 import { revealInFolder } from "@/api/system";
 import { configuredDownloadDir } from "@/utils/downloadPath";
-import { formatSize } from "@/utils/format";
+import { humanSize } from "@/utils/format";
 
-const props = defineProps<{ visible: boolean }>();
+defineProps<{ visible: boolean }>();
 const emit = defineEmits<{ (e: "update:visible", v: boolean): void }>();
 
 const transfer = useTransferStore();
@@ -45,9 +49,13 @@ async function pickDownloadDir() {
 
 /** 清除默认下载目录（恢复"每次下载时选择路径"）。 */
 async function clearDownloadDir() {
-  settings.terminal.downloadDir = "";
-  await settings.save();
-  ElMessage.info("已清除，下载时将每次询问保存位置");
+  try {
+    settings.terminal.downloadDir = "";
+    await settings.save();
+    ElMessage.info("已清除，下载时将每次询问保存位置");
+  } catch (e) {
+    ElMessage.error("清除失败：" + String(e));
+  }
 }
 
 /** 在系统文件管理器中定位该下载文件。 */
@@ -71,37 +79,6 @@ const endedCount = computed(
       (t) => t.status === "done" || t.status === "error" || t.status === "cancelled",
     ).length,
 );
-
-function percent(t: TransferTask): number {
-  if (!t.total || t.total <= 0) return 0;
-  return Math.max(0, Math.min(100, Math.floor((t.transferred / t.total) * 100)));
-}
-
-function statusText(t: TransferTask): string {
-  switch (t.status) {
-    case "pending":
-      return "等待中";
-    case "running":
-      return `${percent(t)}%`;
-    case "done":
-      return "已完成";
-    case "error":
-      return "失败";
-    case "cancelled":
-      return "已取消";
-  }
-}
-
-function progressStatus(t: TransferTask): "" | "success" | "exception" | "warning" {
-  if (t.status === "done") return "success";
-  if (t.status === "error") return "exception";
-  if (t.status === "cancelled") return "warning";
-  return "";
-}
-
-function humanSize(n: number): string {
-  return !n || n <= 0 ? "-" : formatSize(n);
-}
 
 /** 结束时间（HH:mm）；无结束时间（进行中）显示空。 */
 function endTime(t: TransferTask): string {
@@ -139,7 +116,7 @@ function removeItem(t: TransferTask) {
       <span class="dl-dir-text" :class="{ empty: !downloadDir }" :title="downloadDir">
         {{ downloadDir || "未设置默认下载位置（每次下载需选择）" }}
       </span>
-      <el-button size="small" text :icon="FolderOpened" @click="pickDownloadDir">
+      <el-button size="small" text :icon="'FolderOpened'" @click="pickDownloadDir">
         {{ downloadDir ? "更改" : "设置" }}
       </el-button>
       <el-button v-if="downloadDir" size="small" text @click="clearDownloadDir">清除</el-button>
@@ -147,7 +124,7 @@ function removeItem(t: TransferTask) {
 
     <div class="dl-toolbar">
       <span class="dl-hint">ZMODEM 下载记录重启后保留（最近 100 条）</span>
-      <el-button size="small" text :icon="Delete" :disabled="endedCount === 0" @click="clearEnded">
+      <el-button size="small" text :icon="'Delete'" :disabled="endedCount === 0" @click="clearEnded">
         清除已结束
       </el-button>
     </div>
@@ -188,7 +165,7 @@ function removeItem(t: TransferTask) {
               class="dl-open"
               size="small"
               text
-              :icon="Position"
+              :icon="'Position'"
               title="在文件管理器中显示"
               @click.stop="openLocation(t)"
             />

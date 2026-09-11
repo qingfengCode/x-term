@@ -9,7 +9,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { ElMessage } from "element-plus";
-import { Refresh, CopyDocument, Bottom } from "@element-plus/icons-vue";
 import { useMcpStore } from "@/stores/mcp";
 import { mcpLog } from "@/api/mcp";
 import type { McpKind, McpLogContent } from "@/api/mcp";
@@ -87,6 +86,16 @@ async function fetchLog() {
   }
 }
 
+/** 手动刷新（带按钮 loading 态；轮询路径不置位，避免指示灯每 1.5s 闪烁）。 */
+async function refresh() {
+  loading.value = true;
+  try {
+    await fetchLog();
+  } finally {
+    loading.value = false;
+  }
+}
+
 async function copy() {
   if (!log.value.content) return;
   try {
@@ -140,17 +149,17 @@ onBeforeUnmount(() => {
         <el-tooltip content="新内容自动滚动到底部" placement="top">
           <el-button
             :type="autoScroll ? 'primary' : 'default'"
-            :icon="Bottom"
+            :icon="'Bottom'"
             size="small"
             circle
             @click="autoScroll = !autoScroll"
           />
         </el-tooltip>
         <el-tooltip content="复制全部日志" placement="top">
-          <el-button :icon="CopyDocument" size="small" circle @click="copy" />
+          <el-button :icon="'CopyDocument'" size="small" circle @click="copy" />
         </el-tooltip>
         <el-tooltip content="立即刷新" placement="top">
-          <el-button :icon="Refresh" size="small" circle :loading="loading" @click="fetchLog" />
+          <el-button :icon="'Refresh'" size="small" circle :loading="loading" @click="refresh" />
         </el-tooltip>
       </div>
     </div>
@@ -192,7 +201,7 @@ onBeforeUnmount(() => {
   </div>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .log-panel {
   display: flex;
   flex-direction: column;

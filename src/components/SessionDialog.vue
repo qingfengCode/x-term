@@ -501,7 +501,7 @@ async function handleSave() {
   </el-dialog>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 :deep(.el-input-number) {
   width: 100%;
 }

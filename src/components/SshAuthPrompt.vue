@@ -231,7 +231,7 @@ function totpLabel(entry: TotpEntry): string {
   </el-dialog>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .auth-dialog-title {
   display: flex;
   align-items: center;

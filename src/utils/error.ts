@@ -9,6 +9,12 @@ export function isAuthError(e: unknown): boolean {
   return String(e).includes("认证错误");
 }
 
+/** 任意抛出值 → 可读错误消息（Error 取 message，其余字符串化）。
+ * 供各处 `catch` 统一提取，替代 `catch (e: any)` + `e?.message`。 */
+export function errorMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
 /**
  * 判断错误是否为「用户主动取消了认证输入」（后端文本「二次认证已取消」）。
  *
@@ -18,5 +24,7 @@ export function isAuthError(e: unknown): boolean {
  * 失效），应直接清理占位 tab 恢复原状。
  */
 export function isAuthCancelled(e: unknown): boolean {
-  return String(e).includes("已取消");
+  // 用完整锚点串而非裸"已取消"：避免误吞其它含"已取消"的无关错误
+  //（后端文案为「二次认证已取消: user@host:port」，见 ssh/client.rs）。
+  return String(e).includes("二次认证已取消");
 }

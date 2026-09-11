@@ -10,6 +10,7 @@ import { computed, reactive, ref, watch } from "vue";
 import { ElMessage } from "element-plus";
 import type { FormInstance, FormRules } from "element-plus";
 import { useSessionsStore } from "@/stores/sessions";
+import { normalizeKind } from "@/stores/db";
 import { credentialDelete, credentialSave } from "@/api/vault";
 import { dbSaveProfile, dbListGroups } from "@/api/db";
 import type { DbGroup, DbKind, DbProfile, Session } from "@/api/types";
@@ -41,14 +42,6 @@ const KIND_OPTIONS: { label: string; value: DbKind; port: number; user: string }
   { label: "PostgreSQL", value: "postgres", port: 5432, user: "postgres" },
   { label: "SQLite（本地文件）", value: "sqlite", port: 0, user: "" },
 ];
-
-/** profile.kind 归一化（与后端 normalize_kind 一致）。 */
-function normalizeKind(k?: string | null): DbKind {
-  const v = (k ?? "").toLowerCase();
-  if (v === "postgres" || v === "postgresql" || v === "pg") return "postgres";
-  if (v === "sqlite" || v === "sqlite3") return "sqlite";
-  return "mysql";
-}
 
 function kindMeta(kind: DbKind) {
   return KIND_OPTIONS.find((o) => o.value === kind) ?? KIND_OPTIONS[0];
@@ -97,7 +90,7 @@ watch(
   (kind, old) => {
     if (kind === old) return;
     const next = kindMeta(kind);
-    const prev = kindMeta(old as DbKind);
+    const prev = kindMeta(old);
     if (form.port === prev.port) form.port = next.port;
     if (form.username === prev.user) form.username = next.user;
   }
@@ -366,7 +359,7 @@ async function submit() {
   </el-dialog>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .form-hint {
   margin-left: 12px;
   font-size: 12px;

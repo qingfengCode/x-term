@@ -5,7 +5,6 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { SearchAddon } from "@xterm/addon-search";
 import { WebglAddon } from "@xterm/addon-webgl";
-import { Upload, Download } from "@element-plus/icons-vue";
 import { ElMessageBox } from "element-plus";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import * as terminalApi from "@/api/terminal";
@@ -1194,7 +1193,7 @@ defineExpose({
       <div class="zmodem-card">
         <div class="zmodem-head">
           <el-icon :size="14">
-            <component :is="zmodemProgress.kind === 'upload' ? Upload : Download" />
+            <component :is="zmodemProgress.kind === 'upload' ? 'Upload' : 'Download'" />
           </el-icon>
           <span class="zmodem-name" :title="zmodemProgress.name">{{ zmodemProgress.name }}</span>
         </div>
@@ -1214,7 +1213,7 @@ defineExpose({
   </div>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .xterm-wrap {
   position: relative;
   width: 100%;

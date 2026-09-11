@@ -406,25 +406,6 @@ export interface ToolResult {
   output: string;
 }
 
-/** AI 工具调用事件（前端弹确认）。对应后端 ai:tool_call 事件。 */
-export interface AiToolCallEvent {
-  requestId: string;
-  toolCallId: string;
-  name: string;
-  /** arguments 的 JSON 字符串。 */
-  arguments: string;
-  description: string;
-  dangerous: boolean;
-}
-
-/** 工具执行结果事件。对应后端 ai:tool_result 事件。 */
-export interface AiToolResultEvent {
-  requestId: string;
-  toolCallId: string;
-  ok: boolean;
-  output: string;
-}
-
 /** exec_sql 终端可视化回显事件（对应后端 ai:sql_result）。
  *  SQL 控制台（命令行模式）据此把 AI 执行的 SQL 与结构化结果回显进输出流。 */
 export interface AiSqlResultEvent {

@@ -25,6 +25,12 @@ async function submit() {
     ElMessage.warning("请输入主密码");
     return;
   }
+  // 创建时校验最小长度（与占位符"至少 6 位"一致）；解锁不强制——历史
+  // 保险库可能存在更短的旧密码，强制会把用户锁在门外。
+  if (!vault.exists && passphrase.value.length < 6) {
+    ElMessage.warning("主密码至少需要 6 位");
+    return;
+  }
   submitting.value = true;
   try {
     if (!vault.exists) {
@@ -65,7 +71,7 @@ async function submit() {
             v-model="passphrase"
             type="password"
             show-password
-            placeholder="至少 6 位"
+            :placeholder="vault.exists ? '请输入主密码' : '至少 6 位'"
             @keyup.enter="submit"
           />
         </el-form-item>
@@ -85,7 +91,7 @@ async function submit() {
   </div>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .unlock-page {
   display: flex;
   align-items: center;

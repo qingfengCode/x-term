@@ -8,7 +8,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
-import { Connection, Folder, Monitor, MoreFilled } from "@element-plus/icons-vue";
+import type { TreeInstance } from "element-plus";
 import { useDesktopsStore, type DesktopTreeNode } from "@/stores/desktops";
 import { useDesktopTabsStore } from "@/stores/desktopTabs";
 import type { Desktop, DesktopGroup } from "@/api/remote_desktop";
@@ -28,7 +28,7 @@ const emit = defineEmits<{
 const filter = ref("");
 const filterText = computed(() => filter.value.trim().toLowerCase());
 
-const treeRef = ref();
+const treeRef = ref<TreeInstance | null>(null);
 const treeProps = { label: "label", children: "children" };
 
 // el-tree 通过 ref.filter 调用触发 filter-node-method。
@@ -87,7 +87,15 @@ const isEmpty = computed(
 // 单击桌面节点即连接（与终端页会话树一致）；分组节点单击切换展开/折叠。
 function onNodeClick(data: DesktopTreeNode) {
   if (data.type === "desktop") emit("connect", data.raw as Desktop);
-  else treeRef.value?.toggleExpand(data.id);
+  else {
+    // 分组节点：切换展开/折叠。toggleExpand 未在 TreeInstance 类型中导出，
+    // 用文档化的 getNode + expand/collapse 等价实现。
+    const node = treeRef.value?.getNode(data.id);
+    if (node) {
+      if (node.expanded) node.collapse();
+      else node.expand();
+    }
+  }
 }
 
 // --- 节点菜单 -----------------------------------------------------------
@@ -360,7 +368,7 @@ async function onNodeDrop(
   </aside>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .desktop-sidebar {
   display: flex;
   flex-direction: column;

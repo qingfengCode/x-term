@@ -1,10 +1,9 @@
 import { nextTick, onBeforeUnmount, ref, watch, type Ref } from "vue";
-import { EditorState, StateEffect } from "@codemirror/state";
+import { Compartment, EditorState } from "@codemirror/state";
 import { EditorView, keymap, lineNumbers } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { oneDark } from "@codemirror/theme-one-dark";
 import { sql, MySQL, PostgreSQL, SQLConfig } from "@codemirror/lang-sql";
-import { Compartment } from "@codemirror/state";
 
 /**
  * CodeMirror v6 + Vue 3 整合 composable。

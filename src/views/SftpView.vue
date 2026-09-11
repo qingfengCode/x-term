@@ -11,20 +11,6 @@
 // ----------------------------------------------------------------------------
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef, type Ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
-import {
-  ArrowUp,
-  Refresh,
-  FolderAdd,
-  Download as IconDownload,
-  Upload as IconUpload,
-  Delete,
-  EditPen,
-  Link,
-  FolderOpened,
-  Document,
-  Folder,
-  Right,
-} from "@element-plus/icons-vue";
 import { readDir, mkdir, stat as fsStat } from "@tauri-apps/plugin-fs";
 import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -33,7 +19,7 @@ import { homeDir, join, sep as pathSep, dirname, basename } from "@tauri-apps/ap
 import { useSessionsStore } from "@/stores/sessions";
 import { useTransferStore } from "@/stores/transfer";
 import { uniquePathIn, usableDownloadDir } from "@/utils/downloadPath";
-import { formatSize } from "@/utils/format";
+import { humanSize } from "@/utils/format";
 import type { Session, FileEntry } from "@/api/types";
 import {
   sftpList,
@@ -256,7 +242,7 @@ const remoteCrumbs = computed<{ name: string; path: string }[]>(() => {
   const isAbs = p.startsWith("/") || p.startsWith("\\");
   const crumbs: { name: string; path: string }[] = [];
   if (isAbs) crumbs.push({ name: "/", path: "/" });
-  let acc = isAbs ? "" : "";
+  let acc = "";
   for (const part of parts) {
     acc = acc ? acc + "/" + part : "/" + part;
     crumbs.push({ name: part, path: acc });
@@ -776,10 +762,6 @@ async function onPaneDrop(target: "local" | "remote", e: DragEvent) {
 // ---------------------------------------------------------------------------
 // 工具函数
 // ---------------------------------------------------------------------------
-function humanSize(n: number): string {
-  if (!n || n <= 0) return "-";
-  return formatSize(n);
-}
 
 function formatTime(s: string | null): string {
   if (!s) return "-";
@@ -900,14 +882,14 @@ onBeforeUnmount(() => {
       <div class="toolbar-actions">
         <el-button
           type="primary"
-          :icon="Link"
+          :icon="'Link'"
           :loading="connecting"
           @click="connectSftp"
         >
           {{ isConnected ? "重连 SFTP" : "打开 SFTP" }}
         </el-button>
         <el-button
-          :icon="Right"
+          :icon="'Right'"
           :disabled="!isConnected"
           @click="disconnectSftp"
         >
@@ -937,13 +919,13 @@ onBeforeUnmount(() => {
             </span>
             <div class="pane-tools">
               <el-tooltip content="上级目录" placement="bottom">
-                <el-button circle size="small" :icon="ArrowUp" @click="localGoUp" />
+                <el-button circle size="small" :icon="'ArrowUp'" @click="localGoUp" />
               </el-tooltip>
               <el-tooltip content="新建目录" placement="bottom">
-                <el-button circle size="small" :icon="FolderAdd" @click="localMkdir" />
+                <el-button circle size="small" :icon="'FolderAdd'" @click="localMkdir" />
               </el-tooltip>
               <el-tooltip content="刷新" placement="bottom">
-                <el-button circle size="small" :icon="Refresh" @click="refreshLocal" />
+                <el-button circle size="small" :icon="'Refresh'" @click="refreshLocal" />
               </el-tooltip>
             </div>
           </div>
@@ -973,8 +955,8 @@ onBeforeUnmount(() => {
               <span class="row-actions"></span>
             </div>
             <div
-              v-for="(e, idx) in sortedLocal"
-              :key="'l-' + idx"
+              v-for="e in sortedLocal"
+              :key="'l-' + e.name"
               class="file-row"
               :class="{ selected: selectedLocal?.name === e.name }"
               :draggable="!e.isDir"
@@ -1002,14 +984,14 @@ onBeforeUnmount(() => {
             <el-button
               circle
               type="primary"
-              :icon="IconUpload"
+              :icon="'Upload'"
               @click="uploadSelected"
             />
           </el-tooltip>
           <el-tooltip content="从远程下载 (←)" placement="right">
             <el-button
               circle
-              :icon="IconDownload"
+              :icon="'Download'"
               @click="downloadSelected"
             />
           </el-tooltip>
@@ -1031,13 +1013,13 @@ onBeforeUnmount(() => {
             </span>
             <div class="pane-tools">
               <el-tooltip content="上级目录" placement="bottom">
-                <el-button circle size="small" :icon="ArrowUp" @click="remoteGoUp" />
+                <el-button circle size="small" :icon="'ArrowUp'" @click="remoteGoUp" />
               </el-tooltip>
               <el-tooltip content="新建目录" placement="bottom">
-                <el-button circle size="small" :icon="FolderAdd" @click="remoteMkdir" />
+                <el-button circle size="small" :icon="'FolderAdd'" @click="remoteMkdir" />
               </el-tooltip>
               <el-tooltip content="刷新" placement="bottom">
-                <el-button circle size="small" :icon="Refresh" @click="refreshRemote" />
+                <el-button circle size="small" :icon="'Refresh'" @click="refreshRemote" />
               </el-tooltip>
             </div>
           </div>
@@ -1073,8 +1055,8 @@ onBeforeUnmount(() => {
               <span class="row-actions"></span>
             </div>
             <div
-              v-for="(e, idx) in sortedRemote"
-              :key="'r-' + idx"
+              v-for="e in sortedRemote"
+              :key="'r-' + e.name"
               class="file-row"
               :class="{ selected: selectedRemote?.name === e.name }"
               :draggable="!e.isDir"
@@ -1117,7 +1099,7 @@ onBeforeUnmount(() => {
       <div v-else class="placeholder">
         <el-icon class="placeholder-icon"><FolderOpened /></el-icon>
         <p class="placeholder-text">请选择会话并打开 SFTP 连接</p>
-        <el-button type="primary" :icon="Link" :loading="connecting" @click="connectSftp">
+        <el-button type="primary" :icon="'Link'" :loading="connecting" @click="connectSftp">
           打开 SFTP 连接
         </el-button>
       </div>
@@ -1128,7 +1110,7 @@ onBeforeUnmount(() => {
   </div>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .sftp-view {
   display: flex;
   flex-direction: column;

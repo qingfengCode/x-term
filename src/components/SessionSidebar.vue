@@ -2,6 +2,7 @@
 import { computed, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
+import type { TreeInstance } from "element-plus";
 import { useSessionsStore, type TreeNode } from "@/stores/sessions";
 import { useTerminalsStore } from "@/stores/terminals";
 import { useDesktopsStore } from "@/stores/desktops";
@@ -27,7 +28,7 @@ const emit = defineEmits<{ (e: "collapse"): void }>();
 const filter = ref("");
 const filterText = computed(() => filter.value.trim().toLowerCase());
 
-const treeRef = ref();
+const treeRef = ref<TreeInstance | null>(null);
 const filterInputRef = ref<{ focus: () => void } | null>(null);
 const treeProps = { label: "label", children: "children" };
 
@@ -255,7 +256,15 @@ async function connectSession(s: Session) {
 // 现在点击标签也能展开，避免误连会话）。
 function onNodeClick(data: TreeNode) {
   if (data.type === "session") connectSession(data.raw as Session);
-  else treeRef.value?.toggleExpand(data.id);
+  else {
+    // 分组节点：切换展开/折叠。toggleExpand 未在 TreeInstance 类型中导出，
+    // 用文档化的 getNode + expand/collapse 等价实现。
+    const node = treeRef.value?.getNode(data.id);
+    if (node) {
+      if (node.expanded) node.collapse();
+      else node.expand();
+    }
+  }
 }
 
 // --- 右键菜单（el-dropdown 方式，更可控）--------------------------------
@@ -653,7 +662,7 @@ async function onNodeDrop(
   </aside>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .session-sidebar {
   display: flex;
   flex-direction: column;

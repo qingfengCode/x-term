@@ -16,7 +16,6 @@ import {
   ref,
 } from "vue";
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from "element-plus";
-import { Refresh } from "@element-plus/icons-vue";
 import { useDesktopsStore } from "@/stores/desktops";
 import { useDesktopTabsStore, type DesktopTab } from "@/stores/desktopTabs";
 import { useSettingsStore } from "@/stores/settings";
@@ -507,7 +506,7 @@ function preloadRdpWasmWhenIdle() {
                 <div class="reconnect-title">连接已断开</div>
                 <el-button
                   type="primary"
-                  :icon="Refresh"
+                  :icon="'Refresh'"
                   :loading="tab.reconnecting"
                   @click="reconnectTab(tab)"
                 >
@@ -586,7 +585,7 @@ function preloadRdpWasmWhenIdle() {
   </div>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .desktop-view {
   display: flex;
   flex-direction: row;

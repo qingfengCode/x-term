@@ -6,16 +6,6 @@
 import { onMounted, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import {
-  Plus,
-  Delete,
-  View,
-  EditPen,
-  Key,
-  Lock,
-  MagicStick,
-  CopyDocument,
-} from "@element-plus/icons-vue";
-import {
   credentialList,
   credentialSave,
   credentialGet,
@@ -220,8 +210,8 @@ onMounted(load);
     <div class="header">
       <h2><el-icon><Key /></el-icon> 密钥管理</h2>
       <div class="header-actions">
-        <el-button type="primary" :icon="MagicStick" @click="openGen">生成密钥对</el-button>
-        <el-button type="primary" :icon="Plus" @click="openAdd">添加凭据</el-button>
+        <el-button type="primary" :icon="'MagicStick'" @click="openGen">生成密钥对</el-button>
+        <el-button type="primary" :icon="'Plus'" @click="openAdd">添加凭据</el-button>
       </div>
     </div>
     <div class="hint">
@@ -253,9 +243,9 @@ onMounted(load);
       </el-table-column>
       <el-table-column label="操作" width="220" align="center">
         <template #default="{ row }">
-          <el-button size="small" :icon="View" link @click="reveal(row)">查看</el-button>
-          <el-button size="small" :icon="EditPen" link @click="rename(row)">重命名</el-button>
-          <el-button size="small" :icon="Delete" link type="danger" @click="remove(row)">删除</el-button>
+          <el-button size="small" :icon="'View'" link @click="reveal(row)">查看</el-button>
+          <el-button size="small" :icon="'EditPen'" link @click="rename(row)">重命名</el-button>
+          <el-button size="small" :icon="'Delete'" link type="danger" @click="remove(row)">删除</el-button>
         </template>
       </el-table-column>
     </el-table>
@@ -348,7 +338,7 @@ onMounted(load);
             readonly
             :autosize="{ minRows: 2, maxRows: 6 }"
           />
-          <el-button :icon="CopyDocument" @click="copyPublicKey">复制公钥</el-button>
+          <el-button :icon="'CopyDocument'" @click="copyPublicKey">复制公钥</el-button>
         </div>
         <div class="gen-result-label">指纹</div>
         <div class="gen-result-fp">{{ genResult.fingerprint }}</div>
@@ -364,7 +354,7 @@ onMounted(load);
   </div>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .key-manager {
   padding: 20px 24px;
   height: 100%;

@@ -7,9 +7,13 @@
 // ----------------------------------------------------------------------------
 import { computed, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
-import { Download, Upload, Delete, FolderOpened, CaretBottom, CaretTop, VideoPause } from "@element-plus/icons-vue";
 import { useTransferStore, type TransferTask } from "@/stores/transfer";
-import { formatSize } from "@/utils/format";
+import {
+  transferPercent as percent,
+  transferProgressStatus as progressStatus,
+  transferStatusText as statusText,
+} from "@/stores/transfer";
+import { humanSize } from "@/utils/format";
 import { sftpTransferCancel } from "@/api/sftp";
 
 const transfer = useTransferStore();
@@ -31,46 +35,12 @@ const doneCount = computed(
     ).length
 );
 
-function percent(t: TransferTask): number {
-  if (!t.total || t.total <= 0) return 0;
-  const p = Math.floor((t.transferred / t.total) * 100);
-  return Math.max(0, Math.min(100, p));
-}
-
-function statusText(t: TransferTask): string {
-  switch (t.status) {
-    case "pending":
-      return "等待中";
-    case "running":
-      return `${percent(t)}%`;
-    case "done":
-      return "已完成";
-    case "error":
-      return "失败";
-    case "cancelled":
-      return "已取消";
-  }
-}
-
-function progressStatus(t: TransferTask): "" | "success" | "exception" | "warning" {
-  if (t.status === "done") return "success";
-  if (t.status === "error") return "exception";
-  if (t.status === "cancelled") return "warning";
-  return "";
-}
-
 /** 取消传输：本地立即置 cancelled，后端在下一个块边界退出并清理半截文件。 */
 function cancelTask(t: TransferTask) {
   transfer.update(t.id, { status: "cancelled" });
   sftpTransferCancel(t.id).catch(() => {
     /* 任务可能刚好已结束（幂等场景），忽略 */
   });
-}
-
-// 人类可读大小。
-function humanSize(n: number): string {
-  if (!n || n <= 0) return "-";
-  return formatSize(n);
 }
 
 async function removeTask(t: TransferTask) {
@@ -116,13 +86,13 @@ function toggle() {
         <el-button
           size="small"
           text
-          :icon="Delete"
+          :icon="'Delete'"
           :disabled="doneCount === 0"
           @click="clearDone"
         >
           清除已完成
         </el-button>
-        <el-icon class="tq-toggle"><component :is="collapsed ? CaretTop : CaretBottom" /></el-icon>
+        <el-icon class="tq-toggle"><component :is="collapsed ? 'CaretTop' : 'CaretBottom'" /></el-icon>
       </div>
     </header>
 
@@ -187,7 +157,7 @@ function toggle() {
   </div>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .transfer-queue {
   display: flex;
   flex-direction: column;

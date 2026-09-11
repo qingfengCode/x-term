@@ -11,7 +11,6 @@
 -->
 <script setup lang="ts">
 import { ElIcon, ElTooltip } from "element-plus";
-import { QuestionFilled } from "@element-plus/icons-vue";
 
 defineOptions({ name: "HelpTip" });
 withDefaults(defineProps<{ content?: string; size?: number }>(), { content: "", size: 14 });
@@ -39,7 +38,7 @@ withDefaults(defineProps<{ content?: string; size?: number }>(), { content: "", 
   </el-tooltip>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 /* 悬浮触发容器：内容即触发区，不再需要问号图标 */
 .help-trigger {
   cursor: help;

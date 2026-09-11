@@ -12,7 +12,6 @@ import { computed, h, onMounted, reactive, ref, watch } from "vue";
 import { onBeforeRouteLeave } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 import type { FormInstance, FormRules, TabsInstance } from "element-plus";
-import { Delete, Plus, Refresh, Folder, Setting, Download, Upload, FolderOpened } from "@element-plus/icons-vue";
 import HelpTip from "@/components/HelpTip.vue";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { setWorkspaceDir } from "@/api/ai";
@@ -27,6 +26,8 @@ import { useUpdateStore } from "@/stores/update";
 import { useVaultStore } from "@/stores/vault";
 import { useMcpStore } from "@/stores/mcp";
 import { TERMINAL_COLOR_SCHEMES, defaultSchemeFor } from "@/utils/terminalThemes";
+import { formatSize } from "@/utils/format";
+import { errorMessage } from "@/utils/error";
 import { ProviderKind, PROVIDER_DEFAULTS } from "@/api/types";
 import {
   APP_SHORTCUT_METAS,
@@ -57,20 +58,6 @@ const activeTab = ref<
 const tabsRef = ref<TabsInstance | null>(null);
 
 // --- 关于 / 更新 -----------------------------------------------------------
-
-/** 字节数格式化为人类可读单位。 */
-function formatBytes(n: number): string {
-  if (!n) return "0 B";
-  // 升级包可能超过 1TB（大体积应用），缺 TB 会把 1.5TB 显示成 "1536.0 GB"。
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let i = 0;
-  let v = n;
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${units[i]}`;
-}
 
 /** 安装前二次确认（会退出应用）。 */
 async function confirmInstall() {
@@ -431,8 +418,8 @@ async function submitProvider() {
     await settings.save();
     ElMessage.success(editingIndex.value !== null ? "已保存修改" : "已添加 provider");
     providerDialogVisible.value = false;
-  } catch (e: any) {
-    ElMessage.error("保存失败：" + (e?.message ?? String(e)));
+  } catch (e) {
+    ElMessage.error("保存失败：" + errorMessage(e));
   }
 }
 
@@ -458,8 +445,8 @@ async function removeProvider(p: ProviderConfig) {
   try {
     await settings.save();
     ElMessage.success("已删除");
-  } catch (e: any) {
-    ElMessage.error("保存失败：" + (e?.message ?? String(e)));
+  } catch (e) {
+    ElMessage.error("保存失败：" + errorMessage(e));
   }
 }
 
@@ -468,8 +455,8 @@ async function setActive(p: ProviderConfig) {
   try {
     await settings.save();
     ElMessage.success(`已设为默认模型：${kindLabel(p.kind)} / ${p.model}`);
-  } catch (e: any) {
-    ElMessage.error("保存失败：" + (e?.message ?? String(e)));
+  } catch (e) {
+    ElMessage.error("保存失败：" + errorMessage(e));
   }
 }
 
@@ -524,8 +511,8 @@ async function applyTerminal() {
   try {
     await settings.save();
     ElMessage.success("终端设置已应用");
-  } catch (e: any) {
-    ElMessage.error("保存失败：" + (e?.message ?? String(e)));
+  } catch (e) {
+    ElMessage.error("保存失败：" + errorMessage(e));
   }
 }
 
@@ -591,8 +578,8 @@ async function saveShortcuts() {
   try {
     await settings.save();
     ElMessage.success("快捷命令已保存");
-  } catch (e: any) {
-    ElMessage.error("保存失败：" + (e?.message ?? String(e)));
+  } catch (e) {
+    ElMessage.error("保存失败：" + errorMessage(e));
   }
 }
 
@@ -729,8 +716,8 @@ async function doExport() {
     }
     exportPwd.value = "";
     exportPwdConfirm.value = "";
-  } catch (e: any) {
-    ElMessage.error("导出失败：" + (e?.message ?? String(e)));
+  } catch (e) {
+    ElMessage.error("导出失败：" + errorMessage(e));
   } finally {
     exporting.value = false;
   }
@@ -754,8 +741,8 @@ async function doImport() {
   let info: BackupInfo;
   try {
     info = await backupApi.backupInspect(picked, pwd);
-  } catch (e: any) {
-    ElMessage.error("无法读取备份文件：" + (e?.message ?? String(e)));
+  } catch (e) {
+    ElMessage.error("无法读取备份文件：" + errorMessage(e));
     return;
   }
 
@@ -828,8 +815,8 @@ async function doImport() {
     await mcpStore.loadAll();
     ElMessage.success(`导入完成：${countsLines(summary.counts).join("、")}`);
     importPwd.value = "";
-  } catch (e: any) {
-    ElMessage.error("导入失败：" + (e?.message ?? String(e)));
+  } catch (e) {
+    ElMessage.error("导入失败：" + errorMessage(e));
   } finally {
     importing.value = false;
   }
@@ -1172,7 +1159,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
                       <el-icon><FolderOpened /></el-icon>
                     </template>
                   </el-input>
-                  <el-button :icon="FolderOpened" @click="pickZmodemDownloadDir">浏览</el-button>
+                  <el-button :icon="'FolderOpened'" @click="pickZmodemDownloadDir">浏览</el-button>
                 </div>
               </el-form-item>
             </el-form>
@@ -1253,7 +1240,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
           </div>
 
           <div class="table-actions">
-            <el-button :icon="Plus" @click="addShortcut">新增快捷命令</el-button>
+            <el-button :icon="'Plus'" @click="addShortcut">新增快捷命令</el-button>
             <el-button type="primary" @click="saveShortcuts">
               保存快捷命令
             </el-button>
@@ -1318,7 +1305,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
           </div>
 
           <div class="table-actions">
-            <el-button :icon="Refresh" @click="resetAppShortcuts">
+            <el-button :icon="'Refresh'" @click="resetAppShortcuts">
               恢复默认
             </el-button>
             <el-button type="primary" @click="saveAppShortcuts">
@@ -1397,7 +1384,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
                 AI 数据会上传到所选模型服务，请勿输入敏感信息
               </span>
             </div>
-            <el-button size="small" type="primary" plain :icon="Plus" @click="openProviderDialog">
+            <el-button size="small" type="primary" plain :icon="'Plus'" @click="openProviderDialog">
               添加 Provider
             </el-button>
           </div>
@@ -1585,12 +1572,12 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
                   :type="settings.fileAccess.workspaceDirs[d] ? 'info' : 'warning'"
                   effect="plain"
                   :closable="!!settings.fileAccess.workspaceDirs[d]"
-                  :close-icon="Delete"
+                  :close-icon="'Delete'"
                   @close="clearWorkspaceDir(d)"
                 >
                   <span class="path-text">{{ settings.fileAccess.workspaceDirs[d] ?? "未设置" }}</span>
                 </el-tag>
-                <el-button size="small" :icon="Folder" @click="pickWorkspaceDir(d)">
+                <el-button size="small" :icon="'Folder'" @click="pickWorkspaceDir(d)">
                   {{ settings.fileAccess.workspaceDirs[d] ? "更改" : "选择目录" }}
                 </el-button>
               </div>
@@ -1792,7 +1779,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
               <strong>不包含</strong>在备份中；如需完整备份，请先在「安全」页解锁保险库。
             </div>
             <div class="backup-actions">
-              <el-button type="primary" :loading="exporting" :icon="Download" @click="doExport">
+              <el-button type="primary" :loading="exporting" :icon="'Download'" @click="doExport">
                 导出到文件…
               </el-button>
             </div>
@@ -1821,7 +1808,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
               <el-button
                 :type="importMode === 'overwrite' ? 'danger' : 'primary'"
                 :loading="importing"
-                :icon="Upload"
+                :icon="'Upload'"
                 @click="doImport"
               >
                 选择文件导入…
@@ -1848,7 +1835,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
 
             <!-- 空闲 / 错误后重试 -->
             <div v-if="updater.status === 'idle'" class="about-update-body">
-              <el-button type="primary" :icon="Refresh" @click="updater.check()">检查更新</el-button>
+              <el-button type="primary" :icon="'Refresh'" @click="updater.check()">检查更新</el-button>
               <span v-if="updater.skippedVersion" class="about-hint">
                 已跳过 v{{ updater.skippedVersion }}，点击检查将重新提示
               </span>
@@ -1886,8 +1873,8 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
                 :format="(p: number) => `${p}%`"
               />
               <div class="about-dl-meta">
-                {{ formatBytes(updater.progress.received) }}
-                <template v-if="updater.progress.total"> / {{ formatBytes(updater.progress.total) }}</template>
+                {{ formatSize(updater.progress.received) }}
+                <template v-if="updater.progress.total"> / {{ formatSize(updater.progress.total) }}</template>
               </div>
             </div>
 
@@ -1934,7 +1921,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
   </div>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 /* ============ 页面骨架：浅底衬托卡片，头部 + 顶部 Tab + 滚动内容 ============ */
 .settings-view {
   padding: 18px 28px 0;

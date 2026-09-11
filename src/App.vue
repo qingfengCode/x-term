@@ -207,7 +207,7 @@ onBeforeUnmount(() => {
   <SshManualAuthDialog />
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 /* 标题栏之下的页面容器：占满剩余高度（#app 为纵向 flex，见 main.css） */
 .app-body {
   flex: 1;

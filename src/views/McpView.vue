@@ -118,7 +118,7 @@ onMounted(async () => {
   </div>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .mcp-view {
   display: flex;
   flex-direction: column;
@@ -334,17 +334,4 @@ onMounted(async () => {
   min-width: 0;
 }
 
-/* 窄屏时改为上下堆叠 */
-@media (max-width: 960px) {
-  .mcp-columns {
-    grid-template-columns: 1fr;
-    grid-template-rows: auto 1fr;
-  }
-  .service-select {
-    flex-direction: column;
-  }
-  .subtitle {
-    white-space: normal;
-  }
-}
 </style>

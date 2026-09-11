@@ -73,7 +73,6 @@
  * 历史项悬停显示删除按钮；AI 项固定列表底部。
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { Clock, Delete, Lightning, MagicStick } from "@element-plus/icons-vue";
 import type { SuggestionItem } from "@/composables/useSuggestions";
 
 const props = defineProps<{
@@ -178,14 +177,14 @@ watch(
     nextTick(() => {
       const item = props.items[idx];
       if (!item || item.type === "ai-preview" || item.type === "ai-result") return;
-      const el = popupRef.value?.querySelectorAll(".suggestion-item")[listIndexof(idx)];
+      const el = popupRef.value?.querySelectorAll(".suggestion-item")[listIndexOf(idx)];
       el?.scrollIntoView({ block: "nearest" });
     });
   },
 );
 
 /** 原始 items 下标 → 列表内 DOM 下标（AI 项不在列表 DOM 中）。 */
-function listIndexof(originalIndex: number): number {
+function listIndexOf(originalIndex: number): number {
   let n = 0;
   for (let i = 0; i < originalIndex && i < props.items.length; i++) {
     const t = props.items[i].type;

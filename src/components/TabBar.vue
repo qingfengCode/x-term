@@ -17,7 +17,6 @@
 -->
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from "vue";
-import { Close } from "@element-plus/icons-vue";
 
 /** 单个标签的数据抽象（终端 tab 与桌面 tab 的公共子集）。 */
 export interface TabBarItem {
@@ -245,7 +244,7 @@ defineExpose({ closeMenu });
   </div>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .tabs-scroll {
   display: flex;
   align-items: center;

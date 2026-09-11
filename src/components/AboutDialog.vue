@@ -7,24 +7,11 @@
 <script setup lang="ts">
 import { watch } from "vue";
 import { ElMessageBox } from "element-plus";
-import { Refresh } from "@element-plus/icons-vue";
 import { useUpdateStore } from "@/stores/update";
+import { formatSize } from "@/utils/format";
 
 const visible = defineModel<boolean>("visible", { default: false });
 const updater = useUpdateStore();
-
-/** 字节数格式化为人类可读单位（升级包可能超过 1TB，缺 TB 会显示成 1536.0 GB）。 */
-function formatBytes(n: number): string {
-  if (!n) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let i = 0;
-  let v = n;
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${units[i]}`;
-}
 
 /** 安装前二次确认（会退出应用）。 */
 async function confirmInstall() {
@@ -71,7 +58,7 @@ watch(visible, (v) => {
 
         <!-- 空闲 -->
         <div v-if="updater.status === 'idle'" class="update-body">
-          <el-button type="primary" :icon="Refresh" @click="updater.check()">检查更新</el-button>
+          <el-button type="primary" :icon="'Refresh'" @click="updater.check()">检查更新</el-button>
           <span v-if="updater.skippedVersion" class="update-hint">
             已跳过 v{{ updater.skippedVersion }}，点击检查将重新提示
           </span>
@@ -109,8 +96,8 @@ watch(visible, (v) => {
             :format="(p: number) => `${p}%`"
           />
           <div class="dl-meta">
-            {{ formatBytes(updater.progress.received) }}
-            <template v-if="updater.progress.total"> / {{ formatBytes(updater.progress.total) }}</template>
+            {{ formatSize(updater.progress.received) }}
+            <template v-if="updater.progress.total"> / {{ formatSize(updater.progress.total) }}</template>
           </div>
         </div>
 
@@ -155,7 +142,7 @@ watch(visible, (v) => {
   </el-dialog>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .about-body {
   display: flex;
   flex-direction: column;

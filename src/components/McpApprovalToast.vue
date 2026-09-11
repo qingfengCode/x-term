@@ -12,7 +12,6 @@
 <script setup lang="ts">
 import { useMcpStore } from "@/stores/mcp";
 import { ElMessage } from "element-plus";
-import { Check, Close } from "@element-plus/icons-vue";
 
 const mcp = useMcpStore();
 
@@ -114,7 +113,7 @@ function kindLabel(kind: string): string {
         <el-button
           size="small"
           :type="isDangerous(req.toolName, req.arguments) ? 'danger' : 'primary'"
-          :icon="Check"
+          :icon="'Check'"
           :disabled="mcp.respondingIds.has(req.requestId)"
           @click="approve(req.requestId)"
         >
@@ -122,7 +121,7 @@ function kindLabel(kind: string): string {
         </el-button>
         <el-button
           size="small"
-          :icon="Close"
+          :icon="'Close'"
           :disabled="mcp.respondingIds.has(req.requestId)"
           @click="reject(req.requestId)"
         >
@@ -133,7 +132,7 @@ function kindLabel(kind: string): string {
   </TransitionGroup>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .mcp-toast-wrap {
   position: fixed;
   right: 20px;

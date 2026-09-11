@@ -172,7 +172,7 @@ async function respondCurrent(decision: HostKeyDecision) {
   </el-dialog>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .hk-dialog-title {
   display: flex;
   align-items: center;

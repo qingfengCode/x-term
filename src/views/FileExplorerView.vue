@@ -8,19 +8,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onBeforeUnmount, reactive, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
-import {
-  ArrowUp,
-  Refresh,
-  FolderAdd,
-  FolderOpened,
-  Document,
-  Folder,
-  Delete,
-  Edit,
-  Plus,
-  Link as LinkIcon,
-  Files,
-} from "@element-plus/icons-vue";
 import { readDir, mkdir, stat as fsStat } from "@tauri-apps/plugin-fs";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -28,7 +15,7 @@ import { homeDir, join, dirname, basename } from "@tauri-apps/api/path";
 
 import { useTransferStore } from "@/stores/transfer";
 import { uniquePathIn, usableDownloadDir } from "@/utils/downloadPath";
-import { formatSize } from "@/utils/format";
+import { humanSize } from "@/utils/format";
 import type { FileEntry } from "@/api/types";
 import {
   fileAccountList,
@@ -83,6 +70,18 @@ function openNewAccount() {
 function openEditAccount(a: FileAccount) {
   editingAccount.value = a;
   accountDialogVisible.value = true;
+}
+
+/** 编辑当前选中的文件账号（选中项已不存在时静默忽略，替代模板里的 find(...)! 断言）。 */
+function editSelectedAccount() {
+  const a = accounts.value.find((x) => x.id === selectedAccountId.value);
+  if (a) openEditAccount(a);
+}
+
+/** 删除当前选中的文件账号。 */
+function removeSelectedAccount() {
+  const a = accounts.value.find((x) => x.id === selectedAccountId.value);
+  if (a) void removeAccount(a);
 }
 
 async function removeAccount(a: FileAccount) {
@@ -601,10 +600,6 @@ async function pickAndUpload() {
 // ---------------------------------------------------------------------------
 // 工具
 // ---------------------------------------------------------------------------
-function humanSize(n: number): string {
-  if (!n || n <= 0) return "-";
-  return formatSize(n);
-}
 
 function formatTime(s: string | null): string {
   if (!s) return "-";
@@ -705,11 +700,11 @@ onBeforeUnmount(() => {
             :value="a.id"
           />
         </el-select>
-        <el-button :icon="Plus" size="default" @click="openNewAccount">新建账号</el-button>
+        <el-button :icon="'Plus'" size="default" @click="openNewAccount">新建账号</el-button>
         <el-button
           size="default"
           :disabled="!selectedAccountId"
-          @click="openEditAccount(accounts.find((a) => a.id === selectedAccountId)!)"
+          @click="editSelectedAccount"
         >
           编辑
         </el-button>
@@ -718,7 +713,7 @@ onBeforeUnmount(() => {
           type="danger"
           plain
           :disabled="!selectedAccountId"
-          @click="removeAccount(accounts.find((a) => a.id === selectedAccountId)!)"
+          @click="removeSelectedAccount"
         >
           删除
         </el-button>
@@ -727,7 +722,7 @@ onBeforeUnmount(() => {
       <div class="toolbar-actions">
         <el-button
           type="primary"
-          :icon="LinkIcon"
+          :icon="'Link'"
           :loading="connecting"
           @click="connect"
         >
@@ -752,13 +747,13 @@ onBeforeUnmount(() => {
             </span>
             <div class="pane-tools">
               <el-tooltip content="上级目录" placement="bottom">
-                <el-button circle size="small" :icon="ArrowUp" @click="localGoUp" />
+                <el-button circle size="small" :icon="'ArrowUp'" @click="localGoUp" />
               </el-tooltip>
               <el-tooltip content="新建目录" placement="bottom">
-                <el-button circle size="small" :icon="FolderAdd" @click="localMkdir" />
+                <el-button circle size="small" :icon="'FolderAdd'" @click="localMkdir" />
               </el-tooltip>
               <el-tooltip content="刷新" placement="bottom">
-                <el-button circle size="small" :icon="Refresh" @click="refreshLocal" />
+                <el-button circle size="small" :icon="'Refresh'" @click="refreshLocal" />
               </el-tooltip>
             </div>
           </div>
@@ -831,13 +826,13 @@ onBeforeUnmount(() => {
                 </el-button>
               </el-tooltip>
               <el-tooltip content="上级目录" placement="bottom">
-                <el-button circle size="small" :icon="ArrowUp" @click="remoteGoUp" />
+                <el-button circle size="small" :icon="'ArrowUp'" @click="remoteGoUp" />
               </el-tooltip>
               <el-tooltip content="新建目录" placement="bottom">
-                <el-button circle size="small" :icon="FolderAdd" @click="remoteMkdir" />
+                <el-button circle size="small" :icon="'FolderAdd'" @click="remoteMkdir" />
               </el-tooltip>
               <el-tooltip content="刷新" placement="bottom">
-                <el-button circle size="small" :icon="Refresh" @click="refreshRemote" />
+                <el-button circle size="small" :icon="'Refresh'" @click="refreshRemote" />
               </el-tooltip>
             </div>
           </div>
@@ -911,7 +906,7 @@ onBeforeUnmount(() => {
       <div v-else class="fe-placeholder">
         <el-icon :size="48"><Files /></el-icon>
         <p>选择一个文件账号并点击「连接」</p>
-        <el-button type="primary" :icon="Plus" @click="openNewAccount">新建 S3 账号</el-button>
+        <el-button type="primary" :icon="'Plus'" @click="openNewAccount">新建 S3 账号</el-button>
       </div>
     </div>
 
@@ -927,7 +922,7 @@ onBeforeUnmount(() => {
   </div>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .file-explorer-view {
   display: flex;
   flex-direction: column;

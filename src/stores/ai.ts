@@ -169,6 +169,8 @@ export const makeAiStore = (id: string) =>
 
   // --- 持久化（独立 JSON 文件，按 domain 分文件）---------------------------
   let persistTimer: ReturnType<typeof setTimeout> | null = null;
+  /** 持久化防抖间隔（ms）：流式输出期间的高频变更合并为一次写盘。 */
+  const PERSIST_DEBOUNCE_MS = 800;
 
   /** 防抖持久化：把 conversations + archives 映射为可序列化结构后全量写文件。
    *  streaming 字段强制为 false（避免重启后卡在"生成中"）；不存 activeRequestId/sending。
@@ -193,7 +195,7 @@ export const makeAiStore = (id: string) =>
       aiApi.aiSaveConversations(domain, data).catch(() => {
         /* 持久化失败不阻塞对话（如磁盘满），仅忽略 */
       });
-    }, 800);
+    }, PERSIST_DEBOUNCE_MS);
   }
 
   /** 启动时从文件加载历史会话，替换默认的空对话。文件为空则保留默认。 */
@@ -355,7 +357,10 @@ export const makeAiStore = (id: string) =>
     }
   ) {
     ensureConversation();
-    const conv = activeConversation.value!;
+    const conv = activeConversation.value;
+    // 理论上 ensureConversation 后必非空；防御性判空替代非空断言，
+    // 避免 store 状态被外部清空时崩溃。
+    if (!conv) return;
     if (conv.sending) return; // 按会话粒度互斥，不同会话可并发
     conv.sending = true;
     // 新用户消息 = 新回合开始：清空上一任务的任务清单（借鉴 dsh tool-todo 的

@@ -15,6 +15,7 @@ import { ElMessage, ElMessageBox } from "element-plus";
 import type { FormInstance, FormRules } from "element-plus";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useSessionsStore } from "@/stores/sessions";
+import { errorMessage } from "@/utils/error";
 import {
   forwardDeleteRule,
   forwardListRules,
@@ -108,8 +109,8 @@ async function loadRules() {
     ]);
     rules.value = list;
     running.value = new Set(runningIds);
-  } catch (e: any) {
-    ElMessage.error("加载转发规则失败：" + (e?.message ?? String(e)));
+  } catch (e) {
+    ElMessage.error("加载转发规则失败：" + errorMessage(e));
   } finally {
     loading.value = false;
   }
@@ -184,14 +185,14 @@ async function submitForm() {
         await forwardStart(savedId);
         running.value.add(savedId);
         ElMessage.success(`已保存并启动：${rule.name}`);
-      } catch (e: any) {
-        ElMessage.warning("规则已保存，但自动启动失败：" + (e?.message ?? String(e)));
+      } catch (e) {
+        ElMessage.warning("规则已保存，但自动启动失败：" + errorMessage(e));
       }
     } else {
       ElMessage.success(dialogMode.value === "create" ? "已新建转发规则" : "已保存修改");
     }
-  } catch (e: any) {
-    ElMessage.error("保存失败：" + (e?.message ?? String(e)));
+  } catch (e) {
+    ElMessage.error("保存失败：" + errorMessage(e));
   }
 }
 
@@ -219,8 +220,8 @@ async function removeRule(row: ForwardRule) {
     running.value.delete(row.id);
     ElMessage.success("已删除");
     await loadRules();
-  } catch (e: any) {
-    ElMessage.error("删除失败：" + (e?.message ?? String(e)));
+  } catch (e) {
+    ElMessage.error("删除失败：" + errorMessage(e));
   }
 }
 
@@ -231,8 +232,8 @@ async function startRule(row: ForwardRule) {
     await forwardStart(row.id);
     running.value.add(row.id);
     ElMessage.success(`已启动：${row.name}`);
-  } catch (e: any) {
-    ElMessage.error("启动失败：" + (e?.message ?? String(e)));
+  } catch (e) {
+    ElMessage.error("启动失败：" + errorMessage(e));
   } finally {
     toggling.value.delete(row.id);
   }
@@ -244,8 +245,8 @@ async function stopRule(row: ForwardRule) {
     await forwardStop(row.id);
     running.value.delete(row.id);
     ElMessage.success(`已停止：${row.name}`);
-  } catch (e: any) {
-    ElMessage.error("停止失败：" + (e?.message ?? String(e)));
+  } catch (e) {
+    ElMessage.error("停止失败：" + errorMessage(e));
   } finally {
     toggling.value.delete(row.id);
   }
@@ -444,7 +445,7 @@ onUnmounted(() => {
   </div>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .forward-view {
   padding: 20px 24px;
   display: flex;

@@ -122,7 +122,7 @@ onBeforeUnmount(() => unlisten?.());
   </div>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .title-bar {
   display: flex;
   align-items: center;

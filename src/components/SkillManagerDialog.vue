@@ -7,7 +7,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
-import { Edit, Delete, Plus } from "@element-plus/icons-vue";
 import { useSettingsStore } from "@/stores/settings";
 import type { SkillConfig } from "@/api/types";
 import SkillDialog from "@/components/SkillDialog.vue";
@@ -117,7 +116,7 @@ async function removeSkill(s: SkillConfig) {
       </div>
     </div>
     <template #footer>
-      <el-button :icon="Plus" @click="newSkill">新建技能</el-button>
+      <el-button :icon="'Plus'" @click="newSkill">新建技能</el-button>
       <el-button @click="close">关闭</el-button>
     </template>
 
@@ -130,7 +129,7 @@ async function removeSkill(s: SkillConfig) {
   </el-dialog>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .skill-list {
   max-height: 400px;
   overflow-y: auto;

@@ -3,8 +3,9 @@ import { computed, reactive, ref } from "vue";
 import * as dbApi from "@/api/db";
 import type { DbKind, DbProfile } from "@/api/types";
 
-/** profile.kind 归一化：postgres 系 → postgres，sqlite 系 → sqlite，其余按 mysql。 */
-function normalizeKind(kind?: string | null): DbKind {
+/** profile.kind 归一化：postgres 系 → postgres，sqlite 系 → sqlite，其余按 mysql。
+ *  DbProfileDialog 等处共用（此前组件内还有一份相同拷贝）。 */
+export function normalizeKind(kind?: string | null): DbKind {
   const v = (kind ?? "").toLowerCase();
   if (v === "postgres" || v === "postgresql" || v === "pg") return "postgres";
   if (v === "sqlite" || v === "sqlite3") return "sqlite";

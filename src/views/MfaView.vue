@@ -10,7 +10,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
-import { Plus, Delete, CopyDocument, Refresh, Position, Iphone } from "@element-plus/icons-vue";
 import * as totpApi from "@/api/totp";
 import type { TotpEntry, TotpCode } from "@/api/totp";
 import { useTerminalsStore } from "@/stores/terminals";
@@ -183,7 +182,7 @@ const addForm = ref({
 const addLoading = ref(false);
 /** 预览码（用户输入 secret 后实时显示，验证有效性）。 */
 const previewCode = ref("");
-const previewTimer = ref<ReturnType<typeof setInterval> | null>(null);
+const previewTimer = ref<ReturnType<typeof setTimeout> | null>(null);
 
 const algorithms = [
   { label: "SHA1（默认）", value: "SHA1" },
@@ -328,8 +327,8 @@ onBeforeUnmount(() => {
         <span class="subtitle">TOTP 双因素验证码管理 · 自动填充到终端</span>
       </div>
       <div class="actions">
-        <el-button :icon="Refresh" size="small" @click="load">刷新</el-button>
-        <el-button type="primary" :icon="Plus" size="small" @click="openAdd">
+        <el-button :icon="'Refresh'" size="small" @click="load">刷新</el-button>
+        <el-button type="primary" :icon="'Plus'" size="small" @click="openAdd">
           添加验证码
         </el-button>
       </div>
@@ -377,11 +376,11 @@ onBeforeUnmount(() => {
           </div>
           <div class="card-actions">
             <el-tooltip content="复制验证码" placement="top">
-              <el-button :icon="CopyDocument" circle size="small" @click="copyCode(e)" />
+              <el-button :icon="'CopyDocument'" circle size="small" @click="copyCode(e)" />
             </el-tooltip>
             <el-tooltip :content="hasTerminal ? '填充到当前终端' : '（无活动终端）'" placement="top">
               <el-button
-                :icon="Position"
+                :icon="'Position'"
                 circle
                 size="small"
                 :disabled="!hasTerminal"
@@ -390,7 +389,7 @@ onBeforeUnmount(() => {
             </el-tooltip>
             <el-tooltip content="删除" placement="top">
               <el-button
-                :icon="Delete"
+                :icon="'Delete'"
                 circle
                 size="small"
                 type="danger"
@@ -455,7 +454,7 @@ onBeforeUnmount(() => {
   </div>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .mfa-view {
   display: flex;
   flex-direction: column;

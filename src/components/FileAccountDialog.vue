@@ -245,7 +245,7 @@ async function submit() {
   </el-dialog>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .hint-text {
   font-size: 12px;
   color: var(--el-text-color-secondary);

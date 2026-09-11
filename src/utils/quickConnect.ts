@@ -55,17 +55,6 @@ function parseHostPart(s: string): {
   return { username, password, host, port: m[3] ? parseInt(m[3], 10) : undefined };
 }
 
-/** 输入是否"长得像"连接串（用于侧栏提示条显隐判定）。
- *
- * 裸 host 不算（与搜索词无法区分）；要求以下信号之一：
- * - `scheme://` 前缀（且 scheme 是已知协议）；
- * - 含 `@`（user@host）；
- * - `host:数字端口`；
- * - `协议名 host`（首词为已知协议 + 空格）。 */
-export function looksLikeQuickConnect(raw: string): boolean {
-  return parseQuickConnect(raw) !== null;
-}
-
 /** 解析连接串。无法识别时返回 null。 */
 export function parseQuickConnect(raw: string): QuickConnectTarget | null {
   const input = raw.trim();
@@ -97,7 +86,7 @@ export function parseQuickConnect(raw: string): QuickConnectTarget | null {
   if (input.includes("@") || /:\d+$/.test(input)) {
     const hostPart = parseHostPart(input);
     if (!hostPart.host) return null;
-    return build("ssh", hostPart, 22);
+    return build(QUICK_PROTOCOLS.ssh.protocol, hostPart, QUICK_PROTOCOLS.ssh.defaultPort);
   }
   return null;
 }

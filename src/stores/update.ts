@@ -62,8 +62,13 @@ export const useUpdateStore = defineStore("update", () => {
 
   /** 保存更新源地址并刷新 info。 */
   async function saveManifestUrl(url: string) {
-    await updateSetManifestUrl(url);
-    if (info.value) info.value.manifestUrl = url;
+    try {
+      await updateSetManifestUrl(url);
+      if (info.value) info.value.manifestUrl = url;
+    } catch (e) {
+      // 与 check/download/install 一致走 fail() 收口，避免未处理的 rejection。
+      fail(e instanceof Error ? e.message : String(e));
+    }
   }
 
   /**

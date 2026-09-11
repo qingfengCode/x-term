@@ -91,7 +91,7 @@ onBeforeUnmount(() => {
   </div>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .split-area {
   position: relative;
   width: 100%;

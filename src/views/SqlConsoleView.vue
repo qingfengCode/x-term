@@ -16,30 +16,6 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type Ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import {
-  Refresh,
-  VideoPause,
-  Plus,
-  Edit,
-  Delete,
-  CaretRight,
-  Delete as ClearIcon,
-  MagicStick,
-  View,
-  Connection,
-  Coin,
-  Document,
-  Folder,
-  FolderAdd,
-  MoreFilled,
-  EditPen,
-  QuestionFilled,
-  Close,
-  ArrowDown,
-  Clock,
-  Fold,
-  Expand,
-} from "@element-plus/icons-vue";
-import {
   dbDeleteProfile,
   dbDefaultTableQuery,
   dbListDatabases,
@@ -122,7 +98,7 @@ const SYSTEM_EXPLAIN = computed(
     "1) 这段 SQL 做了什么；" +
     "2) 涉及的关键字/函数/子查询含义；" +
     "3) 可能的注意事项。不要重复 SQL 原文。"
-);;
+);
 
 // --- profile 列表 -----------------------------------------------------------
 const profiles = ref<DbProfile[]>([]);
@@ -1313,7 +1289,7 @@ onBeforeUnmount(() => {
     <div class="main-bar">
       <el-tooltip :content="treeCollapsed ? '展开数据库树' : '收起数据库树'" placement="bottom">
         <button class="tree-toggle" @click="treeCollapsed = !treeCollapsed">
-          <el-icon><component :is="treeCollapsed ? Expand : Fold" /></el-icon>
+          <el-icon><component :is="treeCollapsed ? 'Expand' : 'Fold'" /></el-icon>
         </button>
       </el-tooltip>
 
@@ -1352,7 +1328,7 @@ onBeforeUnmount(() => {
             <el-dropdown-item v-for="p in profiles" :key="p.id" :command="p.id">
               {{ p.name }}（{{ p.host }}:{{ p.port }}）
             </el-dropdown-item>
-            <el-dropdown-item command="__new_profile__" :icon="Plus" divided>
+            <el-dropdown-item command="__new_profile__" :icon="'Plus'" divided>
               新建连接…
             </el-dropdown-item>
           </el-dropdown-menu>
@@ -1370,7 +1346,7 @@ onBeforeUnmount(() => {
             <el-button
               size="small"
               link
-              :icon="Coin"
+              :icon="'Coin'"
               :disabled="!activeSelectedTable"
               @click="showStructure"
             >
@@ -1379,16 +1355,16 @@ onBeforeUnmount(() => {
           </el-tooltip>
           <el-divider direction="vertical" />
           <el-tooltip content="清屏" placement="bottom">
-            <el-button :icon="Delete" size="small" link @click="activeState.console.clear()" />
+            <el-button :icon="'Delete'" size="small" link @click="activeState.console.clear()" />
           </el-tooltip>
           <el-tooltip content="AI 优化" placement="bottom">
-            <el-button :icon="MagicStick" size="small" link @click="aiOptimize" />
+            <el-button :icon="'MagicStick'" size="small" link @click="aiOptimize" />
           </el-tooltip>
           <el-tooltip content="AI 解释" placement="bottom">
-            <el-button :icon="View" size="small" link @click="aiExplain" />
+            <el-button :icon="'View'" size="small" link @click="aiExplain" />
           </el-tooltip>
           <el-tooltip content="历史" placement="bottom">
-            <el-button :icon="Clock" size="small" link @click="historyDrawerModel = true" />
+            <el-button :icon="'Clock'" size="small" link @click="historyDrawerModel = true" />
           </el-tooltip>
         </template>
 
@@ -1396,12 +1372,12 @@ onBeforeUnmount(() => {
 
         <!-- 断开当前标签 -->
         <el-tooltip v-if="db.activeTab" content="断开当前标签" placement="bottom">
-          <el-button :icon="VideoPause" size="small" type="warning" plain @click="closeActiveTab" />
+          <el-button :icon="'VideoPause'" size="small" type="warning" plain @click="closeActiveTab" />
         </el-tooltip>
         <!-- 帮助：悬浮显示使用指南 -->
         <el-popover placement="bottom-end" :width="380" trigger="hover">
           <template #reference>
-            <el-button :icon="QuestionFilled" size="small" link class="help-btn" title="使用指南" />
+            <el-button :icon="'QuestionFilled'" size="small" link class="help-btn" title="使用指南" />
           </template>
           <div class="help-content">
             <div class="help-title">SQL 控制台使用指南</div>
@@ -1435,13 +1411,13 @@ onBeforeUnmount(() => {
           <span>数据库</span>
           <div class="list-header-actions">
             <el-tooltip content="新建连接" placement="bottom">
-              <el-button :icon="Plus" size="small" circle @click="openCreateProfile()" />
+              <el-button :icon="'Plus'" size="small" circle @click="openCreateProfile()" />
             </el-tooltip>
             <el-tooltip content="新建分组" placement="bottom">
-              <el-button :icon="FolderAdd" size="small" circle @click="createDbGroup" />
+              <el-button :icon="'FolderAdd'" size="small" circle @click="createDbGroup" />
             </el-tooltip>
             <el-tooltip content="刷新" placement="bottom">
-              <el-button :icon="Refresh" size="small" circle @click="loadProfiles" />
+              <el-button :icon="'Refresh'" size="small" circle @click="loadProfiles" />
             </el-tooltip>
           </div>
         </div>
@@ -1486,13 +1462,13 @@ onBeforeUnmount(() => {
                   <el-icon class="node-menu-icon" @click.stop><MoreFilled /></el-icon>
                   <template #dropdown>
                     <el-dropdown-menu v-if="data.type === 'instance'">
-                      <el-dropdown-item command="edit" :icon="EditPen">编辑</el-dropdown-item>
-                      <el-dropdown-item command="delete" :icon="Delete" divided>删除</el-dropdown-item>
+                      <el-dropdown-item command="edit" :icon="'EditPen'">编辑</el-dropdown-item>
+                      <el-dropdown-item command="delete" :icon="'Delete'" divided>删除</el-dropdown-item>
                     </el-dropdown-menu>
                     <el-dropdown-menu v-else>
-                      <el-dropdown-item command="newChild" :icon="Plus">新建连接</el-dropdown-item>
-                      <el-dropdown-item command="rename" :icon="EditPen">重命名</el-dropdown-item>
-                      <el-dropdown-item command="delete" :icon="Delete" divided>删除</el-dropdown-item>
+                      <el-dropdown-item command="newChild" :icon="'Plus'">新建连接</el-dropdown-item>
+                      <el-dropdown-item command="rename" :icon="'EditPen'">重命名</el-dropdown-item>
+                      <el-dropdown-item command="delete" :icon="'Delete'" divided>删除</el-dropdown-item>
                     </el-dropdown-menu>
                   </template>
                 </el-dropdown>
@@ -1565,7 +1541,7 @@ onBeforeUnmount(() => {
         <!-- ============ 代码模式（多行编辑器 + 结果区） ============ -->
         <template v-else>
           <div class="code-editor-toolbar">
-            <el-button type="primary" size="small" :icon="CaretRight" :loading="activeExecuting" @click="execute">
+            <el-button type="primary" size="small" :icon="'CaretRight'" :loading="activeExecuting" @click="execute">
               执行
             </el-button>
             <!-- 模式切换：命令行 / 代码 + 表结构（位于清空左侧） -->
@@ -1577,27 +1553,27 @@ onBeforeUnmount(() => {
               <el-button
                 size="small"
                 link
-                :icon="Coin"
+                :icon="'Coin'"
                 :disabled="!activeSelectedTable"
                 @click="showStructure"
               >
                 表结构
               </el-button>
             </el-tooltip>
-            <el-button size="small" :icon="ClearIcon" @click="clearSql">清空</el-button>
+            <el-button size="small" :icon="'Delete'" @click="clearSql">清空</el-button>
             <!-- 辅助操作：从顶部工具栏移到执行行右侧（仅图标） -->
             <div class="code-toolbar-right">
               <el-tooltip content="清屏" placement="bottom">
-                <el-button :icon="Delete" size="small" link @click="activeState.console.clear()" />
+                <el-button :icon="'Delete'" size="small" link @click="activeState.console.clear()" />
               </el-tooltip>
               <el-tooltip content="AI 优化" placement="bottom">
-                <el-button :icon="MagicStick" size="small" link @click="aiOptimize" />
+                <el-button :icon="'MagicStick'" size="small" link @click="aiOptimize" />
               </el-tooltip>
               <el-tooltip content="AI 解释" placement="bottom">
-                <el-button :icon="View" size="small" link @click="aiExplain" />
+                <el-button :icon="'View'" size="small" link @click="aiExplain" />
               </el-tooltip>
               <el-tooltip content="历史" placement="bottom">
-                <el-button :icon="Clock" size="small" link @click="historyDrawerModel = true" />
+                <el-button :icon="'Clock'" size="small" link @click="historyDrawerModel = true" />
               </el-tooltip>
             </div>
           </div>
@@ -1697,7 +1673,7 @@ onBeforeUnmount(() => {
   </div>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .sql-console {
   display: flex;
   flex-direction: column;

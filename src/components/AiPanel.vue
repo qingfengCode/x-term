@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { ElMessage, ElMessageBox, ElNotification } from "element-plus";
-import { Promotion, Delete, ChatDotRound, DArrowRight, Connection, Tools, ArrowDown, ArrowUp, Plus, Close, CopyDocument, RefreshRight, VideoPause, Document, Loading, Download, MagicStick, Collection, Picture, CircleCheckFilled, Clock, Odometer, MoreFilled, Lock, Key, Lightning } from "@element-plus/icons-vue";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 import { open, save } from "@tauri-apps/plugin-dialog";
@@ -505,9 +504,9 @@ const domainSkills = computed(() => settings.skills.filter((s) => s.domain === p
 // --- 执行模式图标（面板过窄时选择框只显示图标，title 提示全名） ----------------
 /** 三种执行模式的图标：手动=锁（逐条解锁确认），白名单=钥匙（放行名单内命令），自动=闪电（全自动直通）。 */
 const RUN_MODE_ICONS = {
-  manual: Lock,
-  whitelist: Key,
-  auto: Lightning,
+  manual: "Lock",
+  whitelist: "Key",
+  auto: "Lightning",
 } as const;
 /** 面板过窄（< 360px）时执行模式选择框切到纯图标显示，省出横向空间防换行。 */
 const compactRunMode = computed(() => panelWidth.value < 360);
@@ -531,6 +530,16 @@ function toggleSkill(s: SkillConfig) {
 
 function removeSelectedSkill(id: string) {
   selectedSkills.value = selectedSkills.value.filter((x) => x.id !== id);
+}
+
+/** 技能下拉命令分发：__manage__ 打开管理弹窗，其余按 id 切换勾选。 */
+function onSkillCommand(cmd: string) {
+  if (cmd === "__manage__") {
+    skillManagerVisible.value = true;
+    return;
+  }
+  const s = domainSkills.value.find((x) => x.id === cmd);
+  if (s) toggleSkill(s);
 }
 
 /** 当前激活模型 key（`${kind}:${model}`）。 */
@@ -2132,7 +2141,7 @@ function renderMarkdown(text: string): string {
             v-if="activeTodos.length > TODO_COLLAPSE_THRESHOLD"
             class="todo-collapse"
             :title="todoCollapsed ? '展开' : '收起'"
-          >{{ todoCollapsed ? ArrowDown : ArrowUp }}</el-icon>
+          >{{ todoCollapsed ? 'ArrowDown' : 'ArrowUp' }}</el-icon>
         </div>
         <div v-show="!todoCollapsed" class="todo-items">
           <div
@@ -2528,7 +2537,7 @@ function renderMarkdown(text: string): string {
           <el-button
             v-if="multimodalEnabled"
             link
-            :icon="Picture"
+            :icon="'Picture'"
             class="attach-img-btn"
             :disabled="ai.sending || configBlocked"
             :loading="imageReading"
@@ -2633,7 +2642,7 @@ function renderMarkdown(text: string): string {
                 trigger="click"
                 popper-class="ai-skill-dropdown"
                 placement="top-start"
-                @command="(cmd: string) => (cmd === '__manage__' ? (skillManagerVisible = true) : toggleSkill(domainSkills.find((s) => s.id === cmd)!))"
+                @command="onSkillCommand"
               >
                 <button class="skill-btn" title="选择技能">
                   <el-icon><Plus /></el-icon>
@@ -2730,7 +2739,7 @@ function renderMarkdown(text: string): string {
               <el-button
                 v-if="!ai.sending"
                 link
-                :icon="Promotion"
+                :icon="'Promotion'"
                 :disabled="(!inputText.trim() && attachedImages.length === 0) || configBlocked"
                 class="inline-send-btn"
                 title="发送 (Enter)"
@@ -2739,7 +2748,7 @@ function renderMarkdown(text: string): string {
               <el-button
                 v-else
                 link
-                :icon="VideoPause"
+                :icon="'VideoPause'"
                 class="inline-send-btn stop-btn"
                 title="终止生成"
                 @click="handleStop"
@@ -2773,7 +2782,7 @@ function renderMarkdown(text: string): string {
   </div>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .ai-panel {
   position: relative;
   height: 100%;

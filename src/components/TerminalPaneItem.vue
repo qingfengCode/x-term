@@ -9,7 +9,6 @@
  * inject 注册回 Workspace（工具栏/广播按 tabId::paneId 索引）。
  */
 import { computed, inject } from "vue";
-import { Close, FullScreen, Key, Menu, Refresh } from "@element-plus/icons-vue";
 import TerminalPane from "@/components/TerminalPane.vue";
 import { useTerminalsStore, type TerminalPaneState, type TerminalTab } from "@/stores/terminals";
 import type { SplitDirection } from "@/utils/splitLayout";
@@ -122,7 +121,7 @@ function manualAuth() {
             </div>
             <el-button
               type="primary"
-              :icon="Refresh"
+              :icon="'Refresh'"
               :loading="pane.reconnecting"
               @click="reconnect"
             >
@@ -135,7 +134,7 @@ function manualAuth() {
       <div v-else-if="pane.error" class="pane-status error">
         <span class="pane-error-text">连接失败：{{ pane.error }}</span>
         <!-- 认证失败：提供手动输入密码/口令码重试的入口（弹窗） -->
-        <el-button v-if="isAuthError(pane.error)" size="small" :icon="Key" @click="manualAuth">
+        <el-button v-if="isAuthError(pane.error)" size="small" :icon="'Key'" @click="manualAuth">
           手动认证
         </el-button>
       </div>
@@ -143,7 +142,7 @@ function manualAuth() {
   </div>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .term-item {
   display: flex;
   flex-direction: column;

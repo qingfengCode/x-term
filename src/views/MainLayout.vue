@@ -471,7 +471,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onNumberKeydown));
   </div>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .main-layout {
   display: flex;
   flex-direction: row;

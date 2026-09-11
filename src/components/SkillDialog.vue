@@ -134,7 +134,7 @@ function submit() {
   </el-dialog>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .hint {
   margin-left: 8px;
   font-size: 12px;

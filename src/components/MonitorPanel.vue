@@ -113,7 +113,6 @@
  */
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { Monitor, WarningFilled } from "@element-plus/icons-vue";
 import * as monitorApi from "@/api/monitor";
 import type { MonitorDataEvent } from "@/api/monitor";
 import { formatSize } from "@/utils/format";

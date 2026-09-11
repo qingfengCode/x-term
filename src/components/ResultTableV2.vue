@@ -68,7 +68,7 @@ const v2Columns = computed<Column<any>[]>(() => {
   </div>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .result-table-v2 {
   width: 100%;
   overflow: hidden;

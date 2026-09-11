@@ -13,7 +13,7 @@
  * 借鉴自 uniTerm 的 useTerminalInput（Apache-2.0），适配 x-term 的组件结构：
  * 终端实例以 getter 注入（TerminalPane 的 term 是组件生命周期内的 let 变量）。
  */
-import { computed, ref } from "vue";
+import { computed, onBeforeUnmount, ref } from "vue";
 import type { Terminal } from "@xterm/xterm";
 
 export interface CursorPixelPos {
@@ -360,6 +360,19 @@ export function useTerminalInput(
   function isPasswordMode(): boolean {
     return isPasswordPrompt;
   }
+
+  // 宿主组件卸载时清理待决的定时器/动画帧：销毁瞬间回调仍会触发，里面
+  // 访问已 dispose 的 xterm 缓冲虽被 try/catch 兜住，但没必要留隐患。
+  onBeforeUnmount(() => {
+    if (passwordConfirmTimer) {
+      clearTimeout(passwordConfirmTimer);
+      passwordConfirmTimer = null;
+    }
+    if (cursorPosRAF !== null) {
+      cancelAnimationFrame(cursorPosRAF);
+      cursorPosRAF = null;
+    }
+  });
 
   return {
     lineBuffer,

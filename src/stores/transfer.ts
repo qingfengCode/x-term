@@ -41,6 +41,38 @@ function isEnded(t: TransferTask): boolean {
   return t.status === "done" || t.status === "error" || t.status === "cancelled";
 }
 
+// --- 展示助手（DownloadDrawer / TransferQueue 共用，替代两份拷贝） ----------
+
+/** 任务进度百分比（0-100；总量未知为 0）。 */
+export function transferPercent(t: TransferTask): number {
+  if (!t.total || t.total <= 0) return 0;
+  return Math.max(0, Math.min(100, Math.floor((t.transferred / t.total) * 100)));
+}
+
+/** 任务状态文案（进行中显示百分比）。 */
+export function transferStatusText(t: TransferTask): string {
+  switch (t.status) {
+    case "pending":
+      return "等待中";
+    case "running":
+      return `${transferPercent(t)}%`;
+    case "done":
+      return "已完成";
+    case "error":
+      return "失败";
+    case "cancelled":
+      return "已取消";
+  }
+}
+
+/** el-progress 的 status 映射。 */
+export function transferProgressStatus(t: TransferTask): "" | "success" | "exception" | "warning" {
+  if (t.status === "done") return "success";
+  if (t.status === "error") return "exception";
+  if (t.status === "cancelled") return "warning";
+  return "";
+}
+
 export const useTransferStore = defineStore("transfer", () => {
   const tasks = ref<TransferTask[]>([]);
 

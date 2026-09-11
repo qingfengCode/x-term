@@ -288,7 +288,7 @@ function sendCtrlAltDel() {
   </div>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .vnc-pane {
   position: absolute;
   inset: 0;

@@ -19,12 +19,6 @@ export interface FileAccount {
   updatedAt: string;
 }
 
-/** 创建/更新文件账号时的明文凭据输入（前端临时持有，提交后经 vault 加密）。 */
-export interface S3CredentialInput {
-  accessKey: string;
-  secretKey: string;
-}
-
 // ---------------------------------------------------------------------------
 // 账号 CRUD
 // ---------------------------------------------------------------------------

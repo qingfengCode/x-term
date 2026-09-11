@@ -28,7 +28,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import { ElMessage } from "element-plus";
-import { VideoPlay, VideoPause, Refresh, CopyDocument, Key } from "@element-plus/icons-vue";
 import HelpTip from "@/components/HelpTip.vue";
 import { useMcpStore } from "@/stores/mcp";
 import { useSessionsStore } from "@/stores/sessions";
@@ -791,11 +790,11 @@ onMounted(async () => {
         <span class="card-ico"><el-icon><SwitchButton /></el-icon></span>
         <span class="card-title-text">运行状态</span>
         <div class="head-actions">
-          <el-button :icon="Refresh" size="small" @click="mcp.refresh(kind)">刷新</el-button>
+          <el-button :icon="'Refresh'" size="small" @click="mcp.refresh(kind)">刷新</el-button>
           <el-button
             v-if="!status.running"
             type="primary"
-            :icon="VideoPlay"
+            :icon="'VideoPlay'"
             size="small"
             :loading="loading"
             @click="start"
@@ -805,7 +804,7 @@ onMounted(async () => {
           <el-button
             v-else
             type="danger"
-            :icon="VideoPause"
+            :icon="'VideoPause'"
             size="small"
             :loading="loading"
             @click="stop"
@@ -840,7 +839,7 @@ onMounted(async () => {
         <span class="endpoint-tag">SSE</span>
         <code class="endpoint-url">{{ fullUrl }}</code>
         <el-tooltip content="复制端点地址" placement="top">
-          <el-button :icon="CopyDocument" link size="small" @click="copy(fullUrl, '已复制端点地址')" />
+          <el-button :icon="'CopyDocument'" link size="small" @click="copy(fullUrl, '已复制端点地址')" />
         </el-tooltip>
       </div>
 
@@ -905,10 +904,10 @@ onMounted(async () => {
         <el-input :model-value="config.token ?? ''" placeholder="点击生成 token" readonly class="token-input">
           <template #prefix><el-icon><Key /></el-icon></template>
         </el-input>
-        <el-button type="primary" :icon="Refresh" @click="generateToken">
+        <el-button type="primary" :icon="'Refresh'" @click="generateToken">
           {{ config.token ? "重新生成" : "生成 Token" }}
         </el-button>
-        <el-button v-if="config.token" :icon="CopyDocument" @click="copy(config.token, '已复制 token')">复制</el-button>
+        <el-button v-if="config.token" :icon="'CopyDocument'" @click="copy(config.token, '已复制 token')">复制</el-button>
       </div>
       <!-- 安全警告：保持直接展示，不收进 tooltip -->
       <div class="token-warn">
@@ -933,7 +932,7 @@ onMounted(async () => {
         <div class="json-head">
           <span class="json-dots"><i class="jd-r" /><i class="jd-y" /><i class="jd-g" /></span>
           <span class="json-name">mcp-client-config.json</span>
-          <el-button :icon="CopyDocument" size="small" text bg @click="copy(clientConfig, '已复制配置 JSON')">
+          <el-button :icon="'CopyDocument'" size="small" text bg @click="copy(clientConfig, '已复制配置 JSON')">
             复制配置
           </el-button>
         </div>
@@ -943,7 +942,7 @@ onMounted(async () => {
   </div>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .instance-panel {
   display: flex;
   flex-direction: column;

@@ -7,7 +7,6 @@ import SplitArea from "@/components/SplitArea.vue";
 import MonitorPanel from "@/components/MonitorPanel.vue";
 import AiPanel from "@/components/AiPanel.vue";
 import TabBar, { type TabBarItem } from "@/components/TabBar.vue";
-import { Delete, Top, Bottom, ZoomIn, ZoomOut, Refresh, Plus, ArrowDown, ArrowUp, Monitor, Menu, Bell } from "@element-plus/icons-vue";
 import { ElMessage } from "element-plus";
 import { eventToCombo, isModifierOnly, matchesCombo } from "@/utils/shortcut";
 import type { ShortcutCommand } from "@/api/types";
@@ -607,7 +606,7 @@ onBeforeUnmount(() => {
           :title="scExpanded ? '收起（单行显示）' : '展开（多行换行）'"
           @click="toggleScExpand"
         >
-          <el-icon><component :is="scExpanded ? ArrowUp : ArrowDown" /></el-icon>
+          <el-icon><component :is="scExpanded ? 'ArrowUp' : 'ArrowDown'" /></el-icon>
           <span>{{ scExpanded ? "收起" : "展开" }}</span>
         </button>
       </div>
@@ -615,7 +614,7 @@ onBeforeUnmount(() => {
   </div>
 </template>
 
-<style scoped>
+<style scoped lang="scss">
 .workspace {
   display: flex;
   flex-direction: column;
