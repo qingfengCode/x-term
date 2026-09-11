@@ -11,10 +11,14 @@
   - "client"（客户端直连）：免绑定实例，调用方在工具参数中传
     host/port/username/password，凭据即用即弃、不存储不落日志。
     （File MCP 不支持 client 模式）
+  - "multi"（多机模式，仅 SSH）：勾选一组 SSH 会话授权给外部 AI，工具调用必传
+    target（授权机器名，重名自动加 #序号 后缀），由 AI 自行决定每次执行的目标
+    机器；越权 target 被拒绝。运行中调整勾选可热切换即时生效。
 
   功能：
   - 资源模式开关（直连模式隐藏绑定 UI 并展示安全提示；File kind 隐藏此开关）。
-  - 绑定资源下拉（启动前/后均可改；运行中改后提示"需重启生效"）。
+  - 绑定资源下拉（启动前/后均可改；运行中改后提示"需重启生效"，
+    multi 模式的勾选集合变更可热切换）。
   - 监听地址（默认 127.0.0.1；可改为 0.0.0.0 / 局域网 IP 对外开放）与端口可编辑。
   - token 生成 / 复制。
   - 启停按钮 + 运行状态徽标 + SSE 端点。
@@ -65,6 +69,11 @@ const toolHint = computed(() => {
       ? "对外暴露 exec_ssh(host/port/username/password/command)：目标服务器由调用方在参数中指定，免绑定本地实例。"
       : "对外暴露 exec_sql(host/port/username/password/database/sql)：目标数据库由调用方在参数中指定，免绑定本地实例。";
   }
+  if (multiMode.value) {
+    return "对外暴露 exec_ssh(target, command) / list_files / upload_file / download_file（均需 target）\
+与只读 list_machines()（机器清单）。target 由外部 AI 从下方勾选的机器中自行选择，\
+越权 target 会被拒绝并回显可用清单。";
+  }
   if (terminalBound.value) {
     return "对外暴露 exec_ssh(command)：命令写入下方绑定的终端标签页执行（支持 A→B→C 跳板嵌套，\
 命令在终端当前所在的远端主机上执行，用户可实时看到执行过程）。";
@@ -89,29 +98,47 @@ const loading = computed(() => mcp.loading[props.kind]);
 /** 客户端直连模式（免绑定实例）：目标与账密由调用方在工具参数中传入。File 不支持。 */
 const clientMode = computed(() => !isFile.value && config.value.resourceMode === "client");
 
+/** 多机模式（仅 SSH）：勾选一组机器授权给外部 AI，由 AI 按工具参数 target 自选目标。 */
+const multiMode = computed(() => isSsh.value && config.value.resourceMode === "multi");
+
+/** 多机模式的勾选集合（旧配置无 resourceIds 字段时兜底为空数组，避免 multiple select 收到 undefined）。 */
+const selectedIds = computed<string[]>({
+  get: () => config.value.resourceIds ?? [],
+  set: (v) => {
+    config.value.resourceIds = v;
+  },
+});
+
 /** 绑定来源（兼容旧配置无该字段的情况）。 */
 const boundSource = computed<McpBoundSource>(
   () => config.value.boundSource ?? "config",
 );
 
 /**
- * 模式 / 绑定方式（三选一，下拉框展示用）：
+ * 模式 / 绑定方式（下拉框展示用）：
  * - "config"：会话配置绑定（bound + boundSource=config）
  * - "terminal"：终端标签页绑定（bound + boundSource=terminal）
+ * - "multi"：多机模式（resourceMode=multi，仅 SSH：勾选一组机器，AI 按 target 自选）
  * - "client"：客户端直连（resourceMode=client，免绑定）
  */
-const mode = computed<"config" | "terminal" | "client">(() => {
+const mode = computed<"config" | "terminal" | "multi" | "client">(() => {
   if (config.value.resourceMode === "client") return "client";
+  if (config.value.resourceMode === "multi") return "multi";
   return boundSource.value === "terminal" ? "terminal" : "config";
 });
 
 /** 终端标签页绑定模式（SSH kind + bound 模式 + 来源为 terminal）。 */
 const terminalBound = computed(
-  () => isSsh.value && !clientMode.value && boundSource.value === "terminal",
+  () => isSsh.value && !clientMode.value && !multiMode.value && boundSource.value === "terminal",
 );
 
 /** 模式 / 绑定方式的说明（悬浮帮助）。 */
 const modeHint = computed(() => {
+  if (multiMode.value) {
+    return "勾选一组机器授权给外部 AI：每次工具调用由 AI 按机器名 / 地址 / 标签自行决定目标\
+（参数 target）。重名机器的目标名自动加 #序号 后缀；确认卡片与日志都会显示目标机器。\
+运行中调整勾选即时生效；切换到/离开本模式需重启服务。";
+  }
   if (terminalBound.value) {
     return "命令将写入所选终端执行：终端当前在哪个远端主机（含 A→B→C 跳板嵌套）\
 命令就在哪个主机上执行。执行期间请勿手动操作该终端；终端关闭后绑定失效，需重新选择。";
@@ -124,10 +151,56 @@ const modeHint = computed(() => {
 无法执行到跳板后的主机（如 A→B→C 中的 C）。需要时切换为「终端标签页」。";
 });
 
-/** 自动放行开关的说明（悬浮帮助）。 */
-const autoApproveHint =
-  "开启后，外部客户端的 exec_ssh / exec_sql 请求不再弹出确认框，直接执行。\
-适用于你信任的客户端场景；关闭则每次执行都需要你在 X-Term 中手动确认。";
+/** 多机勾选控件的悬浮帮助。 */
+const machinesHint =
+  "目标名即会话名（重名自动加 #序号 后缀），会连同地址与标签暴露给外部 AI 做路由决策。\
+AI 只能在勾选的机器里选择目标，越权 target 会被拒绝。";
+
+/** 运行模式选项（与 AI 助手的执行模式语义一致）。 */
+const RUN_MODE_OPTIONS: {
+  value: "manual" | "whitelist" | "auto";
+  label: string;
+  desc: string;
+}[] = [
+  {
+    value: "manual",
+    label: "手动运行",
+    desc: "所有调用都弹出确认，批准后才执行",
+  },
+  {
+    value: "whitelist",
+    label: "白名单运行",
+    desc: "白名单内自动放行，其余弹出确认",
+  },
+  {
+    value: "auto",
+    label: "自动运行",
+    desc: "全部自动执行（文件传输仍需确认）",
+  },
+];
+
+/** 当前模式的说明文案（按 kind 展开白名单的具体含义）。 */
+const runModeDesc = computed(() => {
+  switch (config.value.runMode) {
+    case "auto":
+      return "外部客户端的所有调用直接执行，不弹确认（文件传输除外）";
+    case "whitelist":
+      return isSsh.value
+        ? "命令白名单内自动执行（同「设置 → AI」的 SSH 白名单），其余弹确认"
+        : isFile.value
+          ? "读操作自动执行，文件上传/下载仍弹确认"
+          : "只读 SQL（SELECT/SHOW/EXPLAIN/DESCRIBE）自动执行，其余弹确认";
+    default:
+      return "外部客户端的每次调用都需你在 X-Term 中确认后执行";
+  }
+});
+
+/** 运行模式的说明（悬浮帮助）。 */
+const runModeHint =
+  "与 AI 助手的执行模式语义一致：手动运行 = 所有调用人工确认；\
+白名单运行 = 白名单内自动放行（SSH 为「设置 → AI」的命令白名单、DB 为只读 SQL、\
+文件为读操作），其余人工确认；自动运行 = 全部自动执行。\
+例外：upload_file / download_file 读写本机任意路径，任何模式下都强制人工确认。";
 
 /** 记录执行日志开关的说明（悬浮帮助）。 */
 const logHint =
@@ -158,8 +231,40 @@ const hasResources = computed(() => {
   return dbProfiles.value.length > 0;
 });
 
+/**
+ * 与后端 disambiguate_display_names 同规则生成展示名：
+ * 唯一名保持原名；重名组内按 id 字典序加 `#k`（k 从 1 起）。
+ * **必须按已勾选集合计算**（后端同样只对勾选集合编号），全量集合算出的
+ * 编号可能不同（如 3 台同名只勾了 2 台）。
+ */
+function displayNamesOf(sessions: { id: string; name: string }[]): Map<string, string> {
+  const byName = new Map<string, string[]>();
+  for (const s of sessions) {
+    const list = byName.get(s.name) ?? [];
+    list.push(s.id);
+    byName.set(s.name, list);
+  }
+  const out = new Map<string, string>();
+  for (const s of sessions) {
+    const ids = (byName.get(s.name) ?? []).slice().sort();
+    out.set(s.id, ids.length === 1 ? s.name : `${s.name}#${ids.indexOf(s.id) + 1}`);
+  }
+  return out;
+}
+
 /** 绑定资源的展示名（用于运行状态/提示）。 */
 const boundResourceName = computed(() => {
+  if (multiMode.value) {
+    const ids = config.value.resourceIds ?? [];
+    if (ids.length === 0) return "";
+    // 按勾选集合计算带后缀的目标名（与确认卡片 / tools/list enum 完全一致）。
+    const selected = ids
+      .map((id) => sshSessions.value.find((s) => s.id === id))
+      .filter((s): s is Session => !!s);
+    const names = displayNamesOf(selected);
+    const labels = ids.map((id) => names.get(id) ?? "(会话已删除)");
+    return `多机模式 · 已授权 ${ids.length} 台：${labels.join("、")}`;
+  }
   const id = config.value.resourceId;
   if (!id) return "";
   if (isSsh.value && terminalBound.value) {
@@ -265,29 +370,45 @@ async function loadDatabases(profileId: string) {
  * 组合映射：
  * - config  → resourceMode="bound" + boundSource="config"
  * - terminal→ resourceMode="bound" + boundSource="terminal"
+ * - multi   → resourceMode="multi"（仅 SSH；勾选集合另选）
  * - client  → resourceMode="client"（忽略绑定）
  *
  * 规则：
- * - config ↔ terminal 的 id 空间不同，清空 resourceId 重选；
- *   运行中走热切换（`mcp_rebind`）即时生效。
- * - 涉及 client 的切换不能热切换（后端 resource_mode 启动时固化），提示重启。
+ * - config ↔ terminal ↔ multi 的 id 空间不同（单选/多选），清空 resourceId 重选；
+ *   config ↔ terminal 运行中可热切换（`mcp_rebind`）；multi 的勾选集合变更走
+ *   `mcp_rebind_multi` 热切换。
+ * - 涉及 client / multi 的模式切换不能热切换（后端 resource_mode 启动时固化），
+ *   提示重启。
  */
 async function onModeChange(value: string | number | boolean) {
-  const next = value === "client" ? "client" : value === "terminal" ? "terminal" : "config";
+  const next =
+    value === "client"
+      ? "client"
+      : value === "multi"
+        ? "multi"
+        : value === "terminal"
+          ? "terminal"
+          : "config";
   if (next === mode.value) return;
   const prev = mode.value;
-  config.value.resourceMode = next === "client" ? "client" : "bound";
+  config.value.resourceMode =
+    next === "client" ? "client" : next === "multi" ? "multi" : "bound";
   config.value.boundSource = next === "terminal" ? "terminal" : "config";
   if (prev !== "client" && next !== "client") {
-    // 会话配置 ↔ 终端标签页：resourceId 属于不同 id 空间，清空重选。
+    // 单选 / 多选的 id 空间不同，清空重选。
     config.value.resourceId = undefined;
   }
-  if (next === "client" || prev === "client") {
-    // 涉及客户端直连：需重启生效。
+  if (next === "client" || prev === "client" || next === "multi" || prev === "multi") {
+    // 涉及客户端直连或多机：resource_mode 启动时固化，需重启生效。
     await saveConfigAndMaybeWarn();
   } else {
     await saveConfigAndMaybeWarn({ hotRebind: true });
   }
+}
+
+/** 多机模式勾选变更：保存配置；运行中热切换（mcp_rebind_multi）即时生效。 */
+async function onMachinesChange() {
+  await saveConfigAndMaybeWarn({ hotRebindMulti: true });
 }
 
 /** 绑定资源变更处理。 */
@@ -302,7 +423,8 @@ async function onResourceChange() {
 /**
  * 绑定/地址/端口改动后保存配置。
  *
- * `hotRebind`：绑定类改动在服务运行中尝试热切换（`mcp_rebind`，立即生效无需重启）；
+ * `hotRebind`：单选绑定类改动在服务运行中尝试热切换（`mcp_rebind`，立即生效
+ * 无需重启）；`hotRebindMulti`：多机勾选集合改动走 `mcp_rebind_multi` 热切换；
  * 未传则按原有行为提示"需重启生效"。
  *
  * 保存失败时把内存配置回滚到最近一次成功保存的快照（见 [`rollbackConfig`]），
@@ -310,11 +432,32 @@ async function onResourceChange() {
  *
  * @returns 是否保存成功（false 时调用方应中止后续依赖新配置的操作，如启动）。
  */
-async function saveConfigAndMaybeWarn(opts?: { hotRebind?: boolean }): Promise<boolean> {
+async function saveConfigAndMaybeWarn(opts?: {
+  hotRebind?: boolean;
+  hotRebindMulti?: boolean;
+}): Promise<boolean> {
   try {
     await mcp.saveConfig(props.kind);
     lastSaved = { ...config.value };
     if (!needsRestart.value) return true;
+    if (opts?.hotRebindMulti && multiMode.value) {
+      const ids = config.value.resourceIds ?? [];
+      if (ids.length === 0) {
+        // 清空勾选：运行中的集合保持旧值，重新勾选后即时生效。
+        ElMessage.info("已保存。请勾选机器，勾选后将即时生效。");
+        return true;
+      }
+      try {
+        const applied = await mcp.rebindMulti(props.kind, ids);
+        // 区分"已即时生效"与"仅保存"（服务未运行或以其它模式运行），
+        // 避免在 bound/client 模式运行中调整勾选时误导用户。
+        if (applied) ElMessage.success("机器集合已即时生效");
+        else ElMessage.info("配置已保存，服务（重）启动后生效");
+      } catch (e) {
+        ElMessage.warning("热切换失败，重启服务后生效：" + String(e));
+      }
+      return true;
+    }
     if (opts?.hotRebind) {
       if (!config.value.resourceId) {
         // 切换绑定类型后尚未选择新资源：运行中的绑定保持旧值，重选后即时生效。
@@ -358,12 +501,14 @@ function onFieldChange() {
   void saveConfigAndMaybeWarn();
 }
 
-/** 自动放行开关改动：保存配置（后端立即生效，无需重启）。 */
-async function saveAutoApprove() {
+/** 运行模式切换：保存配置（后端立即生效，无需重启）。 */
+async function saveRunMode() {
   try {
     await mcp.saveConfig(props.kind);
     lastSaved = { ...config.value };
-    ElMessage.success(config.value.autoApprove ? "已开启自动放行" : "已关闭自动放行");
+    const label =
+      RUN_MODE_OPTIONS.find((o) => o.value === config.value.runMode)?.label ?? "手动运行";
+    ElMessage.success(`已切换为「${label}」`);
   } catch (e) {
     rollbackConfig();
     ElMessage.error("保存失败：" + String(e));
@@ -371,7 +516,13 @@ async function saveAutoApprove() {
 }
 
 async function start() {
-  if (!clientMode.value && !config.value.resourceId) {
+  // 多机模式：勾选集合非空即可（无单选 resourceId）。
+  if (multiMode.value) {
+    if ((config.value.resourceIds?.length ?? 0) === 0) {
+      ElMessage.warning("多机模式请先勾选至少一台机器");
+      return;
+    }
+  } else if (!clientMode.value && !config.value.resourceId) {
     const resName = terminalBound.value
       ? "终端标签页"
       : isSsh.value
@@ -464,8 +615,46 @@ onMounted(async () => {
             value="config"
             :label="isSsh ? '会话配置（新建连接执行）' : '会话配置（绑定数据库连接）'"
           />
+          <el-option v-if="isSsh" value="multi" label="多机模式（勾选多台，AI 自选目标）" />
           <el-option value="client" label="客户端直连（免绑定，调用方传账密）" />
         </el-select>
+      </div>
+
+      <!-- 多机模式说明 -->
+      <el-alert v-if="multiMode" type="info" :closable="false" show-icon class="alert-gap">
+        <div class="client-mode-alert">
+          <div>工具调用需传 <code>target</code> 指定目标机器，外部 AI 按机器名 / 地址 / 标签自行路由。</div>
+          <div>重名机器的目标名自动加 <code>#序号</code> 后缀；越权 target 会被直接拒绝。</div>
+          <div>运行中调整勾选<strong>即时生效</strong>；切换到 / 离开本模式需<strong>重启 MCP 服务</strong>。</div>
+        </div>
+      </el-alert>
+
+      <!-- 多机模式：勾选授权机器集合 -->
+      <div v-if="multiMode" class="field-row">
+        <label class="field-label">
+          授权机器（多选）
+          <HelpTip :content="machinesHint" />
+          <span class="required">*</span>
+        </label>
+        <el-select
+          v-model="selectedIds"
+          multiple
+          filterable
+          placeholder="勾选授权给外部 AI 的机器（至少一台）"
+          class="field-control"
+          :disabled="!hasResources"
+          @change="onMachinesChange"
+        >
+          <el-option
+            v-for="s in sshSessions"
+            :key="s.id"
+            :label="`${s.name} (${s.host}:${s.port})`"
+            :value="s.id"
+          />
+        </el-select>
+        <div v-if="selectedIds.length > 0" class="hint-text">
+          已选 {{ selectedIds.length }} 台；重名机器的目标名将自动加 #序号 后缀。
+        </div>
       </div>
 
       <!-- 直连模式安全提示 -->
@@ -484,8 +673,8 @@ onMounted(async () => {
         </div>
       </el-alert>
 
-      <!-- 绑定资源（仅绑定模式） -->
-      <div v-if="!clientMode" class="field-row">
+      <!-- 绑定资源（仅单选绑定模式；多机模式用上方的多选集合） -->
+      <div v-if="!clientMode && !multiMode" class="field-row">
         <label class="field-label">
           绑定{{ terminalBound ? "终端标签页" : isSsh ? "SSH 会话" : isFile ? "S3 文件账号" : "数据库连接" }}
           <span class="required">*</span>
@@ -633,7 +822,13 @@ onMounted(async () => {
           <span class="hero-state">{{ status.running ? "运行中" : "已停止" }}</span>
           <span class="hero-desc">
             <template v-if="status.running">
-              {{ clientMode ? "客户端直连模式 · 未绑定实例" : `已绑定 · ${boundResourceName || "—"}` }}
+              {{
+                clientMode
+                  ? "客户端直连模式 · 未绑定实例"
+                  : multiMode
+                    ? boundResourceName || "多机模式 · 未勾选机器"
+                    : `已绑定 · ${boundResourceName || "—"}`
+              }}
             </template>
             <template v-else>完成配置后点击「启动服务」对外提供调用</template>
           </span>
@@ -649,16 +844,35 @@ onMounted(async () => {
         </el-tooltip>
       </div>
 
-      <!-- 自动放行开关 -->
+      <!-- 运行模式（与 AI 助手执行模式一致：手动 / 白名单 / 自动） -->
       <div class="switch-row">
         <div class="switch-info">
           <div class="switch-title">
-            自动放行（免确认）
-            <HelpTip :content="autoApproveHint" />
+            运行模式
+            <HelpTip :content="runModeHint" />
           </div>
-          <div class="switch-desc">外部客户端的调用请求不再弹窗确认，直接执行</div>
+          <div class="switch-desc">{{ runModeDesc }}</div>
         </div>
-        <el-switch v-model="config.autoApprove" @change="saveAutoApprove" />
+        <el-select
+          :model-value="config.runMode"
+          size="small"
+          class="runmode-select"
+          style="width: 118px"
+          @change="
+            (v: 'manual' | 'whitelist' | 'auto') => {
+              config.runMode = v;
+              saveRunMode();
+            }
+          "
+        >
+          <el-option
+            v-for="opt in RUN_MODE_OPTIONS"
+            :key="opt.value"
+            :value="opt.value"
+            :label="opt.label"
+            :title="opt.desc"
+          />
+        </el-select>
       </div>
 
       <!-- 执行日志开关 -->
@@ -712,7 +926,7 @@ onMounted(async () => {
       </div>
       <div v-if="!status.running || !config.token" class="config-empty">
         <el-alert type="info" :closable="false" show-icon>
-          请先完成配置（{{ clientMode ? "直连模式无需绑定实例" : "绑定资源" }}）、生成 token 并启动服务，配置将自动生成。
+          请先完成配置（{{ clientMode ? "直连模式无需绑定实例" : multiMode ? "勾选授权机器" : "绑定资源" }}）、生成 token 并启动服务，配置将自动生成。
         </el-alert>
       </div>
       <div v-else class="json-block">

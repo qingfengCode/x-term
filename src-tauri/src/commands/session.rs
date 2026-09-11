@@ -88,11 +88,26 @@ async fn open_ssh_terminal(
     let mut ssh = SshSession::open(session_config, resolved, state.clone()).await?;
     ssh.spawn_reader()?;
     let id = ssh.id.clone();
-    state
-        .terminals
-        .lock()
-        .insert(id.clone(), crate::state::TerminalSession::Ssh(ssh));
+    let terminal = crate::state::TerminalSession::Ssh(ssh);
+    attach_output_log_if_enabled(state, &terminal, &session_config.name);
+    state.terminals.lock().insert(id.clone(), terminal);
     Ok(id)
+}
+
+/// 设置开启时为终端会话装配输出日志（logs/<会话名>_<时间>.log）。
+///
+/// reader 持有共享句柄，装配即时生效；失败只告警不阻断连接。
+fn attach_output_log_if_enabled(
+    state: &AppState,
+    session: &crate::state::TerminalSession,
+    name: &str,
+) {
+    let enabled = crate::config::settings_load_inner(state)
+        .map(|s| s.terminal.output_log)
+        .unwrap_or(false);
+    if enabled {
+        session.attach_output_log(name, &state.data_dir.join("logs"));
+    }
 }
 
 /// 连接一个会话配置，打开交互式终端，返回终端实例 id（前端 tab 标识）。
@@ -133,10 +148,9 @@ pub async fn connect_session(
             )
             .await?;
             let id = telnet.id.clone();
-            state
-                .terminals
-                .lock()
-                .insert(id.clone(), crate::state::TerminalSession::Telnet(telnet));
+            let terminal = crate::state::TerminalSession::Telnet(telnet);
+            attach_output_log_if_enabled(state.inner(), &terminal, &session_config.name);
+            state.terminals.lock().insert(id.clone(), terminal);
             id
         }
         _ => {
@@ -155,7 +169,8 @@ pub async fn connect_session(
 /// - `password` 非空时，忽略会话配置的认证方式（私钥会话也回退），改用该
 ///   密码认证；
 /// - `otp` 为二次认证验证码（口令码/动态口令等），keyboard-interactive 流程
-///   自动预填首个验证码提示，其余提示仍弹窗请用户输入；
+///   自动预填验证码类提示（跳板机常见第 1 轮问密码、第 2 轮问口令码，任意
+///   轮次均可预填），其余提示仍弹窗请用户输入；
 /// - 两者均可为空：密码为空回退使用会话配置已保存的凭据，验证码为空则不预填。
 ///
 /// 仅支持 SSH 协议；Telnet 等协议直接回退 [`connect_session`] 原流程。
@@ -198,6 +213,55 @@ pub async fn connect_session_with_manual_auth(
     // 私钥会话 + 均未提供：保持原认证方式重试。
 
     open_ssh_terminal(&session_config, resolved, state.inner()).await
+}
+
+/// 复制一个已连接的 SSH 终端会话：在同一条**已认证**连接上打开新 channel
+/// （PTY + shell），返回新终端实例 id。
+///
+/// 不新建 TCP 连接、不重新认证——二次认证（口令码/动态口令）服务器上复制
+/// 通道无需再次输入验证码。连接生命周期由共享计数管理：任一副本关闭只
+/// 关自己的 channel，最后一个关闭者才断开传输层（见 [`SshSession::close`]）。
+///
+/// 仅支持 SSH 协议；源实例不存在 / 非 SSH / 通道打开失败时返回错误，由前端
+/// 回退到全量重连（`connect_session`）。
+#[tauri::command]
+pub async fn clone_terminal_session(
+    instance_id: String,
+    state: State<'_, AppState>,
+) -> AppResult<String> {
+    // 短锁取出共享部件后立即放锁：channel_open_session 是网络操作，
+    // 锁内 await 会冻结所有终端的读写命令。
+    let transport = {
+        let terminals = state.terminals.lock();
+        match terminals.get(&instance_id) {
+            Some(crate::state::TerminalSession::Ssh(s)) => s.shared_transport(),
+            _ => {
+                return Err(AppError::NotFound(format!(
+                    "终端 {} 不存在或非 SSH 会话（仅 SSH 支持复制通道）",
+                    instance_id
+                )))
+            }
+        }
+    };
+
+    let mut ssh = SshSession::open_channel_on(transport).await?;
+    ssh.spawn_reader()?;
+    let id = ssh.id.clone();
+    // 复制通道：日志名沿用源会话配置名（查 DB；查不到用配置 id）。
+    // 在 move 进 TerminalSession 之前取。
+    let config_id = ssh.session_config_id.clone();
+    let log_name = {
+        let conn = state.conn()?;
+        crate::storage::sessions_repo::get_session(&conn, &config_id)
+            .ok()
+            .flatten()
+            .map(|s| s.name)
+            .unwrap_or(config_id)
+    };
+    let terminal = crate::state::TerminalSession::Ssh(ssh);
+    attach_output_log_if_enabled(state.inner(), &terminal, &log_name);
+    state.terminals.lock().insert(id.clone(), terminal);
+    Ok(id)
 }
 
 /// 断开一个终端实例。

@@ -8,7 +8,7 @@ export interface AiChatRequest {
   agentMode?: boolean;
   /** 当前活动终端 instanceId（工具上下文，可选）。 */
   activeTerminalId?: string;
-  /** 当前活动 MySQL 连接 id（可选）。 */
+  /** 当前活动数据库连接 id（MySQL / PostgreSQL，可选）。 */
   activeDbConnId?: string;
   /** 当前活动内嵌 RDP 会话的桥接实例 id（桌面助手用，启用 desktop_* 工具）。 */
   activeDesktopId?: string;
@@ -23,6 +23,11 @@ export function aiChat(req: AiChatRequest): Promise<void> {
 /** 终止正在进行的 AI 请求。 */
 export function aiStop(requestId: string): Promise<void> {
   return invoke<void>("ai_stop", { requestId });
+}
+
+/** 终端智能补全：让 AI 把当前输入补全为完整命令（一次性、无对话历史）。 */
+export function aiCompleteCommand(input: string): Promise<string> {
+  return invoke<string>("ai_complete_command", { input });
 }
 
 /** 设置某个助手域的工作目录（传空串清除）。 */
@@ -42,8 +47,15 @@ export interface SerializableConversation {
   messages: unknown[];
   /** 智能体任务清单（todo_write 维护；旧文件无此字段）。 */
   todos?: { content: string; status: string }[];
-  /** 会话累计 token 用量（ai:usage 事件累计；旧文件无此字段）。 */
+  /** 最近一次模型请求的 token 用量（ai:usage 事件覆盖写入，非累计；
+   *  旧文件无此字段，或旧值语义为"累计"——会在下一次请求时被覆盖）。 */
   usage?: { prompt: number; completion: number };
+  /** 是否已归档（关闭的会话进历史归档；旧文件无此字段 → false）。 */
+  archived?: boolean;
+  /** 最后活动时间（毫秒时间戳；旧文件无此字段）。 */
+  updatedAt?: number;
+  /** 归档时间（毫秒时间戳；仅归档会话有；旧文件无此字段）。 */
+  archivedAt?: number;
 }
 
 /** 读取指定 domain（"ssh" / "db"）的对话历史。 */

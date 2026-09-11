@@ -1,6 +1,6 @@
 [package]
 name = "x-term"
-version = "0.1.41"
+version = "0.1.59"
 description = "X-Term 现代化运维终端客户端"
 authors = ["x-term"]
 edition = "2021"
@@ -43,9 +43,10 @@ portable-pty = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.25"
-# MySQL（SQL 控制台 + AI 工具）
-# rust_decimal：DECIMAL 列解码（sqlx 的 String 解码不兼容 DECIMAL）
-sqlx = { version = "0.8", default-features = false, features = ["mysql", "runtime-tokio-rustls", "chrono", "json", "rust_decimal"] }
+# MySQL / PostgreSQL（SQL 控制台 + AI 工具）
+# rust_decimal：DECIMAL/NUMERIC 列解码（sqlx 的 String 解码不兼容）
+# uuid：PostgreSQL uuid 列解码
+sqlx = { version = "0.8", default-features = false, features = ["mysql", "postgres", "uuid", "runtime-tokio-rustls", "chrono", "json", "rust_decimal"] }
 
 # 加密
 aes-gcm = "0.10"
@@ -87,6 +88,9 @@ parking_lot = "0.12"
 async-trait = "0.1"
 base64 = "0.22"
 regex = "1"
+# 终端多字符编码（GBK/Big5/Shift-JIS 等）：已是 tauri-plugin-shell 的传递依赖
+# （Cargo.lock 锁定 0.8.35），此处显式声明不引入新的传递依赖。
+encoding_rs = "0.8"
 zmodem2 = "0.7.1"
 
 # 文件后端（S3 / 兼容存储）
@@ -105,6 +109,14 @@ md-5 = "0.10"
 [dev-dependencies]
 # 桥接回归测试：真实 WebSocket 升级握手（与 axum 0.7 ws 特性同版本）。
 tokio-tungstenite = "0.24"
+
+# 本地修补 russh-0.45：修复 keepalive/channel 请求的响应编码——russh 原实现
+# 用"客户端视角的 channel id"回 CHANNEL_SUCCESS/FAILURE，而 Go 服务端
+# （x/crypto/ssh，如 JumpServer koko）按"服务端 localId"匹配响应，匹配不到会
+# 判定 "invalid channel" 协议错误并关闭整个连接（挂机 30 秒断线）。修改同步
+# 自 cargo registry 缓存，vendor 目录随仓库走，避免 cargo update 后丢失。
+[patch.crates-io]
+russh = { path = "vendor/russh" }
 
 [profile.release]
 panic = "abort"

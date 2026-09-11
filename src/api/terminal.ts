@@ -1,7 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export function terminalWrite(instanceId: string, data: string): Promise<void> {
-  return invoke<void>("terminal_write", { instanceId, data });
+/**
+ * 向终端实例写入数据（base64 字节流）。
+ *
+ * @param raw true = 原样写入（ZMODEM 协议/文件二进制的旁路，不做编码转换）；
+ *            默认 false = 键盘文本输入，后端按设置的终端编码转码（GBK 等）。
+ */
+export function terminalWrite(instanceId: string, data: string, raw = false): Promise<void> {
+  return invoke<void>("terminal_write", { instanceId, data, raw });
 }
 
 export function terminalResize(instanceId: string, cols: number, rows: number): Promise<void> {
@@ -34,4 +40,33 @@ export interface TerminalAttachResult {
  */
 export function terminalAttach(instanceId: string): Promise<TerminalAttachResult> {
   return invoke<TerminalAttachResult>("terminal_attach", { instanceId });
+}
+
+/**
+ * ZMODEM 专用：无父窗口的原生多选文件框（rz 上传）。
+ *
+ * 与 tauri-plugin-dialog 的 JS API 不同，后端不设置 owner——带 owner 的
+ * 模态对话框会禁用主窗口，期间 WebView2 会把进程光标置为隐藏（弹窗内
+ * 鼠标不可见但可点击）。取消时返回空数组。
+ */
+export function zmodemPickFiles(title: string): Promise<string[]> {
+  return invoke<string[]>("zmodem_pick_files", { title });
+}
+
+/**
+ * ZMODEM 专用：无父窗口的原生保存文件框（sz 下载）。
+ *
+ * 返回完整保存路径；取消时返回 null。defaultName 预填文件名。
+ */
+export function zmodemSaveFile(title: string, defaultName: string): Promise<string | null> {
+  return invoke<string | null>("zmodem_save_file", { title, defaultName });
+}
+
+/**
+ * ZMODEM 专用：无父窗口的原生目录选择框（设置默认下载目录）。
+ *
+ * 返回选中目录的绝对路径；取消时返回 null。
+ */
+export function zmodemPickFolder(title: string): Promise<string | null> {
+  return invoke<string | null>("zmodem_pick_folder", { title });
 }

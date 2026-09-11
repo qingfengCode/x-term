@@ -3,7 +3,7 @@ import { EditorState, StateEffect } from "@codemirror/state";
 import { EditorView, keymap, lineNumbers } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { oneDark } from "@codemirror/theme-one-dark";
-import { sql, SQLConfig, PostgreSQL } from "@codemirror/lang-sql";
+import { sql, MySQL, PostgreSQL, SQLConfig } from "@codemirror/lang-sql";
 import { Compartment } from "@codemirror/state";
 
 /**
@@ -16,6 +16,9 @@ import { Compartment } from "@codemirror/state";
  * @param model 双向绑定的文本 ref
  * @param tables 表→字段映射（用于 SQL 自动补全：表名 + 字段名）；变化时重配语言扩展
  * @param onCtrlEnter Ctrl+Enter 回调（执行 SQL）
+ * @param isDark 主题暗色标记
+ * @param onEnter Enter 回调
+ * @param dialect SQL 方言（mysql / postgres / sqlite，默认 postgres）；切换标签时变化重配高亮/补全
  */
 export function useCodeMirror(
   container: Ref<HTMLElement | null>,
@@ -24,13 +27,24 @@ export function useCodeMirror(
   onCtrlEnter: () => void,
   isDark: Ref<boolean>,
   onEnter?: () => void,
+  dialect?: Ref<"mysql" | "postgres" | "sqlite">,
 ) {
   let view: EditorView | null = null;
-  // 用 Compartment 让语言扩展（含 tables）可在运行时重配。
+  // 用 Compartment 让语言扩展（含 tables / dialect）可在运行时重配。
   const langCompartment = new Compartment();
   const themeCompartment = new Compartment();
 
-  function buildSqlExtension(schemaMap: Record<string, string[]>): SQLConfig {
+  /** 当前方言（未传 dialect 参数时按 postgres）。
+   *  mount / watch / buildExtensions 共用，保证取值一致。
+   *  SQLite 用 PostgreSQL 方言近似（@codemirror/lang-sql 无 SQLite 方言）。 */
+  type EditorDialect = "mysql" | "postgres";
+  const currentDialect = (): EditorDialect =>
+    dialect?.value === "mysql" ? "mysql" : "postgres";
+
+  function buildSqlExtension(
+    schemaMap: Record<string, string[]>,
+    lang: EditorDialect = "postgres",
+  ): SQLConfig {
     // schema 用 SQLNamespace 形式：{ 表名: { 字段名: {} } }，字段来自 DESCRIBE 预拉。
     // 未预拉字段的表，值为空对象（仍可补全表名，字段补全为空）。
     const tableMap: Record<string, Record<string, Record<string, never>>> = {};
@@ -42,7 +56,8 @@ export function useCodeMirror(
     return {
       upperCaseKeywords: true,
       schema: tableMap,
-      dialect: PostgreSQL,
+      // 按连接的数据库类型选方言（关键字/函数高亮与补全）。
+      dialect: lang === "mysql" ? MySQL : PostgreSQL,
     };
   }
 
@@ -63,7 +78,7 @@ export function useCodeMirror(
           },
         },
       ]),
-      langCompartment.of(sql(buildSqlExtension(schemaMap))),
+      langCompartment.of(sql(buildSqlExtension(schemaMap, currentDialect()))),
       themeCompartment.of(isDark.value ? oneDark : []),
       EditorView.lineWrapping,
       // 文档变化 → 同步到 model ref（避免循环：仅当不同时写）
@@ -100,17 +115,31 @@ export function useCodeMirror(
     }
   }
 
-  // tables 变化时重配 SQL 扩展（补全列表更新）。
+  // tables 变化时重配 SQL 扩展（补全列表更新）。方言必须随当前取值重传：
+  // 漏传会回退 buildSqlExtension 的默认 postgres，MySQL 标签展开库节点
+  // （tables 刷新触发本 watch）后高亮/补全方言被重置。
   watch(
     tables,
     (list) => {
       if (!view) return;
       view.dispatch({
-        effects: langCompartment.reconfigure(sql(buildSqlExtension(list))),
+        effects: langCompartment.reconfigure(sql(buildSqlExtension(list, currentDialect()))),
       });
     },
     { deep: true },
   );
+
+  // 方言切换（同容器复用、不重挂载的场景）同样重配语言扩展。
+  if (dialect) {
+    watch(dialect, () => {
+      if (!view) return;
+      view.dispatch({
+        effects: langCompartment.reconfigure(
+          sql(buildSqlExtension(tables.value, currentDialect())),
+        ),
+      });
+    });
+  }
 
   // 主题切换。
   watch(isDark, (dark) => {

@@ -139,6 +139,26 @@ impl TerminalSession {
             TerminalSession::Local(_) => "",
         }
     }
+
+    /// 装配输出日志（设置开启时由连接命令在会话建立后调用）。
+    ///
+    /// reader 持有同一 `Arc<Mutex<Option<..>>>`，之后置入即时生效。
+    /// 创建失败仅告警——日志是旁路能力，绝不阻断连接。
+    pub fn attach_output_log(&self, name: &str, dir: &std::path::Path) {
+        let slot = match self {
+            TerminalSession::Ssh(s) => &s.output_log,
+            TerminalSession::Telnet(s) => &s.output_log,
+            TerminalSession::Local(s) => &s.output_log,
+        };
+        match crate::output_log::OutputLogger::create(dir, name) {
+            Ok(logger) => {
+                if let Ok(mut guard) = slot.lock() {
+                    *guard = Some(logger);
+                }
+            }
+            Err(e) => log::warn!("[output_log] 创建日志失败: {e}"),
+        }
+    }
 }
 
 /// SSH client handle（russh 的 `Handle` 未实现 `Clone`，故用 `Arc` 共享）。
@@ -189,13 +209,15 @@ pub struct AppState {
     pub file_backends:
         Arc<Mutex<HashMap<String, (String, std::sync::Arc<dyn crate::file_backend::FileBackend>)>>>,
 
-    /// 已建立的 MySQL 业务连接：connId -> Arc<MySqlConn>。
+    /// 已建立的数据库业务连接（MySQL / PostgreSQL）：connId -> DbConnHandle。
     ///
-    /// 用 `Arc` 而非裸值：命令按需 `get().cloned()` 出句柄后释放锁再跨 await 使用，
-    /// 多个命令可并发操作同一连接（过去 remove/insert 模式在并发下会 NotFound 竞争，
-    /// 导致前端展开库/执行 SQL 偶发失败）。
-    pub mysql_conns: Arc<
-        Mutex<HashMap<String, std::sync::Arc<crate::database::mysql::MySqlConn>>>,
+    /// 用 `DbConnHandle`（enum）而非具体类型：命令按 kind 分发到各方言实现，
+    /// 命令层 / AI 工具 / MCP 通过统一句柄执行 SQL 与元数据查询。
+    /// 取 `Arc` 语义（句柄可克隆）：命令按需 `get().cloned()` 出句柄后释放锁
+    /// 再跨 await 使用，多个命令可并发操作同一连接（过去 remove/insert 模式
+    /// 在并发下会 NotFound 竞争，导致前端展开库/执行 SQL 偶发失败）。
+    pub db_conns: Arc<
+        Mutex<HashMap<String, crate::database::DbConnHandle>>,
     >,
 
     /// 待确认执行的 AI 工具调用：toolCallId -> (requestId, oneshot 发送端)。
@@ -276,6 +298,16 @@ pub struct AppState {
         Mutex<HashMap<String, tokio::sync::oneshot::Sender<crate::ssh::client::HostKeyDecision>>>,
     >,
 
+    /// SSH 连接断开原因注册表：连接专属键（`host:port#随机后缀`，终端会话
+    /// 生成）-> 人类可读的断开原因。
+    ///
+    /// [`crate::ssh::client::ClientHandler::disconnected`] 回调写入（服务器
+    /// DISCONNECT 的原因码+文字，或连接错误），终端 reader 退出时取出（take）
+    /// 随 `terminal:closed` 事件发往前端并写日志——用于诊断"连上后很快被
+    /// 断开"类问题（如跳板机主动踢下线、保活超时）。非终端连接（监控/
+    /// SFTP/隧道）不写入（键为空），避免同 host:port 互相覆盖与残留泄漏。
+    pub ssh_disconnect_reasons: Arc<Mutex<HashMap<String, String>>>,
+
     /// Tauri 应用句柄（事件发射、日志等）。
     pub app: tauri::AppHandle,
 
@@ -307,6 +339,9 @@ pub struct AppState {
 
     /// settings.json 的路径（缓存的快捷访问）。
     pub settings_path: Arc<PathBuf>,
+
+    /// 运行中的服务器监控：monitorId -> 停止信号发送端。
+    pub monitors: crate::monitor::MonitorMap,
 
     /// settings.json 的内存缓存：首次读取后驻留，`settings_save` 时失效。
     ///
@@ -372,13 +407,14 @@ impl AppState {
             sftp_transfers: Arc::new(Mutex::new(HashMap::new())),
             tunnels: Arc::new(Mutex::new(HashMap::new())),
             file_backends: Arc::new(Mutex::new(HashMap::new())),
-            mysql_conns: Arc::new(Mutex::new(HashMap::new())),
+            db_conns: Arc::new(Mutex::new(HashMap::new())),
             pending_tool_calls: Arc::new(Mutex::new(HashMap::new())),
             pending_desktop_calls: Arc::new(Mutex::new(HashMap::new())),
             pending_ask_user_calls: Arc::new(Mutex::new(HashMap::new())),
             pending_ai_tasks: Arc::new(Mutex::new(HashMap::new())),
             pending_auth_challenges: Arc::new(Mutex::new(HashMap::new())),
             pending_host_keys: Arc::new(Mutex::new(HashMap::new())),
+            ssh_disconnect_reasons: Arc::new(Mutex::new(HashMap::new())),
             app,
             approval_registry: Arc::new(crate::mcp::approval::ApprovalRegistry::new()),
             vnc_bridges: Arc::new(Mutex::new(HashMap::new())),
@@ -386,6 +422,7 @@ impl AppState {
             mcp_terminal_busy: Arc::new(Mutex::new(HashMap::new())),
             settings_path: Arc::new(settings_path),
             settings_cache: Arc::new(parking_lot::RwLock::new(None)),
+            monitors: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
     }
 

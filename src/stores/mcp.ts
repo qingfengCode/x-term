@@ -44,10 +44,11 @@ export const useMcpStore = defineStore("mcp", () => {
       port,
       token: undefined,
       resourceId: undefined,
+      resourceIds: undefined,
       resourceMode: "bound",
       boundSource: "config",
       boundDatabase: undefined,
-      autoApprove: false,
+      runMode: "manual",
       enableLog: true,
     };
   }
@@ -101,6 +102,18 @@ export const useMcpStore = defineStore("mcp", () => {
     const c = configOf(kind).value;
     c.boundSource = boundSource;
     c.resourceId = resourceId;
+  }
+
+  /**
+   * 运行中热切换多机模式的机器集合（仅 ssh + multi）。
+   * 返回 true = 已即时生效；false = 仅保存（服务未运行或以其它模式运行）。
+   */
+  async function rebindMulti(kind: McpKind, resourceIds: string[]): Promise<boolean> {
+    const applied = await mcpApi.mcpRebindMulti(kind, resourceIds);
+    const c = configOf(kind).value;
+    c.resourceIds = [...resourceIds];
+    c.resourceMode = "multi";
+    return applied;
   }
 
   /** 拉取该 kind 的服务端状态。 */
@@ -180,6 +193,7 @@ export const useMcpStore = defineStore("mcp", () => {
     loadConfig,
     saveConfig,
     rebind,
+    rebindMulti,
     refresh,
     start,
     stop,

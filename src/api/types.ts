@@ -132,6 +132,25 @@ export interface TerminalSettings {
   desktopClients: DesktopClients;
   /** 内嵌 RDP 是否校验服务器证书（严格模式，系统信任根；默认 false 与官方一致）。 */
   rdpVerifyCert: boolean;
+  /**
+   * 默认下载目录（终端 sz / SFTP / 对象存储下载共用）。空 = 每次下载弹保存
+   * 对话框；非空 = 直接落盘到该目录（同名文件自动加 " (n)" 后缀），可在标题栏
+   * 的下载列表中查看记录。
+   */
+  downloadDir: string;
+  /** 终端智能补全：输入时按历史命令 + 快捷命令给出建议弹窗。 */
+  suggestHistory: boolean;
+  /** 智能补全附带 AI 建议项（占位显示，方向键选中才真正调用模型）。 */
+  suggestAi: boolean;
+  /** 安全粘贴：多行 / 危险内容粘贴前弹确认。 */
+  pasteConfirm: boolean;
+  /** 终端输出日志落盘（logs/ 目录，"可打印文本"模式）。对新会话生效。 */
+  outputLog: boolean;
+  /**
+   * 终端字符编码（远端服务器 locale，如 "gbk"；默认 "utf-8" 不转码）。
+   * 输出方向前端流式解码，输入方向 terminal_write 转换；对已打开终端实时生效。
+   */
+  encoding: string;
 }
 
 /** 桌面客户端模式："app" 程序内嵌 / "system" 系统客户端。 */
@@ -426,13 +445,16 @@ export interface AiSqlResultEvent {
 }
 
 // ---------------------------------------------------------------------------
-// MySQL DB profile
+// DB profile（MySQL / PostgreSQL）
 // ---------------------------------------------------------------------------
+
+/** 数据库类型（与后端 normalize_kind 归一化后的值一致）。 */
+export type DbKind = "mysql" | "postgres" | "sqlite";
 
 export interface DbProfile {
   id: string;
   name: string;
-  kind: string; // 目前固定 "mysql"
+  kind: DbKind | string;
   host: string;
   port: number;
   username: string;

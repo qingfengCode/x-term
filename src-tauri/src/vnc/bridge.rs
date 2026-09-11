@@ -4,7 +4,7 @@
 //! 临时端口并启动 axum server，前端拿 `ws_url` 直连；`stop`/Drop 时整体回收
 //! （关监听 + abort 连接任务），防止泄漏。
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -142,7 +142,14 @@ async fn bridge_ws_tcp(socket: WebSocket, host: String, port: u16) {
         Ok(Err(e)) => {
             log::warn!("[vnc] 连接 {}:{} 失败: {}", host, port, e);
             let mut socket = socket;
-            let _ = socket.send(Message::Close(None)).await;
+            // 带关闭原因（RFC 6455 关闭码 4000+ 为应用自定义），noVNC 能直接读到
+            // reason 并显示给用户，避免只看到 "Connection closed (code: 1005)"。
+            let _ = socket
+                .send(Message::Close(Some(CloseFrame {
+                    code: 4001,
+                    reason: format!("目标 {host}:{port} 连接被拒绝（端口未开或服务未启动）").into(),
+                })))
+                .await;
             return;
         }
         Err(_) => {
@@ -153,7 +160,12 @@ async fn bridge_ws_tcp(socket: WebSocket, host: String, port: u16) {
                 TCP_CONNECT_TIMEOUT_SECS
             );
             let mut socket = socket;
-            let _ = socket.send(Message::Close(None)).await;
+            let _ = socket
+                .send(Message::Close(Some(CloseFrame {
+                    code: 4002,
+                    reason: format!("连接目标 {host}:{port} 超时（主机不可达或防火墙拦截）").into(),
+                })))
+                .await;
             return;
         }
     };

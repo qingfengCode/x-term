@@ -1,8 +1,8 @@
 <!--
-  DbProfileDialog.vue — MySQL 数据库 profile 新建 / 编辑表单
+  DbProfileDialog.vue — 数据库 profile（MySQL / PostgreSQL）新建 / 编辑表单
 
-  字段：名称 / 主机 / 端口 / 用户名 / 密码 / 默认数据库 / SSH 隧道（含会话选择）。
-  密码以 credential（kind="mysql_password"）形式保存到保险库，profile 只持有 credentialId。
+  字段：类型 / 名称 / 主机 / 端口 / 用户名 / 密码 / 默认数据库 / SSH 隧道（含会话选择）。
+  密码以 credential（kind="db_password"）形式保存到保险库，profile 只持有 credentialId。
   编辑时密码留空表示不修改原密码。
 -->
 <script setup lang="ts">
@@ -12,7 +12,7 @@ import type { FormInstance, FormRules } from "element-plus";
 import { useSessionsStore } from "@/stores/sessions";
 import { credentialDelete, credentialSave } from "@/api/vault";
 import { dbSaveProfile, dbListGroups } from "@/api/db";
-import type { DbGroup, DbProfile, Session } from "@/api/types";
+import type { DbGroup, DbKind, DbProfile, Session } from "@/api/types";
 
 const props = withDefaults(
   defineProps<{
@@ -32,10 +32,33 @@ const emit = defineEmits<{
 
 const sessionsStore = useSessionsStore();
 
-/** 与后端保险库约定的 MySQL 密码 credential kind。 */
-const KIND_MYSQL_PASSWORD = "mysql_password";
+/** 与后端保险库约定的数据库密码 credential kind（历史 mysql_password 仍可解密）。 */
+const KIND_DB_PASSWORD = "db_password";
+
+/** 数据库类型选项（value 与后端 normalize_kind 归一化值一致）。 */
+const KIND_OPTIONS: { label: string; value: DbKind; port: number; user: string }[] = [
+  { label: "MySQL", value: "mysql", port: 3306, user: "root" },
+  { label: "PostgreSQL", value: "postgres", port: 5432, user: "postgres" },
+  { label: "SQLite（本地文件）", value: "sqlite", port: 0, user: "" },
+];
+
+/** profile.kind 归一化（与后端 normalize_kind 一致）。 */
+function normalizeKind(k?: string | null): DbKind {
+  const v = (k ?? "").toLowerCase();
+  if (v === "postgres" || v === "postgresql" || v === "pg") return "postgres";
+  if (v === "sqlite" || v === "sqlite3") return "sqlite";
+  return "mysql";
+}
+
+function kindMeta(kind: DbKind) {
+  return KIND_OPTIONS.find((o) => o.value === kind) ?? KIND_OPTIONS[0];
+}
+
+/** SQLite 是本地文件连接：无端口/用户/密码/SSH 隧道概念。 */
+const isSqlite = computed(() => form.kind === "sqlite");
 
 interface FormState {
+  kind: DbKind;
   name: string;
   host: string;
   port: number;
@@ -53,6 +76,7 @@ const groups = ref<DbGroup[]>([]);
 
 function emptyForm(): FormState {
   return {
+    kind: "mysql",
     name: "",
     host: "127.0.0.1",
     port: 3306,
@@ -67,18 +91,51 @@ function emptyForm(): FormState {
 
 const form = reactive<FormState>(emptyForm());
 
+/** 切换数据库类型：端口 / 用户名若仍是另一类型的默认值则联动更新。 */
+watch(
+  () => form.kind,
+  (kind, old) => {
+    if (kind === old) return;
+    const next = kindMeta(kind);
+    const prev = kindMeta(old as DbKind);
+    if (form.port === prev.port) form.port = next.port;
+    if (form.username === prev.user) form.username = next.user;
+  }
+);
+
 const isEdit = computed(() => !!props.profile);
 
 const dialogTitle = computed(() => (isEdit.value ? "编辑数据库连接" : "新建数据库连接"));
 
 const formRules: FormRules = {
   name: [{ required: true, message: "请输入名称", trigger: "blur" }],
-  host: [{ required: true, message: "请输入主机地址", trigger: "blur" }],
-  port: [
-    { required: true, message: "请输入端口", trigger: "blur" },
-    { type: "number", min: 1, max: 65535, message: "端口范围 1-65535", trigger: "blur" },
+  host: [
+    {
+      required: true,
+      // SQLite 填文件路径，其余填主机地址。
+      message: "请输入主机地址（SQLite 填数据库文件路径）",
+      trigger: "blur",
+    },
   ],
-  username: [{ required: true, message: "请输入用户名", trigger: "blur" }],
+  port: [
+    // SQLite 无端口概念，跳过校验。
+    {
+      validator: (_rule, value, callback) => {
+        if (isSqlite.value || (value >= 1 && value <= 65535)) callback();
+        else callback(new Error("端口范围 1-65535"));
+      },
+      trigger: "blur",
+    },
+  ],
+  username: [
+    {
+      validator: (_rule, value, callback) => {
+        if (isSqlite.value || value.trim()) callback();
+        else callback(new Error("请输入用户名"));
+      },
+      trigger: "blur",
+    },
+  ],
   sshSessionId: [
     {
       validator: (_rule, value, callback) => {
@@ -112,6 +169,7 @@ watch(
     if (props.profile) {
       // 编辑模式：密码留空（保持不变）。
       Object.assign(form, {
+        kind: normalizeKind(props.profile.kind),
         name: props.profile.name,
         host: props.profile.host,
         port: props.profile.port,
@@ -162,8 +220,8 @@ async function submit() {
     if (pwd) {
       credentialId = await credentialSave({
         id: base?.credentialId ?? undefined,
-        name: `mysql:${form.name}`,
-        kind: KIND_MYSQL_PASSWORD,
+        name: `db:${form.name}`,
+        kind: KIND_DB_PASSWORD,
         value: pwd,
       });
       if (!base?.credentialId) createdCredId = credentialId;
@@ -172,13 +230,16 @@ async function submit() {
     const profile: DbProfile = {
       id: base?.id ?? genId(),
       name: form.name.trim(),
-      kind: base?.kind ?? "mysql",
+      kind: form.kind,
       host: form.host.trim(),
       port: Number(form.port),
       username: form.username.trim(),
       defaultDatabase: form.defaultDatabase.trim() || null,
       credentialId,
-      sshSessionConfigId: form.useSshTunnel ? form.sshSessionId : null,
+      // SQLite 是本地文件：SSH 开关已随 v-if 隐藏，但表单值可能残留
+      //（先选 MySQL 开了隧道再切 SQLite），提交时强制清空。
+      sshSessionConfigId:
+        !isSqlite.value && form.useSshTunnel ? form.sshSessionId : null,
       groupId: form.groupId || null,
       createdAt: base?.createdAt ?? new Date().toISOString(),
     };
@@ -216,6 +277,17 @@ async function submit() {
       label-width="92px"
       label-position="right"
     >
+      <el-form-item label="类型">
+        <el-select v-model="form.kind" style="width: 100%">
+          <el-option
+            v-for="o in KIND_OPTIONS"
+            :key="o.value"
+            :label="o.label"
+            :value="o.value"
+          />
+        </el-select>
+      </el-form-item>
+
       <el-form-item label="名称" prop="name">
         <el-input v-model="form.name" placeholder="例如：生产库-主" />
       </el-form-item>
@@ -231,11 +303,14 @@ async function submit() {
         </el-select>
       </el-form-item>
 
-      <el-form-item label="主机" prop="host">
-        <el-input v-model="form.host" placeholder="127.0.0.1" />
+      <el-form-item :label="isSqlite ? '文件路径' : '主机'" prop="host">
+        <el-input
+          v-model="form.host"
+          :placeholder="isSqlite ? '例如：D:\\data\\app.db（不存在会自动创建）' : '127.0.0.1'"
+        />
       </el-form-item>
 
-      <el-form-item label="端口" prop="port">
+      <el-form-item v-if="!isSqlite" label="端口" prop="port">
         <el-input-number
           v-model="form.port"
           :min="1"
@@ -245,11 +320,11 @@ async function submit() {
         />
       </el-form-item>
 
-      <el-form-item label="用户名" prop="username">
+      <el-form-item v-if="!isSqlite" label="用户名" prop="username">
         <el-input v-model="form.username" placeholder="root" />
       </el-form-item>
 
-      <el-form-item label="密码" prop="password">
+      <el-form-item v-if="!isSqlite" label="密码" prop="password">
         <el-input
           v-model="form.password"
           type="password"
@@ -258,16 +333,16 @@ async function submit() {
         />
       </el-form-item>
 
-      <el-form-item label="默认数据库">
+      <el-form-item v-if="!isSqlite" label="默认数据库">
         <el-input v-model="form.defaultDatabase" placeholder="可选，如 app_db" />
       </el-form-item>
 
-      <el-form-item label="SSH 隧道">
+      <el-form-item v-if="!isSqlite" label="SSH 隧道">
         <el-switch v-model="form.useSshTunnel" />
         <span class="form-hint">通过 SSH 会话连接数据库</span>
       </el-form-item>
 
-      <el-form-item v-if="form.useSshTunnel" label="SSH 会话" prop="sshSessionId">
+      <el-form-item v-if="!isSqlite && form.useSshTunnel" label="SSH 会话" prop="sshSessionId">
         <el-select
           v-model="form.sshSessionId"
           placeholder="选择 SSH 会话"

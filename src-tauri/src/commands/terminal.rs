@@ -21,15 +21,39 @@ const TERMINAL_WRITE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::fro
 ///
 /// 异步 + 写确认：等待 reader 把字节真正写入 SSH channel 后才返回，
 /// 为 ZMODEM 大文件上传提供背压（防止无界输入队列堆积整个文件）。
+///
+/// 多字符编码：非 raw 写入且会话为远程（SSH/Telnet）时，按设置的
+/// `terminal.encoding` 把 UTF-8 字节转换为远端编码（GBK 等）。`raw = true`
+/// 是 ZMODEM 上传的旁路——协议帧/文件内容是任意二进制，绝不能转码；本地
+/// 终端（ConPTY 恒 UTF-8）同样跳过转换。
 #[tauri::command]
 pub async fn terminal_write(
     instance_id: String,
     data: String,
+    raw: Option<bool>,
     state: State<'_, AppState>,
 ) -> AppResult<()> {
-    let bytes = base64::engine::general_purpose::STANDARD
+    let mut bytes = base64::engine::general_purpose::STANDARD
         .decode(data.as_bytes())
         .map_err(|e| AppError::InvalidInput(format!("base64 解码失败: {}", e)))?;
+
+    // 键盘输入编码转换（UTF-8 → GBK/Big5/…）。读取设置的缓存（RwLock 读 +
+    // 小结构 clone），逐键调用开销可忽略。
+    if !raw.unwrap_or(false) {
+        let is_remote = {
+            let terminals = state.terminals.lock();
+            let session = terminals
+                .get(&instance_id)
+                .ok_or_else(|| AppError::NotFound(format!("终端 {} 不存在", instance_id)))?;
+            !matches!(session, crate::state::TerminalSession::Local(_))
+        };
+        if is_remote {
+            let label = crate::config::settings_load_inner(&state)
+                .map(|s| s.terminal.encoding)
+                .unwrap_or_default();
+            bytes = crate::encoding::encode_input(&label, &bytes);
+        }
+    }
 
     // 短临界区：只取出 ack receiver 即释放锁，再在锁外等待写完成。
     let ack_rx = {

@@ -27,6 +27,7 @@ import TabBar, { type TabBarItem } from "@/components/TabBar.vue";
 import VncPane from "@/components/VncPane.vue";
 import RdpPane from "@/components/RdpPane.vue";
 import AiPanel from "@/components/AiPanel.vue";
+import { matchesCombo } from "@/utils/shortcut";
 
 // KeepAlive 按 name 匹配缓存本组件（MainLayout），切走页面时已连接的桌面会话不中断。
 defineOptions({ name: "RemoteDesktopView" });
@@ -369,8 +370,10 @@ function onTabsKeydown(e: KeyboardEvent) {
   // 不触发标签快捷键，避免与远端应用的 Ctrl+组合冲突。
   const target = e.target as HTMLElement | null;
   if (target?.closest(".rdp-pane, .vnc-pane")) return;
-  // Ctrl+W：关闭当前标签（阻止 WebView 默认行为）。
-  if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === "w") {
+  // 关闭当前标签（默认 Ctrl+W）：跟随「设置 → 快捷键」的 closeTab 绑定，
+  // 用户在设置中清除/改绑后这里不再抢按键（否则"删了快捷键仍生效"）。
+  const closeTabCombo = settings.getAppShortcut("closeTab");
+  if (closeTabCombo && matchesCombo(e, closeTabCombo)) {
     if (!active.value?.instanceId) return;
     e.preventDefault();
     void desktopTabs.close(active.value.instanceId);
@@ -480,6 +483,7 @@ function preloadRdpWasmWhenIdle() {
               v-if="tab.protocol === 'vnc'"
               :instance-id="tab.instanceId"
               :ws-url="tab.wsUrl"
+              :username="tab.username"
               :password="tab.password"
               @connected="onPaneConnected(tab.instanceId)"
               @closed="onPaneClosed(tab.instanceId)"

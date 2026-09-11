@@ -1,15 +1,17 @@
 <script setup lang="ts">
-import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, reactive, ref } from "vue";
+import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, provide, reactive, ref, watch } from "vue";
 import { useTerminalsStore, type TerminalTab } from "@/stores/terminals";
 import { useSettingsStore } from "@/stores/settings";
 import TerminalPane from "@/components/TerminalPane.vue";
+import SplitArea from "@/components/SplitArea.vue";
+import MonitorPanel from "@/components/MonitorPanel.vue";
 import AiPanel from "@/components/AiPanel.vue";
 import TabBar, { type TabBarItem } from "@/components/TabBar.vue";
-import { Delete, Top, Bottom, ZoomIn, ZoomOut, Refresh, Plus, ArrowDown, ArrowUp, Monitor, Key } from "@element-plus/icons-vue";
+import { Delete, Top, Bottom, ZoomIn, ZoomOut, Refresh, Plus, ArrowDown, ArrowUp, Monitor, Menu, Bell } from "@element-plus/icons-vue";
 import { ElMessage } from "element-plus";
-import { eventToCombo, isModifierOnly } from "@/utils/shortcut";
-import { isAuthError } from "@/utils/error";
+import { eventToCombo, isModifierOnly, matchesCombo } from "@/utils/shortcut";
 import type { ShortcutCommand } from "@/api/types";
+import type { SplitDirection } from "@/utils/splitLayout";
 
 // KeepAlive 按 name 匹配缓存本组件（保留终端助手面板状态）。
 defineOptions({ name: "Workspace" });
@@ -17,77 +19,144 @@ defineOptions({ name: "Workspace" });
 const terminals = useTerminalsStore();
 const settings = useSettingsStore();
 
+/** 当前活动页签（终端或服务器监控）。 */
 const active = computed(() =>
-  terminals.tabs.find((t) => t.instanceId === terminals.activeId)
+  terminals.tabs.find((t) => t.id === terminals.activeTabId)
 );
 
-// 各 tab 的 TerminalPane 引用（按稳定 tab.id 索引——instanceId 在重连时会
-// 更换，用它做 key 会在重连瞬间误删新引用）。
+/** 当前活动终端页签（终端专属动作/工具栏作用对象；监控页签时为 undefined）。 */
+const activeTerminal = computed(() =>
+  active.value?.kind === "terminal" ? active.value : undefined
+);
+
+// 各窗格的 TerminalPane 引用（按 `tabId::paneId` 复合键索引——instanceId
+// 在重连时会更换，用它做 key 会在重连瞬间误删新引用；窗格 id 永不变化）。
 // reactive Map 保证增删触发 activePaneRef 重新求值。
 const paneRefs = reactive(new Map<string, InstanceType<typeof TerminalPane>>());
 
-/** 当前活动 tab 的 pane 引用（工具动作作用于它；vnc tab 时为 undefined）。 */
-const activePaneRef = computed(() => {
-  const id = active.value?.id;
-  return id ? paneRefs.get(id) : undefined;
+/** TerminalPaneItem 经 inject 调用：登记/移除窗格的 TerminalPane 实例。 */
+provide("xterm:registerPaneRef", (tabId: string, paneId: string, el: unknown) => {
+  const key = `${tabId}::${paneId}`;
+  if (el) paneRefs.set(key, el as InstanceType<typeof TerminalPane>);
+  else paneRefs.delete(key);
 });
 
-/** TerminalPane 挂载/卸载时的 ref 回调：登记或移除 pane 引用。 */
-function onPaneRef(tab: TerminalTab, el: unknown) {
-  if (el) {
-    paneRefs.set(tab.id, el as InstanceType<typeof TerminalPane>);
-  } else {
-    paneRefs.delete(tab.id);
-  }
-}
+/** 当前活动窗格的 pane 引用（工具动作作用于它；监控页签时为 undefined）。 */
+const activePaneRef = computed(() => {
+  const t = active.value;
+  if (!t || t.kind !== "terminal" || !t.activePaneId) return undefined;
+  return paneRefs.get(`${t.id}::${t.activePaneId}`);
+});
+
+// 程序化激活页签/窗格后把焦点交给新活动 pane：只有用户手动点 tab 才走
+// TabBar @select 的 focus 路径，复制标签页 / 克隆通道 / 会话树连接 / 重连 /
+// 关闭后回退邻 tab / 拆分窗格都无人还焦。watch 兜底覆盖全部路径（含
+// @select，重复 focus 无害）。activeId 覆盖"活动窗格的实例就绪"（拆分出的
+// 新窗格连接完成后自动聚焦）。
+watch(
+  [() => terminals.activeTabId, () => terminals.activeId],
+  () => {
+    void nextTick(() => {
+      // 焦点已在其它文本输入上下文（AI 面板输入框、搜索框、对话框等）时不抢：
+      // 后台连接完成的自动激活不该打断用户正在进行的输入。点击其它窗格时
+      // xterm 自身已完成聚焦，这里跳过同样安全。
+      const el = document.activeElement as HTMLElement | null;
+      if (
+        el &&
+        el !== document.body &&
+        (el.tagName === "INPUT" ||
+          el.tagName === "TEXTAREA" ||
+          el.isContentEditable)
+      ) {
+        return;
+      }
+      // 监控页签 / 占位页签没有 pane（activePaneRef 为 undefined）——安全 no-op。
+      activePaneRef.value?.focus();
+    });
+  },
+);
 
 // --- Tab 栏（共享 TabBar 组件） ---------------------------------------------
 
-/** 映射为 TabBar 的数据抽象。 */
+/**
+ * TabBar 的激活键：当前活动 tab 的稳定 id。
+ *
+ * TabBar 的键统一用 tab.id（创建时生成、永不变化、同一会话多开也唯一）——
+ * 原复合键 `instanceId || session.id` 在复制通道/同会话多开时有歧义：占位
+ * tab 的键等于源 tab 的 session.id，点击/关闭占位会命中源 tab（关错对象）。
+ */
+const activeTabKey = computed(() => terminals.activeTabId ?? "");
+
+/** 映射为 TabBar 的数据抽象（键 = 稳定 tab.id，见 activeTabKey 说明）。 */
 const tabItems = computed<TabBarItem[]>(() =>
   terminals.tabs.map((t) => ({
-    key: t.instanceId || t.session.id,
-    title: t.session.name,
+    key: t.id,
+    title: t.kind === "monitor" ? `监控 · ${t.session.name}` : t.session.name,
+    // 监控页签无连接状态语义：用图标区分、不显示状态圆点（面板内容才是状态）。
+    icon: t.kind === "monitor" ? "DataLine" : undefined,
+    hideDot: t.kind === "monitor",
     connecting: t.connecting,
     disconnected: t.disconnected,
+    // 「复制」/「复制 SSH 通道」：仅终端页签（监控页签无连接可复制）。
+    duplicable: t.kind === "terminal" && t.session.protocol === "ssh",
+    cloneable:
+      t.kind === "terminal" &&
+      t.session.protocol === "ssh" &&
+      !!t.instanceId &&
+      !t.disconnected,
   })),
 );
 
 /**
  * TabBar 右键菜单命令（作用于对应 tab）。
  *
- * key 为 TabBar 的复合键（instanceId || session.id）：连接中的占位 tab 只有
- * 复合键可用，close 系列命令照常生效；reconnect 仍要求已建立实例。
+ * key 为 TabBar 的键（稳定 tab.id）；保留复合键兜底以防过期引用。
  */
 function onTabMenuCommand(cmd: string, key: string) {
-  const t = terminals.tabs.find((x) => (x.instanceId || x.session.id) === key);
+  const t = terminals.tabs.find(
+    (x) => x.id === key || (x.kind === "terminal" && (x.instanceId || x.session.id) === key)
+  );
   if (!t) return;
+  // 终端专属命令（复制/克隆通道/重连）：监控页签无连接，直接忽略
+  // （菜单项也已按 duplicable/cloneable 隐藏，这里兜底防误触发）。
+  const isTerminal = t.kind === "terminal";
   switch (cmd) {
+    case "cloneChannel":
+      if (!isTerminal) break;
+      // 复制 SSH 通道：在同一条已认证连接上开新 channel（不重新认证，二次
+      // 认证服务器无需再输口令码）；源未连接/克隆失败时由 cloneChannel
+      // 回退全量重连。
+      terminals
+        .cloneChannel(t)
+        .catch((e) => ElMessage.error("复制 SSH 通道失败: " + String(e)));
+      break;
+    case "duplicate":
+      if (!isTerminal) break;
+      // 复制：用同一会话配置新开一条**独立连接**的终端标签页（重新认证）。
+      // Sidebar 的"复制"复制的是配置记录，这里是运行时新开连接。
+      terminals
+        .open(t.session)
+        .catch((e) => ElMessage.error("打开终端失败: " + String(e)));
+      break;
     case "close":
-      void terminals.close(key);
+      void terminals.close(t.id);
       break;
     case "closeOthers":
       for (const x of [...terminals.tabs]) {
         if (x !== t) {
-          void terminals.close(x.instanceId || x.session.id);
+          void terminals.close(x.id);
         }
       }
       break;
     case "closeAll":
       for (const x of [...terminals.tabs]) {
-        void terminals.close(x.instanceId || x.session.id);
+        void terminals.close(x.id);
       }
       break;
     case "reconnect":
-      if (t.instanceId) void terminals.reconnect(t.instanceId);
+      if (isTerminal && t.instanceId) void terminals.reconnect(t.instanceId);
       break;
   }
-}
-
-// 终端被通知连接断开（由 TerminalPane emit "closed"）：标记断开并顺手清理后端
-// 已死的 session 实例（避免 registry 泄漏），重连时会自行重建。
-function onTerminalClosed(instanceId: string) {
-  void terminals.handleTerminalClosed(instanceId);
 }
 
 // 工具栏动作。
@@ -96,16 +165,38 @@ function clearActive() {
   activePaneRef.value?.focus();
 }
 async function reconnectActive() {
-  if (!active.value?.instanceId) return;
+  const t = activeTerminal.value;
+  if (!t?.instanceId) return;
   try {
-    await terminals.reconnect(active.value.instanceId);
+    await terminals.reconnect(t.instanceId);
   } catch (e) {
-    /* 错误已存进 tab.error */
+    /* 错误已存进窗格 error */
   }
 }
 function zoom(delta: number) {
   // 作用于活动面板的字号覆盖（每 tab 独立、不写全局设置、不持久化）。
   activePaneRef.value?.zoomFont(delta);
+}
+
+// --- 分屏 + 广播输入 ------------------------------------------------------
+
+/** 工具栏/快捷键触发：拆分活动窗格（row=右侧 / col=下侧）。 */
+function splitActive(dir: SplitDirection) {
+  const t = activeTerminal.value;
+  if (t) void terminals.splitPane(t, dir);
+}
+
+/**
+ * 窗格原始按键 → 广播路由：开启广播后同步到同页签其它已连接窗格。
+ * 源窗格已自行写入（TerminalPane.onData），目标窗格走 receiveBroadcast
+ * （影子缓冲同步 + 写远端，不触发建议/焦点副作用）。
+ */
+function onPaneInput(tab: TerminalTab, fromPaneId: string, data: string) {
+  if (!terminals.broadcastInput) return;
+  for (const p of tab.panes) {
+    if (p.id === fromPaneId || !p.instanceId) continue;
+    paneRefs.get(`${tab.id}::${p.id}`)?.receiveBroadcast(data);
+  }
 }
 
 // --- 快捷命令栏 ---------------------------------------------------------
@@ -144,10 +235,18 @@ async function openLocalTerminal() {
   }
 }
 
-/** 向活动终端发送一条快捷命令。 */
+/** 向活动终端发送一条快捷命令（开启广播时同步到本页签全部已连接窗格）。 */
 function runShortcut(sc: ShortcutCommand) {
-  if (!active.value?.instanceId) return;
-  activePaneRef.value?.sendCommand(resolveCommand(sc.command));
+  const t = activeTerminal.value;
+  if (!t?.instanceId) return;
+  const cmd = resolveCommand(sc.command);
+  if (terminals.broadcastInput && t.panes.length > 1) {
+    for (const p of t.panes) {
+      if (p.instanceId) paneRefs.get(`${t.id}::${p.id}`)?.sendCommand(cmd);
+    }
+    return;
+  }
+  activePaneRef.value?.sendCommand(cmd);
 }
 
 // --- 快捷命令栏：展开/折叠（状态持久化） --------------------------------
@@ -217,23 +316,62 @@ async function saveNewShortcut() {
 function onGlobalKeydown(e: KeyboardEvent) {
   // 长按连发（e.repeat）只响应首次按键，避免自定义命令被连续执行。
   if (e.repeat) return;
-  // Ctrl+W 关闭当前标签：放在可编辑元素排除**之前**——焦点在终端画布内时
-  // 事件源是 xterm 的隐藏 textarea，若先走排除逻辑就永远拦不到。捕获阶段
-  // 拦截 + stopPropagation：xterm 收不到就不会把 Ctrl+W（\x17 删词）发往
-  // 远端，关标签不会连带删掉远端一个词（shell 删词可用 Alt+Backspace）。
-  if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === "w") {
-    if (!active.value?.instanceId) return;
+  const target = e.target as HTMLElement | null;
+  // 是否聚焦在可编辑元素（AI 输入框/搜索框，以及 xterm 的隐藏 textarea——
+  // 后者同样是 TEXTAREA，用 inXterm 区分）。
+  const isEditable =
+    !!target &&
+    (target.tagName === "INPUT" ||
+      target.tagName === "TEXTAREA" ||
+      target.isContentEditable);
+  const inXterm = !!target?.closest(".xterm-wrap");
+
+  // 关闭当前标签（默认 Ctrl+W）：焦点在终端画布内时事件源是 xterm 的隐藏
+  // textarea，必须在此捕获阶段拦截 + stopPropagation——xterm 收不到就不会
+  // 把 Ctrl+W（\x17 删词）发往远端。**其它可编辑元素**（AI 输入框/搜索框）
+  // 放行原按键，不再误关标签。拦截与否跟随「设置 → 快捷键」的 closeTab
+  // 绑定：用户清除/改绑后这里不再抢按键。
+  const closeTabCombo = settings.getAppShortcut("closeTab");
+  if (closeTabCombo && matchesCombo(e, closeTabCombo) && (!isEditable || inXterm)) {
+    if (!active.value) return;
     e.preventDefault();
     e.stopPropagation();
-    void terminals.close(active.value.instanceId);
+    void terminals.close(active.value.id);
     return;
   }
-  // 仅当聚焦在 body 或非可编辑元素时才响应快捷键，避免与输入框冲突。
-  const target = e.target as HTMLElement | null;
-  if (target) {
-    const tag = target.tagName;
-    if (tag === "INPUT" || tag === "TEXTAREA" || target.isContentEditable) return;
+  // --- 分屏窗格快捷键（固定 Alt+Shift 组合，参考 Windows Terminal） ---
+  // 焦点在终端画布内（xterm 隐藏 textarea）也响应——Alt+Shift 组合与终端
+  // 应用冲突少；捕获阶段拦截防止 Alt 转义序列发给远端。
+  if (e.altKey && e.shiftKey && !e.ctrlKey && !e.metaKey && (!isEditable || inXterm)) {
+    const t = activeTerminal.value;
+    if (t) {
+      let handled = true;
+      if (e.key === "+" || e.key === "=") {
+        void terminals.splitPane(t, "row");
+      } else if (e.key === "-" || e.key === "_") {
+        void terminals.splitPane(t, "col");
+      } else if (e.key === "w" || e.key === "W") {
+        void terminals.closePane(t, t.activePaneId);
+      } else if (e.key === "Enter") {
+        terminals.toggleZoomPane(t, t.activePaneId);
+      } else if (e.key === "b" || e.key === "B") {
+        terminals.toggleBroadcast();
+      } else if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+        terminals.focusPaneRelative(t, 1);
+      } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+        terminals.focusPaneRelative(t, -1);
+      } else {
+        handled = false;
+      }
+      if (handled) {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+    }
   }
+  // 其余快捷键仅当聚焦在 body 或非可编辑元素时响应，避免与输入框冲突。
+  if (isEditable) return;
   const combo = eventToCombo(e);
   if (!combo || isModifierOnly(combo)) return;
   const hit = settings.shortcuts.find((s) => s.shortcut && s.shortcut === combo);
@@ -246,13 +384,13 @@ function onGlobalKeydown(e: KeyboardEvent) {
   // Ctrl+1~9 切换标签。焦点在终端画布内时让给远端（终端应用的 Ctrl+组合
   // 冲突更少，且切换有会话侧栏可用）。
   if ((e.ctrlKey || e.metaKey) && !e.altKey) {
-    if (!target?.closest(".xterm-wrap")) {
+    if (!inXterm) {
       if (/^[1-9]$/.test(e.key)) {
         const idx = Number(e.key) - 1;
         const tab = terminals.tabs[idx];
-        if (tab?.instanceId) {
+        if (tab) {
           e.preventDefault();
-          terminals.setActive(tab.instanceId);
+          terminals.setActive(tab.id);
         }
       }
     }
@@ -281,7 +419,7 @@ onBeforeUnmount(() => {
     <div class="tab-bar">
       <TabBar
         :tabs="tabItems"
-        :active-key="terminals.activeId"
+        :active-key="activeTabKey"
         empty-hint="从左侧会话树双击连接"
         @select="
           (k) => {
@@ -304,8 +442,32 @@ onBeforeUnmount(() => {
         <el-icon><Monitor /></el-icon>
         <span>本地终端</span>
       </button>
-      <!-- 终端工具栏 -->
-      <div v-if="active" class="term-toolbar">
+      <!-- 终端工具栏（仅终端页签；监控页签无清屏/字号/重连语义） -->
+      <div v-if="activeTerminal" class="term-toolbar">
+        <el-tooltip content="向右分屏 (Alt+Shift+=)" placement="bottom">
+          <el-button class="tool-btn" link @click="splitActive('row')">
+            <el-icon class="rot-90"><Menu /></el-icon>
+          </el-button>
+        </el-tooltip>
+        <el-tooltip content="向下分屏 (Alt+Shift+-)" placement="bottom">
+          <el-button class="tool-btn" link @click="splitActive('col')">
+            <el-icon><Menu /></el-icon>
+          </el-button>
+        </el-tooltip>
+        <el-tooltip
+          :content="terminals.broadcastInput ? '关闭广播输入 (Alt+Shift+B)' : '广播输入：按键同步到本页签全部窗格 (Alt+Shift+B)'"
+          placement="bottom"
+        >
+          <el-button
+            class="tool-btn"
+            link
+            :class="{ 'is-on': terminals.broadcastInput }"
+            @click="terminals.toggleBroadcast()"
+          >
+            <el-icon><Bell /></el-icon>
+          </el-button>
+        </el-tooltip>
+        <span class="tool-sep" />
         <el-tooltip content="清屏" placement="bottom">
           <el-button class="tool-btn" link @click="clearActive"><el-icon><Delete /></el-icon></el-button>
         </el-tooltip>
@@ -315,8 +477,8 @@ onBeforeUnmount(() => {
         <el-tooltip content="字体减小" placement="bottom">
           <el-button class="tool-btn" link @click="zoom(-1)"><el-icon><ZoomOut /></el-icon></el-button>
         </el-tooltip>
-        <el-tooltip content="重连" placement="bottom" v-if="active.disconnected">
-          <el-button class="tool-btn" link :loading="active.reconnecting" @click="reconnectActive">
+        <el-tooltip content="重连" placement="bottom" v-if="activeTerminal.disconnected">
+          <el-button class="tool-btn" link :loading="activeTerminal.reconnecting" @click="reconnectActive">
             <el-icon><Refresh /></el-icon>
           </el-button>
         </el-tooltip>
@@ -327,49 +489,21 @@ onBeforeUnmount(() => {
         <div
           v-for="tab in terminals.tabs"
           :key="tab.id"
-          v-show="tab.instanceId === terminals.activeId"
+          v-show="tab.id === terminals.activeTabId"
           class="pane"
         >
-          <template v-if="tab.instanceId">
-            <TerminalPane
-              :ref="(el: any) => onPaneRef(tab, el)"
-              :instance-id="tab.instanceId"
-              @closed="onTerminalClosed(tab.instanceId)"
-            />
-            <!-- 断开重连覆盖层 -->
-            <div v-if="tab.disconnected" class="reconnect-overlay">
-              <div class="reconnect-card">
-                <div class="reconnect-title">连接已断开</div>
-                <!-- 最近一次重连失败的原因（reconnect 失败写入 tab.error；pane
-                     已挂载时错误分支显示不到，不在 overlay 上展示用户就无从
-                     知道为什么连不上）。 -->
-                <div v-if="tab.error" class="reconnect-error" :title="tab.error">
-                  {{ tab.error }}
-                </div>
-                <el-button
-                  type="primary"
-                  :icon="Refresh"
-                  :loading="tab.reconnecting"
-                  @click="terminals.reconnect(tab.instanceId)"
-                >
-                  重新连接
-                </el-button>
-              </div>
-            </div>
-          </template>
-          <div v-else-if="tab.connecting" class="pane-status">连接中…</div>
-          <div v-else-if="tab.error" class="pane-status error">
-            <span class="pane-error-text">连接失败：{{ tab.error }}</span>
-            <!-- 认证失败：提供手动输入密码/口令码重试的入口（弹窗） -->
-            <el-button
-              v-if="isAuthError(tab.error)"
-              size="small"
-              :icon="Key"
-              @click="terminals.openManualAuth(tab)"
-            >
-              手动认证
-            </el-button>
+          <!-- 服务器监控页签：自建 SSH 连接采集，与终端实例无关；v-show 常驻
+               使其切到后台仍持续采集（曲线不中断），关闭页签即卸载停止 -->
+          <div v-if="tab.kind === 'monitor'" class="monitor-pane">
+            <MonitorPanel :session-config-id="tab.session.id" />
           </div>
+          <!-- 终端页签：分屏窗格树 + 稳定挂载的窗格实例（连接中/失败/断开
+               重连等状态由各窗格内部渲染） -->
+          <SplitArea
+            v-else
+            :tab="tab"
+            @pane-input="(pid: string, d: string) => onPaneInput(tab, pid, d)"
+          />
         </div>
         <div v-if="!active" class="workspace-empty">
           还没有打开任何终端。请从左侧会话树连接一台服务器。
@@ -378,8 +512,8 @@ onBeforeUnmount(() => {
       <!-- 终端助手面板：仅在终端页显示，与 DB 助手完全隔离 -->
       <AiPanel domain="ssh" />
     </div>
-    <!-- 终端底部快捷命令栏 -->
-    <div v-if="active" class="shortcut-bar">
+    <!-- 终端底部快捷命令栏（仅终端页签；监控页签无终端可发命令） -->
+    <div v-if="activeTerminal" class="shortcut-bar">
       <!-- 分组标签行：分组在左，右侧为「添加快捷命令」按钮 -->
       <div class="sc-tabs">
         <template v-if="hasGroups">
@@ -540,6 +674,21 @@ onBeforeUnmount(() => {
   color: var(--el-color-primary);
   background: var(--el-fill-color-light);
 }
+/* 广播输入开启态 */
+.tool-btn.is-on {
+  color: var(--el-color-primary);
+}
+/* 工具按钮分组分隔线 */
+.tool-sep {
+  width: 1px;
+  height: 16px;
+  margin: 0 4px;
+  background: var(--el-border-color-lighter);
+}
+/* 向右分屏图标（横线图标旋转 90° = 垂直分隔） */
+.rot-90 {
+  transform: rotate(90deg);
+}
 .workspace-body {
   flex: 1;
   min-height: 0;
@@ -557,85 +706,13 @@ onBeforeUnmount(() => {
   position: absolute;
   inset: 0;
 }
-/* 断开重连覆盖层 */
-.reconnect-overlay {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: rgba(0, 0, 0, 0.35);
-  backdrop-filter: blur(3px);
-  z-index: 20;
-  /* 遮罩放行鼠标事件：断开后终端输出仍可选中/复制/滚动（排障刚需——
-     拿不到最后几行日志就没法定位问题）；只有中央卡片拦截点击。 */
-  pointer-events: none;
-}
-.reconnect-card {
-  pointer-events: auto;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 12px;
-  padding: 24px 32px;
-  background: var(--el-bg-color-overlay);
-  border: 1px solid var(--el-border-color-lighter);
-  border-radius: 12px;
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.22);
-}
-.reconnect-error {
-  max-width: 320px;
-  margin-bottom: 2px;
-  font-size: 12px;
-  color: var(--el-color-danger);
-  text-align: center;
-  line-height: 1.5;
-  word-break: break-all;
-  display: -webkit-box;
-  -webkit-line-clamp: 3;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-.reconnect-title {
-  font-size: 14px;
-  font-weight: 600;
-  letter-spacing: 0.5px;
-  color: var(--el-text-color-primary);
-}
-.pane-status {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
+/* 监控页签容器：撑满 pane 并可滚动（面板本身是内容高度布局，
+   矮窗口/多指标时需要滚动而不是被裁切） */
+.monitor-pane {
   height: 100%;
-  font-size: 13px;
-  color: var(--el-text-color-secondary);
-}
-/* 连接中：主色旋转指示环 */
-.pane-status:not(.error)::before {
-  content: "";
-  width: 14px;
-  height: 14px;
-  border-radius: 50%;
-  border: 2px solid var(--el-border-color-light);
-  border-top-color: var(--el-color-primary);
-  animation: pane-spin 0.8s linear infinite;
-}
-@keyframes pane-spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-.pane-status.error {
-  color: var(--el-color-danger);
-  gap: 12px;
-  flex-wrap: wrap;
-  padding: 0 32px;
-  text-align: center;
-}
-
-.pane-error-text {
-  word-break: break-all;
+  overflow-y: auto;
+  padding: 14px 16px;
+  box-sizing: border-box;
 }
 
 /* --- 终端底部快捷命令栏 --- */

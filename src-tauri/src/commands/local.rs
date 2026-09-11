@@ -26,10 +26,16 @@ pub fn connect_local_terminal(
 
     let session = crate::local::LocalSession::spawn(&shell_id, &app)?;
     let id = session.id.clone();
-    state
-        .terminals
-        .lock()
-        .insert(id.clone(), crate::state::TerminalSession::Local(session));
+    // 输出日志（设置开启时）：本地 shell 以 shell 展示名命名。
+    let log_enabled = crate::config::settings_load_inner(&state)
+        .map(|s| s.terminal.output_log)
+        .unwrap_or(false);
+    let terminal = crate::state::TerminalSession::Local(session);
+    if log_enabled {
+        let name = format!("local-{}", shell_id);
+        terminal.attach_output_log(&name, &state.data_dir.join("logs"));
+    }
+    state.terminals.lock().insert(id.clone(), terminal);
     Ok(id)
 }
 

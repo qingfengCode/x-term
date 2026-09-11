@@ -15,6 +15,11 @@ const props = defineProps<{
   instanceId: string;
   /** noVNC 直连的 ws 地址（后端 vnc_bridge_start 返回）。 */
   wsUrl: string;
+  /**
+   * VNC 用户名（可选）。macOS 屏幕共享「账户登录」只提供 Apple ARD 认证
+   * （security type 30），必须同时带用户名+口令；普通 VNC Auth 只校验口令。
+   */
+  username?: string;
   /** VNC 口令（可选；服务端要求认证时由 RFB 握手使用，不经过后端）。 */
   password?: string;
 }>();
@@ -24,6 +29,10 @@ const containerRef = ref<HTMLDivElement | null>(null);
 const status = ref<"connecting" | "connected" | "disconnected" | "error">("connecting");
 /** 连接中覆盖层显示的分阶段提示（诊断用：挂载/构造/拨号哪一步卡住一目了然）。 */
 const stage = ref("连接中…");
+/** 最近一次握手失败原因（补丁 noVNC 内部 _fail 捕获，用于界面提示与日志）。 */
+const lastError = ref<string | null>(null);
+/** 是否已因认证失败提示过（避免断开时再弹一次重复文案）。 */
+let authFailed = false;
 
 const statusText = computed(() => {
   switch (status.value) {
@@ -39,6 +48,29 @@ const statusText = computed(() => {
 });
 
 let rfb: RFB | null = null;
+
+// --- 认证输入（macOS 屏幕共享等要求 username+password 的服务端） -----------
+// noVNC 在服务端要求认证且缺少凭据时会停下握手并派发 credentialsrequired，
+// 这里改成页面内输入继续（sendCredentials 恢复握手），而不是直接断开。
+const credPrompt = ref(false);
+const credUsername = ref("");
+const credPassword = ref("");
+
+/** 提交页面内输入的凭据，恢复被暂停的认证握手。 */
+function submitCreds() {
+  if (!rfb) return;
+  rfb.sendCredentials({
+    username: credUsername.value.trim() || undefined,
+    password: credPassword.value,
+  });
+  credPrompt.value = false;
+}
+
+/** 取消认证：主动断开（走 disconnect 事件统一通知外层）。 */
+function cancelCreds() {
+  credPrompt.value = false;
+  rfb?.disconnect();
+}
 
 // --- 缩放模式：fit 适配容器（等比，noVNC 内部缩放）/ original 原始大小（可滚动）/
 // stretch 拉伸填满（非等比，CSS 强制 canvas 尺寸）。 ---
@@ -87,7 +119,7 @@ onMounted(() => {
   stage.value = "正在连接 " + (props.wsUrl || "(空地址!)");
   try {
     rfb = new RFB(target, props.wsUrl, {
-      credentials: { password: props.password },
+      credentials: { username: props.username, password: props.password },
       shared: true,
       // 缩放到容器尺寸：noVNC 自带 ResizeObserver，容器变化时自动重算。
       scaleViewport: true,
@@ -104,24 +136,54 @@ onMounted(() => {
   }
   rfb.focusOnClick = true; // 点击画布抓取键盘焦点
 
+  // noVNC 的 _fail 只把原因写进内部日志、不随事件暴露；补丁捕获它以便
+  // 在界面/console 直接看到失败点（如 "Unsupported security types (types: 30,33,35,36)"）。
+  const rawRfb = rfb as unknown as { _fail?: (details: string) => boolean };
+  const origFail = rawRfb._fail?.bind(rfb);
+  if (typeof origFail === "function") {
+    rawRfb._fail = (details: string) => {
+      lastError.value = details;
+      console.error("[vnc-pane] RFB 失败:", details);
+      return origFail(details);
+    };
+  }
+
   rfb.addEventListener("connect", () => {
     status.value = "connected";
     // 已连上即通知外层抹除内存中的明文口令（RFB 握手已完成）。
     emit("connected");
   });
-  rfb.addEventListener("credentialsrequired", () => {
-    // 服务端再次要求口令（缺失或错误）：无法在画布内输入，提示并断开。
-    console.warn("[vnc-pane] 服务端要求口令");
-    ElMessage.error("VNC 需要口令（缺失或错误）：请在桌面页编辑连接并填写密码");
-    rfb?.disconnect();
+  rfb.addEventListener("credentialsrequired", (e) => {
+    // 服务端要求认证且缺凭据：macOS 屏幕共享（ARD）需要 username+password，
+    // 部分服务端只要求口令。统一弹出输入层，预填连接里保存过的值，
+    // 用户补齐后 sendCredentials 继续握手，不再直接断开。
+    const need = (e as unknown as CustomEvent<{ types?: string[] }>).detail?.types ?? [];
+    stage.value = need.includes("username")
+      ? "服务端要求用户名和密码认证（如 macOS 屏幕共享）"
+      : "服务端要求口令";
+    credUsername.value = props.username ?? "";
+    credPassword.value = props.password ?? "";
+    credPrompt.value = true;
   });
-  rfb.addEventListener("securityfailure", () => {
-    console.warn("[vnc-pane] 认证失败");
-    ElMessage.error("VNC 认证失败：口令不正确或服务端拒绝连接");
+  rfb.addEventListener("securityfailure", (e) => {
+    authFailed = true;
+    const detail = (e as unknown as CustomEvent<{ status?: number; reason?: string }>).detail;
+    console.warn("[vnc-pane] 认证失败:", detail);
+    ElMessage.error(
+      "VNC 认证失败：" +
+        (detail?.reason ? `（服务端：${detail.reason}）` : "") +
+        "用户名/口令不正确，或服务端拒绝了该连接方式",
+    );
   });
-  rfb.addEventListener("disconnect", () => {
+  rfb.addEventListener("disconnect", (e) => {
     if (!rfb) return; // 组件卸载主动断开时不重复通知
+    credPrompt.value = false; // 认证输入层随断开关闭，避免叠在重连覆盖层下
+    const clean = (e as unknown as CustomEvent<{ clean?: boolean }>).detail?.clean ?? true;
     status.value = "disconnected";
+    // 非正常断开：把捕获到的失败原因弹给用户（认证失败已在 securityfailure 提示过）。
+    if (!clean && !authFailed && lastError.value) {
+      ElMessage.error("VNC 连接失败：" + lastError.value);
+    }
     emit("closed");
   });
 
@@ -169,6 +231,34 @@ function sendCtrlAltDel() {
       :class="[`scale-${scaleMode}`]"
     ></div>
     <div v-if="status === 'connecting'" class="vnc-status">{{ stage }}</div>
+
+    <!-- 认证输入覆盖层：macOS 屏幕共享(ARD)等要求 username+password -->
+    <div v-if="credPrompt" class="cred-overlay">
+      <div class="cred-card">
+        <div class="cred-title">需要认证</div>
+        <div class="cred-hint">
+          macOS 屏幕共享需填 macOS 账户的用户名与密码；普通 VNC 只需填密码。
+        </div>
+        <input
+          v-model="credUsername"
+          class="cred-input"
+          placeholder="用户名（可选）"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <input
+          v-model="credPassword"
+          class="cred-input"
+          type="password"
+          placeholder="密码"
+          @keydown.enter="submitCreds"
+        />
+        <div class="cred-actions">
+          <button class="cred-btn" @click="cancelCreds">取消</button>
+          <button class="cred-btn primary" @click="submitCreds">连接</button>
+        </div>
+      </div>
+    </div>
     <div class="vnc-toolbar">
       <span class="vnc-state" :class="status">{{ statusText }}</span>
       <button
@@ -230,6 +320,75 @@ function sendCtrlAltDel() {
   color: var(--el-text-color-secondary);
   font-size: 13px;
   pointer-events: none;
+}
+/* 认证输入覆盖层（macOS 屏幕共享 ARD 等） */
+.cred-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+  z-index: 10;
+}
+.cred-card {
+  width: 300px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px;
+  border-radius: 8px;
+  background: var(--el-bg-color-overlay);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+  color: var(--el-text-color-primary);
+}
+.cred-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+.cred-hint {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  line-height: 1.6;
+}
+.cred-input {
+  width: 100%;
+  box-sizing: border-box;
+  height: 30px;
+  padding: 0 10px;
+  font-size: 13px;
+  color: var(--el-text-color-primary);
+  background: var(--el-bg-color);
+  border: 1px solid var(--el-border-color);
+  border-radius: 4px;
+  outline: none;
+}
+.cred-input:focus {
+  border-color: var(--el-color-primary);
+}
+.cred-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 2px;
+}
+.cred-btn {
+  border: 1px solid var(--el-border-color);
+  background: transparent;
+  color: var(--el-text-color-primary);
+  font-size: 12px;
+  padding: 4px 14px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.cred-btn.primary {
+  border-color: var(--el-color-primary);
+  background: var(--el-color-primary);
+  color: #fff;
+}
+.cred-btn:hover:not(.primary) {
+  border-color: var(--el-color-primary);
+  color: var(--el-color-primary);
 }
 .vnc-toolbar {
   position: absolute;

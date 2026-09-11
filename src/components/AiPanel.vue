@@ -109,6 +109,7 @@ function resetWidth() {
 
 onBeforeUnmount(() => {
   if (dragging.value) onResizeEnd();
+  if (composerHeightDragging.value) onComposerResizeEnd();
 });
 
 // --- 模式 ----------------------------------------------------------------
@@ -148,15 +149,16 @@ const SSH_PROMPTS: Record<SshMode, string> = {
 
 const DB_PROMPTS: Record<DbMode, string> = {
   chat:
-    "你是一名资深 MySQL DBA 助手，专注于 SQL 优化、表结构设计、索引、事务、性能调优。" +
+    "你是一名资深数据库 DBA 助手（按用户当前连接的 MySQL / PostgreSQL 方言作答），" +
+    "专注于 SQL 优化、表结构设计、索引、事务、性能调优。" +
     "回答简洁专业；SQL 用 markdown ```sql 代码块给出。",
   optimize:
-    "用户会提供一段 MySQL SQL。请给出优化建议：索引、重写、执行计划推测。" +
+    "用户会提供一段 SQL（MySQL / PostgreSQL 方言以当前连接为准）。请给出优化建议：索引、重写、执行计划推测。" +
     "优化后的 SQL 用 ```sql 代码块给出，并附简短说明。",
   explain:
-    "用户会提供一段 MySQL SQL 或查询结果。请用通俗简洁的中文解释其含义、潜在问题。",
+    "用户会提供一段 SQL 或查询结果（MySQL / PostgreSQL 方言以当前连接为准）。请用通俗简洁的中文解释其含义、潜在问题。",
   agent:
-    "你是一名可执行操作的 MySQL 数据库智能体。你可以调用工具在用户的数据库上执行 SQL" +
+    "你是一名可执行操作的数据库智能体。你可以调用工具在用户的数据库（MySQL / PostgreSQL，以当前连接为准）上执行 SQL" +
     "（exec_sql）、列出表（list_db_tables）、查看表结构（describe_table）来完成任务。\n" +
     "规则：\n" +
     "1. 需要查询数据时，调用 exec_sql（提供 dbConnId 和 sql）。默认只读查询（SELECT/SHOW/EXPLAIN）。" +
@@ -238,7 +240,7 @@ const todoCollapsed = ref(false);
 /** 超过该条数时显示折叠按钮。 */
 const TODO_COLLAPSE_THRESHOLD = 6;
 
-/** 当前活动会话的累计 token 用量（ai:usage 事件累加；无则 0）。 */
+/** 当前活动会话最近一次模型请求的 token 用量（ai:usage 事件覆盖；无则 0）。 */
 const activeUsage = computed(() => ai.activeConversation?.usage ?? { prompt: 0, completion: 0 });
 
 /** 用量展示文本："1.2k / 3M tokens"（千分位友好；整数千位不带小数，避免 "1.0k"）。 */
@@ -289,6 +291,10 @@ const activeTerminalId = computed(() => terminals.activeId);
 const AUTO_TERMINAL = "auto";
 const boundTerminals = ref<Record<string, string>>({});
 
+/** 仅终端页签：监控页签虽在同一 tab 列表，但没有终端实例，AI 无法在其上执行
+ *  命令，故绑定下拉 / 上下文解析 / 跟随目标一律排除。 */
+const terminalTabs = computed(() => terminals.tabs.filter((t) => t.kind === "terminal"));
+
 /**
  * 当前对话的绑定值（"auto" 或终端 tab 的**稳定 id**）。
  * 用 tab.id 而非 instanceId：重连会更换 instanceId，稳定 id 让绑定在
@@ -298,23 +304,69 @@ const boundTerminals = ref<Record<string, string>>({});
 const boundTerminalId = computed(() => {
   const bound = boundTerminals.value[ai.activeCid ?? ""];
   if (bound && bound !== AUTO_TERMINAL) {
-    if (terminals.tabs.some((t) => t.id === bound)) return bound;
+    if (terminalTabs.value.some((t) => t.id === bound)) return bound;
   }
   return AUTO_TERMINAL;
 });
 
-/** 绑定 / 跟随的目标 tab（绑定 tab 未连接时为 null——instanceId 还没有）。 */
+/**
+ * 发送时快照的终端 instanceId：响应期间 resolvedTerminalTab 固定用它。
+ *
+ * 痛点修复：agent 模式下后端一轮请求内所有工具调用都锁定在**发送时**传入的
+ * sessionId（ai_chat 入参只带一次）。若响应期间用户切了 tab，auto 跟随的
+ * computed 会漂到新终端——面板提示显示新终端，而 AI 实际操作的是发送时的
+ * 旧终端，两者不一致（用户感知"AI 用了旧终端"）。锁定后响应期间提示与
+ * 实际操作一致；响应结束（ai.sending=false）自动恢复跟随新活动终端。
+ */
+const sentTerminalId = ref<string | null>(null);
+
+// 响应结束（sending true→false）显式清空快照：resolvedTerminalTab 的锁定分支
+// 本就会因 ai.sending=false 跳过，这里兜底清掉残留值，杜绝任何路径读到旧终端。
+watch(
+  () => ai.sending,
+  (sending) => {
+    if (!sending) sentTerminalId.value = null;
+  },
+);
+
+// 响应期间用户切换终端 tab：AI 本轮仍操作发送时的终端，提示用户避免误判
+// （实际锁定已由 resolvedTerminalTab 的 sentTerminalId 分支保证，这里只告知）。
+watch(
+  () => terminals.activeId,
+  (id, old) => {
+    if (
+      id &&
+      id !== old &&
+      ai.sending &&
+      sentTerminalId.value &&
+      id !== sentTerminalId.value
+    ) {
+      ElMessage.info("AI 响应中，本轮仍操作发送时的终端（响应结束后自动跟随）");
+    }
+  },
+);
+
+/** 绑定 / 跟随的目标 tab（绑定 tab 未连接或已断开未重连时为 null——
+ *  断开 tab 的 instanceId 指向后端已销毁的会话，注入上下文只会让 AI 每轮
+ *  exec_ssh 必败）。 */
 const resolvedTerminalTab = computed(() => {
+  // 响应期间：锁定发送时的终端，不随 tab 切换 / activeId 变化漂移
+  // （中途断开也保持——本轮后端本就以该 sessionId 执行，断开由执行错误呈现）。
+  if (ai.sending && sentTerminalId.value) {
+    return terminalTabs.value.find((t) => t.instanceId === sentTerminalId.value) ?? null;
+  }
   if (boundTerminalId.value === AUTO_TERMINAL) {
     const id = activeTerminalId.value;
-    return id ? terminals.tabs.find((t) => t.instanceId === id) ?? null : null;
+    const t = id ? terminalTabs.value.find((x) => x.instanceId === id) : undefined;
+    return t && !t.disconnected ? t : null;
   }
-  return terminals.tabs.find((t) => t.id === boundTerminalId.value) ?? null;
+  const t = terminalTabs.value.find((x) => x.id === boundTerminalId.value);
+  return t && !t.disconnected ? t : null;
 });
 
-/** 可绑定的终端选项（所有 tab；断开的标记，重连后绑定自动恢复）。 */
+/** 可绑定的终端选项（仅终端页签；断开的标记，重连后绑定自动恢复）。 */
 const terminalOptions = computed(() =>
-  terminals.tabs.map((t, i) => ({
+  terminalTabs.value.map((t, i) => ({
     id: t.id,
     label:
       (terminalOptions_dup(t.session.name) ? `${t.session.name} #${i + 1}` : t.session.name) +
@@ -322,10 +374,16 @@ const terminalOptions = computed(() =>
   })),
 );
 function terminalOptions_dup(name: string): boolean {
-  return terminals.tabs.filter((t) => t.session.name === name).length > 1;
+  return terminalTabs.value.filter((t) => t.session.name === name).length > 1;
 }
 
 function setBoundTerminal(v: string) {
+  // 响应期间锁定终端绑定：AI 本轮正按发送时的终端操作，中途切换会造成
+  // 提示与实际操作不一致（且后端单轮内不会改用新 sessionId）。
+  if (ai.sending) {
+    ElMessage.warning("AI 响应中，暂不能切换终端（响应结束后可切换）");
+    return;
+  }
   const cid = ai.activeCid;
   if (!cid) return;
   if (v === AUTO_TERMINAL) delete boundTerminals.value[cid];
@@ -347,10 +405,14 @@ const contextTip = computed(() => {
     if (resolvedTerminalId.value) {
       const tab = terminals.tabs.find((t) => t.instanceId === resolvedTerminalId.value);
       if (tab) {
+        // 响应期间 AI 固定操作发送时的终端：标注"本轮固定"，避免用户误以为
+        // 已跟随到新切换的 tab（发送后 contextTip 立即显示锁定结果）。
         parts.push(
-          boundTerminalId.value === AUTO_TERMINAL
-            ? `附加终端: ${tab.session.name}（跟随当前）`
-            : `附加终端: ${tab.session.name}（已绑定）`,
+          ai.sending && sentTerminalId.value
+            ? `${tab.session.name}（本轮固定）`
+            : boundTerminalId.value === AUTO_TERMINAL
+              ? `${tab.session.name}（跟随当前）`
+              : `${tab.session.name}（已绑定）`,
         );
       }
     }
@@ -374,9 +436,15 @@ const contextTip = computed(() => {
     parts.push(dir ? `文件: ${dir}` : "⚠ 文件读写已开启，未设置工作目录");
   }
   if (props.domain === "ssh") {
-    return parts.length
-      ? parts.join("、")
-      : "未选择活动终端，请先连接后 AI 才能操作";
+    if (parts.length) return parts.join("、");
+    // 当前页签是服务器监控（与终端同一 tab 列表）时，别把原因说成"未连接"——
+    // 用户可能开着终端，只是停在了监控页签上。
+    const onMonitorTab = terminals.tabs.some(
+      (t) => t.kind === "monitor" && t.id === terminals.activeTabId,
+    );
+    return onMonitorTab
+      ? "当前页签是服务器监控，不是终端。请切到终端页签，或用上方下拉绑定一个终端"
+      : "无可用活动终端（未连接或已断开），请连接/重连后 AI 才能操作";
   }
   if (props.domain === "db") {
     return parts.length
@@ -625,20 +693,31 @@ async function attachFile(file: File) {
   }
 }
 
-/** 输入框粘贴：剪贴板含图片时附加（不拦截纯文本粘贴）。 */
+/** 输入框粘贴：剪贴板含图片时附加（不拦截纯文本粘贴）。
+ *  仅多模态模型支持图片输入：未开启时不做任何拦截，让默认行为生效
+ *  （剪贴板里的文本照常粘贴，图片被忽略）。 */
 function onComposerPaste(e: ClipboardEvent) {
   const items = e.clipboardData?.items ?? [];
   const imageItem = Array.from(items).find((it) => it.type.startsWith("image/"));
   const file = imageItem?.getAsFile();
   if (file) {
+    if (!multimodalEnabled.value) {
+      ElMessage.warning("当前模型未开启多模态，不支持粘贴图片（可在设置中开启）");
+      return;
+    }
     e.preventDefault();
     void attachFile(file);
   }
 }
 
-/** 拖入文件（图片）：与拖表共用 drop 通道，互不干扰。 */
+/** 拖入文件（图片）：与拖表共用 drop 通道，互不干扰。
+ *  仅多模态模型支持拖入图片：未开启时忽略图片（一次提示），不阻断拖表。 */
 function onComposerDropFiles(e: DragEvent) {
   const files = Array.from(e.dataTransfer?.files ?? []);
+  if (!multimodalEnabled.value && files.some((f) => f.type.startsWith("image/"))) {
+    ElMessage.warning("当前模型未开启多模态，不支持拖入图片（可在设置中开启）");
+    return;
+  }
   for (const f of files) void attachFile(f);
 }
 
@@ -646,6 +725,64 @@ function onComposerDropFiles(e: DragEvent) {
 const inputText = ref("");
 const scrollbarRef = ref();
 const inputRef = ref();
+
+// --- 输入框高度拖拽（拖动 composer 上边缘调整；仅放大，拖回自然高度恢复自适应） ---
+const composerRef = ref<HTMLElement | null>(null);
+/** 自定义高度（px）；null = 内容自适应（默认，autosize 2~5 行）。 */
+const composerH = ref<number | null>(null);
+const composerHeightDragging = ref(false);
+let dragStartY = 0;
+let dragStartComposerH = 0;
+/** 当前自然高度缓存：允许用户从自定义高度逐步下拖缩回，直到自然高才恢复 auto。 */
+let naturalComposerH = 0;
+
+function startComposerResize(e: MouseEvent) {
+  const el = composerRef.value;
+  if (!el) return;
+  e.preventDefault();
+  composerHeightDragging.value = true;
+  dragStartY = e.clientY;
+  if (composerH.value == null) {
+    naturalComposerH = el.getBoundingClientRect().height;
+  }
+  dragStartComposerH = composerH.value ?? naturalComposerH;
+  document.body.style.cursor = "row-resize";
+  document.body.style.userSelect = "none";
+  document.addEventListener("mousemove", onComposerResizeMove);
+  document.addEventListener("mouseup", onComposerResizeEnd);
+  // 鼠标在窗口外释放（拖出窗口边缘 / Alt-Tab 切走）时 mouseup 不触发，
+  // 监听器与 row-resize 光标、userSelect:none 会永久残留——用 window blur 兜底清理。
+  window.addEventListener("blur", onComposerResizeEnd);
+}
+
+function onComposerResizeMove(e: MouseEvent) {
+  const el = composerRef.value;
+  if (!el) return;
+  // 向上拖（clientY 减小）→ 输入区变高；最大不超面板高度的 60%。
+  const panel = el.closest(".ai-panel") as HTMLElement | null;
+  const maxH = panel ? Math.round(panel.clientHeight * 0.6) : 600;
+  const h = dragStartComposerH + (dragStartY - e.clientY);
+  if (h <= naturalComposerH) {
+    // 拖回自然高度及以下：恢复内容自适应。
+    composerH.value = null;
+  } else {
+    composerH.value = Math.min(maxH, Math.round(h));
+  }
+}
+
+function onComposerResizeEnd() {
+  composerHeightDragging.value = false;
+  document.body.style.cursor = "";
+  document.body.style.userSelect = "";
+  document.removeEventListener("mousemove", onComposerResizeMove);
+  document.removeEventListener("mouseup", onComposerResizeEnd);
+  window.removeEventListener("blur", onComposerResizeEnd);
+}
+
+/** 双击拖拽条：恢复内容自适应。 */
+function resetComposerH() {
+  composerH.value = null;
+}
 
 // --- 会话标签栏：溢出时活动标签自动滚入视野 -------------------------------
 const convTabsRef = ref<HTMLElement | null>(null);
@@ -775,9 +912,10 @@ function onComposerDragOver(e: DragEvent) {
   // 携带表数据（拖表附加）或图片文件（多模态）时才允许 drop。
   const types = Array.from(e.dataTransfer?.types ?? []);
   const hasTable = types.includes("application/x-xterm-table");
-  const hasImageFile = Array.from(e.dataTransfer?.files ?? []).some((f) =>
-    f.type.startsWith("image/")
-  );
+  // 图片仅在多模态模型下可拖入（非多模态不给"可放置"反馈，避免误导）。
+  const hasImageFile =
+    multimodalEnabled.value &&
+    Array.from(e.dataTransfer?.files ?? []).some((f) => f.type.startsWith("image/"));
   if (hasTable || hasImageFile) {
     e.preventDefault();
     if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
@@ -873,6 +1011,70 @@ function onSwitchConversation(cid: string) {
   void scrollToBottom();
 }
 
+// --- 历史会话归档（关闭的会话移入，可恢复或彻底删除） ----------------------
+/** 历史面板（el-popover 实例引用：恢复会话后手动关闭面板）。 */
+const historyPopRef = ref();
+
+/** 归档列表按归档时间倒序展示（旧持久化数据无 archivedAt 的排最后）。 */
+const archiveList = computed(() =>
+  [...ai.archives].sort((a, b) => (b.archivedAt ?? 0) - (a.archivedAt ?? 0)),
+);
+
+/** 相对时间：刚刚 / x 分钟前 / x 小时前 / x 天前 / 具体日期。 */
+function fmtRelTime(ts?: number): string {
+  if (!ts) return "";
+  const diff = Date.now() - ts;
+  if (diff < 60_000) return "刚刚";
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`;
+  if (diff < 7 * 86_400_000) return `${Math.floor(diff / 86_400_000)} 天前`;
+  const d = new Date(ts);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/** 恢复历史会话：移回标签栏并激活（复用切换逻辑：重置折叠 + 滚到底部）。 */
+function onRestoreConversation(cid: string) {
+  ai.restoreConversation(cid);
+  olderExpanded.value = false;
+  void scrollToBottom();
+  // 恢复后关闭历史面板，让用户直接看到恢复的会话。
+  historyPopRef.value?.hide?.();
+  ElMessage.success("已恢复会话");
+}
+
+/** 彻底删除归档会话（二次确认，不可恢复）。 */
+function onDeleteConversation(cid: string, title: string) {
+  ElMessageBox.confirm(`彻底删除会话「${title}」？删除后不可恢复。`, "删除历史会话", {
+    type: "warning",
+    confirmButtonText: "删除",
+    cancelButtonText: "取消",
+  })
+    .then(() => {
+      ai.deleteConversation(cid);
+      ElMessage.success("已删除");
+    })
+    .catch(() => {
+      /* 用户取消 */
+    });
+}
+
+/** 清空全部历史归档（二次确认，不可恢复）。 */
+function onClearArchives() {
+  ElMessageBox.confirm(`清空全部 ${ai.archives.length} 条历史会话？删除后不可恢复。`, "清空历史会话", {
+    type: "warning",
+    confirmButtonText: "清空",
+    cancelButtonText: "取消",
+  })
+    .then(() => {
+      ai.clearArchives();
+      ElMessage.success("已清空历史会话");
+    })
+    .catch(() => {
+      /* 用户取消 */
+    });
+}
+
 // --- 长对话折叠：只渲染最新 N 条，更早的消息折叠为一条提示 ----------
 // 长对话 DOM 数百条（每条含 markdown/工具卡片）导致滚动与流式更新卡顿；
 // 折叠后旧消息不进 DOM，展开按钮可临时查看全部（切换会话/发送新消息自动折叠）。
@@ -940,25 +1142,43 @@ function buildSendContext(agent: boolean): {
         "用户绑定的终端尚未连接完成（或已断开未重连）。请告诉用户：绑定的终端未就绪，稍候重试或重新选择终端。不要调用任何工具。"
       );
     } else {
+      // 当前停在监控页签（非终端）时给出可执行的指引，别让模型笼统地说
+      // "请先连接终端"（用户可能本就有已连接的终端）。
+      const onMonitorTab = terminals.tabs.some(
+        (t) => t.kind === "monitor" && t.id === terminals.activeTabId,
+      );
       ctxParts.push(
-        "当前没有活动终端。请直接告诉用户：请先连接终端后再让我操作。不要调用任何工具。"
+        onMonitorTab
+          ? "当前页签是服务器监控，不是终端。请告诉用户：切换到终端页签，或在上方下拉里绑定一个终端后再操作。不要调用任何工具。"
+          : "当前没有活动终端。请直接告诉用户：请先连接终端后再让我操作。不要调用任何工具。"
       );
     }
   } else if (props.domain === "db") {
     if (db.activeConnId) {
       const tab = db.activeTab;
       const name = tab?.profileName ?? "未命名";
+      const isPg = db.activeKind === "postgres";
+      const kindLabel = isPg ? "PostgreSQL" : "MySQL";
       ctxParts.push(
-        `当前活动 MySQL 连接：dbConnId="${db.activeConnId}"（${name}）。调用 exec_sql / list_db_tables / describe_table 时直接用这个 dbConnId。`
+        `当前活动 ${kindLabel} 连接：dbConnId="${db.activeConnId}"（${name}）。` +
+          `请书写 ${kindLabel} 方言的 SQL。调用 exec_sql / list_db_tables / describe_table 时直接用这个 dbConnId。`
       );
       activeDb = db.activeConnId;
       // 注入当前绑定库（点库/表或拖表时设置），让 AI 默认在该库 schema 下操作。
       if (db.activeDatabase) {
-        ctxParts.push(
-          `当前库（schema）为 "${db.activeDatabase}"，该连接已自动 USE 此库。` +
-            `执行 SQL 时直接引用表名（如 \`表名\`）即可，不要加库前缀；` +
-            `确需跨库时才用 \`${db.activeDatabase}\`.\`表名\` 限定。`
-        );
+        if (isPg) {
+          ctxParts.push(
+            `当前数据库为 "${db.activeDatabase}"（该连接已绑定此库）。` +
+              `执行 SQL 时直接引用表名（必要时用 "schema"."表名" 双引号限定）即可；` +
+              `PostgreSQL 表名常带 schema 前缀（如 public.users），跨 schema 才需要限定。`
+          );
+        } else {
+          ctxParts.push(
+            `当前库（schema）为 "${db.activeDatabase}"，该连接已自动 USE 此库。` +
+              `执行 SQL 时直接引用表名（如 \`表名\`）即可，不要加库前缀；` +
+              `确需跨库时才用 \`${db.activeDatabase}\`.\`表名\` 限定。`
+          );
+        }
       }
     } else {
       ctxParts.push(
@@ -1049,14 +1269,21 @@ async function handleSend() {
   // 发送新消息回到最新窗口：旧消息重新折叠（用户关注新回复）。
   olderExpanded.value = false;
   const ctx = buildSendContext(mode.value === "agent");
+  // 快照发送时的终端：agent 响应期间锁定它（不随 tab 切换漂移），
+  // 响应结束（ai.sending=false）后自动恢复跟随当前活动终端。
+  if (props.domain === "ssh" && ctx.opts.agent) {
+    sentTerminalId.value = ctx.opts.activeTerminalId ?? null;
+  }
+  // 立即清空附加项（内容已快照进 images 与 ctx.prompt）：原先在 await
+  // send() 之后才清理——agent 响应长达数十秒，期间用户新粘贴的图片/新勾选
+  // 的技能/新拖入的表会被这段收尾误清。
+  clearAttachedTables();
+  attachedImages.value = [];
+  selectedSkills.value = [];
   await ai.send(text, ctx.prompt, { ...ctx.opts, images });
   // 发送后强制跟随滚动到底部（用户主动发送，应看到自己的消息与回复开始；
   // 若此刻正在上翻浏览，也以发送为准回到最新位置）。
   void scrollToBottom();
-  // 发送后清空附加表、图片与已选技能（下次提问重新拖/选）。
-  clearAttachedTables();
-  attachedImages.value = [];
-  selectedSkills.value = [];
 }
 
 /** 拼接附加表的 DDL 段落（用于注入 system prompt）。无附加表返回空串。 */
@@ -1255,6 +1482,10 @@ async function regenerateMessage(m: AiMessage) {
   // 用消息生成时的 agent 模式（而非面板当前 mode）重建上下文，保证"重问"
   // 得到的上下文与首次发送一致；附加表 DDL / skill 段落同样按当前状态注入。
   const ctx = buildSendContext(m.agent === true);
+  // 与 handleSend 一致：重生也是新请求，快照当前终端供响应期间锁定。
+  if (props.domain === "ssh" && ctx.opts.agent) {
+    sentTerminalId.value = ctx.opts.activeTerminalId ?? null;
+  }
   try {
     await ai.regenerate(m.id, ctx.prompt, ctx.opts);
   } catch (e) {
@@ -1297,9 +1528,9 @@ async function approveTool(tool: ToolCallItem) {
   }
   const ok = await ai.approveToolCall(tool.toolCallId);
   if (!ok) {
-    // 僵尸卡片（轮次已超时/请求已结束）：命令不会执行，明确告知而非让用户
-    // 对着"执行中"的卡片干等。
-    ElMessage.warning("该确认已超过 5 分钟等待上限（或请求已结束），命令未执行；请重新发送请求");
+    // 僵尸卡片（轮次已超时/请求已结束）或桌面工具执行失败（RDP 会话不可用
+    // 等）：命令不会执行，明确告知而非让用户对着"执行中"的卡片干等。
+    ElMessage.warning("命令未执行（确认已超时、请求已结束或执行失败）；请重试或重新发送请求");
   }
 }
 
@@ -1746,6 +1977,63 @@ function renderMarkdown(text: string): string {
               <el-icon><DArrowRight /></el-icon>
             </el-button>
           </el-tooltip>
+          <!-- 历史会话：关闭归档的会话列表，面板在按钮下方弹出 -->
+          <el-popover
+            ref="historyPopRef"
+            placement="bottom-end"
+            :width="280"
+            trigger="click"
+            popper-class="ai-history-popper"
+          >
+            <template #reference>
+              <el-button class="icon-btn" link title="历史会话">
+                <el-icon><Clock /></el-icon>
+              </el-button>
+            </template>
+            <div class="arch-panel">
+              <div class="arch-head">
+                <span>历史会话</span>
+                <el-button
+                  v-if="archiveList.length > 0"
+                  size="small"
+                  link
+                  type="danger"
+                  @click="onClearArchives"
+                >
+                  清空
+                </el-button>
+              </div>
+              <div class="arch-list">
+                <div
+                  v-for="c in archiveList"
+                  :key="c.id"
+                  class="arch-item"
+                  @click="onRestoreConversation(c.id)"
+                >
+                  <div class="arch-item-main">
+                    <div class="arch-item-title" :title="c.title">{{ c.title || '新对话' }}</div>
+                    <div class="arch-item-meta">
+                      <span>{{ c.messages.length }} 条消息</span>
+                      <span v-if="fmtRelTime(c.archivedAt)">关闭于 {{ fmtRelTime(c.archivedAt) }}</span>
+                    </div>
+                  </div>
+                  <el-tooltip content="恢复会话" placement="top">
+                    <el-icon class="arch-act restore" @click.stop="onRestoreConversation(c.id)">
+                      <RefreshRight />
+                    </el-icon>
+                  </el-tooltip>
+                  <el-tooltip content="彻底删除" placement="top">
+                    <el-icon class="arch-act delete" @click.stop="onDeleteConversation(c.id, c.title)">
+                      <Delete />
+                    </el-icon>
+                  </el-tooltip>
+                </div>
+                <div v-if="archiveList.length === 0" class="arch-empty">
+                  暂无历史会话（关闭的对话会归档到这里）
+                </div>
+              </div>
+            </div>
+          </el-popover>
           <el-dropdown
             trigger="click"
             popper-class="ai-header-dropdown"
@@ -1830,39 +2118,41 @@ function renderMarkdown(text: string): string {
         <el-alert :title="configTip" type="warning" :closable="false" show-icon />
       </div>
 
-      <!-- 消息列表 -->
-      <el-scrollbar ref="scrollbarRef" class="messages">
-        <!-- 智能体任务清单条（todo_write 维护；新回合自动清空） -->
-        <div v-if="activeTodos.length > 0" class="todo-strip">
-          <div class="todo-strip-title" @click="todoCollapsed = !todoCollapsed">
-            <el-icon><Collection /></el-icon>
-            <span>任务清单</span>
-            <span class="todo-stats">{{ todoStats.completed }}/{{ todoStats.total }} 完成</span>
-            <div class="todo-progress" :class="{ done: todoStats.completed === todoStats.total }">
-              <div class="todo-progress-bar" :style="{ width: todoStats.pct + '%' }" />
-            </div>
-            <el-icon
-              v-if="activeTodos.length > TODO_COLLAPSE_THRESHOLD"
-              class="todo-collapse"
-              :title="todoCollapsed ? '展开' : '收起'"
-            >{{ todoCollapsed ? ArrowDown : ArrowUp }}</el-icon>
+      <!-- 智能体任务清单条（todo_write 维护；新回合自动清空）。
+           放在滚动区之外：始终固定在消息列表顶部，不随消息滚动被滚走。 -->
+      <div v-if="activeTodos.length > 0" class="todo-strip">
+        <div class="todo-strip-title" @click="todoCollapsed = !todoCollapsed">
+          <el-icon><Collection /></el-icon>
+          <span>任务清单</span>
+          <span class="todo-stats">{{ todoStats.completed }}/{{ todoStats.total }} 完成</span>
+          <div class="todo-progress" :class="{ done: todoStats.completed === todoStats.total }">
+            <div class="todo-progress-bar" :style="{ width: todoStats.pct + '%' }" />
           </div>
-          <div v-show="!todoCollapsed" class="todo-items">
-            <div
-              v-for="(t, i) in activeTodos"
-              :key="i"
-              class="todo-item"
-              :class="`todo-${t.status}`"
-            >
-              <el-icon v-if="t.status === 'completed'" class="todo-icon done"><CircleCheckFilled /></el-icon>
-              <el-icon v-else-if="t.status === 'in_progress'" class="todo-icon in-progress is-loading"><Loading /></el-icon>
-              <el-icon v-else class="todo-icon"><Clock /></el-icon>
-              <span class="todo-content" :class="{ 'todo-content-done': t.status === 'completed' }">
-                {{ t.content }}
-              </span>
-            </div>
+          <el-icon
+            v-if="activeTodos.length > TODO_COLLAPSE_THRESHOLD"
+            class="todo-collapse"
+            :title="todoCollapsed ? '展开' : '收起'"
+          >{{ todoCollapsed ? ArrowDown : ArrowUp }}</el-icon>
+        </div>
+        <div v-show="!todoCollapsed" class="todo-items">
+          <div
+            v-for="(t, i) in activeTodos"
+            :key="i"
+            class="todo-item"
+            :class="`todo-${t.status}`"
+          >
+            <el-icon v-if="t.status === 'completed'" class="todo-icon done"><CircleCheckFilled /></el-icon>
+            <el-icon v-else-if="t.status === 'in_progress'" class="todo-icon in-progress is-loading"><Loading /></el-icon>
+            <el-icon v-else class="todo-icon"><Clock /></el-icon>
+            <span class="todo-content" :class="{ 'todo-content-done': t.status === 'completed' }">
+              {{ t.content }}
+            </span>
           </div>
         </div>
+      </div>
+
+      <!-- 消息列表 -->
+      <el-scrollbar ref="scrollbarRef" class="messages">
         <div v-if="ai.messages.length === 0" class="empty-hint">
           <template v-if="mode === 'agent'">
             <template v-if="domain === 'ssh'">
@@ -2161,10 +2451,21 @@ function renderMarkdown(text: string): string {
         </div>
       </el-scrollbar>
 
+      <!-- 输入框高度拖拽条（composer 上边缘）：向上拖放大输入区，双击恢复自动 -->
+      <div
+        class="composer-resizer"
+        :class="{ active: composerHeightDragging }"
+        title="拖拽调整输入框高度（双击恢复自动）"
+        @mousedown="startComposerResize"
+        @dblclick="resetComposerH"
+      />
+
       <!-- 底部输入区 -->
       <div
+        ref="composerRef"
         class="composer"
-        :class="{ 'drag-over': dragOver }"
+        :class="{ 'drag-over': dragOver, 'has-custom-height': composerH != null }"
+        :style="composerH != null ? { height: composerH + 'px' } : undefined"
         @drop="onComposerDrop"
         @dragover="onComposerDragOver"
         @dragleave="onComposerDragLeave"
@@ -2172,14 +2473,18 @@ function renderMarkdown(text: string): string {
         <!-- 输入框上方的信息栏：智能体上下文（已附加终端）+ token 用量 -->
         <div class="composer-toolbar">
           <!-- ssh 域：提示条即终端绑定入口（点击弹出终端菜单，选择结果体现在
-               提示文案"终端: xxx（已绑定/跟随当前）"里）——不额外占用工具栏宽度。 -->
+               提示文案"xxx（已绑定/跟随当前）"里）——不额外占用工具栏宽度。 -->
           <el-dropdown
             v-if="props.domain === 'ssh' && mode === 'agent' && !configBlocked"
             trigger="click"
             popper-class="ai-term-bind-dropdown"
+            :disabled="ai.sending"
             @command="setBoundTerminal"
           >
-            <span class="ctx-tip-inline ctx-tip-link" title="点击选择 AI 固定操作的终端">
+            <span
+              class="ctx-tip-inline ctx-tip-link"
+              :title="ai.sending ? 'AI 响应中，本轮固定操作该终端，响应结束后可切换' : '点击选择 AI 固定操作的终端'"
+            >
               <el-icon><Connection /></el-icon>
               <span>{{ contextTip }}</span>
               <el-icon class="ctx-caret"><ArrowDown /></el-icon>
@@ -2210,11 +2515,11 @@ function renderMarkdown(text: string): string {
             <el-icon><Connection /></el-icon>
             <span>{{ contextTip }}</span>
           </span>
-          <!-- token 用量（当前会话累计；借鉴 dsh llm/token-meter） -->
+          <!-- token 用量（最近一次模型请求；取最后一次返回的 usage，不累计） -->
           <span
             v-if="activeUsage.prompt > 0 || activeUsage.completion > 0"
             class="usage-meter"
-            :title="`本会话累计：输入 ${activeUsage.prompt.toLocaleString()} tokens，输出 ${activeUsage.completion.toLocaleString()} tokens（清空对话后归零）`"
+            :title="`最近一次请求：输入 ${activeUsage.prompt.toLocaleString()} tokens，输出 ${activeUsage.completion.toLocaleString()} tokens`"
           >
             <el-icon><Odometer /></el-icon>
             {{ formatTokens(activeUsage.prompt + activeUsage.completion) }} tokens
@@ -2646,6 +2951,86 @@ function renderMarkdown(text: string): string {
 .conv-new:hover {
   color: var(--el-color-primary);
 }
+
+/* --- 历史会话面板（header 按钮下方弹出的 popover 内容） ---
+   popover 挂 body，但插槽内容带本组件 data-v 属性，scoped 样式依然生效；
+   面板外壳（padding 等）用下方 :global(.ai-history-popper) 微调。 */
+:global(.ai-history-popper.el-popover) {
+  padding: 8px;
+}
+.arch-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.arch-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--el-text-color-primary);
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+}
+.arch-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  /* 归档很多时限高滚动，面板不撑出屏幕。 */
+  max-height: 320px;
+  overflow-y: auto;
+}
+.arch-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.arch-item:hover {
+  border-color: var(--el-color-primary-light-5);
+  background: var(--el-fill-color-light);
+}
+.arch-item-main {
+  flex: 1;
+  min-width: 0;
+}
+.arch-item-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--el-text-color-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.arch-item-meta {
+  display: flex;
+  gap: 10px;
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+.arch-act {
+  flex-shrink: 0;
+  font-size: 14px;
+  color: var(--el-text-color-secondary);
+}
+.arch-act.restore:hover {
+  color: var(--el-color-primary);
+}
+.arch-act.delete:hover {
+  color: var(--el-color-danger);
+}
+.arch-empty {
+  padding: 32px 0;
+  text-align: center;
+  font-size: 13px;
+  color: var(--el-text-color-placeholder);
+}
 .icon-btn {
   padding: 4px;
   color: var(--el-text-color-secondary);
@@ -2742,8 +3127,13 @@ function renderMarkdown(text: string): string {
   border-radius: 6px;
   background: var(--el-fill-color-light);
   padding: 8px 10px;
-  margin-bottom: 10px;
+  /* 固定条：不参与 flex 压缩；左右留白对齐消息区 padding（12px）。 */
+  flex-shrink: 0;
+  margin: 12px 12px 0;
   font-size: 12px;
+  /* 清单条目很多（展开态）时限高内部滚动，避免把消息区挤没。 */
+  max-height: 40%;
+  overflow-y: auto;
 }
 .todo-strip-title {
   display: flex;
@@ -3076,12 +3466,66 @@ function renderMarkdown(text: string): string {
   font-weight: 600;
 }
 
+/* --- 输入框高度拖拽条（composer 上边缘） ---
+   flex 布局中占独立一行：常态为一条细横线把手，hover / 拖拽中主色高亮。 */
+.composer-resizer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  height: 7px;
+  cursor: row-resize;
+  user-select: none;
+}
+.composer-resizer::before {
+  content: "";
+  width: 44px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--el-border-color);
+  transition: background-color 0.15s ease, width 0.15s ease;
+}
+.composer-resizer:hover::before,
+.composer-resizer.active::before {
+  width: 64px;
+  background: var(--el-color-primary);
+}
+
 /* --- 输入区 --- */
 .composer {
   border-top: 1px solid var(--el-border-color-lighter);
   padding: 10px 12px;
   flex-shrink: 0;
   transition: background 0.15s, box-shadow 0.15s;
+}
+/* 自定义高度（用户拖高输入区）：纵向弹性布局，输入框填满剩余空间并内部滚动。
+   默认（无此 class）保持 autosize 2~5 行内容自适应，行为不变。 */
+.composer.has-custom-height {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.composer.has-custom-height .composer-row {
+  flex: 1;
+  min-height: 0;
+}
+.composer.has-custom-height .input-wrap {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+/* el-input textarea：flex 拉伸填满容器（autosize 内联高度不生效），超长内容内部滚动。 */
+.composer.has-custom-height :deep(.el-textarea) {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.composer.has-custom-height :deep(.el-textarea__inner) {
+  flex: 1;
+  min-height: 0;
+  height: auto;
+  overflow-y: auto;
 }
 /* 拖表悬停时高亮整个 composer，提示可放置。 */
 .composer.drag-over {
@@ -3244,7 +3688,7 @@ function renderMarkdown(text: string): string {
   white-space: nowrap;
   text-overflow: ellipsis;
 }
-/* 当前会话累计 token 用量（ai:usage 事件累计，借鉴 dsh llm/token-meter） */
+/* 最近一次模型请求的 token 用量（ai:usage 事件覆盖写入，非累计） */
 .usage-meter {
   display: inline-flex;
   align-items: center;

@@ -1,5 +1,5 @@
 <!--
-  SqlConsoleView.vue — MySQL SQL 控制台（多标签）
+  SqlConsoleView.vue — SQL 控制台（MySQL / PostgreSQL，多标签）
 
   功能：
   - 多标签页（参考终端）：每个标签 = 一个独立连接 + 绑定一个库（schema）。
@@ -41,6 +41,7 @@ import {
 } from "@element-plus/icons-vue";
 import {
   dbDeleteProfile,
+  dbDefaultTableQuery,
   dbListDatabases,
   dbListProfiles,
   dbListTables,
@@ -49,7 +50,7 @@ import {
   dbDeleteGroup,
   type DraggedTable,
 } from "@/api/db";
-import type { DbGroup, DbProfile, QueryResult, AiSqlResultEvent } from "@/api/types";
+import type { DbGroup, DbKind, DbProfile, QueryResult, AiSqlResultEvent } from "@/api/types";
 import { listen } from "@tauri-apps/api/event";
 import DbProfileDialog from "@/components/DbProfileDialog.vue";
 import AiPanel from "@/components/AiPanel.vue";
@@ -70,17 +71,58 @@ const settings = useSettingsStore();
 const isDark = computed(() => settings.terminal.theme === "dark");
 
 // --- AI 系统提示词 ----------------------------------------------------------
-const SYSTEM_DIAGNOSE =
-  "你是一名资深 MySQL DBA。用户会提供一段 SQL，请给出优化建议：" +
-  "1) 指出潜在的性能问题（缺索引、全表扫描、N+1、回表等）；" +
-  "2) 给出优化后的 SQL（用 ```sql 代码块）；" +
-  "3) 必要时建议索引（CREATE INDEX）。简洁、专业、中文。";
+// 按活动标签连接的数据库类型切换措辞（MySQL / PostgreSQL 方言差异大）。
 
-const SYSTEM_EXPLAIN =
-  "你是一名资深 MySQL DBA。用户会提供一段 SQL，请用通俗简洁的中文解释：" +
-  "1) 这段 SQL 做了什么；" +
-  "2) 涉及的关键字/函数/子查询含义；" +
-  "3) 可能的注意事项。不要重复 SQL 原文。";
+/** profile.kind 是否为 PostgreSQL（容忍 postgresql/pg 别名）。 */
+function isPostgres(kind?: string | null): boolean {
+  const k = (kind ?? "").toLowerCase();
+  return k === "postgres" || k === "postgresql" || k === "pg";
+}
+
+// kind 由标签携带（openTab 时从 profile 归一化），不依赖 profiles 列表加载时序。
+const activeKind = computed<DbKind>(() => db.activeKind);
+
+const dbaTitle = computed(() =>
+  activeKind.value === "postgres" ? "资深 PostgreSQL DBA" : "资深 MySQL DBA"
+);
+const dbDialectLabel = computed(() =>
+  activeKind.value === "postgres" ? "PostgreSQL SQL" : "MySQL SQL"
+);
+
+/** 命令行模式提示符（按数据库类型区分）。 */
+const cliPrompt = computed(() => (activeKind.value === "postgres" ? "postgres>" : "mysql>"));
+
+/** 树中隐藏的系统库（按数据库类型）。 */
+const SYSTEM_DATABASES: Record<"mysql" | "postgres", string[]> = {
+  mysql: ["information_schema", "performance_schema", "mysql", "sys"],
+  postgres: ["postgres", "template0", "template1"],
+};
+
+function systemDatabasesOf(profile: DbProfile): string[] {
+  return isPostgres(profile.kind) ? SYSTEM_DATABASES.postgres : SYSTEM_DATABASES.mysql;
+}
+
+/** 按数据库类型生成标识符限定名（MySQL 反引号 / PG 双引号；段间点分隔）。 */
+function quoteTableForKind(kind: string | null | undefined, table: string): string {
+  const q = isPostgres(kind) ? (s: string) => `"${s}"` : (s: string) => `\`${s}\``;
+  return table.split(".").map(q).join(".");
+}
+
+const SYSTEM_DIAGNOSE = computed(
+  () =>
+    `你是一名${dbaTitle.value}。用户会提供一段 SQL，请给出优化建议：` +
+    "1) 指出潜在的性能问题（缺索引、全表扫描、N+1、回表等）；" +
+    "2) 给出优化后的 SQL（用 ```sql 代码块）；" +
+    "3) 必要时建议索引（CREATE INDEX）。简洁、专业、中文。"
+);
+
+const SYSTEM_EXPLAIN = computed(
+  () =>
+    `你是一名${dbaTitle.value}。用户会提供一段 SQL，请用通俗简洁的中文解释：` +
+    "1) 这段 SQL 做了什么；" +
+    "2) 涉及的关键字/函数/子查询含义；" +
+    "3) 可能的注意事项。不要重复 SQL 原文。"
+);;
 
 // --- profile 列表 -----------------------------------------------------------
 const profiles = ref<DbProfile[]>([]);
@@ -428,7 +470,7 @@ async function loadTreeNode(node: any, resolve: (children: TreeNode[]) => void, 
       const nodes = await cachedOrLoad(`dbs:${profile.id}`, async () => {
         const dbs = await dbListDatabases(connId);
         return dbs
-          .filter((d) => !["information_schema", "performance_schema", "mysql", "sys"].includes(d))
+          .filter((d) => !systemDatabasesOf(profile).includes(d))
           .map((d) => ({
             type: "database" as const,
             key: `db-${profile.id}-${d}`,
@@ -589,7 +631,18 @@ async function onTreeNodeClick(data: TreeNode) {
       if (!ok) return; // 连接失败已弹提示；不填模板，避免执行落在错连接上
     }
     // 活动标签即表所属库标签（已自动 USE）→ 用不带前缀的表名。
-    const selectTpl = `SELECT * FROM \`${data.value}\` LIMIT 100;`;
+    // SELECT 模板由后端按方言生成（浏览模式）：MySQL/SQLite 反引号、PG 双引号
+    // ——前端不再手拼（旧实现对 PG 也用反引号，是已知小瑕疵）。
+    let selectTpl = "";
+    try {
+      const tplConnId = db.activeTab?.connId ?? "";
+      selectTpl =
+        tplConnId && data.database !== undefined
+          ? await dbDefaultTableQuery(tplConnId, data.value, 100, 0)
+          : `SELECT * FROM \`${data.value}\` LIMIT 100;`;
+    } catch {
+      selectTpl = `SELECT * FROM \`${data.value}\` LIMIT 100;`;
+    }
     const s = activeState.value;
     if (s) {
       if (s.editorMode.value === "console") {
@@ -605,10 +658,13 @@ async function onTreeNodeClick(data: TreeNode) {
         }
       }
     }
-    // 预拉表结构（不弹层）——DESCRIBE 带库名限定（`db`.`table`），不依赖连接
-    // 当前库：同 profile 开了多个库标签时，连接当前库未必是表所在库。
+    // 预拉表结构（不弹层）——MySQL 的 DESCRIBE 需 `db`.`table` 限定（同 profile
+    // 开多个库标签时连接当前库未必是表所在库）；PG 的表名已带 schema 前缀，
+    // 库由连接层决定，不拼接库名。
     const connId = db.activeTab?.connId ?? (await ensureProfileConn(data.profileId ?? ""));
-    const desc = connId && s ? await s.console.loadStructure(data.value, connId, dbName) : null;
+    const descDb = isPostgres(profile?.kind) ? undefined : dbName;
+    const desc =
+      connId && s ? await s.console.loadStructure(data.value, connId, descDb) : null;
     if (desc) {
       const cols = desc.rows.map((r) => r[0]).filter(Boolean);
       data.columns = cols;
@@ -792,6 +848,37 @@ onBeforeUnmount(() => {
   resultBodyObs = null;
 });
 
+// --- 命令行模式输出区高度（结果表自适应基准） ---
+// 表格高度不再固定 400px：内容少时贴合实际行数（不留大片空白），
+// 内容多时占满输出区可视高度（扣除语句行/元信息/输入框的预留空间）。
+const consoleOutputHeight = ref(400);
+let consoleOutputObs: ResizeObserver | null = null;
+watch(
+  () => activeState.value?.console.scrollRef.value ?? null,
+  (el) => {
+    consoleOutputObs?.disconnect();
+    if (!el) return;
+    consoleOutputHeight.value = Math.max(160, el.clientHeight);
+    consoleOutputObs = new ResizeObserver((entries) => {
+      for (const en of entries) {
+        consoleOutputHeight.value = Math.max(160, Math.floor(en.contentRect.height));
+      }
+    });
+    consoleOutputObs.observe(el);
+  },
+);
+onBeforeUnmount(() => {
+  consoleOutputObs?.disconnect();
+  consoleOutputObs = null;
+});
+
+/** 命令行模式结果表自适应高度：min(表头+行数×行高, 输出区可视高度-预留)。 */
+function consoleTableHeight(rowCount: number): number {
+  const content = 36 + rowCount * 34 + 2; // 表头 36 + 数据行 34/行 + 滚动条余量
+  const avail = Math.max(120, consoleOutputHeight.value - 105);
+  return Math.max(70, Math.min(content, avail));
+}
+
 // --- 标签管理（横向标签栏） ----------------------------------------------
 /** 标签标题：库名（未绑定库时为 profile 名）。 */
 function tabTitle(tab: DbTab) {
@@ -921,6 +1008,7 @@ const { mount: mountSqlEditor, remount: remountSqlEditor, getView: getSqlView } 
   () => void execute(),
   isDark,
   () => void execute(), // Enter 直接执行（Shift+Enter 换行）
+  activeKind, // SQL 方言按活动标签的数据库类型切换
 );
 
 // 模式切换时重新挂载 CodeMirror（容器 DOM 因 v-if 切换而变化，需 destroy 后重建）。
@@ -1100,7 +1188,7 @@ function aiOptimize() {
     ElMessage.warning("AI 正在处理中，请稍候");
     return;
   }
-  void ai.send(`请优化以下 MySQL SQL：\n\n\`\`\`sql\n${sql}\n\`\`\``, SYSTEM_DIAGNOSE);
+  void ai.send(`请优化以下${dbDialectLabel.value}：\n\n\`\`\`sql\n${sql}\n\`\`\``, SYSTEM_DIAGNOSE.value);
   ElMessage.success("已发送给 AI，请在右侧 AI 面板查看");
 }
 
@@ -1111,7 +1199,7 @@ function aiExplain() {
     ElMessage.warning("AI 正在处理中，请稍候");
     return;
   }
-  void ai.send(`请解释以下 MySQL SQL：\n\n\`\`\`sql\n${sql}\n\`\`\``, SYSTEM_EXPLAIN);
+  void ai.send(`请解释以下${dbDialectLabel.value}：\n\n\`\`\`sql\n${sql}\n\`\`\``, SYSTEM_EXPLAIN.value);
   ElMessage.success("已发送给 AI，请在右侧 AI 面板查看");
 }
 
@@ -1382,6 +1470,7 @@ onBeforeUnmount(() => {
                 <el-icon v-else-if="data.type === 'instance'" class="node-icon"><Connection /></el-icon>
                 <el-icon v-else-if="data.type === 'database'" class="node-icon"><Coin /></el-icon>
                 <el-icon v-else class="node-icon"><Document /></el-icon>
+                <span v-if="data.type === 'instance' && isPostgres(data.kind)" class="node-kind">PG</span>
                 <span class="node-label">{{ data.label }}</span>
 
                 <!-- 实例/分组悬浮操作菜单 -->
@@ -1443,7 +1532,7 @@ onBeforeUnmount(() => {
             </div>
             <!-- 表格结果（虚拟滚动：大结果集只渲染可视行） -->
             <div v-else-if="e.kind === 'table'" class="entry entry-table">
-              <ResultTableV2 :rows="e.rows" :columns="e.columns" :height="400" />
+              <ResultTableV2 :rows="e.rows" :columns="e.columns" :height="consoleTableHeight(e.rows.length)" />
               <div class="entry-meta">{{ e.rows.length }} 行{{ e.elapsedMs ? ` · ${e.elapsedMs}ms` : "" }}</div>
             </div>
             <!-- 非查询成功 -->
@@ -1459,7 +1548,7 @@ onBeforeUnmount(() => {
           </template>
           <!-- 输入框（mysql CLI 风格：常驻输出流末尾，新输出贴在它上方） -->
           <div :ref="(el) => bindAnchorRef(activeState, el)" class="console-input-wrap">
-            <span class="input-prompt">mysql&gt;</span>
+            <span class="input-prompt">{{ cliPrompt }}</span>
             <textarea
               :ref="(el) => { if (activeState) activeState.cliInputRef.value = (el as HTMLTextAreaElement | null) ?? null }"
               v-model="cliInputModel"
@@ -2036,9 +2125,6 @@ onBeforeUnmount(() => {
 }
 .entry-table {
   margin: 4px 0 8px 16px;
-}
-.entry-table :deep(.result-table) {
-  max-height: 400px;
 }
 .entry-meta {
   font-size: 11px;

@@ -4,25 +4,29 @@
 //! 负责：按名查 Session/DbProfile → 解析凭据 → 建立短连接 → 执行 → 返回输出。
 //!
 //! - [`exec_ssh_by_name`]：SSH exec（参考 `ai::tools::exec_ssh` 的"独立连接"分支）。
-//! - [`exec_sql_by_name`]：MySQL 执行（解析密码 → 直连或 SSH 隧道）。
+//! - [`exec_sql_by_name`]：数据库执行（MySQL / PostgreSQL，按 profile.kind 分发；
+//!   解析密码 → 直连或 SSH 隧道）。
 //! - [`list_ssh_sessions_view`] / [`list_db_profiles_view`]：只读元数据视图。
 //! - [`list_files_by_id`] / [`upload_file_by_id`] / [`download_file_by_id`]：基于
 //!   SFTP 的文件级运维工具（MCP 绑定模式）；`*_direct` 为客户端直连模式。
 //! - [`exec_ssh_terminal`]：**终端标签页绑定**模式 —— 命令写入用户已打开的终端
 //!   PTY 执行（支持 A→B→C 跳板嵌套场景，命令在终端当前所在的远端主机上执行）。
 //!
-//! 注意 `resolve_credential` / `fetch_mysql_password` 都是同步的且需要短生命 DB
+//! 注意 `resolve_credential` / `fetch_db_password` 都是同步的且需要短生命 DB
 //! 连接，本模块在调用前集中获取连接、解析凭据后立即释放，不在 `.await` 间持有。
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::Value;
 use tokio::time::timeout;
 
-use crate::database::mysql::{connect_direct as mysql_connect_direct, connect_via_ssh};
+use crate::database::mysql;
+use crate::database::postgres;
 use crate::database::profiles::{list_db_profiles, DbProfile};
+use crate::database::DbConnHandle;
 use crate::error::{AppError, AppResult};
 use crate::file_backend::s3::{S3Backend, S3Config};
 use crate::file_backend::FileBackend;
@@ -148,6 +152,145 @@ pub fn profile_name_by_id(state: &AppState, id: &str) -> String {
     find_profile_by_id(state, id)
         .map(|p| p.name)
         .unwrap_or_else(|_| "(未知数据库)".into())
+}
+
+// ===========================================================================
+// 多机模式（multi）：绑定一组 SSH 会话，由外部 AI 按 target 参数自选目标
+// ===========================================================================
+
+/// 多机模式下的一台机器（不含敏感字段）。
+///
+/// `display_name` 是对外（工具参数 target / 确认卡片 / 日志）使用的目标名：
+/// 唯一会话名直接用；勾选集合内重名的会话加 `#序号` 后缀（按 id 字典序稳定编号）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MultiMachine {
+    /// 对外目标名（target 参数用它匹配）。
+    pub display_name: String,
+    /// SSH 会话配置 id（执行时按它解析凭据建短连接）。
+    pub id: String,
+    /// 原始会话名（可能重名）。
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    /// 用户标签（供 AI 语义路由，如 "nginx"、"生产"）。
+    pub tags: Option<String>,
+}
+
+/// 为一组 (id, name) 生成去重展示名：唯一名保持原名；重名组内按 id 字典序
+/// 加 `#k`（k 从 1 起）。纯函数，独立单测覆盖。
+fn disambiguate_display_names(entries: &[(String, String)]) -> Vec<String> {
+    // 统计每个名字出现的会话 id（排好序），重名组内按序编号。
+    use std::collections::BTreeMap;
+    let mut by_name: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (id, name) in entries {
+        by_name.entry(name.as_str()).or_default().push(id.as_str());
+    }
+    entries
+        .iter()
+        .map(|(id, name)| {
+            let ids = &by_name[name.as_str()];
+            if ids.len() == 1 {
+                name.clone()
+            } else {
+                // BTreeMap 值内的 Vec 保持插入顺序；这里按 id 排序保证编号稳定。
+                let mut sorted = ids.clone();
+                sorted.sort_unstable();
+                let idx = sorted
+                    .iter()
+                    .position(|x| *x == id.as_str())
+                    .unwrap_or_default();
+                format!("{}#{}", name, idx + 1)
+            }
+        })
+        .collect()
+}
+
+/// 解析多机模式的机器清单（按绑定 id 集合）。
+///
+/// - 过滤非 SSH 协议的 id（配置被改坏的兜底）；
+/// - `strict = true`（启动 / 主动勾选校验）：任何一个 id 查不到（会话已删除）
+///   都报错并列出缺失项；
+/// - `strict = false`（执行期 / tools/list / 日志）：**降级**跳过缺失的 id——
+///   服务运行中用户删掉一台会话不应导致其余机器全部不可用；全部缺失才报错
+///   （此时该 MCP 已无可用目标，需要用户重新勾选）。
+/// - 顺序与传入 ids 一致（前端勾选顺序），展示名重名去重见
+///   [`disambiguate_display_names`]。
+///
+/// 返回 `(机器清单, 缺失的 id 列表)`——宽松模式下调用方可把缺失项写进日志。
+pub fn multi_machines_lenient(
+    state: &AppState,
+    ids: &[String],
+    strict: bool,
+) -> AppResult<(Vec<MultiMachine>, Vec<String>)> {
+    let conn = state.conn()?;
+    let mut sessions = Vec::new();
+    let mut missing = Vec::new();
+    for id in ids {
+        match get_session(&conn, id)? {
+            Some(s) if s.protocol == "ssh" => sessions.push(s),
+            Some(_) => {} // 非 SSH 会话：跳过（多选 UI 只允许 SSH，配置手改的兜底）
+            None => missing.push(id.clone()),
+        }
+    }
+    if (strict || sessions.is_empty()) && !missing.is_empty() {
+        return Err(AppError::NotFound(format!(
+            "以下 SSH 会话已不存在，请重新勾选：{}",
+            missing.join("、")
+        )));
+    }
+    if !missing.is_empty() {
+        log::warn!(
+            "[mcp] 多机模式部分机器已不存在（已跳过，其余照常可用）：{}",
+            missing.join("、")
+        );
+    }
+    let entries: Vec<(String, String)> = sessions
+        .iter()
+        .map(|s| (s.id.clone(), s.name.clone()))
+        .collect();
+    let display_names = disambiguate_display_names(&entries);
+    Ok((
+        sessions
+            .into_iter()
+            .zip(display_names)
+            .map(|(s, display_name)| MultiMachine {
+                display_name,
+                id: s.id,
+                name: s.name,
+                host: s.host,
+                port: s.port,
+                username: s.username,
+                tags: s.tags,
+            })
+            .collect(),
+        missing,
+    ))
+}
+
+/// [`multi_machines_lenient`] 的严格便捷封装（忽略缺失列表，只要有缺失即报错）。
+pub fn multi_machines(state: &AppState, ids: &[String]) -> AppResult<Vec<MultiMachine>> {
+    multi_machines_lenient(state, ids, true).map(|(machines, _)| machines)
+}
+
+/// 按 target（展示名）在机器清单中定位会话 id。
+///
+/// 找不到时返回包含全部可用目标名的错误（回填给模型，它会自行改用正确值）。
+pub fn multi_resolve<'a>(machines: &'a [MultiMachine], target: &str) -> AppResult<&'a MultiMachine> {
+    machines
+        .iter()
+        .find(|m| m.display_name == target)
+        .ok_or_else(|| {
+            AppError::InvalidInput(format!(
+                "target `{target}` 不在已授权的机器列表中。可用目标：{}",
+                machines
+                    .iter()
+                    .map(|m| m.display_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("、")
+            ))
+        })
 }
 
 // ===========================================================================
@@ -294,12 +437,21 @@ pub async fn exec_ssh_terminal(
 
         // 写入 PTY 前记录累计字节基准（同一把锁内先记基准再写，保证命令回显
         // 与输出都落在基准之后的窗口里）。
+        // 按终端编码设置转码（GBK 等远端下中文命令不乱码；哨兵为 ASCII 恒等）。
+        // 在 terminals 锁**外**读取设置并转码，避免 terminals → settings_cache
+        // 的锁嵌套。
+        let write_bytes = {
+            let label = crate::config::settings_load_inner(state)
+                .map(|s| s.terminal.encoding)
+                .unwrap_or_default();
+            crate::encoding::encode_input(&label, wrapped.as_bytes())
+        };
         let base = {
             let terminals = state.terminals.lock();
             match terminals.get(instance_id) {
                 Some(t) => {
                     let base = t.total_output_bytes();
-                    if let Err(e) = t.write(wrapped.into_bytes()) {
+                    if let Err(e) = t.write(write_bytes) {
                         return Err(AppError::Ssh(format!("写入终端失败: {e}")));
                     }
                     base
@@ -615,9 +767,9 @@ async fn exec_ssh_with_auth(
 ///
 /// 流程：
 /// 1. 按 `profile_name` 查 DbProfile。
-/// 2. 取 MySQL 密码（`credential_id` → `credentials` 表 → vault 解密）。
-/// 3. 若 profile 指定了 `ssh_session_config_id`，先建立 SSH 隧道再连 MySQL；
-///    否则直连。
+/// 2. 取数据库密码（`credential_id` → `credentials` 表 → vault 解密）。
+/// 3. 若 profile 指定了 `ssh_session_config_id`，先建立 SSH 隧道再连数据库；
+///    否则直连。MySQL / PostgreSQL 按 profile.kind 分发。
 /// 4. 执行 SQL（限制返回行数 = `limit`），结果格式化为对齐文本表格。
 pub async fn exec_sql_by_name(
     state: &AppState,
@@ -660,8 +812,8 @@ async fn exec_sql_with_profile(
     // 确定实际使用的数据库：override 优先，否则用 profile 的 default_database。
     let effective_db: Option<&str> = database_override.or(profile.default_database.as_deref());
 
-    // 取 MySQL 密码（同步块）。
-    let mysql_pass = {
+    // 取数据库密码（同步块）。
+    let db_pass = {
         let cred_id = profile.credential_id.as_ref().ok_or_else(|| {
             AppError::Auth(format!("DB profile `{}` 缺少 credential_id", profile.name))
         })?;
@@ -673,7 +825,7 @@ async fn exec_sql_with_profile(
                 .clone()
         };
         let conn = state.conn()?;
-        crate::database::mysql::fetch_mysql_password(&conn, cred_id, &vault)?
+        crate::database::fetch_db_password(&conn, cred_id, &vault)?
     };
 
     // SQL 全文可能含敏感数据（INSERT/UPDATE 的明文值），日志只记前 200 字符。
@@ -686,79 +838,120 @@ async fn exec_sql_with_profile(
         truncate_log(&sql, 200)
     );
 
-    // 建立连接。
-    let conn_obj = if let Some(ssh_id) = &profile.ssh_session_config_id {
-        // SSH 隧道模式。
-        let ssh_config = {
-            let conn = state.conn()?;
-            get_session(&conn, ssh_id)?
-                .ok_or_else(|| AppError::NotFound(format!("SSH 会话 {} 不存在", ssh_id)))?
-        };
-        let resolved = {
-            let vault = {
-                let guard = state.vault_read()?;
-                guard
-                    .as_ref()
-                    .ok_or_else(|| AppError::Auth("保险库未解锁".into()))?
-                    .clone()
+    // 建立连接（按 kind 分发方言；SSH 隧道流程共用）。
+    let conn_obj: DbConnHandle = match crate::database::normalize_kind(&profile.kind) {
+        "postgres" => {
+            let c = if let Some(ssh_id) = &profile.ssh_session_config_id {
+                let (ssh_config, resolved) = resolve_ssh_tunnel(state, ssh_id)?;
+                postgres::connect_via_ssh(
+                    &ssh_config,
+                    resolved,
+                    &profile.host,
+                    profile.port,
+                    &profile.username,
+                    &db_pass,
+                    effective_db,
+                    state.clone(),
+                )
+                .await?
+            } else {
+                postgres::connect_direct(
+                    &profile.host,
+                    profile.port,
+                    &profile.username,
+                    &db_pass,
+                    effective_db,
+                )
+                .await?
             };
-            let conn = state.conn()?;
-            crate::ssh::session::resolve_credential(&ssh_config, &vault, &conn)?
-        };
-        connect_via_ssh(
-            &ssh_config,
-            resolved,
-            &profile.host,
-            profile.port,
-            &profile.username,
-            &mysql_pass,
-            effective_db,
-            state.clone(),
-        )
-        .await?
-    } else {
-        // 直连。
-        mysql_connect_direct(
-            &profile.host,
-            profile.port,
-            &profile.username,
-            &mysql_pass,
-            effective_db,
-        )
-        .await?
+            DbConnHandle::Postgres(Arc::new(c))
+        }
+        _ => {
+            let c = if let Some(ssh_id) = &profile.ssh_session_config_id {
+                let (ssh_config, resolved) = resolve_ssh_tunnel(state, ssh_id)?;
+                mysql::connect_via_ssh(
+                    &ssh_config,
+                    resolved,
+                    &profile.host,
+                    profile.port,
+                    &profile.username,
+                    &db_pass,
+                    effective_db,
+                    state.clone(),
+                )
+                .await?
+            } else {
+                mysql::connect_direct(
+                    &profile.host,
+                    profile.port,
+                    &profile.username,
+                    &db_pass,
+                    effective_db,
+                )
+                .await?
+            };
+            DbConnHandle::MySql(Arc::new(c))
+        }
     };
 
-    // USE 语句拦截：prepared 协议不支持 USE（MySQL 1295）；MCP 是一次性连接、
-    // 无跨语句状态，直接返回成功消息，避免把协议错误抛给调用方。
+    // USE 语句拦截：MySQL prepared 协议不支持 USE（1295）、PG 无 USE 语句；
+    // MCP 是一次性连接、无跨语句状态，切换成功后连接立即关闭，直接返回
+    // 成功消息，避免把协议错误抛给调用方。
     if let Some(use_db) = crate::database::mysql::parse_use_statement(sql) {
-        if let Some(db) = &use_db {
-            crate::database::mysql::validate_database_identifier(db)?;
-        }
+        let res = conn_obj.use_database(use_db.as_deref()).await;
         conn_obj.close().await;
-        return Ok(match use_db {
-            Some(db) => format!("已切换到数据库 `{db}`（本次连接）"),
-            None => "USE 语句缺少库名".into(),
-        });
+        return match res {
+            Ok(()) => Ok(match use_db {
+                Some(db) => format!("已切换到数据库 `{db}`（本次连接）"),
+                None => "USE 语句缺少库名".into(),
+            }),
+            Err(e) => Err(e),
+        };
     }
 
     // 执行并立即关闭连接（MCP 模式不缓存连接池）。
-    let cur_db = conn_obj.current_db();
-    let res = conn_obj.execute(sql, limit, cur_db.as_deref()).await;
+    let res = conn_obj.execute(sql, limit).await;
     conn_obj.close().await;
 
     let qr = res?;
     Ok(format_query_result(&qr))
 }
 
-/// 在调用方指定的 MySQL 服务器上执行 SQL（MCP 客户端直连模式）。
+/// 解析 SSH 隧道所需的会话配置与凭据（exec_sql_with_profile 用）。
+fn resolve_ssh_tunnel(
+    state: &AppState,
+    ssh_id: &str,
+) -> AppResult<(Session, crate::ssh::session::ResolvedCredential)> {
+    let ssh_config = {
+        let conn = state.conn()?;
+        get_session(&conn, ssh_id)?
+            .ok_or_else(|| AppError::NotFound(format!("SSH 会话 {ssh_id} 不存在")))?
+    };
+    let resolved = {
+        let vault = {
+            let guard = state.vault_read()?;
+            guard
+                .as_ref()
+                .ok_or_else(|| AppError::Auth("保险库未解锁".into()))?
+                .clone()
+        };
+        let conn = state.conn()?;
+        crate::ssh::session::resolve_credential(&ssh_config, &vault, &conn)?
+    };
+    Ok((ssh_config, resolved))
+}
+
+/// 在调用方指定的数据库服务器上执行 SQL（MCP 客户端直连模式）。
 ///
 /// 与 [`exec_sql_with_profile`] 的区别：host/port/username/密码直接由调用方在工具
 /// 参数中传入，不经过 DB profile 与 vault 解析；密码仅本次连接使用，不缓存、不落
-/// 日志、不写入任何配置文件。
+/// 日志、不写入任何配置文件。`kind` 指定方言（`mysql` / `postgres`，默认 mysql）。
 ///
 /// 不支持 SSH 隧道（如需要可后续扩展 sshHost/sshPort 等可选参数）。`database` 为
-/// 可选：传则作为默认库连接，不传则不指定默认库（SQL 里可带 `db.table` 限定名）。
+/// 可选：传则作为默认库连接，不传则不指定默认库（SQL 里可带限定名）。
+#[allow(clippy::too_many_arguments)]
 pub async fn exec_sql_direct(
+    kind: &str,
     host: &str,
     port: u16,
     username: &str,
@@ -783,23 +976,30 @@ pub async fn exec_sql_direct(
         truncate_log(sql, 200)
     );
 
-    // 直连（不走 SSH 隧道）→ 执行 → 立即关闭。
-    let conn_obj = mysql_connect_direct(host, port, username, password, database).await?;
+    // 直连（不走 SSH 隧道）。
+    let conn_obj: DbConnHandle = match crate::database::normalize_kind(kind) {
+        "postgres" => DbConnHandle::Postgres(Arc::new(
+            postgres::connect_direct(host, port, username, password, database).await?,
+        )),
+        _ => DbConnHandle::MySql(Arc::new(
+            mysql::connect_direct(host, port, username, password, database).await?,
+        )),
+    };
 
-    // USE 语句拦截（同 exec_sql_with_profile）：prepared 协议不支持 USE。
+    // USE 语句拦截（同 exec_sql_with_profile）。
     if let Some(use_db) = crate::database::mysql::parse_use_statement(sql) {
-        if let Some(db) = &use_db {
-            crate::database::mysql::validate_database_identifier(db)?;
-        }
+        let res = conn_obj.use_database(use_db.as_deref()).await;
         conn_obj.close().await;
-        return Ok(match use_db {
-            Some(db) => format!("已切换到数据库 `{db}`（本次连接）"),
-            None => "USE 语句缺少库名".into(),
-        });
+        return match res {
+            Ok(()) => Ok(match use_db {
+                Some(db) => format!("已切换到数据库 `{db}`（本次连接）"),
+                None => "USE 语句缺少库名".into(),
+            }),
+            Err(e) => Err(e),
+        };
     }
 
-    let cur_db = conn_obj.current_db();
-    let res = conn_obj.execute(sql, limit, cur_db.as_deref()).await;
+    let res = conn_obj.execute(sql, limit).await;
     conn_obj.close().await;
 
     let qr = res?;
@@ -863,15 +1063,21 @@ pub fn arg_host(args: &Value) -> AppResult<String> {
         .ok_or_else(|| AppError::InvalidInput("缺少 host 参数（直连模式需指定目标服务器）".into()))
 }
 
-/// 解析工具参数中 `port` 字段（直连模式用，省略默认 22）。
+/// 解析工具参数中 `port` 字段（SSH 直连模式用，省略默认 22）。
 pub fn arg_port(args: &Value) -> AppResult<u16> {
+    arg_port_with_default(args, 22)
+}
+
+/// 与 [`arg_port`] 相同，但省略时使用调用方给定的缺省值（DB 直连模式
+/// 按方言取 3306/5432，不能沿用 SSH 语义的 22）。
+pub fn arg_port_with_default(args: &Value, default: u16) -> AppResult<u16> {
     match args.get("port") {
         Some(v) => v
             .as_u64()
             .filter(|n| (1..=65535).contains(n))
             .map(|n| n as u16)
             .ok_or_else(|| AppError::InvalidInput("port 参数无效（需为 1-65535 的整数）".into())),
-        None => Ok(22),
+        None => Ok(default),
     }
 }
 
@@ -899,6 +1105,17 @@ pub fn arg_database(args: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// 解析工具参数中 `dbKind` 字段（exec_sql 直连模式用，默认 mysql）。
+///
+/// 传 postgres/postgresql/pg 归一化为 postgres，其余按 mysql 处理。
+pub fn arg_db_kind(args: &Value) -> String {
+    let raw = args
+        .get("dbKind")
+        .and_then(Value::as_str)
+        .unwrap_or("mysql");
+    crate::database::normalize_kind(raw).to_string()
 }
 
 // ===========================================================================
@@ -1421,7 +1638,60 @@ pub async fn download_file_by_account(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     const S: &str = "__XTERM_DONE_abcd__";
+
+    /// 重名展示名去重：唯一名保持原名；重名组按 id 字典序加 #k，编号稳定。
+    #[test]
+    fn disambiguate_display_names_dedupes() {
+        let entries = vec![
+            ("b-id".to_string(), "web".to_string()),
+            ("a-id".to_string(), "web".to_string()),
+            ("c-id".to_string(), "db".to_string()),
+        ];
+        // "web" 重名：a-id 排序在前 → #1，b-id → #2；"db" 唯一保持原名。
+        assert_eq!(
+            disambiguate_display_names(&entries),
+            vec!["web#2", "web#1", "db"]
+        );
+        // 全部唯一：原样。
+        let unique = vec![
+            ("x".to_string(), "a".to_string()),
+            ("y".to_string(), "b".to_string()),
+        ];
+        assert_eq!(disambiguate_display_names(&unique), vec!["a", "b"]);
+    }
+
+    /// target 路由：命中返回对应机器；未命中报错并列出全部可用目标名。
+    #[test]
+    fn multi_resolve_matches_and_reports_available() {
+        let machines = vec![
+            MultiMachine {
+                display_name: "web".into(),
+                id: "id-1".into(),
+                name: "web".into(),
+                host: "1.2.3.4".into(),
+                port: 22,
+                username: "root".into(),
+                tags: None,
+            },
+            MultiMachine {
+                display_name: "db".into(),
+                id: "id-2".into(),
+                name: "db".into(),
+                host: "5.6.7.8".into(),
+                port: 22,
+                username: "root".into(),
+                tags: Some("生产".into()),
+            },
+        ];
+        assert_eq!(multi_resolve(&machines, "db").unwrap().id, "id-2");
+        let err = multi_resolve(&machines, "old-web").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("old-web"), "错误应包含非法 target：{msg}");
+        assert!(msg.contains("web") && msg.contains("db"), "错误应列出可用目标：{msg}");
+    }
 
     /// 常规场景：回显行 + echo 输出行都存在，去掉回显、哨兵行与提示符只留输出。
     #[test]

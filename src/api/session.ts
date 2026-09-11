@@ -57,6 +57,15 @@ export function disconnectSession(instanceId: string): Promise<void> {
   return invoke<void>("disconnect_session", { instanceId });
 }
 
+/**
+ * 复制一个已连接的 SSH 终端会话：在同一条已认证连接上打开新 channel
+ * （PTY + shell），**不重新认证**——二次认证（口令码）服务器上复制通道
+ * 无需再次输入验证码。仅支持 SSH；失败时调用方应回退 connectSession。
+ */
+export function cloneTerminalSession(instanceId: string): Promise<string> {
+  return invoke<string>("clone_terminal_session", { instanceId });
+}
+
 export function openSftpForSession(sessionConfigId: string): Promise<string> {
   return invoke<string>("open_sftp_for_session", { sessionConfigId });
 }

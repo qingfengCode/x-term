@@ -233,7 +233,7 @@ cat 配置文件等）。单命令超时 30 秒，输出截断 16KB（超出会�
                 "properties": {
                     "sessionId": {
                         "type": "string",
-                        "description": "目标 SSH 终端会话的实例 id"
+                        "description": "目标 SSH 终端会话的实例 id。必须使用系统提示「当前可用上下文」中给出的 sessionId；不要复用对话历史里旧轮次的 id（用户可能已切换终端）"
                     },
                     "command": {
                         "type": "string",
@@ -252,7 +252,10 @@ cat 配置文件等）。单命令超时 30 秒，输出截断 16KB（超出会�
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "sessionId": { "type": "string" },
+                    "sessionId": {
+                        "type": "string",
+                        "description": "目标 SSH 终端会话的实例 id。必须使用系统提示「当前可用上下文」中给出的 sessionId；不要复用对话历史里旧轮次的 id（用户可能已切换终端）"
+                    },
                     "maxBytes": {
                         "type": "integer",
                         "description": "最多返回的字节数，可省略（默认 8192）",
@@ -274,13 +277,16 @@ pub fn sql_tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "exec_sql".into(),
-            description: "在指定的 MySQL 连接上执行 SQL 语句。默认只读\
-（SELECT/SHOW/EXPLAIN/DESCRIBE）；写操作（INSERT/UPDATE/DELETE/DDL）需要用户在确认时\
-额外批准。返回列名和行（最多 100 行）。".into(),
+            description: "在指定的数据库连接上执行 SQL（支持 MySQL 与 PostgreSQL，\
+按用户当前打开的连接方言书写 SQL）。默认只读（SELECT/SHOW/EXPLAIN/DESCRIBE）；\
+写操作（INSERT/UPDATE/DELETE/DDL）需要用户在确认时额外批准。返回列名和行（最多 100 行）。".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "dbConnId": { "type": "string" },
+                    "dbConnId": {
+                        "type": "string",
+                        "description": "数据库连接 id。必须使用系统提示「当前可用上下文」中给出的 dbConnId；不要复用对话历史里旧轮次的 id（用户可能已切换连接）"
+                    },
                     "sql": { "type": "string" },
                     "limit": {
                         "type": "integer",
@@ -293,21 +299,31 @@ pub fn sql_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "list_db_tables".into(),
-            description: "列出指定 MySQL 连接当前数据库的所有表名。".into(),
+            description: "列出指定数据库连接当前库的所有表名（PostgreSQL 表名带 \
+schema 前缀，如 public.users）。".into(),
             parameters: json!({
                 "type": "object",
-                "properties": { "dbConnId": { "type": "string" } },
+                "properties": {
+                    "dbConnId": {
+                        "type": "string",
+                        "description": "数据库连接 id。必须使用系统提示「当前可用上下文」中给出的 dbConnId；不要复用对话历史里旧轮次的 id（用户可能已切换连接）"
+                    }
+                },
                 "required": ["dbConnId"]
             }),
         },
         ToolDef {
             name: "describe_table".into(),
-            description: "返回指定表的列结构（字段名、类型、是否可空、键、默认值、注释）。\
-table 可用 `database.table` 限定名（推荐，尤其当连接未指定默认库时），或仅 `table`（取当前默认库）。".into(),
+            description: "返回指定表的列结构（字段名、类型、是否可空、默认值）。\
+table 可用限定名（MySQL 为 `database.table`，PostgreSQL 为 `schema.table`，推荐，\
+尤其当连接未指定默认库时），或仅 `table`（取当前默认库）。".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "dbConnId": { "type": "string" },
+                    "dbConnId": {
+                        "type": "string",
+                        "description": "数据库连接 id。必须使用系统提示「当前可用上下文」中给出的 dbConnId；不要复用对话历史里旧轮次的 id（用户可能已切换连接）"
+                    },
                     "table": {
                         "type": "string",
                         "description": "表名，可用 `database.table` 限定（如 apidoc.api_keys）或仅 table"
@@ -757,6 +773,81 @@ pub fn allowed_tool_names(tools: &[ToolDef]) -> HashSet<String> {
 }
 
 // ===========================================================================
+// 会话路由纠偏（跟随模式核心护栏）
+// ===========================================================================
+
+/// 按工具名取需要纠偏的（参数名, 活动 id）。
+fn reroute_target<'a>(
+    name: &str,
+    active_terminal_id: &'a str,
+    active_db_conn_id: &'a str,
+) -> Option<(&'static str, &'a str)> {
+    match name {
+        "exec_ssh" | "terminal_snapshot" => Some(("sessionId", active_terminal_id)),
+        "exec_sql" | "list_db_tables" | "describe_table" => Some(("dbConnId", active_db_conn_id)),
+        _ => None,
+    }
+}
+
+/// 把工具调用里的会话 id 强制改写为**请求发起时**的活动上下文 id。
+///
+/// 痛点：跟随模式下用户切换终端（或数据库）tab 后继续对话，system prompt 虽注入了
+/// 新 sessionId，但**对话历史里旧轮次的工具调用仍带着旧 id**——模型经常直接复制
+/// 历史参数，命令落到旧终端（用户感知"AI 在旧终端执行"）。提示注入无法保证参数
+/// 正确，必须在执行端强制路由（桌面工具早有同等防护：desktop_id 快照透传前端）。
+///
+/// 规则（`active_*` 为空 = 该域无活动上下文，工具本就未 advertised，不动参数）：
+/// - 参数缺失 → 自动补全为活动 id；
+/// - 参数与活动 id 不一致（多为历史里的旧 id 或幻觉值）→ 改写为活动 id。
+///
+/// 返回 `(改写后的调用克隆, 提示语)`；无需改写返回 `(None, 空串)`。提示语会由
+/// [`execute_tool`] 前置到工具结果，让模型在本轮后续调用中自觉使用正确 id。
+fn reroute_session_ids(
+    call: &ToolCall,
+    active_terminal_id: &str,
+    active_db_conn_id: &str,
+) -> (Option<ToolCall>, String) {
+    let Some((key, active)) = reroute_target(&call.name, active_terminal_id, active_db_conn_id) else {
+        return (None, String::new());
+    };
+    if active.is_empty() {
+        return (None, String::new());
+    }
+    let supplied = call
+        .arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if supplied == active {
+        return (None, String::new());
+    }
+    let mut arguments = if call.arguments.is_object() {
+        call.arguments.clone()
+    } else {
+        json!({})
+    };
+    arguments[key] = Value::String(active.to_string());
+    let id_label = if key == "sessionId" { "sessionId" } else { "dbConnId" };
+    let notice = if supplied.is_empty() {
+        format!("系统已自动填入当前活动会话的 {id_label}=\"{active}\"，后续调用请直接使用它。")
+    } else {
+        format!(
+            "你传入的 {id_label}=\"{supplied}\" 不是本次请求的活动会话（可能复制了历史消息中的旧 id，\
+该会话已不是当前操作对象）。系统已强制改写为当前活动会话 {id_label}=\"{active}\"，\
+本次结果来自改写后的会话；后续调用请直接使用 \"{active}\"。"
+        )
+    };
+    (
+        Some(ToolCall {
+            id: call.id.clone(),
+            name: call.name.clone(),
+            arguments,
+        }),
+        notice,
+    )
+}
+
+// ===========================================================================
 // 工具执行器
 // ===========================================================================
 
@@ -771,6 +862,11 @@ pub fn allowed_tool_names(tools: &[ToolDef]) -> HashSet<String> {
 ///
 /// `request_id` 是当前请求 id：`todo_write` 的 `ai:todo` 事件据此路由到前端会话。
 ///
+/// `active_terminal_id` / `active_db_conn_id` 是请求发起时的活动终端/数据库连接 id
+/// （空串 = 无）：执行前先把模型传的 sessionId/dbConnId 纠偏到它们（见
+/// [`reroute_session_ids`]），保证命令落在用户当前跟随的目标上，而不是模型从
+/// 对话历史里复制的旧会话。
+///
 /// 任何执行错误都被吞掉并返回 `ToolResult { ok: false, output: <错误信息> }`，
 /// 由调用方把错误回填给模型，让模型据此重试或解释给用户。
 pub async fn execute_tool(
@@ -781,6 +877,8 @@ pub async fn execute_tool(
     visualization: bool,
     file_domain: &str,
     request_id: &str,
+    active_terminal_id: &str,
+    active_db_conn_id: &str,
 ) -> ToolResult {
     if !allowed.contains(&call.name) {
         return ToolResult::err(format!(
@@ -788,7 +886,11 @@ pub async fn execute_tool(
             call.name
         ));
     }
-    match call.name.as_str() {
+    // 会话路由纠偏：模型复制历史旧 id / 漏传参数时，强制改写为请求发起时的
+    // 活动上下文 id（跟随模式切 tab 后旧 id 仍留在对话历史里，模型极易照抄）。
+    let (rerouted, notice) = reroute_session_ids(call, active_terminal_id, active_db_conn_id);
+    let call = rerouted.as_ref().unwrap_or(call);
+    let mut result = match call.name.as_str() {
         "exec_ssh" => exec_ssh(state, &call.arguments, visualization).await,
         "terminal_snapshot" => terminal_snapshot(state, &call.arguments),
         "exec_sql" => exec_sql(app, state, &call.arguments, visualization).await,
@@ -807,7 +909,12 @@ pub async fn execute_tool(
             "工具 `{name}` 应由前端 RDP 会话执行，后端无法直接执行（执行路由异常）"
         )),
         other => ToolResult::err(format!("未知工具: {other}")),
+    };
+    if !notice.is_empty() {
+        // 纠偏提示前置到结果：无论成败模型都能看到，本轮后续调用即会带正确 id。
+        result.output = format!("[会话纠偏] {notice}\n\n{}", result.output);
     }
+    result
 }
 
 /// exec_ssh：在指定 SSH 会话对应服务器上执行命令。
@@ -1026,12 +1133,21 @@ async fn exec_ssh_visual_unlocked(state: &AppState, session_id: &str, command: &
 
     // 写入 PTY 前记录累计字节基准（同一把锁内先记基准再写，保证命令回显
     // 与输出都落在基准之后的窗口里）。
+    // 按终端编码设置转码（GBK 等远端下中文命令不乱码；哨兵为 ASCII 恒等）。
+    // 在 terminals 锁**外**读取设置并转码，避免 terminals → settings_cache
+    // 的锁嵌套。
+    let write_bytes = {
+        let label = crate::config::settings_load_inner(state)
+            .map(|s| s.terminal.encoding)
+            .unwrap_or_default();
+        crate::encoding::encode_input(&label, wrapped.as_bytes())
+    };
     let base = {
         let terminals = state.terminals.lock();
         match terminals.get(session_id) {
             Some(ssh) => {
                 let base = ssh.total_output_bytes();
-                if let Err(e) = ssh.write(wrapped.into_bytes()) {
+                if let Err(e) = ssh.write(write_bytes) {
                     return ToolResult::err(format!("写入终端失败: {e}"));
                 }
                 base
@@ -1250,7 +1366,7 @@ fn terminal_snapshot(state: &AppState, args: &Value) -> ToolResult {
     }
 }
 
-/// exec_sql：在指定 MySQL 连接上执行 SQL。
+/// exec_sql：在指定数据库连接（MySQL / PostgreSQL）上执行 SQL。
 ///
 /// 写操作（INSERT/UPDATE/DELETE/DDL）由调用方在确认阶段把关（前端弹二次确认）；
 /// 此函数本身只在用户已批准后才会被调用，故直接执行。
@@ -1282,36 +1398,33 @@ async fn exec_sql(
         if visualization { "是" } else { "否" }
     );
 
-    // 取出 conn 句柄（Arc 克隆；并发下不会与用户操作互相 remove/insert 竞争）。
+    // 取出 conn 句柄（enum 克隆；并发下不会与用户操作互相 remove/insert 竞争）。
     let conn = {
-        let map = state.mysql_conns.lock();
+        let map = state.db_conns.lock();
         match map.get(&conn_id) {
             Some(c) => c.clone(),
             None => {
-                return ToolResult::err(format!("找不到 MySQL 连接 {conn_id}"));
+                return ToolResult::err(format!("找不到数据库连接 {conn_id}"));
             }
         }
     };
 
     // USE 语句拦截：与 db_exec_sql 一致——AI 生成的 `USE xxx` 不能直接发给
-    // MySQL（prepared 协议不支持 USE，MySQL 1295），改为更新连接的 current_db。
+    // MySQL（prepared 协议不支持 USE，MySQL 1295）；PG 没有 USE 语句。统一走
+    // use_database：MySQL 记录 current_db，PG 换库重连。
     if let Some(use_db) = crate::database::mysql::parse_use_statement(&sql) {
-        if let Some(db) = &use_db {
-            if let Err(e) = crate::database::mysql::validate_database_identifier(db) {
-                return ToolResult::err(e.to_string());
-            }
-        }
-        conn.set_current_db(use_db.clone());
-        return ToolResult::ok(match use_db {
-            Some(db) => format!("已切换到数据库 `{db}`"),
-            None => "USE 语句缺少库名".into(),
-        });
+        return match conn.use_database(use_db.as_deref()).await {
+            Ok(()) => ToolResult::ok(match use_db {
+                Some(db) => format!("已切换到数据库 `{db}`"),
+                None => "USE 语句缺少库名".into(),
+            }),
+            Err(e) => ToolResult::err(e.to_string()),
+        };
     }
 
     let started = std::time::Instant::now();
-    // 带当前库执行：AI 工具同样自动落在连接的当前库上（USE 由 execute 自动带上）。
-    let cur_db = conn.current_db();
-    let res = conn.execute(&sql, limit, cur_db.as_deref()).await;
+    // 执行（MySQL 自动落在连接的当前库上；PG 的库在连接层已确定）。
+    let res = conn.execute(&sql, limit).await;
     let elapsed_ms = started.elapsed().as_millis() as u64;
 
     // SQL 终端可视化：把结构化结果回显给 SQL 控制台（命令行模式）。
@@ -1354,33 +1467,32 @@ async fn exec_sql(
     }
 }
 
-/// list_db_tables：执行 `SHOW TABLES`，返回表名列表。
+/// list_db_tables：列出当前库的表，返回表名列表。
 async fn list_db_tables(state: &AppState, args: &Value) -> ToolResult {
     let conn_id = match args.get("dbConnId").and_then(Value::as_str) {
         Some(c) => c.to_string(),
         None => return ToolResult::err("list_db_tables 缺少 dbConnId"),
     };
     let conn = {
-        let map = state.mysql_conns.lock();
+        let map = state.db_conns.lock();
         match map.get(&conn_id) {
             Some(c) => c.clone(),
-            None => return ToolResult::err(format!("找不到 MySQL 连接 {conn_id}")),
+            None => return ToolResult::err(format!("找不到数据库连接 {conn_id}")),
         }
     };
-    // 带当前库执行（SHOW TABLES 即当前库的表）。
-    let cur_db = conn.current_db();
-    let res = conn.execute("SHOW TABLES", 10_000, cur_db.as_deref()).await;
+    // 带当前库执行（MySQL SHOW TABLES / PG information_schema，PG 表名带
+    // schema 前缀，如 public.users）。
+    let res = conn.list_tables(None).await;
 
     match res {
-        Ok(qr) => {
-            let tables: Vec<String> = qr.rows.into_iter().filter_map(|mut r| r.pop()).collect();
+        Ok(tables) => {
             ToolResult::ok(format!("共 {} 张表：\n{}", tables.len(), tables.join("\n")))
         }
         Err(e) => ToolResult::err(format!("列出表失败: {e}")),
     }
 }
 
-/// describe_table：执行 `DESCRIBE <table>`，返回结构化文本。
+/// describe_table：返回表的列结构（结构化文本）。
 async fn describe_table(state: &AppState, args: &Value) -> ToolResult {
     let (conn_id, table) = match (
         args.get("dbConnId").and_then(Value::as_str),
@@ -1389,23 +1501,17 @@ async fn describe_table(state: &AppState, args: &Value) -> ToolResult {
         (Some(c), Some(t)) => (c.to_string(), t.to_string()),
         _ => return ToolResult::err("describe_table 缺少 dbConnId 或 table"),
     };
-    // 解析表标识符为安全的反引号限定名（支持 `table` 或 `db.table`）。
-    let qualified = match crate::database::mysql::qualify_table_identifier(&table) {
-        Ok(q) => q,
-        Err(e) => return ToolResult::err(format!("{e}")),
-    };
-    let sql = format!("DESCRIBE {qualified}");
 
     let conn = {
-        let map = state.mysql_conns.lock();
+        let map = state.db_conns.lock();
         match map.get(&conn_id) {
             Some(c) => c.clone(),
-            None => return ToolResult::err(format!("找不到 MySQL 连接 {conn_id}")),
+            None => return ToolResult::err(format!("找不到数据库连接 {conn_id}")),
         }
     };
-    // 未限定库名的 DESCRIBE（`DESCRIBE \`table\``）按连接当前库执行。
-    let cur_db = conn.current_db();
-    let res = conn.execute(&sql, 1000, cur_db.as_deref()).await;
+    // 标识符校验与限定名拼接由 describe_table 内部按方言处理
+    // （MySQL `db.table` / PG `schema.table`）。
+    let res = conn.describe_table(&table).await;
 
     match res {
         Ok(qr) => ToolResult::ok(format_query_result(&qr)),
@@ -1943,7 +2049,8 @@ fn sql_first_keyword(sql: &str) -> String {
 
 /// 根据 `sql_mode` 判断一条 SQL 是否被允许执行。
 ///
-/// - `readonly`：只允许 `SELECT` / `SHOW` / `EXPLAIN` / `DESCRIBE` / `DESC`。
+/// - `readonly`：只允许 `SELECT` / `SHOW` / `EXPLAIN` / `DESCRIBE` / `DESC` /
+///   `TABLE` / `VALUES`（后两者为 PostgreSQL 的隐式查询形式）。
 ///   注意 `WITH` 不在集合内——[`sql_first_keyword`] 会把 CTE 语句解析成其主语句
 ///   关键字（`WITH cte AS (...) SELECT ...` → SELECT，仍放行；而
 ///   `WITH cte AS (...) DELETE ...` → DELETE，被拦截）。
@@ -1958,23 +2065,124 @@ pub fn sql_allowed_by_mode(sql: &str, mode: &str) -> bool {
     }
     match mode {
         "full" => true,
+        // restricted 允许 DML（EXPLAIN ANALYZE 执行的是 DML 时可放行；DDL 仍禁止）。
         "restricted" => matches!(
             kw.as_str(),
-            "SELECT" | "SHOW" | "EXPLAIN" | "DESCRIBE" | "DESC" | "INSERT" | "UPDATE" | "DELETE" | "MERGE"
+            "SELECT" | "SHOW" | "EXPLAIN" | "DESCRIBE" | "DESC" | "TABLE" | "VALUES" | "INSERT" | "UPDATE" | "DELETE" | "MERGE"
         ),
         // 默认（含 "readonly" 及任何未知值）按只读处理。
-        _ => matches!(kw.as_str(), "SELECT" | "SHOW" | "EXPLAIN" | "DESCRIBE" | "DESC"),
+        // EXPLAIN ANALYZE 会真实执行被解释语句，只读模式下拒绝。
+        _ => {
+            if kw == "EXPLAIN" && sql_executes_explain_analyze(sql) {
+                return false;
+            }
+            matches!(kw.as_str(), "SELECT" | "SHOW" | "EXPLAIN" | "DESCRIBE" | "DESC" | "TABLE" | "VALUES")
+        }
     }
 }
 
 /// 判断一条 SQL 是否为只读查询（用于"白名单运行"模式下自动放行判定）。
 ///
-/// 只读 = SELECT / SHOW / EXPLAIN / DESCRIBE / DESC（CTE 语句由
-/// [`sql_first_keyword`] 解析成主语句关键字后再判定）。与
+/// 只读 = SELECT / SHOW / EXPLAIN / DESCRIBE / DESC / TABLE / VALUES（CTE 语句由
+/// [`sql_first_keyword`] 解析成主语句关键字后再判定）。TABLE（`TABLE t` ≡
+/// `SELECT * FROM t`）与 VALUES 是 PostgreSQL 的隐式查询形式。与
+/// 判断是否为 `EXPLAIN ANALYZE`（MySQL 8.0.18+ / PostgreSQL 均支持）。
+///
+/// EXPLAIN 只做计划，ANALYZE 变体会**真实执行**被解释的语句——
+/// `EXPLAIN ANALYZE DELETE ...` 等价于执行一次 DELETE。只读判定必须把它
+/// 当非只读处理，否则白名单模式下可借道免确认执行写操作。
+fn sql_executes_explain_analyze(sql: &str) -> bool {
+    let clean = strip_sql_comments(sql);
+    let first_stmt = clean.split(';').next().unwrap_or("").trim();
+    let mut tokens = first_stmt.split_whitespace();
+    match tokens.next() {
+        Some(t) if t.eq_ignore_ascii_case("EXPLAIN") => {}
+        _ => return false,
+    }
+    // 只检查 EXPLAIN 之后的**选项位** token，遇到被解释语句的首关键字即
+    // 停止：语句体里的 ANALYZE（`WHERE msg = 'ANALYZE'` 的字面量、名为
+    // analyze 的列）不是选项，扫描整条语句会把合法只读查询误判为会真实
+    // 执行的 EXPLAIN ANALYZE，导致只读模式拒绝。
+    const STMT_STARTERS: &[&str] = &[
+        "SELECT", "WITH", "INSERT", "UPDATE", "DELETE", "MERGE", "TABLE", "VALUES", "DESCRIBE",
+        "DESC", "SHOW", "DECLARE", "EXECUTE", "CREATE", "DROP", "ALTER",
+    ];
+    for t in tokens {
+        let bare = t.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        if STMT_STARTERS.iter().any(|s| bare.eq_ignore_ascii_case(s)) {
+            break;
+        }
+        // PG 的 ANALYSE 与 ANALYZE 等价。
+        if bare.eq_ignore_ascii_case("ANALYZE") || bare.eq_ignore_ascii_case("ANALYSE") {
+            return true;
+        }
+    }
+    false
+}
+
 /// [`sql_allowed_by_mode`] 的 readonly 集合一致。
 pub fn is_readonly_sql(sql: &str) -> bool {
     let kw = sql_first_keyword(sql);
-    matches!(kw.as_str(), "SELECT" | "SHOW" | "EXPLAIN" | "DESCRIBE" | "DESC")
+    if kw == "EXPLAIN" && sql_executes_explain_analyze(sql) {
+        return false;
+    }
+    if kw == "PRAGMA" {
+        // SQLite 的 PRAGMA 部分有写副作用，只放行显式只读清单
+        //（table_info / integrity_check 等是高频只读操作）。
+        return is_readonly_pragma(sql);
+    }
+    matches!(
+        kw.as_str(),
+        "SELECT" | "SHOW" | "EXPLAIN" | "DESCRIBE" | "DESC" | "TABLE" | "VALUES"
+    )
+}
+
+/// SQLite 只读 PRAGMA 名单（无写副作用）。
+///
+/// 注意 `user_version`/`application_id` 等也可写，但 `PRAGMA user_version = N`
+/// 形式才写——只读名单按**名字**放行会漏掉赋值形式。这里对名单内的 PRAGMA
+/// 再拒绝含 `=` 的赋值形式（`PRAGMA user_version` 查询放行、赋值拦截）。
+/// SQLite 中 `PRAGMA name(v)` 与 `PRAGMA name = v` 语法等价（同为赋值），
+/// 名单内可写的 PRAGMA 其括号形式也必须拦截；table_info(users) 这类
+/// 查询语义的括号参数不受影响。
+fn is_readonly_pragma(sql: &str) -> bool {
+    const READONLY_PRAGMAS: &[&str] = &[
+        "table_info", "table_xinfo", "index_list", "index_info", "index_xinfo", "database_list",
+        "foreign_key_list", "collation_list", "function_list", "module_list", "pragma_list",
+        "integrity_check", "quick_check", "foreign_key_check", "page_count", "page_size",
+        "freelist_count", "schema_version", "user_version", "application_id", "encoding",
+        "journal_mode", "locking_mode", "cache_size", "max_page_count", "auto_vacuum",
+    ];
+    // 名单内但「带值即写入」的 PRAGMA：括号形式赋值与 `=` 赋值等价，需一并拦截。
+    const WRITE_BY_VALUE_PRAGMAS: &[&str] = &[
+        "schema_version", "user_version", "application_id", "encoding", "journal_mode",
+        "locking_mode", "cache_size", "max_page_count", "auto_vacuum", "page_size",
+    ];
+    // 剥 PRAGMA 前缀（大小写不敏感；前缀是 ASCII，字节切片安全）。
+    let head = sql.trim_start();
+    let body = if head.len() >= 6 && head[..6].eq_ignore_ascii_case("PRAGMA") {
+        head[6..].trim_start()
+    } else {
+        head
+    };
+    // 取 pragma 名（到 `(`、`=`、空白为止），小写比较。
+    let name: String = body
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if !READONLY_PRAGMAS.contains(&name.as_str()) {
+        return false;
+    }
+    // 拒绝赋值形式（`PRAGMA cache_size = 100`）：PRAGMA 语句体内含 `=` 即拦截；
+    // 可写 PRAGMA 的括号赋值（`PRAGMA journal_mode(WAL)`）同样拦截。
+    if body.contains('=') {
+        return false;
+    }
+    if WRITE_BY_VALUE_PRAGMAS.contains(&name.as_str()) && body.contains('(') {
+        return false;
+    }
+    true
 }
 
 /// Shell 元字符正则：命中任一即视为"复合命令"，**不**算白名单内。
@@ -2180,6 +2388,77 @@ pub fn describe_call(name: &str, arguments: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn call(name: &str, args: Value) -> ToolCall {
+        ToolCall {
+            id: "call_1".into(),
+            name: name.into(),
+            arguments: args,
+        }
+    }
+
+    /// 会话路由纠偏：模型照抄历史旧 sessionId 时必须被强制改写为活动终端。
+    #[test]
+    fn reroute_rewrites_stale_terminal_id() {
+        let c = call(
+            "exec_ssh",
+            json!({ "sessionId": "old-session", "command": "uptime" }),
+        );
+        let (routed, notice) = reroute_session_ids(&c, "new-session", "");
+        let routed = routed.expect("应产生改写后的调用");
+        assert_eq!(routed.arguments["sessionId"], "new-session");
+        // 其余参数原样保留。
+        assert_eq!(routed.arguments["command"], "uptime");
+        assert!(notice.contains("old-session"));
+        assert!(notice.contains("new-session"));
+    }
+
+    /// 参数缺失时自动补全活动 id；id 一致时不改写、无提示。
+    #[test]
+    fn reroute_fills_missing_and_skips_match() {
+        // 缺 sessionId：自动补全。
+        let c = call("terminal_snapshot", json!({}));
+        let (routed, notice) = reroute_session_ids(&c, "active-term", "");
+        assert_eq!(routed.unwrap().arguments["sessionId"], "active-term");
+        assert!(notice.contains("active-term"));
+        // sessionId 与活动一致：原样放行。
+        let c = call("exec_ssh", json!({ "sessionId": "active-term", "command": "ls" }));
+        let (routed, notice) = reroute_session_ids(&c, "active-term", "");
+        assert!(routed.is_none());
+        assert!(notice.is_empty());
+    }
+
+    /// 数据库连接同样纠偏；无活动上下文（空串）与非会话工具不动参数。
+    #[test]
+    fn reroute_db_and_noop_cases() {
+        // dbConnId 旧值改写。
+        let c = call("exec_sql", json!({ "dbConnId": "old-conn", "sql": "SELECT 1" }));
+        let (routed, _) = reroute_session_ids(&c, "", "new-conn");
+        assert_eq!(routed.unwrap().arguments["dbConnId"], "new-conn");
+        // 无活动终端（空串）：不改写（该工具本就未 advertised，由 allowed 拦截）。
+        let c = call("exec_ssh", json!({ "sessionId": "old-session", "command": "ls" }));
+        let (routed, notice) = reroute_session_ids(&c, "", "");
+        assert!(routed.is_none());
+        assert!(notice.is_empty());
+        // 非会话工具（todo_write）：不涉及。
+        let c = call("todo_write", json!({ "items": [] }));
+        let (routed, notice) = reroute_session_ids(&c, "active-term", "active-conn");
+        assert!(routed.is_none());
+        assert!(notice.is_empty());
+    }
+
+    /// SQLite 只读 PRAGMA 放行/拦截边界。
+    #[test]
+    fn readonly_pragma_boundaries() {
+        // 只读查询放行（含括号参数与小写形式）。
+        assert!(is_readonly_sql("PRAGMA table_info(users)"));
+        assert!(is_readonly_sql("pragma integrity_check"));
+        assert!(is_readonly_sql("PRAGMA  user_version"));
+        // 写副作用形式拦截：赋值、写类 PRAGMA、PRAGMA 名单外。
+        assert!(!is_readonly_sql("PRAGMA cache_size = 100"));
+        assert!(!is_readonly_sql("PRAGMA writable_schema = 1"));
+        assert!(!is_readonly_sql("PRAGMA wal_checkpoint(TRUNCATE)"));
+    }
 
     /// 白名单元字符正则必须能正常编译（回归：曾用 `\0` 写法导致 regex crate
     /// 拒绝编译，首次使用 `Lazy` 初始化时直接 panic）。访问 `COMMAND_METACHAR_RE`

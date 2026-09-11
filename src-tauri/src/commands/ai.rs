@@ -977,6 +977,11 @@ async fn run_agent_loop(
             let app = app.clone();
             let state = state.clone();
             let allowed = allowed.clone();
+            // 活动上下文快照（请求发起时）：execute_tool 据此把模型传的
+            // sessionId/dbConnId 纠偏到用户当前跟随的目标——跟随模式切 tab 后，
+            // 对话历史里的旧 id 会被模型照抄，导致命令落到旧终端/旧连接。
+            let active_terminal_id = req.active_terminal_id.clone().unwrap_or_default();
+            let active_db_conn_id = req.active_db_conn_id.clone().unwrap_or_default();
             let semaphore = std::sync::Arc::clone(&semaphore);
             let slot = slots[i].take();
             let wait_gate = wait_gates[i].take();
@@ -1065,6 +1070,8 @@ async fn run_agent_loop(
                                     pc.visualization,
                                     file_domain,
                                     &request_id,
+                                    &active_terminal_id,
+                                    &active_db_conn_id,
                                 )
                                 .await
                             }
@@ -1117,6 +1124,8 @@ async fn run_agent_loop(
                             pc.visualization,
                             file_domain,
                             &request_id,
+                            &active_terminal_id,
+                            &active_db_conn_id,
                         )
                         .await
                     }
@@ -1690,6 +1699,18 @@ pub struct SerializableConversation {
     /// 智能体任务清单（todo_write 维护；旧文件无此字段 → 默认空）。
     #[serde(default)]
     pub todos: Vec<crate::events::AiTodoItem>,
+    /// 会话累计 token 用量（前端 ai:usage 事件累加后随保存传入；原样透传）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Value>,
+    /// 是否已归档（关闭的会话进历史归档，可在历史列表恢复；旧文件无此字段 → false）。
+    #[serde(default)]
+    pub archived: bool,
+    /// 最后活动时间（毫秒时间戳；旧文件无此字段）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<u64>,
+    /// 归档时间（毫秒时间戳；仅归档会话有；旧文件无此字段）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<u64>,
 }
 
 /// 对话历史文件路径：`<app_data>/ai_conversations_<domain>.json`。
@@ -1726,6 +1747,62 @@ fn filter_images_for_model(messages: &mut [ChatMessage], multimodal: bool) {
             m.images = None;
         }
     }
+}
+
+// ===========================================================================
+// 终端智能补全（AI 建议项）
+// ===========================================================================
+
+/// 终端命令补全的系统提示词。
+const AI_COMPLETE_SYSTEM_PROMPT: &str = "你是终端命令助手。用户正在 SSH 终端中输入命令。\
+请根据当前输入上下文，补全或改写为一个完整、正确的命令。\
+只返回命令本身，不要添加任何解释，不要使用 markdown 代码块。";
+
+/// 终端智能补全：根据当前输入生成一条完整命令建议。
+///
+/// 一次性调用（无对话历史、无工具），同步返回完整命令文本——补全建议是
+/// 单值结果，无需流式事件。内部 request_id 产生的 `ai:chunk` 事件不会被
+/// 前端会话路由（ai store 按 requestId→conversation 映射路由，此请求不在
+/// 映射中，事件被安全丢弃），可放心复用 `chat_with_tools` 空 tools 通道。
+#[tauri::command]
+pub async fn ai_complete_command(
+    input: String,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> AppResult<String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err(AppError::InvalidInput("输入为空".into()));
+    }
+    let settings = settings_load_inner(&state)?;
+    let provider_cfg = settings
+        .ai
+        .active_provider()
+        .ok_or_else(|| AppError::InvalidInput("未配置 AI provider，请先在设置中添加".into()))?;
+    let provider = build_provider(&provider_cfg)?;
+
+    let messages = vec![
+        ChatMessage::new(Role::System, AI_COMPLETE_SYSTEM_PROMPT),
+        ChatMessage::new(Role::User, format!("当前输入: {input}")),
+    ];
+    let request_id = format!("ai-complete-{}", uuid::Uuid::new_v4());
+    let resp = provider
+        .chat_with_tools(messages, vec![], vec![], request_id, app)
+        .await?;
+
+    // 剥离模型偶尔附带的 markdown 代码围栏与首尾空白。多行围栏
+    //（```lang\n...\n```）与单行围栏（```df -h```）都要处理：单行时
+    // split_once('\n') 为 None，旧实现回退原始串导致开头的 ``` 残留在
+    // 补全建议里。
+    let cleaned = resp.message.trim();
+    let cleaned = if let Some(rest) = cleaned.strip_prefix("```") {
+        // 多行围栏跳过语言标注行；单行围栏无标注行，剩余整体即内容。
+        let body = rest.split_once('\n').map(|(_, r)| r).unwrap_or(rest);
+        body.trim_end().trim_end_matches("```").trim()
+    } else {
+        cleaned
+    };
+    Ok(cleaned.to_string())
 }
 
 // ===========================================================================

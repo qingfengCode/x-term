@@ -51,12 +51,19 @@ pub struct McpInstanceConfig {
     /// 时必填；`"client"` 模式下忽略。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_id: Option<String>,
-    /// 资源模式："bound"（绑定本地资源，默认）| "client"（客户端直连，免绑定实例）。
+    /// 多机模式（`resource_mode == "multi"`，仅 SSH）勾选的 SSH 会话 id 集合。
+    /// 其它模式下忽略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_ids: Option<Vec<String>>,
+    /// 资源模式："bound"（绑定本地资源，默认）| "client"（客户端直连，免绑定实例）
+    /// | "multi"（多机模式，仅 SSH：绑定一组会话，由外部 AI 按 target 自选目标）。
     ///
     /// - bound：启动要求绑定资源（resourceId），工具参数只传 command/sql，目标从绑定解析，
     ///   凭据从本地 vault 解析。
     /// - client：无需绑定资源，工具参数需携带 host/port/username/password 等目标信息，
     ///   凭据即用即弃、不存储不落日志。适合调用方自带账密表的巡检场景。
+    /// - multi：启动要求勾选至少一台机器（resourceIds 非空），工具参数必传 target
+    ///   （授权机器名），AI 自行决定每次调用落在哪台机器。
     #[serde(default = "default_resource_mode")]
     pub resource_mode: String,
     /// 绑定来源（仅 bound 模式有效）："config"（绑定会话配置，默认；执行时新建
@@ -68,12 +75,35 @@ pub struct McpInstanceConfig {
     /// 为空则使用 profile 的 default_database。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bound_database: Option<String>,
-    /// 自动放行：开启后 exec_ssh/exec_sql 跳过人工确认直接执行。默认 false。
-    #[serde(default)]
+    /// 运行模式（与 AI 助手的执行模式语义一致）：
+    /// - `manual`：所有写/执行类调用人工确认（默认）；
+    /// - `whitelist`：白名单内自动放行，其余人工确认——SSH 为命令白名单
+    ///   （复用「设置 → AI」的 SSH 命令白名单）、DB 为只读 SQL（SELECT/
+    ///   SHOW/EXPLAIN/DESCRIBE）；
+    /// - `auto`：全部自动执行（例外：文件传输工具仍强制人工确认）。
+    #[serde(default = "default_run_mode")]
+    pub run_mode: String,
+    /// 旧字段（仅向后兼容读取，不再写出）：旧 mcp.json 的 `autoApprove: true`
+    /// 在 [`instance_config`] 中迁移为 `run_mode = "auto"`。
+    #[serde(default, skip_serializing)]
     pub auto_approve: bool,
     /// 是否记录执行日志到文本文件（每次启动生成一个日志文件）。默认 true。
     #[serde(default = "default_enable_log")]
     pub enable_log: bool,
+}
+
+/// 默认运行模式：全部人工确认（最安全）。
+fn default_run_mode() -> String {
+    "manual".into()
+}
+
+/// 规范化运行模式：仅 manual / whitelist / auto 合法，其余一律回退 manual
+/// （防配置文件被手动改坏导致意外自动执行）。
+pub(crate) fn normalize_run_mode(m: &str) -> String {
+    match m {
+        "whitelist" | "auto" => m.into(),
+        _ => "manual".into(),
+    }
 }
 
 /// 默认监听地址：仅本机回环。
@@ -98,13 +128,13 @@ fn default_bound_source() -> String {
     "config".into()
 }
 
-/// 规范化资源模式：仅 `"client"` 视为直连模式，其余一律按 `"bound"` 处理
-/// （防配置文件被手动改坏导致意外直连）。
+/// 规范化资源模式：仅 `"client"`（直连）与 `"multi"`（多机，仅 SSH）为特殊模式，
+/// 其余一律按 `"bound"` 处理（防配置文件被手动改坏导致意外直连/越权多机）。
 pub(crate) fn normalize_resource_mode(m: &str) -> String {
-    if m == "client" {
-        "client".into()
-    } else {
-        "bound".into()
+    match m {
+        "client" => "client".into(),
+        "multi" => "multi".into(),
+        _ => "bound".into(),
     }
 }
 
@@ -135,9 +165,11 @@ impl McpInstanceConfig {
             port: default_port_for(kind),
             token: None,
             resource_id: None,
+            resource_ids: None,
             resource_mode: default_resource_mode(),
             bound_source: default_bound_source(),
             bound_database: None,
+            run_mode: default_run_mode(),
             auto_approve: false,
             enable_log: true,
         }
@@ -182,7 +214,8 @@ fn write_config_file(state: &AppState, cfg: &McpConfigFile) -> AppResult<()> {
     crate::storage::json_store::write_json(&path, cfg)
 }
 
-/// 从配置文件取指定 kind 的配置（保证字段非空：host/port 用默认兜底）。
+/// 从配置文件取指定 kind 的配置（保证字段非空：host/port 用默认兜底，
+/// run_mode 规范化并迁移旧 `autoApprove` 布尔开关）。
 fn instance_config(state: &AppState, kind: McpKind) -> McpInstanceConfig {
     let file = read_config_file(state);
     let mut c = match kind {
@@ -197,6 +230,15 @@ fn instance_config(state: &AppState, kind: McpKind) -> McpInstanceConfig {
     if c.port == 0 {
         c.port = default_port_for(kind);
     }
+    // 旧配置迁移：autoApprove=true（旧自动放行开关）→ run_mode="auto"；
+    // 之后清零旧字段，避免下次保存时重复迁移（字段 skip_serializing 不落盘）。
+    if c.auto_approve {
+        if normalize_run_mode(&c.run_mode) == "manual" {
+            c.run_mode = "auto".into();
+        }
+        c.auto_approve = false;
+    }
+    c.run_mode = normalize_run_mode(&c.run_mode);
     c
 }
 
@@ -234,6 +276,16 @@ pub async fn mcp_start(
     let kind = McpKind::parse(&kind);
     let cfg = instance_config(state.inner(), kind);
     let resource_mode = normalize_resource_mode(&cfg.resource_mode);
+    // 多机模式仅 SSH kind 支持（DB/File 回退 bound 并告警）。
+    let resource_mode = if resource_mode == "multi" && kind != McpKind::Ssh {
+        log::warn!(
+            "[mcp] {} 不支持多机模式，已回退为单资源绑定",
+            kind.label()
+        );
+        "bound".to_string()
+    } else {
+        resource_mode
+    };
 
     let host = host.unwrap_or(cfg.host);
     let port = port.unwrap_or(cfg.port);
@@ -257,7 +309,33 @@ pub async fn mcp_start(
         }
         _ => "config",
     };
-    let bound_resource_id = if resource_mode == "client" {
+    // 多机模式：勾选集合非空且所有会话存在（启动时校验，执行期 resolve 双保险）。
+    let bound_resource_ids = if resource_mode == "multi" {
+        let ids = cfg.resource_ids.clone().unwrap_or_default();
+        if ids.is_empty() {
+            return Err(AppError::Config(
+                "SSH MCP 多机模式未勾选任何机器：请先在 MCP 页面勾选至少一台".into(),
+            ));
+        }
+        // 去重（重复 id 无意义；保留勾选顺序——展示顺序与用户勾选一致，
+        // 重名后缀编号在 exec::disambiguate_display_names 内按 id 字典序稳定）。
+        let mut unique: Vec<String> = Vec::with_capacity(ids.len());
+        for id in &ids {
+            if !unique.contains(id) {
+                unique.push(id.clone());
+            }
+        }
+        if let Err(e) = crate::mcp::exec::multi_machines(state.inner(), &unique) {
+            return Err(AppError::Config(format!(
+                "多机模式机器清单校验失败：{}",
+                e
+            )));
+        }
+        unique
+    } else {
+        Vec::new()
+    };
+    let bound_resource_id = if resource_mode == "client" || resource_mode == "multi" {
         None
     } else if bound_source == "terminal" {
         // 终端标签页绑定：校验终端存在且为 SSH 终端（启动时校验，避免每次调用都报错）。
@@ -295,10 +373,11 @@ pub async fn mcp_start(
         port,
         token,
         bound_resource_id,
+        bound_resource_ids,
         bound_source.to_string(),
         cfg.bound_database,
         resource_mode,
-        cfg.auto_approve,
+        cfg.run_mode,
         cfg.enable_log,
     )
     .await?;
@@ -317,11 +396,11 @@ pub fn mcp_status(kind: String) -> AppResult<McpServerStatus> {
     Ok(crate::mcp::mcp_server_status(McpKind::parse(&kind)))
 }
 
-/// 保存指定 kind 的配置（绑定资源 / host / port / enabled / token / auto_approve）。
+/// 保存指定 kind 的配置（绑定资源 / host / port / enabled / token / run_mode）。
 ///
 /// 前端在用户改了绑定、地址、端口、开关后调用。**不直接重启服务**——若服务在运行，
 /// 前端应先 mcp_stop 再 mcp_start 生效（本命令只持久化配置）。
-/// 例外：`auto_approve` 改动**立即生效**（更新运行时开关，无需重启）。
+/// 例外：`run_mode` 改动**立即生效**（更新运行时模式，无需重启）。
 #[tauri::command]
 pub fn mcp_save_config(
     kind: String,
@@ -331,8 +410,10 @@ pub fn mcp_save_config(
     let kind = McpKind::parse(&kind);
     // host 不做地址限制：允许 0.0.0.0 / 局域网 IP 等任意监听地址（空值允许——
     // 启动时回退默认 127.0.0.1）。
-    // auto_approve 立即生效（无需重启服务）。
-    crate::mcp::server::set_auto_approve(kind, config.auto_approve);
+    // run_mode 立即生效（无需重启服务）。
+    let mut config = config;
+    config.run_mode = normalize_run_mode(&config.run_mode);
+    crate::mcp::server::set_run_mode(kind, &config.run_mode);
     set_instance_config(state.inner(), kind, config)
 }
 
@@ -390,6 +471,59 @@ pub async fn mcp_rebind(
     cfg.bound_source = bound_source;
     cfg.resource_id = Some(resource_id);
     set_instance_config(state.inner(), kind, cfg)
+}
+
+/// 运行中热切换多机模式的机器集合（仅 SSH kind + multi 模式），立即生效无需重启。
+///
+/// - `resource_ids`：勾选的 SSH 会话 id 集合（非空；去重保留顺序；逐个校验存在）。
+///
+/// 同时把新集合持久化到 mcp.json。返回值：
+/// - `true`：服务正以 multi 模式运行，新集合已热切换即时生效；
+/// - `false`：未热切换（服务未运行，或正以其它模式运行——切换模式需重启），
+///   配置已保存，服务（重）启动时生效。
+#[tauri::command]
+pub async fn mcp_rebind_multi(
+    kind: String,
+    resource_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> AppResult<bool> {
+    let kind = McpKind::parse(&kind);
+    if kind != McpKind::Ssh {
+        return Err(AppError::InvalidInput(format!(
+            "{} 不支持多机模式（仅 SSH MCP 支持）",
+            kind.label()
+        )));
+    }
+    if resource_ids.is_empty() {
+        return Err(AppError::InvalidInput(
+            "多机模式至少需要勾选一台机器".into(),
+        ));
+    }
+    // 去重（保留顺序）并校验全部存在。
+    let mut unique: Vec<String> = Vec::with_capacity(resource_ids.len());
+    for id in &resource_ids {
+        if !unique.contains(id) {
+            unique.push(id.clone());
+        }
+    }
+    crate::mcp::exec::multi_machines(state.inner(), &unique)?;
+
+    // 热切换运行中的实例：区分"已生效"与"未生效（仅保存）"，前端据此给出
+    // 准确提示——避免服务以其它模式运行时误导用户"已即时生效"。
+    let hot_applied = match crate::mcp::server::rebind_mcp_multi(kind, &unique) {
+        Ok(()) => true,
+        Err(e) => {
+            log::info!("[mcp] {} 多机热切换跳过：{}", kind.label(), e);
+            false
+        }
+    };
+
+    // 持久化配置。
+    let mut cfg = instance_config(state.inner(), kind);
+    cfg.resource_ids = Some(unique);
+    cfg.resource_mode = "multi".into();
+    set_instance_config(state.inner(), kind, cfg)?;
+    Ok(hot_applied)
 }
 
 /// 为指定 kind 生成随机 token（uuid 去横线），写入配置文件并返回。

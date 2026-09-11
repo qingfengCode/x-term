@@ -1,13 +1,24 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
+import { useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { useSessionsStore, type TreeNode } from "@/stores/sessions";
 import { useTerminalsStore } from "@/stores/terminals";
-import type { Group, Session } from "@/api/types";
+import { useDesktopsStore } from "@/stores/desktops";
+import { useDesktopTabsStore } from "@/stores/desktopTabs";
+import { useSettingsStore } from "@/stores/settings";
+import { AuthType, type Group, type Session } from "@/api/types";
+import { credentialSave } from "@/api/vault";
+import { remoteDesktopLaunch, type Desktop } from "@/api/remote_desktop";
+import { parseQuickConnect, type QuickConnectTarget } from "@/utils/quickConnect";
 import SessionDialog from "./SessionDialog.vue";
 
 const sessionsStore = useSessionsStore();
 const terminalsStore = useTerminalsStore();
+const desktopsStore = useDesktopsStore();
+const desktopTabs = useDesktopTabsStore();
+const settings = useSettingsStore();
+const router = useRouter();
 
 /** 收起侧栏（由 MainLayout 处理：隐藏侧栏并显示窄条展开按钮）。 */
 const emit = defineEmits<{ (e: "collapse"): void }>();
@@ -61,10 +72,135 @@ const isEmpty = computed(
   () => sessionsStore.terminalSessions.length === 0 && sessionsStore.groups.length === 0
 );
 
+// --- 快速连接 ---------------------------------------------------------------
+// 搜索框输入连接串（ssh://user@host:port / ssh host / user@host:port）时，
+// 在搜索结果上方显示"连接"条目：解析 → 存会话 → 连接，免去新建表单。
+const quickTarget = computed<QuickConnectTarget | null>(() => {
+  const t = filter.value.trim();
+  if (!t) return null;
+  return parseQuickConnect(t);
+});
+
+async function quickConnect() {
+  const target = quickTarget.value;
+  if (!target) return;
+  let credentialId: string | null = null;
+  // URI 中携带的密码入保险库（明文不落 settings/DB）。
+  if (target.password) {
+    try {
+      credentialId = await credentialSave({
+        name: `quick-${target.label}`,
+        kind: "password",
+        value: target.password,
+      });
+    } catch (e) {
+      ElMessage.error("保存密码失败（保险库可能未解锁）: " + String(e));
+      return;
+    }
+  }
+  const now = new Date().toISOString();
+  // rdp/vnc 走远程桌面链路（独立的 Desktop 数据源 + 桥接），不能进终端
+  // connect_session——后端会把 3389/5900 端口当 SSH 握手，必然失败，
+  // 且 protocol=rdp 的 Session 会被终端侧栏过滤成不可见的幽灵会话。
+  if (target.protocol === "rdp" || target.protocol === "vnc") {
+    const desktop: Desktop = {
+      id: `d-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      name: target.label,
+      protocol: target.protocol,
+      host: target.host,
+      port: target.port,
+      username: target.username || null,
+      credentialId,
+      groupId: null,
+      desktopSize: null,
+      sortOrder: 0,
+      createdAt: now,
+      updatedAt: now,
+    };
+    try {
+      await desktopsStore.save(desktop);
+    } catch (e) {
+      ElMessage.error("保存桌面连接失败: " + String(e));
+      return;
+    }
+    filter.value = "";
+    // 切到远程桌面页（KeepAlive，已加载不重挂载），再按设置的客户端模式连接
+    //（与 RemoteDesktopView.connect 同一规则）。
+    router.push({ name: "remote" });
+    if (!settings.loaded) await settings.load().catch(() => {});
+    const mode =
+      target.protocol === "vnc"
+        ? settings.terminal.desktopClients.vnc
+        : settings.terminal.desktopClients.rdp;
+    try {
+      if (mode === "app") {
+        // 内嵌 RDP 走 NLA 认证，必须带用户名和密码。
+        if (target.protocol === "rdp" && (!target.username || !target.password)) {
+          ElMessage.warning("内嵌 RDP 需要用户名和密码：请在远程桌面页编辑补充，或切换为系统客户端");
+          return;
+        }
+        await desktopTabs.open(desktop, target.password);
+      } else {
+        const msg = await remoteDesktopLaunch({
+          protocol: target.protocol,
+          host: target.host,
+          port: target.port,
+          username: target.username || undefined,
+          password: target.password,
+        });
+        ElMessage.success(msg);
+      }
+    } catch (e) {
+      ElMessage.error("连接失败: " + String(e));
+    }
+    return;
+  }
+  const session: Session = {
+    id: crypto.randomUUID(),
+    name: target.label,
+    groupId: null,
+    host: target.host,
+    port: target.port,
+    username: target.username || "",
+    authType: AuthType.Password,
+    credentialId,
+    keyPath: null,
+    jumpSessionId: null,
+    startupScript: null,
+    tags: null,
+    color: null,
+    sortOrder: 0,
+    createdAt: now,
+    updatedAt: now,
+    protocol: target.protocol,
+  };
+  try {
+    await sessionsStore.saveSession(session);
+  } catch (e) {
+    ElMessage.error("保存会话失败: " + String(e));
+    return;
+  }
+  filter.value = "";
+  await connectSession(session);
+}
+
 // --- 对话框 -------------------------------------------------------------
 const dialogVisible = ref(false);
 const editingSession = ref<Session | null>(null);
 const defaultGroupId = ref<string | null>(null);
+
+// --- 服务器监控（以页签打开，与终端同栏；仅 SSH 会话） ----------------------
+
+/** 是否 SSH 会话（监控仅对 SSH 有意义；旧数据无 protocol 视为 ssh）。 */
+function isSshSession(s: Session): boolean {
+  return s.protocol === "ssh" || !s.protocol;
+}
+
+/** 打开服务器监控页签（终端页旁的独立页签，由 terminals store 承载）。 */
+function openMonitor(s: Session) {
+  if (!isSshSession(s)) return;
+  terminalsStore.openMonitor(s);
+}
 
 function openNewSession(groupId: string | null = null) {
   editingSession.value = null;
@@ -131,6 +267,9 @@ function onCommand(cmd: string, data: TreeNode) {
     switch (cmd) {
       case "connect":
         connectSession(s);
+        break;
+      case "monitor":
+        openMonitor(s);
         break;
       case "edit":
         openEditSession(s);
@@ -346,6 +485,24 @@ async function onNodeDrop(
       />
     </div>
 
+    <!-- 快速连接：输入连接串（如 ssh://root@10.0.0.1）时出现 -->
+    <div v-if="quickTarget" class="quick-connect">
+      <div
+        class="quick-connect-item"
+        role="button"
+        tabindex="0"
+        @click="quickConnect"
+        @keydown.enter.prevent="quickConnect"
+      >
+        <el-icon class="quick-connect-icon"><Promotion /></el-icon>
+        <span class="quick-connect-label">
+          连接
+          <span class="quick-connect-target">{{ quickTarget.label }}</span>
+        </span>
+        <span class="quick-connect-proto">{{ quickTarget.protocol.toUpperCase() }}</span>
+      </div>
+    </div>
+
     <!-- 最近连接（最近成功连接的会话，单击连接；Ctrl+T 会连第一个） -->
     <div v-if="sessionsStore.recentSessions.length" class="recent-section">
       <div class="recent-header">
@@ -375,6 +532,14 @@ async function onNodeDrop(
           <template #dropdown>
             <el-dropdown-menu>
               <el-dropdown-item command="connect" :icon="'Link'">连接</el-dropdown-item>
+              <!-- 服务器监控：仅 SSH 会话（走 SFTP 采集系统指标） -->
+              <el-dropdown-item
+                v-if="isSshSession(s)"
+                command="monitor"
+                :icon="'DataLine'"
+              >
+                服务器监控
+              </el-dropdown-item>
               <el-dropdown-item command="edit" :icon="'Edit'">编辑</el-dropdown-item>
               <el-dropdown-item command="copy" :icon="'CopyDocument'">复制</el-dropdown-item>
               <el-dropdown-item command="delete" :icon="'Delete'" divided>删除</el-dropdown-item>
@@ -440,6 +605,14 @@ async function onNodeDrop(
               <template #dropdown>
                 <el-dropdown-menu v-if="data.type === 'session'">
                   <el-dropdown-item command="connect" :icon="'Link'">连接</el-dropdown-item>
+                  <!-- 服务器监控：仅 SSH 会话（走 SFTP 采集系统指标） -->
+                  <el-dropdown-item
+                    v-if="isSshSession(data.raw as Session)"
+                    command="monitor"
+                    :icon="'DataLine'"
+                  >
+                    服务器监控
+                  </el-dropdown-item>
                   <el-dropdown-item command="edit" :icon="'Edit'">编辑</el-dropdown-item>
                   <el-dropdown-item command="copy" :icon="'CopyDocument'">复制</el-dropdown-item>
                   <el-dropdown-item command="delete" :icon="'Delete'" divided>
@@ -572,6 +745,52 @@ async function onNodeDrop(
 .recent-item:hover .recent-menu,
 .recent-menu:focus-within {
   display: flex;
+}
+
+/* 快速连接条目 */
+.quick-connect {
+  padding: 0 4px 8px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+}
+.quick-connect-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+.quick-connect-item:hover {
+  background: var(--el-fill-color-light);
+}
+.quick-connect-icon {
+  font-size: 13px;
+  color: var(--el-color-primary);
+}
+.quick-connect-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  color: var(--el-text-color-secondary);
+}
+.quick-connect-target {
+  color: var(--el-color-primary);
+  font-weight: 600;
+}
+.quick-connect-proto {
+  flex-shrink: 0;
+  font-size: 10px;
+  line-height: 1;
+  padding: 3px 5px;
+  border-radius: 4px;
+  color: var(--el-color-primary);
+  background: var(--el-color-primary-light-9);
 }
 
 /* 搜索高亮 */

@@ -113,10 +113,17 @@ body {
   background: transparent;
 }
 
-/* xterm 容器：宽高由 TerminalPane.vue 的 scoped 规则提供，此处不设背景色，
-   避免浅色主题下终端首帧出现黑底黑边硬切（主题背景由 xterm 运行时内联）。 */
+/* xterm 容器：宽高由 TerminalPane.vue 的 scoped 规则提供，背景色由
+   TerminalPane 按当前主题同步（见 applyBackdrop），首帧即与画布同色。 */
 .xterm-pane .xterm {
   padding: 4px;
+}
+
+/* xterm v6：主题背景只内联到内容滚动层（.xterm-scrollable-element），
+   垫底的 .xterm-viewport 保留库默认 #000——容器尺寸除以单元格的余量
+   （不足一行的底部/右侧）会露出黑边。置透明，让容器背景透出。 */
+.xterm-pane .xterm .xterm-viewport {
+  background-color: transparent;
 }
 
 /* 工作区无标签时占位 */

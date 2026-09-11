@@ -8,7 +8,7 @@
   - 连接状态圆点（connecting 黄 / disconnected 红 / 正常绿）
   - 滚轮纵向转横向滚动
   - HTML5 拖拽排序（过半即换位，通过 move 事件交给 store 执行）
-  - 右键菜单（关闭/关闭其他/关闭全部/断开时显示重新连接），带视口钳制
+  - 右键菜单（关闭/复制/关闭其他/关闭全部/断开时显示重新连接），带视口钳制
     （窗口右/下边缘右键时菜单不会被裁掉）与统一 z-index。
 
   用法：
@@ -21,19 +21,29 @@ import { Close } from "@element-plus/icons-vue";
 
 /** 单个标签的数据抽象（终端 tab 与桌面 tab 的公共子集）。 */
 export interface TabBarItem {
-  /** 唯一键（instanceId，未建立连接前可为 session/desktop id）。 */
+  /** 唯一键（调用方提供：终端页签用稳定 tab.id，桌面页签用其自身标识）。 */
   key: string;
   /** 标签标题。 */
   title: string;
+  /** 可选的图标名（Element Plus 图标组件名，如 "DataLine"）；终端 tab 不传。 */
+  icon?: string;
+  /** 不显示连接状态圆点（无"连接状态"语义的页签，如服务器监控：它自建连接，
+   *  状态由面板内容表达，圆点会误导为"一直正常"）。 */
+  hideDot?: boolean;
   /** 连接中（黄点）。 */
   connecting?: boolean;
   /** 已断开（红点，右键菜单追加"重新连接"）。 */
   disconnected?: boolean;
+  /** 是否可在右键菜单中"复制"（同配置新开一条独立连接；如 SSH 终端）。 */
+  duplicable?: boolean;
+  /** 是否可在右键菜单中"复制 SSH 通道"（同一条已认证连接上开新 channel，
+   *  需已连接的 SSH——占位/断开的 tab 不显示）。 */
+  cloneable?: boolean;
 }
 
 const props = defineProps<{
   tabs: TabBarItem[];
-  /** 当前激活的 tab key（store 的 activeId 可能为 null 表示无激活）。 */
+  /** 当前激活的 tab key（store 的 activeTabId / activeId 可能为 null 表示无激活）。 */
   activeKey?: string | null;
   /** 无 tab 时的提示文案。 */
   emptyHint?: string;
@@ -47,7 +57,16 @@ const emit = defineEmits<{
   /** 拖拽排序：把 from 移到 target 的前/后。 */
   move: [from: string, to: string, before: boolean];
   /** 右键菜单命令（作用于右键的 tab）。 */
-  command: [cmd: "close" | "closeOthers" | "closeAll" | "reconnect", key: string];
+  command: [
+    cmd:
+      | "duplicate"
+      | "cloneChannel"
+      | "close"
+      | "closeOthers"
+      | "closeAll"
+      | "reconnect",
+    key: string,
+  ];
 }>();
 
 function onSelect(tab: TabBarItem) {
@@ -101,9 +120,10 @@ function onDragEnd() {
 
 // --- 右键菜单（视口钳制 + 统一 z-index） -------------------------------------
 
-/** 菜单浮层的估算尺寸（钳制坐标用，需覆盖最坏情况：断开时 4 项 + 分隔线）。 */
+/** 菜单浮层的估算尺寸（钳制坐标用，需覆盖最坏情况：复制通道 + 复制 +
+ *  4 项 + 2 分隔线）。 */
 const MENU_W = 150;
-const MENU_H = 170;
+const MENU_H = 240;
 
 const menu = ref<{ x: number; y: number; tab: TabBarItem | null }>({
   x: 0,
@@ -124,7 +144,15 @@ function closeMenu() {
   menu.value.tab = null;
 }
 
-function onMenuCommand(cmd: "close" | "closeOthers" | "closeAll" | "reconnect") {
+function onMenuCommand(
+  cmd:
+    | "duplicate"
+    | "cloneChannel"
+    | "close"
+    | "closeOthers"
+    | "closeAll"
+    | "reconnect"
+) {
   const t = menu.value.tab;
   closeMenu();
   if (t) emit("command", cmd, t.key);
@@ -166,7 +194,12 @@ defineExpose({ closeMenu });
       @dragover="(e: DragEvent) => onDragOver(e, tab.key)"
       @dragend="onDragEnd"
     >
-      <span class="dot" :class="{ connecting: tab.connecting, dead: tab.disconnected }" />
+      <span
+        v-if="!tab.hideDot"
+        class="dot"
+        :class="{ connecting: tab.connecting, dead: tab.disconnected }"
+      />
+      <el-icon v-if="tab.icon" class="tab-ico"><component :is="tab.icon" /></el-icon>
       <span v-if="i < 9" class="tab-idx">{{ i + 1 }}</span>
       <span class="title">{{ tab.title }}</span>
       <el-icon class="close" @click="(e: Event) => onClose(tab, e)"><Close /></el-icon>
@@ -182,6 +215,25 @@ defineExpose({ closeMenu });
       :style="{ left: menu.x + 'px', top: menu.y + 'px' }"
       @click.stop
     >
+      <!-- 复制 SSH 通道：同一条已认证连接上开新 channel（不重新认证） -->
+      <div
+        class="tab-menu-item"
+        v-if="menu.tab?.cloneable"
+        title="在同一条已认证连接上开新终端标签页，不重新认证（二次认证无需再输口令码）"
+        @click="onMenuCommand('cloneChannel')"
+      >
+        复制 SSH 通道
+      </div>
+      <!-- 复制：同配置新开一条独立连接 -->
+      <div
+        class="tab-menu-item"
+        v-if="menu.tab?.duplicable"
+        title="用同一会话配置新开一条独立连接的终端标签页（会重新认证）"
+        @click="onMenuCommand('duplicate')"
+      >
+        复制
+      </div>
+      <div class="tab-menu-sep" v-if="menu.tab?.duplicable" />
       <div class="tab-menu-item" @click="onMenuCommand('close')">关闭</div>
       <div class="tab-menu-item" @click="onMenuCommand('closeOthers')">关闭其他</div>
       <div class="tab-menu-item" @click="onMenuCommand('closeAll')">关闭全部</div>
@@ -244,6 +296,11 @@ defineExpose({ closeMenu });
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* 可选图标（如监控页签的 DataLine），与状态圆点并列 */
+.tab .tab-ico {
+  font-size: 12px;
+  flex-shrink: 0;
 }
 .tab .dot {
   width: 7px;

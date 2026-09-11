@@ -87,17 +87,35 @@ struct ServerHandle {
 static SERVERS: Lazy<Mutex<HashMap<McpKind, ServerHandle>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-/// 运行时自动放行开关（per-kind）。`mcp_save_config` 更新此值，改后立即生效无需重启。
-static AUTO_APPROVE: Lazy<Mutex<HashMap<McpKind, bool>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+/// 运行时运行模式（per-kind，"manual"/"whitelist"/"auto"）。`mcp_save_config`
+/// 更新此值，改后立即生效无需重启。
+static RUN_MODES: Lazy<Mutex<HashMap<McpKind, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
-/// 设置指定 kind 的自动放行开关（由 commands::mcp::mcp_save_config 调用）。
-pub fn set_auto_approve(kind: McpKind, enabled: bool) {
-    AUTO_APPROVE.lock().insert(kind, enabled);
+/// 设置指定 kind 的运行模式（由 commands::mcp 的启动/保存配置调用）。
+pub fn set_run_mode(kind: McpKind, mode: &str) {
+    let m = match mode {
+        "whitelist" | "auto" => mode.to_string(),
+        _ => "manual".to_string(),
+    };
+    RUN_MODES.lock().insert(kind, m);
 }
 
-/// 查询指定 kind 是否开启了自动放行。
-pub fn is_auto_approved(kind: McpKind) -> bool {
-    AUTO_APPROVE.lock().get(&kind).copied().unwrap_or(false)
+/// 查询指定 kind 的运行模式（默认 "manual"，全部人工确认）。
+pub fn run_mode_of(kind: McpKind) -> String {
+    RUN_MODES
+        .lock()
+        .get(&kind)
+        .cloned()
+        .unwrap_or_else(|| "manual".into())
+}
+
+/// 运行模式的中文标签（执行日志头部用）。
+fn run_mode_label(mode: &str) -> &'static str {
+    match mode {
+        "whitelist" => "白名单运行",
+        "auto" => "自动运行",
+        _ => "手动运行",
+    }
 }
 
 /// 查询指定 kind 的服务端状态（未启动时返回 running=false）。
@@ -124,6 +142,9 @@ pub fn mcp_server_status(kind: McpKind) -> McpServerStatus {
 /// bound_source=terminal 时的终端实例 id），执行工具时按此 id 解析目标；
 /// `resource_mode == "client"`（客户端直连）时传 `None`，目标与凭据由调用方在
 /// 工具参数中传入。若该 kind 已有实例运行则返回错误。
+///
+/// `bound_resource_ids` 是多机模式（`resource_mode == "multi"`，仅 SSH）绑定的
+/// 会话 id 集合；其它模式传空 Vec。
 pub async fn start_mcp_server(
     kind: McpKind,
     app: AppHandle,
@@ -132,10 +153,11 @@ pub async fn start_mcp_server(
     port: u16,
     token: String,
     bound_resource_id: Option<String>,
+    bound_resource_ids: Vec<String>,
     bound_source: String,
     bound_database: Option<String>,
     resource_mode: String,
-    auto_approve: bool,
+    run_mode: String,
     enable_log: bool,
 ) -> AppResult<()> {
     {
@@ -148,16 +170,27 @@ pub async fn start_mcp_server(
         }
     }
 
-    // 启动时设置自动放行开关。
-    set_auto_approve(kind, auto_approve);
+    // 启动时设置运行模式。
+    set_run_mode(kind, &run_mode);
 
-    // 资源模式规范化：仅 "client" 视为直连模式，其余一律按 bound 处理。
-    let resource_mode = if resource_mode == "client" {
-        "client"
-    } else {
-        "bound"
+    // 资源模式规范化：multi 仅 SSH kind 支持（其它 kind 回退 bound），
+    // 其余按 client / bound 处理。
+    let resource_mode = match resource_mode.as_str() {
+        "client" => "client",
+        "multi" if kind == McpKind::Ssh => "multi",
+        "multi" => {
+            log::warn!("[mcp] {} 不支持多机模式，已回退为单资源绑定", kind.label());
+            "bound"
+        }
+        _ => "bound",
     };
     let bound_resource_id = bound_resource_id.unwrap_or_default();
+    // 多机模式：空集合视为配置错误（启动前应已校验，双保险）。
+    if resource_mode == "multi" && bound_resource_ids.is_empty() {
+        return Err(AppError::Config(
+            "SSH MCP 多机模式未勾选任何机器：请先在 MCP 页面勾选至少一台".into(),
+        ));
+    }
     // 绑定来源规范化：仅 "terminal" 视为终端标签页绑定，其余一律按 "config"。
     // （commands 层已校验合法性，这里双保险。）
     let bound_source = if bound_source == "terminal" {
@@ -198,13 +231,27 @@ pub async fn start_mcp_server(
         let path = log_dir.join(format!("mcp-{}-{}.log", kind_str, ts));
         let bound_desc = if resource_mode == "client" {
             "(客户端直连，未绑定)".to_string()
+        } else if resource_mode == "multi" {
+            // 启动时快照机器清单（热切换的变更由逐条执行日志体现）。
+            exec::multi_machines(&state, &bound_resource_ids)
+                .map(|ms| {
+                    format!(
+                        "(多机 {} 台) {}",
+                        ms.len(),
+                        ms.iter()
+                            .map(|m| m.display_name.as_str())
+                            .collect::<Vec<_>>()
+                            .join("、")
+                    )
+                })
+                .unwrap_or_else(|e| format!("(多机) 机器清单解析失败: {}", e))
         } else if bound_source == "terminal" {
             format!("(终端标签页) {}", bound_resource_id)
         } else {
             bound_resource_id.clone()
         };
         let header = format!(
-            "=== X-Term {} 执行日志 ===\n启动时间: {}\n监听: {}:{}\n资源模式: {}\n绑定资源: {}\n绑定数据库: {}\n自动放行: {}\n---\n",
+            "=== X-Term {} 执行日志 ===\n启动时间: {}\n监听: {}:{}\n资源模式: {}\n绑定资源: {}\n绑定数据库: {}\n运行模式: {}\n---\n",
             kind.label(),
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
             host,
@@ -212,7 +259,7 @@ pub async fn start_mcp_server(
             resource_mode,
             bound_desc,
             bound_database.as_deref().unwrap_or("(默认)"),
-            if auto_approve { "是" } else { "否" },
+            run_mode_label(&run_mode),
         );
         let _ = std::fs::write(&path, header);
         log::info!("[mcp] {} 日志文件: {}", kind.label(), path.display());
@@ -230,6 +277,7 @@ pub async fn start_mcp_server(
         resource_mode: resource_mode.to_string(),
         bound_source: Mutex::new(bound_source.to_string()),
         bound_resource_id: Mutex::new(bound_resource_id),
+        bound_resource_ids: Mutex::new(bound_resource_ids),
         bound_database,
         token,
         clients: Arc::new(Mutex::new(HashMap::new())),
@@ -365,6 +413,37 @@ pub fn rebind_mcp(kind: McpKind, bound_source: &str, resource_id: &str) -> AppRe
     }
 }
 
+/// 运行中热切换多机模式的机器集合，立即生效无需重启。
+///
+/// 由 `commands::mcp::mcp_rebind_multi` 调用（ids 已做存在性校验）。
+/// 热切换后 tools/list 会按新集合生成 target 枚举；已建立的客户端会话可能
+/// 缓存旧 schema，其旧 target 会执行失败并收到可用目标清单，模型可自行纠正。
+/// 服务未运行或非 multi 模式时返回错误。
+pub fn rebind_mcp_multi(kind: McpKind, resource_ids: &[String]) -> AppResult<()> {
+    let guard = SERVERS.lock();
+    match guard.get(&kind) {
+        Some(h) => {
+            if h.shared.resource_mode != "multi" {
+                return Err(AppError::InvalidInput(format!(
+                    "{} 当前不在多机模式运行（切换模式需重启服务）",
+                    kind.label()
+                )));
+            }
+            *h.shared.bound_resource_ids.lock() = resource_ids.to_vec();
+            log::info!(
+                "[mcp] {} 多机模式热切换：{} 台机器",
+                kind.label(),
+                resource_ids.len()
+            );
+            Ok(())
+        }
+        None => Err(AppError::InvalidInput(format!(
+            "{} 未运行，无需热切换（配置已保存，启动时生效）",
+            kind.label()
+        ))),
+    }
+}
+
 // ===========================================================================
 // 共享状态
 // ===========================================================================
@@ -381,7 +460,8 @@ struct SharedState {
     state: AppState,
     /// 该实例是 SSH MCP 还是 DB MCP（决定对外暴露哪个工具）。
     kind: McpKind,
-    /// 资源模式："bound"（绑定本地资源）| "client"（客户端直连，目标/凭据来自参数）。
+    /// 资源模式："bound"（绑定本地资源）| "client"（客户端直连，目标/凭据来自参数）
+    /// | "multi"（多机模式，仅 SSH：绑定一组会话，由外部 AI 按 target 参数自选目标）。
     /// 决定工具定义、目标解析与确认请求的脱敏行为。
     resource_mode: String,
     /// 绑定来源："config"（绑定会话配置，执行时新建短连接，默认）|
@@ -393,6 +473,9 @@ struct SharedState {
     /// 终端实例 id（bound_source=terminal）。工具执行时按此 id 解析目标，
     /// 外部客户端无需传连接名。client 模式下为空串。
     bound_resource_id: Mutex<String>,
+    /// 多机模式（multi）绑定的 SSH 会话 id 集合（其它模式为空）。用 Mutex 包裹
+    /// 支持运行中热切换（`mcp_rebind_multi`）；执行时按 target 展示名在其中路由。
+    bound_resource_ids: Mutex<Vec<String>>,
     /// 绑定的具体数据库名（仅 kind=Db 有效）。设置后 exec_sql 只针对该库。
     bound_database: Option<String>,
     token: String,
@@ -803,11 +886,25 @@ async fn dispatch(shared: &Arc<SharedState>, req: &JsonRpcRequest) -> JsonRpcRes
             JsonRpcResponse::success(req.id.clone(), result)
         }
         "tools/list" => {
+            // 多机模式：机器清单现算（热切换后立即反映新集合），驱动 target 枚举。
+            // 宽松解析：个别会话被删除时跳过（其余机器照常暴露）。
+            let machines = if shared.kind == McpKind::Ssh && shared.resource_mode == "multi" {
+                exec::multi_machines_lenient(
+                    &shared.state,
+                    &shared.bound_resource_ids.lock(),
+                    false,
+                )
+                .map(|(ms, _)| ms)
+                .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             let tools = tool_defs(
                 shared.kind,
                 &shared.resource_mode,
                 &shared.bound_source.lock(),
                 shared.bound_database.as_deref(),
+                &machines,
             );
             JsonRpcResponse::success(req.id.clone(), json!({ "tools": tools }))
         }
@@ -866,8 +963,23 @@ async fn handle_tool_call(shared: &Arc<SharedState>, name: &str, arguments: &Val
         ))));
     }
 
-    // 只读工具（list_files）跳过人工确认，直接执行。
+    // 只读工具（list_files / list_machines）跳过人工确认，直接执行。
     if is_readonly_tool(name) {
+        // list_machines（多机模式专用）：无 target 参数、无需解析执行目标，
+        // 直接返回授权机器清单（非 multi 模式调用则拒绝，防越权枚举）。
+        if name == "list_machines" {
+            if shared.kind != McpKind::Ssh || shared.resource_mode != "multi" {
+                return tool_text_result(Err(AppError::InvalidInput(
+                    "list_machines 仅在多机模式下可用".into(),
+                )));
+            }
+            let machines =
+                exec::multi_machines_lenient(&shared.state, &shared.bound_resource_ids.lock(), false)
+                    .map(|(ms, _)| ms);
+            let res = machines.map(|ms| format_machines(&ms));
+            log_execution(shared, name, "[只读] 列出授权机器清单", &res, 0);
+            return tool_text_result(res);
+        }
         log::info!(
             "[mcp] {} 只读工具 `{}` 直接执行（目标: {}）",
             shared.kind.label(),
@@ -905,15 +1017,24 @@ async fn handle_tool_call(shared: &Arc<SharedState>, name: &str, arguments: &Val
     // 执行内容原文（记录到日志，按工具名提取关键字段，不含密码）。
     let exec_detail = exec_detail_for(name, arguments);
 
-    // 自动放行：跳过人工确认直接执行。
+    // 运行模式判定（与 AI 助手的执行模式语义一致）：
+    // - manual：人工确认（默认）；
+    // - auto：全部自动执行；
+    // - whitelist：白名单内自动放行（SSH=命令白名单、DB=只读 SQL），其余确认。
     // 例外：文件传输工具（upload_file / download_file）读写**本机任意路径**
     // （localPath 不设沙箱是功能刚需——外部客户端要把本机任意文件上传到
-    // S3/SFTP），即使开启 auto_approve 也必须人工确认；确认卡片会展示完整的
+    // S3/SFTP），无论何种模式都必须人工确认；确认卡片会展示完整的
     // 本地/远端路径与目标，用户可见可控。
-    if is_auto_approved(shared.kind) && !matches!(name, "upload_file" | "download_file") {
+    let mode = run_mode_of(shared.kind);
+    let is_file_tool = matches!(name, "upload_file" | "download_file");
+    let whitelist_hit = mode == "whitelist" && !is_file_tool && is_whitelist_auto(shared, name, arguments);
+    let auto_run = (mode == "auto" || whitelist_hit) && !is_file_tool;
+    if auto_run {
+        let tag = if whitelist_hit { "白名单放行" } else { "自动放行" };
         log::info!(
-            "[mcp] {} 自动放行，直接执行（目标: {}）",
+            "[mcp] {} {}，直接执行（目标: {}）",
             shared.kind.label(),
+            tag,
             resource_name
         );
         let started = std::time::Instant::now();
@@ -922,7 +1043,7 @@ async fn handle_tool_call(shared: &Arc<SharedState>, name: &str, arguments: &Val
         log_execution(
             shared,
             name,
-            &format!("[自动放行] {} | {}", resource_name, exec_detail),
+            &format!("[{}] {} | {}", tag, resource_name, exec_detail),
             &res,
             elapsed_ms,
         );
@@ -1040,6 +1161,37 @@ fn resolve_target(shared: &SharedState, arguments: &Value) -> Result<ResolvedTar
             })
         }
         McpKind::Ssh => {
+            // 多机模式：从工具参数 target（展示名）在授权集合内路由。
+            // 不在集合内 / 缺失 target 都报错并回显可用清单（模型可自行纠正）。
+            // 宽松解析：个别会话被删除时跳过（其余机器照常可用）。
+            if shared.resource_mode == "multi" {
+                let ids = shared.bound_resource_ids.lock().clone();
+                if ids.is_empty() {
+                    return Err(AppError::Config(
+                        "多机模式未勾选任何机器：请先在 X-Term 的 MCP 页面勾选".into(),
+                    ));
+                }
+                let (machines, _) = exec::multi_machines_lenient(&shared.state, &ids, false)?;
+                let target = arguments
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if target.is_empty() {
+                    return Err(AppError::InvalidInput(format!(
+                        "多机模式必须传 target 参数指定目标机器。可用目标：{}",
+                        machines
+                            .iter()
+                            .map(|m| m.display_name.as_str())
+                            .collect::<Vec<_>>()
+                            .join("、")
+                    )));
+                }
+                let m = exec::multi_resolve(&machines, target)?;
+                return Ok(ResolvedTarget::Bound {
+                    resource_id: m.id.clone(),
+                    display: m.display_name.clone(),
+                });
+            }
             // 终端标签页绑定：命令写入该终端 PTY 执行（支持 A→B→C 跳板嵌套）。
             if shared.bound_source.lock().as_str() == "terminal" {
                 let instance_id = shared.bound_resource_id.lock().clone();
@@ -1071,7 +1223,15 @@ fn resolve_target(shared: &SharedState, arguments: &Value) -> Result<ResolvedTar
         }
         McpKind::Db if client_mode => {
             let host = exec::arg_host(arguments)?;
-            let port = exec::arg_port(arguments)?;
+            // port 省略时按方言缺省（工具 schema 描述声明 MySQL 3306 /
+            // PostgreSQL 5432）：沿用 SSH 语义的 22 会让信任描述而省略
+            // port 的调用必然连接失败。
+            let default_port = if exec::arg_db_kind(arguments) == "postgres" {
+                5432
+            } else {
+                3306
+            };
+            let port = exec::arg_port_with_default(arguments, default_port)?;
             let username = exec::arg_username(arguments)?;
             let password = exec::arg_password(arguments)?;
             Ok(ResolvedTarget::Direct {
@@ -1274,9 +1434,12 @@ async fn run_target(
                     password,
                     ..
                 } => {
-                    // 客户端直连：database 取参数（可选），未传则不指定默认库。
+                    // 客户端直连：database / dbKind 取参数（可选），未传则不指定
+                    // 默认库 / 按 mysql 处理。
                     let database = exec::arg_database(arguments);
+                    let db_kind = exec::arg_db_kind(arguments);
                     exec::exec_sql_direct(
+                        &db_kind,
                         host,
                         *port,
                         username,
@@ -1435,13 +1598,43 @@ fn describe_exec_sql(arguments: &Value, resource: &str) -> String {
     format!("[DB MCP · {}] {}", resource, preview)
 }
 
+/// 白名单运行模式下，本次调用是否落在白名单内（可自动放行）。
+///
+/// - `exec_sql`：只读 SQL（SELECT / SHOW / EXPLAIN / DESCRIBE / DESC，
+///   与 AI SQL 助手的"白名单运行"同一判定）；
+/// - `exec_ssh`：命令命中「设置 → AI」的 SSH 命令白名单（与 AI SSH 助手
+///   共用同一份白名单，含元字符/换行防拼接绕过的严格匹配）；
+/// - 其它工具：一律不自动（走人工确认）。
+fn is_whitelist_auto(shared: &Arc<SharedState>, name: &str, arguments: &Value) -> bool {
+    match name {
+        "exec_sql" => arguments
+            .get("sql")
+            .and_then(Value::as_str)
+            .map(crate::ai::tools::is_readonly_sql)
+            .unwrap_or(false),
+        "exec_ssh" => {
+            let cmd = match arguments.get("command").and_then(Value::as_str) {
+                Some(c) => c,
+                None => return false,
+            };
+            // 白名单复用 AI 助手的设置（含内存缓存；读取失败按无白名单处理）。
+            let whitelist = crate::config::settings_load_inner(&shared.state)
+                .map(|s| s.ai.ssh_agent.command_whitelist)
+                .unwrap_or_default();
+            crate::ai::tools::is_whitelisted(cmd, &whitelist)
+        }
+        _ => false,
+    }
+}
+
 // ===========================================================================
 // 工具元信息辅助：名称校验 / 只读判定 / 日志与确认描述
 // ===========================================================================
 
 /// 该 kind 的 MCP 实例是否支持指定工具。
 ///
-/// SSH MCP 暴露 exec_ssh + 3 个文件工具；DB MCP 仅暴露 exec_sql。
+/// SSH MCP 暴露 exec_ssh + 3 个文件工具（多机模式另含 list_machines）；
+/// DB MCP 仅暴露 exec_sql。
 fn kind_supports_tool(kind: McpKind, name: &str) -> bool {
     matches!(
         (kind, name),
@@ -1449,6 +1642,7 @@ fn kind_supports_tool(kind: McpKind, name: &str) -> bool {
             | (McpKind::Ssh, "list_files")
             | (McpKind::Ssh, "upload_file")
             | (McpKind::Ssh, "download_file")
+            | (McpKind::Ssh, "list_machines")
             | (McpKind::Db, "exec_sql")
             | (McpKind::File, "list_files")
             | (McpKind::File, "upload_file")
@@ -1456,9 +1650,34 @@ fn kind_supports_tool(kind: McpKind, name: &str) -> bool {
     )
 }
 
-/// 工具是否为只读（跳过人工确认）。目前 `list_files` 是只读。
+/// 工具是否为只读（跳过人工确认）。`list_files` 与 `list_machines`（多机元数据）只读。
 fn is_readonly_tool(name: &str) -> bool {
-    matches!(name, "list_files")
+    matches!(name, "list_files" | "list_machines")
+}
+
+/// 把机器清单格式化为给模型看的文本（list_machines 工具输出）。
+///
+/// 每台一行：`目标名 | user@host:port | 标签`。target 必须与目标名完全一致。
+fn format_machines(machines: &[exec::MultiMachine]) -> String {
+    let mut out = format!(
+        "当前授权机器共 {} 台（工具参数 target 必须与「目标名」完全一致）：\n",
+        machines.len()
+    );
+    for m in machines {
+        out.push_str(&format!(
+            "- 目标名: {} | {}@{}:{}{}\n",
+            m.display_name,
+            m.username,
+            m.host,
+            m.port,
+            m.tags
+                .as_deref()
+                .filter(|t| !t.trim().is_empty())
+                .map(|t| format!(" | 标签: {}", t))
+                .unwrap_or_default()
+        ));
+    }
+    out
 }
 
 /// 只读工具执行前预先解析目标展示名（用于日志，失败时回退占位）。
@@ -1557,13 +1776,20 @@ fn describe_tool(name: &str, arguments: &Value, resource: &str) -> String {
 /// - `"bound"`（默认）：目标由绑定资源决定，工具参数只传 command/sql/path 等。
 /// - `"client"`（客户端直连）：目标与凭据由调用方在参数中传入
 ///   （host/port/username/password），工具描述中注明密码不存储不落日志。
+/// - `"multi"`（多机，仅 SSH）：绑定一组会话，工具必传 `target`（授权机器的
+///   展示名，schema 附 enum 约束），另暴露只读 `list_machines` 供模型路由。
+///
+/// `machines` 是 multi 模式当前的授权机器清单（其它模式忽略；由调用方现算，
+/// 热切换后立即反映新集合）。
 fn tool_defs(
     kind: McpKind,
     resource_mode: &str,
     bound_source: &str,
     bound_database: Option<&str>,
+    machines: &[exec::MultiMachine],
 ) -> Vec<Value> {
     let client_mode = resource_mode == "client";
+    let multi_mode = resource_mode == "multi";
     match kind {
         McpKind::Ssh => {
             // 连接参数（client 模式专用）。
@@ -1590,6 +1816,41 @@ fn tool_defs(
             } else {
                 vec![]
             };
+            // 多机模式：target 参数（enum 约束为授权机器的展示名，帮助模型精确路由）。
+            // 机器清单为空（全部会话被删）时不加 enum——空 enum 是非法 JSON Schema，
+            // 描述改为告知无可机器，模型会转告用户重新勾选。
+            let (target_prop, has_target): (Option<Value>, bool) = if multi_mode {
+                let desc = if machines.is_empty() {
+                    "目标机器名。当前无可用的授权机器（会话可能已被删除），请告知用户到 X-Term 的 MCP 页面重新勾选，不要调用任何工具。".to_string()
+                } else {
+                    format!(
+                        "目标机器名（必须是用户授权的机器之一，当前可用：{}）。可用 list_machines 查看各机器的地址与标签",
+                        machines
+                            .iter()
+                            .map(|m| format!("{} ({}@{})", m.display_name, m.username, m.host))
+                            .collect::<Vec<_>>()
+                            .join("、")
+                    )
+                };
+                let mut prop = json!({ "type": "string", "description": desc });
+                if !machines.is_empty() {
+                    prop["enum"] = Value::Array(
+                        machines
+                            .iter()
+                            .map(|m| Value::String(m.display_name.clone()))
+                            .collect(),
+                    );
+                }
+                (Some(prop), true)
+            } else {
+                (None, false)
+            };
+            /// 把 target 参数插到 props 最前（multi 模式专用；语义上先选机器再给命令）。
+            fn insert_target(props: &mut Value, target: &Option<Value>) {
+                if let (Some(obj), Some(t)) = (props.as_object_mut(), target) {
+                    obj.insert("target".into(), t.clone());
+                }
+            }
 
             // exec_ssh
             let mut tools = vec![];
@@ -1603,14 +1864,22 @@ fn tool_defs(
                     }),
                 );
             }
+            insert_target(&mut exec_props, &target_prop);
             let mut exec_required = conn_required.clone();
             exec_required.push("command");
+            if has_target {
+                exec_required.insert(0, "target");
+            }
             // 终端标签页绑定：命令写入用户已打开的终端执行（支持跳板嵌套）。
             let terminal_bound = !client_mode && bound_source == "terminal";
             let exec_desc = if client_mode {
                 "在调用方指定的服务器上执行一条 shell 命令（非交互），返回标准输出和标准错误的合并文本。\
 目标服务器由参数 host/port/username 指定，password 为登录密码（敏感字段，仅本次调用有效，\
 X-Term 不存储、不落日志）。单命令超时 30 秒，输出截断 16KB。执行前需要 X-Term 用户人工确认。"
+            } else if multi_mode {
+                "在 target 指定的机器上执行一条 shell 命令（非交互），返回标准输出和标准错误的合并文本。\
+target 必须从用户授权的机器中选择（可用 list_machines 查看地址与标签再决定）。\
+单命令超时 30 秒，输出截断 16KB。执行前需要 X-Term 用户人工确认。"
             } else if terminal_bound {
                 "在 X-Term 中绑定的**终端标签页**里执行一条 shell 命令（非交互）。\
 命令写入该终端 PTY 执行：终端当前在哪个远端主机（含 A→B→C 跳板嵌套），\
@@ -1642,13 +1911,20 @@ X-Term 不存储、不落日志）。单命令超时 30 秒，输出截断 16KB�
                     }),
                 );
             }
+            insert_target(&mut list_props, &target_prop);
             let mut list_required = conn_required.clone();
             list_required.push("path");
+            if has_target {
+                list_required.insert(0, "target");
+            }
             let list_desc = if client_mode {
                 "列出调用方指定服务器上某目录的内容（基于 SFTP）。\
 返回 JSON 数组，元素含 name / isDir / size / modified。\
 目标由 host/port/username 指定，password 为登录密码（敏感字段，仅本次调用有效）。\
 只读操作，无需人工确认。"
+            } else if multi_mode {
+                "列出 target 指定机器上某目录的内容（基于 SFTP）。\
+返回 JSON 数组，元素含 name / isDir / size / modified。只读操作，无需人工确认。"
             } else {
                 "列出当前 SSH MCP 绑定服务器上某目录的内容（基于 SFTP）。\
 返回 JSON 数组，元素含 name / isDir / size / modified。只读操作，无需人工确认。"
@@ -1681,12 +1957,20 @@ X-Term 不存储、不落日志）。单命令超时 30 秒，输出截断 16KB�
                     }),
                 );
             }
+            insert_target(&mut up_props, &target_prop);
             let mut up_required = conn_required.clone();
             up_required.push("localPath");
             up_required.push("remotePath");
+            if has_target {
+                up_required.insert(0, "target");
+            }
             let up_desc = if client_mode {
                 "把 X-Term 所在主机的一个本地文件上传到调用方指定服务器的远端路径（基于 SFTP）。\
 目标服务器由 host/port/username 指定，password 为登录密码（敏感字段，仅本次调用有效）。\
+单文件超时 5 分钟。执行前需要 X-Term 用户人工确认。\
+提示：可先用 exec_ssh 配合 shell 命令把内容写入本地文件（如 heredoc），再调用本工具上传。"
+            } else if multi_mode {
+                "把 X-Term 所在主机的一个本地文件上传到 target 指定机器的远端路径（基于 SFTP）。\
 单文件超时 5 分钟。执行前需要 X-Term 用户人工确认。\
 提示：可先用 exec_ssh 配合 shell 命令把内容写入本地文件（如 heredoc），再调用本工具上传。"
             } else {
@@ -1722,13 +2006,20 @@ X-Term 不存储、不落日志）。单命令超时 30 秒，输出截断 16KB�
                     }),
                 );
             }
+            insert_target(&mut dl_props, &target_prop);
             let mut dl_required = conn_required.clone();
             dl_required.push("remotePath");
             dl_required.push("localPath");
+            if has_target {
+                dl_required.insert(0, "target");
+            }
             let dl_desc = if client_mode {
                 "从调用方指定服务器下载一个远端文件到 X-Term 所在主机的本地路径（基于 SFTP），\
 成功后返回本地路径。目标服务器由 host/port/username 指定，password 为登录密码\
 （敏感字段，仅本次调用有效）。单文件超时 5 分钟。执行前需要 X-Term 用户人工确认。"
+            } else if multi_mode {
+                "从 target 指定机器下载一个远端文件到 X-Term 所在主机的本地路径（基于 SFTP），\
+成功后返回本地路径。单文件超时 5 分钟。执行前需要 X-Term 用户人工确认。"
             } else {
                 "从当前 SSH MCP 绑定服务器下载一个远端文件到 X-Term 所在主机的本地路径\
 （基于 SFTP），成功后返回本地路径。单文件超时 5 分钟。执行前需要 X-Term 用户人工确认。"
@@ -1743,26 +2034,60 @@ X-Term 不存储、不落日志）。单命令超时 30 秒，输出截断 16KB�
                 }
             }));
 
+            // list_machines（多机模式专用，只读免确认）：授权机器清单，供模型路由决策。
+            if multi_mode {
+                tools.push(json!({
+                    "name": "list_machines",
+                    "description": format!(
+                        "列出用户授权的全部机器（目标名 / 地址 / 标签）。当前共 {} 台：{}。\
+其余工具的 target 参数必须使用这里列出的「目标名」（完全一致）。只读操作，无需人工确认。",
+                        machines.len(),
+                        machines
+                            .iter()
+                            .map(|m| format!(
+                                "{}（{}@{}:{}{}）",
+                                m.display_name,
+                                m.username,
+                                m.host,
+                                m.port,
+                                m.tags
+                                    .as_deref()
+                                    .filter(|t| !t.trim().is_empty())
+                                    .map(|t| format!("，标签: {}", t))
+                                    .unwrap_or_default()
+                            ))
+                            .collect::<Vec<_>>()
+                            .join("、")
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
+                }));
+            }
+
             tools
         }
         McpKind::Db => {
             if client_mode {
                 vec![json!({
                     "name": "exec_sql",
-                    "description": "在调用方指定的 MySQL 服务器上执行 SQL，返回结果表格文本。\
+                    "description": "在调用方指定的数据库服务器（MySQL / PostgreSQL）上执行 SQL，返回结果表格文本。\
                 目标数据库由参数 host/port/username 指定，password 为连接密码（敏感字段，仅本次调用有效，\
-                X-Term 不存储、不落日志）。database 可选，传则作为默认库。\
+                X-Term 不存储、不落日志）。dbKind 指定数据库类型（mysql/postgres，默认 mysql）；\
+                database 可选，传则作为默认库。\
                 执行前需要 X-Term 用户人工确认。",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "host": {
                                 "type": "string",
-                                "description": "目标 MySQL 服务器 IP 或域名"
+                                "description": "目标数据库服务器 IP 或域名"
                             },
                             "port": {
                                 "type": "integer",
-                                "description": "MySQL 端口，默认 3306",
+                                "description": "数据库端口（MySQL 默认 3306，PostgreSQL 默认 5432）",
                                 "minimum": 1,
                                 "maximum": 65535
                             },
@@ -1774,9 +2099,14 @@ X-Term 不存储、不落日志）。单命令超时 30 秒，输出截断 16KB�
                                 "type": "string",
                                 "description": "连接密码（敏感字段，仅本次调用有效）"
                             },
+                            "dbKind": {
+                                "type": "string",
+                                "enum": ["mysql", "postgres"],
+                                "description": "数据库类型，默认 mysql"
+                            },
                             "database": {
                                 "type": "string",
-                                "description": "默认数据库（可选，省略则 SQL 需带库名限定）"
+                                "description": "默认数据库（可选，省略则 SQL 需带限定名）"
                             },
                             "sql": { "type": "string", "description": "要执行的 SQL 语句" },
                             "limit": {
@@ -1796,7 +2126,7 @@ X-Term 不存储、不落日志）。单命令超时 30 秒，输出截断 16KB�
                 vec![json!({
                     "name": "exec_sql",
                     "description": format!(
-                        "在当前 DB MCP 绑定的 MySQL 上执行 SQL，返回结果表格文本。{}\
+                        "在当前 DB MCP 绑定的数据库（MySQL / PostgreSQL，按绑定连接的类型）上执行 SQL，返回结果表格文本。{}\
                 执行前需要 X-Term 用户人工确认。",
                         db_hint
                     ),

@@ -20,6 +20,59 @@ pub struct HistoryEntry {
     pub run_at: String,
 }
 
+/// 新增一条历史（同命令去重：先删旧行再插入，使每条命令只保留最新一次执行）。
+///
+/// 与 [`add_history`] 的区别：补全建议按命令文本匹配，同命令保留多行只会
+/// 让建议列表重复；"删旧插新"同时实现了天然的 LRU 语义（最近使用的命令
+/// id 最大，排在 [`list_recent_history`] 结果最前）。
+pub fn add_history_dedup(conn: &DbConn, entry: &HistoryEntry) -> AppResult<i64> {
+    // 事务包裹：DELETE+INSERT 原子化。连接来自 r2d2 池，两条语句若落在
+    // 不同连接上交错执行（两个终端并发记录同一命令），会留下重复行，
+    // 破坏"每条命令只保留最新一次"的去重语义。
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM history WHERE command = ?1",
+        rusqlite::params![entry.command],
+    )?;
+    tx.execute(
+        "INSERT INTO history (session_id, command, exit_code, run_at) \
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![
+            entry.session_id,
+            entry.command,
+            entry.exit_code,
+            entry.run_at
+        ],
+    )?;
+    let id = tx.last_insert_rowid();
+    tx.commit()?;
+    Ok(id)
+}
+
+/// 全局最近历史（跨所有会话，按命令去重），按新→旧排列，最多 `limit` 条。
+///
+/// 终端补全建议的数据源：shell 的 Ctrl+R 式体验是全局的，不区分会话。
+/// 去重用 `GROUP BY command` 取每组最大 id（即最近一次执行）。
+pub fn list_recent_history(conn: &DbConn, limit: u32) -> AppResult<Vec<HistoryEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, session_id, command, exit_code, run_at FROM history \
+         WHERE id IN (SELECT MAX(id) FROM history GROUP BY command) \
+         ORDER BY id DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![limit as i64], row_to_entry)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// 删除一条历史（补全弹窗的删除按钮）。
+pub fn delete_history(conn: &DbConn, id: i64) -> AppResult<()> {
+    conn.execute("DELETE FROM history WHERE id = ?1", rusqlite::params![id])?;
+    Ok(())
+}
+
 /// 新增一条历史，返回新分配的自增 id。
 pub fn add_history(conn: &DbConn, entry: &HistoryEntry) -> AppResult<i64> {
     conn.execute(

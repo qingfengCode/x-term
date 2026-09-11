@@ -87,6 +87,17 @@ pub struct ClientHandler {
     /// 会无限忙旋（`_ => {}` 分支不处理 None），认证阶段通过监听本信号在
     /// 连接断开时立即中止，避免忙旋到认证总超时。
     pub connection_closed: Arc<tokio::sync::Notify>,
+    /// 断开原因注册表（与 [`AppState::ssh_disconnect_reasons`] 共享）。
+    ///
+    /// `disconnected` 回调按 [`Self::disconnect_key`] 写入原因，终端 reader
+    /// 退出时取出随事件发给前端——把"连上后很快被断开"的原因暴露给用户/日志。
+    pub disconnect_reasons: Arc<parking_lot::Mutex<HashMap<String, String>>>,
+    /// 本连接在断开原因注册表中的键（终端会话生成，含随机后缀）。
+    ///
+    /// 同一 `host:port` 常同时存在多条独立连接（监控/SFTP/隧道/多标签），
+    /// 按 `host:port` 做键会互相覆盖、把别人的断开原因当自己的上报。空串
+    /// 表示不记录（非终端连接没有 consumer，写进去只会残留泄漏）。
+    pub disconnect_key: String,
 }
 
 /// russh 0.45 的 `Handler` 是 `#[async_trait]`，因此 impl 上也需带上该属性。
@@ -325,15 +336,28 @@ impl client::Handler for ClientHandler {
         Ok(())
     }
 
-    /// 连接断开（服务端主动断开或出错）时通知认证阶段的看门狗。
+    /// 连接断开（服务端主动断开或出错）时通知认证阶段的看门狗，并记录原因。
     ///
     /// 不向 russh 返回错误：russh 默认实现会把 `DisconnectReason::Error` 原样
     /// 回传（导致连接任务 join 报错），这里吞掉——断开本身对上层不是异常，
     /// 会话清理由各自的 reader 任务处理。
     async fn disconnected(
         &mut self,
-        _reason: DisconnectReason<Self::Error>,
+        reason: DisconnectReason<Self::Error>,
     ) -> Result<(), Self::Error> {
+        // 提取人类可读的原因：服务器 DISCONNECT（原因码+文字，跳板机踢下线
+        // 时会写明）或本地连接错误（保活超时/IO 错误等）。
+        let desc = match reason {
+            DisconnectReason::ReceivedDisconnect(info) => format!(
+                "服务器断开连接（{:?}）{}",
+                info.reason_code, info.message
+            ),
+            DisconnectReason::Error(e) => format!("连接错误: {}", e),
+        };
+        log::warn!("SSH 连接断开 {}:{}: {}", self.host, self.port, desc);
+        self.disconnect_reasons
+            .lock()
+            .insert(format!("{}:{}", self.host, self.port), desc);
         self.connection_closed.notify_waiters();
         Ok(())
     }
@@ -402,6 +426,28 @@ impl std::fmt::Debug for AuthMethod {
 // 配置与连接
 // ===========================================================================
 
+/// 默认的 KEX 算法表：后量子优先，下探到老算法（DH-G14-SHA1 / ECDH nistp），
+/// 覆盖常见老设备而无需触发降级重试。
+const DEFAULT_KEX: &[russh::kex::Name] = &[
+    russh::kex::MLKEM768_X25519,
+    russh::kex::CURVE25519,
+    russh::kex::CURVE25519_PRE_RFC_8731,
+    russh::kex::DH_G16_SHA512,
+    russh::kex::DH_G14_SHA256,
+    russh::kex::ECDH_SHA2_NISTP256,
+    russh::kex::DH_G14_SHA1,
+];
+
+/// 降级重试用的主机密钥算法（同默认表）。
+const DEFAULT_HOST_KEYS: &[russh::keys::key::Name] = &[
+    russh::keys::key::ED25519,
+    russh::keys::key::ECDSA_SHA2_NISTP256,
+    russh::keys::key::ECDSA_SHA2_NISTP521,
+    russh::keys::key::RSA_SHA2_256,
+    russh::keys::key::RSA_SHA2_512,
+    russh::keys::key::SSH_RSA,
+];
+
 /// 构造默认的 SSH 客户端配置。
 ///
 /// `idle_timeout` 为客户端侧的空闲断开时长（与设置页"SSH 空闲断开时间"对应）：
@@ -428,18 +474,89 @@ pub fn default_config(
         keepalive_interval,
         keepalive_max: 3,
         preferred: russh::Preferred {
-            key: Cow::Borrowed(&[
-                russh::keys::key::ED25519,
-                russh::keys::key::ECDSA_SHA2_NISTP256,
-                russh::keys::key::ECDSA_SHA2_NISTP521,
-                russh::keys::key::RSA_SHA2_256,
-                russh::keys::key::RSA_SHA2_512,
-                russh::keys::key::SSH_RSA,
+            key: Cow::Borrowed(DEFAULT_HOST_KEYS),
+            kex: Cow::Borrowed(DEFAULT_KEX),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// 降级重试配置：CTR 优先 + 下探 CBC/3DES 老密码套件 + DH-G1-SHA1 老 KEX。
+///
+/// 用于握手失败的第二次尝试（见 [`connect_direct_inner`]）：一类老设备
+/// （交换机/打印机固件等）在 KEX 里**宣称**支持 AEAD（GCM/chacha20），协商
+/// 成功后却直接断开（实现 bug）；CBC-only 的更老设备则在首次协商就报
+/// "无共同算法"。CTR-first 列表对两者都有效（借鉴 uniTerm ssh_dial.go 的
+/// `dialSSHWithCipherFallback`，issue 实锤场景）。CBC/3DES/SHA1 只在降级
+/// 时进入协商面——默认连接不放宽。
+fn legacy_fallback_config(
+    idle_timeout: Option<Duration>,
+    keepalive_interval: Option<Duration>,
+) -> client::Config {
+    client::Config {
+        inactivity_timeout: idle_timeout,
+        keepalive_interval,
+        keepalive_max: 3,
+        preferred: russh::Preferred {
+            key: Cow::Borrowed(DEFAULT_HOST_KEYS),
+            kex: Cow::Borrowed(&[
+                russh::kex::CURVE25519,
+                russh::kex::CURVE25519_PRE_RFC_8731,
+                russh::kex::DH_G16_SHA512,
+                russh::kex::DH_G14_SHA256,
+                russh::kex::ECDH_SHA2_NISTP256,
+                russh::kex::ECDH_SHA2_NISTP384,
+                russh::kex::ECDH_SHA2_NISTP521,
+                russh::kex::DH_G14_SHA1,
+                russh::kex::DH_G14_SHA256,
+                russh::kex::DH_G1_SHA1,
+            ]),
+            cipher: Cow::Borrowed(&[
+                russh::cipher::AES_128_CTR,
+                russh::cipher::AES_256_CTR,
+                russh::cipher::AES_192_CTR,
+                russh::cipher::AES_128_CBC,
+                russh::cipher::AES_256_CBC,
+                russh::cipher::AES_192_CBC,
+                russh::cipher::TRIPLE_DES_CBC,
+                russh::cipher::AES_256_GCM,
+                russh::cipher::CHACHA20_POLY1305,
+            ]),
+            mac: Cow::Borrowed(&[
+                russh::mac::HMAC_SHA1_ETM,
+                russh::mac::HMAC_SHA256_ETM,
+                russh::mac::HMAC_SHA512_ETM,
+                russh::mac::HMAC_SHA1,
+                russh::mac::HMAC_SHA256,
+                russh::mac::HMAC_SHA512,
             ]),
             ..Default::default()
         },
         ..Default::default()
     }
+}
+
+/// 错误是否属于"握手/算法协商协议类"——值得换 CTR-first 算法表重试一次。
+///
+/// 覆盖三类典型特征：
+/// - EOF/连接重置：假 AEAD 设备协商后立刻断开（关键词 eof/reset）；
+/// - 协商失败：无共同算法（negotiat / no common / kex / key exchange / algorithm）；
+/// - 解密协议错：MAC/cipher/decrypt 校验失败（老实现对 AEAD 分组边界的缺陷）。
+/// 认证类错误（密码错误/用户拒绝主机密钥）不含这些关键词，不会触发重试。
+fn is_handshake_protocol_error(msg: &str) -> bool {
+    let s = msg.to_ascii_lowercase();
+    s.contains("eof")
+        || s.contains("reset")
+        || s.contains("disconnect")
+        || s.contains("negotiat")
+        || s.contains("no common")
+        || s.contains("key exchange")
+        || s.contains("kex")
+        || s.contains("algorithm")
+        || s.contains("decrypt")
+        || s.contains("cipher")
+        || s.contains("mac mismatch")
 }
 
 /// 等待用户填写二次认证挑战的最长时间（超时视为认证失败）。
@@ -632,12 +749,24 @@ const R_BRIDGE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_
 
 /// 建立一条直连 SSH 连接并完成认证。
 ///
-/// 认证顺序（与常见 SSH 客户端一致，逐级回退）：
-/// 1. 公钥认证（配置为私钥时）；
-/// 2. 密码认证（配置为密码时）；
-/// 3. 前两步都失败后回退到 keyboard-interactive：密码类提示用已保存的密码
-///    自动填充，其余提示（OTP/验证码等二次认证）通过
-///    [`events::SSH_AUTH_CHALLENGE`] 事件发往前端弹窗，等待用户填写后继续认证。
+/// 认证顺序（与 OpenSSH 客户端默认顺序一致，逐级回退）：
+/// 1. 密码认证（配置为密码时）三步走：
+///    a. **keyboard-interactive 先行**——密码类提示用已保存的密码自动填充，
+///       口令码/验证码类提示预填或通过 [`events::SSH_AUTH_CHALLENGE`] 事件
+///       发往前端弹窗，等待用户填写后继续认证；
+///    b. 服务器初始宣告不含 KI 时回退 password 方式；
+///    c. password 也被拒时**再试一轮 keyboard-interactive**——跳板机
+///       （JumpServer）的密码+口令码流程：password 阶段密码校验通过但要求
+///       MFA，服务器以 partial success 引导客户端改走 KI 输入口令码；
+/// 2. 公钥认证（配置为私钥时）：publickey 失败后回退 keyboard-interactive
+///    （全部提示弹窗请用户输入）。
+///
+/// 密码场景必须 keyboard-interactive 先行：russh 0.45 的认证状态机只在
+/// 「连接上第一个认证请求为 keyboard-interactive」时才会把服务器后续发来的
+/// InfoRequest 转发给上层；若先 password/publickey 失败再回退
+/// keyboard-interactive，跳板机（如 JumpServer 密码+口令码两轮挑战）发来的
+/// 挑战会被 russh 静默丢弃，认证永久挂起直到超时——表现为「二次认证总是
+/// 登录不上」。
 ///
 /// 客户端配置（空闲断开、保活、连接超时）从 settings.json 的
 /// `terminal.sshIdleTimeoutMinutes` / `terminal.sshKeepaliveSecs`
@@ -658,7 +787,35 @@ pub async fn connect_direct(
     auth: AuthMethod,
     state: AppState,
 ) -> AppResult<Handle<ClientHandler>> {
-    connect_direct_inner(host, port, username, session_config_id, auth, state, None).await
+    connect_direct_inner(host, port, username, session_config_id, auth, state, None, None).await
+}
+
+/// 与 [`connect_direct`] 相同，但注册终端会话专属的断开原因键。
+///
+/// 调用方（终端 reader）持有同一键，退出时从注册表取出本连接的断开原因
+/// 随 `terminal:closed` 事件上报。键由调用方生成（host:port#随机后缀），
+/// 保证同一 host:port 的多条连接互不覆盖。
+#[allow(clippy::too_many_arguments)]
+pub async fn connect_direct_terminal(
+    host: &str,
+    port: u16,
+    username: &str,
+    session_config_id: &str,
+    auth: AuthMethod,
+    state: AppState,
+    disconnect_key: String,
+) -> AppResult<Handle<ClientHandler>> {
+    connect_direct_inner(
+        host,
+        port,
+        username,
+        session_config_id,
+        auth,
+        state,
+        None,
+        Some(disconnect_key),
+    )
+    .await
 }
 
 /// 与 [`connect_direct`] 相同，但额外返回远程转发注册表的共享句柄。
@@ -682,6 +839,7 @@ pub async fn connect_direct_tunnel(
         auth,
         state,
         Some(forwards.clone()),
+        None,
     )
     .await?;
     Ok((handle, forwards))
@@ -700,6 +858,7 @@ async fn connect_direct_inner(
     auth: AuthMethod,
     state: AppState,
     forwards: Option<ForwardsMap>,
+    disconnect_key: Option<String>,
 ) -> AppResult<Handle<ClientHandler>> {
     // 终端设置（空闲断开 + 保活 + 连接超时）：读一次 settings.json 复用。
     let terminal = crate::config::settings_load_inner(&state)
@@ -720,61 +879,97 @@ async fn connect_direct_inner(
     // 连接超时（秒）：设置 0 表示永不超时。
     let connect_timeout_secs = terminal.ssh_connect_timeout_secs;
 
-    let config = Arc::new(default_config(idle_timeout, keepalive_interval));
-    // 连接/认证阶段与 handler 共享的两个信号：
-    // - host_key_pending：连接期间是否正在等待主机公钥确认（超时暂停计）；
-    // - connection_closed：连接断开通知（认证阶段看门狗用）。
-    let host_key_pending = Arc::new(parking_lot::Mutex::new(false));
-    let connection_closed = Arc::new(tokio::sync::Notify::new());
-    let handler = ClientHandler {
-        app: state.app.clone(),
-        host: host.to_string(),
-        port,
-        known_hosts_path: crate::storage::known_hosts::known_hosts_path(&state.data_dir),
-        pending_host_keys: state.pending_host_keys.clone(),
-        forwards: forwards.unwrap_or_else(|| Arc::new(parking_lot::Mutex::new(HashMap::new()))),
-        host_key_pending: host_key_pending.clone(),
-        connection_closed: connection_closed.clone(),
-    };
-    let addr = (host.to_string(), port);
+    // 单次连接尝试：给定算法配置完成握手（TCP + 版本交换 + KEX），带连接
+    // 超时与主机公钥确认暂停计。返回句柄与认证阶段需要的两个共享信号。
+    // 抽成闭包以支持"默认算法 → CTR-first 降级"的两次尝试。
+    let connect_once = |config: Arc<client::Config>| {
+        let state = state.clone();
+        let host_owned = host.to_string();
+        let username_owned = username.to_string();
+        let forwards = forwards.clone();
+        let disconnect_key = disconnect_key.clone();
+        async move {
+            // 连接/认证阶段与 handler 共享的两个信号：
+            // - host_key_pending：连接期间是否正在等待主机公钥确认（超时暂停计）；
+            // - connection_closed：连接断开通知（认证阶段看门狗用）。
+            let host_key_pending = Arc::new(parking_lot::Mutex::new(false));
+            let connection_closed = Arc::new(tokio::sync::Notify::new());
+            let handler = ClientHandler {
+                app: state.app.clone(),
+                host: host_owned.clone(),
+                port,
+                known_hosts_path: crate::storage::known_hosts::known_hosts_path(&state.data_dir),
+                pending_host_keys: state.pending_host_keys.clone(),
+                forwards: forwards
+                    .unwrap_or_else(|| Arc::new(parking_lot::Mutex::new(HashMap::new()))),
+                host_key_pending: host_key_pending.clone(),
+                connection_closed: connection_closed.clone(),
+                disconnect_reasons: state.ssh_disconnect_reasons.clone(),
+                // None（非终端连接）= 空串：不记录断开原因（无 consumer，只残留）。
+                disconnect_key: disconnect_key.unwrap_or_default(),
+            };
+            let addr = (host_owned, port);
 
-    log::info!("正在连接 SSH {}@{}:{}...", username, host, port);
-    // connect 放入独立任务：连接期间若进入主机公钥确认（等待用户决策，自身
-    // 有 120s 上限），连接超时暂停计——指纹弹窗不能被短连接超时截断。
-    let connect_task = tokio::spawn(client::connect(config, addr, handler));
-    let mut handle = match connect_timeout_secs {
-        // 0 = 永不超时。
-        0 => match connect_task.await {
-            Ok(res) => res.map_err(|e| AppError::Ssh(format!("连接 SSH 失败: {}", e)))?,
-            Err(e) => return Err(e.into()),
-        },
-        secs => {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(u64::from(secs));
-            loop {
-                if connect_task.is_finished() {
-                    break match connect_task.await {
-                        Ok(res) => {
-                            res.map_err(|e| AppError::Ssh(format!("连接 SSH 失败: {}", e)))?
+            log::info!("正在连接 SSH {}@{}:{}...", username_owned, addr.0, addr.1);
+            // connect 放入独立任务：连接期间若进入主机公钥确认（等待用户决策，
+            // 自身有 120s 上限），连接超时暂停计——指纹弹窗不能被短连接超时截断。
+            let connect_task = tokio::spawn(client::connect(config, addr, handler));
+            let handle = match connect_timeout_secs {
+                // 0 = 永不超时。
+                0 => match connect_task.await {
+                    Ok(res) => res.map_err(|e| AppError::Ssh(format!("连接 SSH 失败: {}", e)))?,
+                    Err(e) => return Err(e.into()),
+                },
+                secs => {
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(u64::from(secs));
+                    loop {
+                        if connect_task.is_finished() {
+                            break match connect_task.await {
+                                Ok(res) => {
+                                    res.map_err(|e| AppError::Ssh(format!("连接 SSH 失败: {}", e)))?
+                                }
+                                Err(e) => return Err(e.into()),
+                            };
                         }
-                        Err(e) => return Err(e.into()),
-                    };
+                        // 主机公钥确认等待用户决策期间，连接超时暂停计。
+                        if *host_key_pending.lock() {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            continue;
+                        }
+                        if tokio::time::Instant::now() >= deadline {
+                            connect_task.abort();
+                            return Err(AppError::Ssh(format!(
+                                "连接 SSH 超时（{} 秒，可在设置中调整）",
+                                secs
+                            )));
+                        }
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
                 }
-                // 主机公钥确认等待用户决策期间，连接超时暂停计。
-                if *host_key_pending.lock() {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    continue;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    connect_task.abort();
-                    return Err(AppError::Ssh(format!(
-                        "连接 SSH 超时（{} 秒，可在设置中调整）",
-                        secs
-                    )));
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
+            };
+            Ok((handle, host_key_pending, connection_closed))
         }
     };
+
+    // 第一次：默认算法（后量子优先）。失败且属握手协议类错误时，用
+    // CTR-first 兼容算法表重试一次（老设备：假 AEAD 协商后断连 / CBC-only）。
+    let mut attempt = connect_once(Arc::new(default_config(idle_timeout, keepalive_interval))).await;
+    if let Err(e) = &attempt {
+        if is_handshake_protocol_error(&e.to_string()) {
+            log::info!(
+                "[ssh] 默认算法握手失败（{}），用 CTR-first 兼容算法重试 {}:{} ...",
+                e,
+                host,
+                port
+            );
+            attempt =
+                connect_once(Arc::new(legacy_fallback_config(idle_timeout, keepalive_interval)))
+                    .await;
+        }
+    }
+    // host_key_pending 仅在 connect_once 内部使用（超时暂停计），此处不
+    // 再需要；connection_closed 供认证阶段看门狗使用。
+    let (mut handle, _host_key_pending, connection_closed) = attempt?;
 
     // 认证阶段（密码/公钥 + 键盘交互回退）：
     // 1. 整体超时 120s 兜底——服务器握手后不回应认证请求时认证会永久挂起。
@@ -784,39 +979,91 @@ async fn connect_direct_inner(
     //    立即中止，避免忙旋到整体超时。
     let handle = tokio::select! {
         r = tokio::time::timeout(AUTH_TIMEOUT, async {
-            // 1/2. 公钥或密码认证（按配置的 AuthMethod 单次尝试）。
-            let (mut authenticated, fallback_password, fallback_otp) = match auth {
+            // 认证编排（对齐 OpenSSH 默认顺序）：
+            // - 密码认证三步走：keyboard-interactive 先行（密码类提示自动填充
+            //   已保存密码，口令码类提示预填/弹窗）→ password 方式 →
+            //   password 被拒后再试一轮 KI（跳板机密码+口令码场景，服务器以
+            //   partial success 引导 KI 输入 MFA 码）；
+            // - 公钥认证：publickey 先行，失败后回退 keyboard-interactive。
+            //
+            // KI 必须先行：russh 0.45 仅在首个认证请求为 KI 时才转发服务器后续
+            // 的 InfoRequest（current 标记在 SERVICE_ACCEPT 时按首个方法设置且
+            // 不再更新）；先 password/publickey 失败再回退 KI 时，跳板机发来的
+            // 密码/口令码挑战会被 russh 静默丢弃 → 认证挂起到超时。
+            let authenticated = match auth {
                 AuthMethod::PrivateKey { key_data, .. } => {
                     let key = Arc::new(key_data);
                     let ok = handle
                         .authenticate_publickey(username, key)
                         .await
                         .map_err(|e| AppError::Ssh(format!("公钥认证请求失败: {}", e)))?;
-                    (ok, None, None)
+                    if ok {
+                        true
+                    } else {
+                        // 公钥失败 → keyboard-interactive 回退（本地无密码，
+                        // 密码/验证码提示全部弹窗请用户输入）。
+                        auth_keyboard_interactive(
+                            &mut handle,
+                            host,
+                            port,
+                            username,
+                            session_config_id,
+                            None,
+                            None,
+                            &state,
+                        )
+                        .await?
+                    }
                 }
                 AuthMethod::Password(pa) => {
-                    let ok = handle
-                        .authenticate_password(username, pa.password.clone())
-                        .await
-                        .map_err(|e| AppError::Ssh(format!("密码认证请求失败: {}", e)))?;
-                    (ok, Some(pa.password), pa.otp)
+                    // keyboard-interactive 先行：密码类提示自动填充，口令码类
+                    // 提示预填（手动认证重试时用户提供）或弹窗收集。
+                    let ok = auth_keyboard_interactive(
+                        &mut handle,
+                        host,
+                        port,
+                        username,
+                        session_config_id,
+                        Some(pa.password.as_str()),
+                        pa.otp.as_deref(),
+                        &state,
+                    )
+                    .await?;
+                    if ok {
+                        true
+                    } else {
+                        // 服务器初始宣告不含 keyboard-interactive（如 JumpServer
+                        // 只宣告 password,publickey）：常规 password 方式。
+                        let pw_ok = handle
+                            .authenticate_password(username, pa.password.clone())
+                            .await
+                            .map_err(|e| AppError::Ssh(format!("密码认证请求失败: {}", e)))?;
+                        if pw_ok {
+                            true
+                        } else {
+                            // password 被拒后再试一轮 keyboard-interactive：
+                            // 跳板机（JumpServer）常见流程是「password 阶段密码
+                            // 校验通过但要求 MFA」，以 partial success 引导客户端
+                            // 改走 keyboard-interactive 输入口令码——OpenSSH 客户端
+                            // 正是据此继续 KI 才能登录。本轮密码已在服务端验证，
+                            // 通常只问口令码：用户提供的验证码预填，否则弹窗收集；
+                            // 不再自动预填密码（若本轮仍被问密码说明凭据有误，
+                            // 应让用户手动输入）。
+                            auth_keyboard_interactive(
+                                &mut handle,
+                                host,
+                                port,
+                                username,
+                                session_config_id,
+                                None,
+                                pa.otp.as_deref(),
+                                &state,
+                            )
+                            .await?
+                        }
+                    }
                 }
             };
-
-            // 3. 回退 keyboard-interactive（服务器只提供该方法，或要求二次认证）。
-            if !authenticated {
-                authenticated = auth_keyboard_interactive(
-                    &mut handle,
-                    host,
-                    port,
-                    username,
-                    session_config_id,
-                    fallback_password.as_deref(),
-                    fallback_otp.as_deref(),
-                    &state,
-                )
-                .await?;
-            }
 
             if !authenticated {
                 return Err(AppError::Auth(format!(
@@ -850,13 +1097,17 @@ async fn connect_direct_inner(
 /// 循环处理服务器发来的 [`KeyboardInteractiveAuthResponse::InfoRequest`]：
 /// - 密码类提示（且本地有密码）→ 自动填充（仅首次尝试的首轮、首个未回显的
 ///   密码提示，与 OpenSSH 行为一致），不发往前端（避免凭据泄露）；
-/// - 验证码类提示（口令码/动态口令等，且调用方提供了验证码）→ 自动填充首个；
+/// - 验证码类提示（口令码/动态口令等，且调用方提供了验证码）→ 自动填充，
+///   首轮之后的轮次同样填充（跳板机普遍第 1 轮问密码、第 2 轮问口令码）；
 /// - 其余提示（二次认证码等）→ 注册 oneshot 并 emit [`events::SSH_AUTH_CHALLENGE`]，
 ///   等待前端通过 `ssh_auth_respond` 回传；用户取消或超时返回认证错误。
 ///
 /// 自动填充的尝试被服务器拒绝（`Failure`）时，自动重试一轮**全部手动输入**
 /// （不再自动填充任何提示），给用户改正密码/口令码的机会——常见场景：已保存的
 /// 密码过期、服务器要求验证码等；全部手动输入仍被拒绝才返回认证失败。
+/// 若服务器从未发过任何挑战提示即失败（不支持 keyboard-interactive），直接
+/// 返回 false，由调用方回退其他认证方式——不做无谓重试，避免白白消耗服务器
+/// 的认证失败次数上限（MaxAuthTries）。
 ///
 /// 返回是否认证成功。
 /// 认证阶段整体超时。
@@ -884,16 +1135,15 @@ async fn auth_keyboard_interactive(
 ) -> AppResult<bool> {
     // 首次尝试可自动填充密码/验证码；被服务器拒绝后（manual_only 置位）重试
     // 一轮全部手动输入——提示全部弹窗由用户填写，不再自动填充。
+    // saw_info_request：本次连接是否出现过挑战提示（用于区分「自动填充答案
+    // 被拒」与「服务器不支持 keyboard-interactive」两种失败）。
     let mut manual_only = false;
+    let mut saw_info_request = false;
+    // 轮次只按 InfoRequest 计数（跨自动填充/手动重试两轮尝试累计，防恶意
+    // 服务器无限挑战）。不在外层循环顶部累加：那会与每个 InfoRequest 的
+    // 计数叠加，把"密码+口令码"两轮跳板机的手动重试误杀在上限上。
     let mut rounds = 0usize;
     loop {
-        rounds += 1;
-        if rounds > MAX_KI_ROUNDS {
-            return Err(AppError::Auth(format!(
-                "keyboard-interactive 认证轮次超过上限（{}），服务器可能异常",
-                MAX_KI_ROUNDS
-            )));
-        }
         let mut reply = handle
             .authenticate_keyboard_interactive_start(username, None::<String>)
             .await
@@ -905,7 +1155,11 @@ async fn auth_keyboard_interactive(
             match reply {
                 KeyboardInteractiveAuthResponse::Success => return Ok(true),
                 KeyboardInteractiveAuthResponse::Failure => {
-                    if !manual_only {
+                    // 仅当服务器确实发过挑战提示（自动填充的密码/口令码可能
+                    // 输错）时，才值得重试一轮全部手动输入；从未出现提示说明
+                    // 服务器不支持 keyboard-interactive，直接返回 false 由调用
+                    // 方回退其他方式，不消耗服务器 MaxAuthTries 次数。
+                    if !manual_only && saw_info_request {
                         // 自动填充（含已保存密码）被服务器拒绝：重试一轮全部手动
                         // 输入，让用户有机会修正密码/口令码（OpenSSH 也会
                         // "Permission denied, please try again" 重新提示）。
@@ -925,6 +1179,7 @@ async fn auth_keyboard_interactive(
                     instructions,
                     prompts,
                 } => {
+                    saw_info_request = true;
                     ki_round += 1;
                     rounds += 1;
                     if rounds > MAX_KI_ROUNDS {
@@ -937,16 +1192,21 @@ async fn auth_keyboard_interactive(
                     // 逐条决定答案：密码/验证码类提示自动填充，其余打上"需用户输入"标记。
                     // manual 元素：(responses 中的占位下标, 提示文本, 是否回显)。
                     //
-                    // 自动填充仅限首次尝试的首轮（与 OpenSSH 行为一致）：强制改密
-                    // 等流程会出现 "New password:" / "Confirm password:" 等提示，
-                    // 无差别填充会把旧密码填进新密码框破坏流程；后续轮次也不再填充。
-                    let can_prefill = !manual_only && ki_round == 1;
+                    // - 密码预填仅限首次尝试的首轮（与 OpenSSH 行为一致）：强制
+                    //   改密等流程的后续轮次会出现 "New password:" /
+                    //   "Confirm password:" 等提示，无差别填充会把旧密码填进
+                    //   新密码框破坏流程；
+                    // - 验证码预填放宽到首次尝试的任意轮次：跳板机普遍第 1 轮
+                    //   问密码、第 2 轮才问口令码，手动认证重试时用户已提供
+                    //   验证码，不应再弹窗要求输入一遍。
+                    let can_prefill = !manual_only;
+                    let can_prefill_password = can_prefill && ki_round == 1;
                     let mut responses: Vec<String> = Vec::with_capacity(prompts.len());
                     let mut manual: Vec<(usize, String, bool)> = Vec::new();
                     let mut password_autofilled = false;
                     let mut otp_autofilled = false;
                     for p in prompts {
-                        if can_prefill && !password_autofilled && !p.echo
+                        if can_prefill_password && !password_autofilled && !p.echo
                             && looks_like_password(&p.prompt)
                         {
                             if let Some(pw) = password.filter(|pw| !pw.is_empty()) {

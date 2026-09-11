@@ -110,8 +110,12 @@ export const makeAiStore = (id: string) =>
     sending: boolean;
     /** 智能体任务清单（todo_write 工具最新整表；新用户消息时清空）。 */
     todos: AiTodoItem[];
-    /** 会话累计 token 用量（ai:usage 事件累加，借鉴 dsh llm/token-meter）。 */
+    /** 最近一次模型请求的 token 用量（ai:usage 事件覆盖写入，非累计）。 */
     usage: { prompt: number; completion: number };
+    /** 最后活动时间（ms 时间戳；历史列表展示用；旧持久化数据无此字段）。 */
+    updatedAt?: number;
+    /** 归档时间（ms 时间戳；关闭进历史归档时写入）。 */
+    archivedAt?: number;
   }
 
   /** 空用量（新会话初始值）。 */
@@ -140,6 +144,13 @@ export const makeAiStore = (id: string) =>
   /** requestId → cid 索引，事件路由用。 */
   const requestToCid = new Map<string, string>();
 
+  /**
+   * 历史归档：关闭的会话不直接删除，而是移入此处（带 archivedAt 时间戳）。
+   * 与 conversations 存同一个持久化文件（archived=true 标记区分），
+   * 可从历史列表恢复（restoreConversation）或彻底删除（deleteConversation）。
+   */
+  const archives = ref<Conversation[]>([]);
+
   /** 启动时确保至少有一个对话。 */
   function ensureConversation() {
     if (conversations.value.length === 0) {
@@ -159,18 +170,26 @@ export const makeAiStore = (id: string) =>
   // --- 持久化（独立 JSON 文件，按 domain 分文件）---------------------------
   let persistTimer: ReturnType<typeof setTimeout> | null = null;
 
-  /** 防抖持久化：把 conversations 映射为可序列化结构后全量写文件。
-   *  streaming 字段强制为 false（避免重启后卡在"生成中"）；不存 activeRequestId/sending。 */
+  /** 防抖持久化：把 conversations + archives 映射为可序列化结构后全量写文件。
+   *  streaming 字段强制为 false（避免重启后卡在"生成中"）；不存 activeRequestId/sending。
+   *  归档会话带 archived=true 标记，加载时据此拆分回两个列表。 */
   function persist() {
     if (persistTimer) clearTimeout(persistTimer);
     persistTimer = setTimeout(() => {
-      const data = conversations.value.map((c) => ({
+      const serialize = (c: Conversation, archived: boolean) => ({
         id: c.id,
         title: c.title,
         messages: c.messages.map((m) => ({ ...m, streaming: false })),
         todos: c.todos,
         usage: c.usage,
-      }));
+        archived,
+        updatedAt: c.updatedAt,
+        archivedAt: archived ? c.archivedAt : undefined,
+      });
+      const data = [
+        ...conversations.value.map((c) => serialize(c, false)),
+        ...archives.value.map((c) => serialize(c, true)),
+      ];
       aiApi.aiSaveConversations(domain, data).catch(() => {
         /* 持久化失败不阻塞对话（如磁盘满），仅忽略 */
       });
@@ -181,21 +200,27 @@ export const makeAiStore = (id: string) =>
   async function loadPersisted() {
     try {
       const list = await aiApi.aiListConversations(domain);
-      if (list.length > 0) {
-        conversations.value = list.map((c) => ({
-          id: c.id,
-          title: c.title || "新对话",
-          // 还原消息，确保 streaming 为 false。
-          messages: (c.messages as AiMessage[]).map((m) => ({ ...m, streaming: false })),
-          activeRequestId: null,
-          sending: false,
-          // 旧持久化数据无 todos / usage 字段 → 默认空值。
-          todos: (c as unknown as { todos?: AiTodoItem[] }).todos ?? [],
-          usage: (c as unknown as { usage?: { prompt: number; completion: number } }).usage ?? {
-            prompt: 0,
-            completion: 0,
-          },
-        }));
+      // 按 archived 标记拆分为「打开中的会话」与「历史归档」两个列表。
+      const restore = (c: (typeof list)[number]): Conversation => ({
+        id: c.id,
+        title: c.title || "新对话",
+        // 还原消息，确保 streaming 为 false。
+        messages: (c.messages as AiMessage[]).map((m) => ({ ...m, streaming: false })),
+        activeRequestId: null,
+        sending: false,
+        // 旧持久化数据无 todos / usage 字段 → 默认空值。
+        todos: (c as unknown as { todos?: AiTodoItem[] }).todos ?? [],
+        usage: (c as unknown as { usage?: { prompt: number; completion: number } }).usage ?? {
+          prompt: 0,
+          completion: 0,
+        },
+        updatedAt: c.updatedAt,
+        archivedAt: c.archivedAt,
+      });
+      const open = list.filter((c) => !c.archived).map(restore);
+      archives.value = list.filter((c) => c.archived).map(restore);
+      if (open.length > 0) {
+        conversations.value = open;
         activeCid.value = conversations.value[0].id;
       }
     } catch {
@@ -239,20 +264,63 @@ export const makeAiStore = (id: string) =>
     if (conversations.value.some((c) => c.id === cid)) activeCid.value = cid;
   }
 
+  /**
+   * 关闭对话：移入历史归档（不删除，可在历史列表恢复）。
+   * 空会话（没说过一句话就关掉的"新对话"）没有保留价值，直接丢弃。
+   * 若该对话正在流式生成，先中止后端任务：否则关闭后 token 还在继续消耗、
+   * 事件无人接收，且后端 pending_ai_tasks 里的 JoinHandle 会一直挂到自然结束。
+   */
   function closeConversation(cid: string) {
     const idx = conversations.value.findIndex((c) => c.id === cid);
     if (idx < 0) return;
     const closed = conversations.value[idx];
     conversations.value.splice(idx, 1);
-    // 若该对话正在流式生成，先中止后端任务：否则关闭后 token 还在继续消耗、
-    // 事件无人接收，且后端 pending_ai_tasks 里的 JoinHandle 会一直挂到自然结束。
     if (closed.activeRequestId) {
-      void stop(closed.activeRequestId);
+      // 先取 rid 再本地收尾：finalizeStopped 会把 closed.activeRequestId 置
+      // null，之后再读会传 null，stop() 的 ?? 兜底会错误命中当前活动会话的
+      // 任务（跨会话误停）或直接返回（后端任务不停）。
+      const rid = closed.activeRequestId;
+      // 先本地收尾再停后端：会话即将离开 conversations（进 archives），stop()
+      // 里的 onStopped 经 convForRequest 将查不到它——不复位的话会话带着
+      // sending=true 入档（恢复后无法发送）、requestToCid 映射泄漏。
+      finalizeStopped(closed, rid);
+      void stop(rid);
+    }
+    if (closed.messages.length > 0) {
+      closed.archivedAt = Date.now();
+      // 归档列表按归档时间倒序（最新关闭的排最前）。
+      archives.value.unshift(closed);
     }
     if (activeCid.value === cid) {
       activeCid.value = conversations.value[0]?.id ?? null;
       if (!activeCid.value) ensureConversation();
     }
+    persist();
+  }
+
+  /** 从历史归档恢复会话：移回会话标签栏并激活。 */
+  function restoreConversation(cid: string) {
+    const idx = archives.value.findIndex((c) => c.id === cid);
+    if (idx < 0) return;
+    const [conv] = archives.value.splice(idx, 1);
+    conv.archivedAt = undefined;
+    conversations.value.push(conv);
+    activeCid.value = conv.id;
+    persist();
+  }
+
+  /** 彻底删除历史归档中的会话（不可恢复）。 */
+  function deleteConversation(cid: string) {
+    const idx = archives.value.findIndex((c) => c.id === cid);
+    if (idx < 0) return;
+    archives.value.splice(idx, 1);
+    persist();
+  }
+
+  /** 清空全部历史归档（不可恢复）。 */
+  function clearArchives() {
+    if (archives.value.length === 0) return;
+    archives.value = [];
     persist();
   }
 
@@ -269,7 +337,7 @@ export const makeAiStore = (id: string) =>
    * @param systemPrompt 系统提示词
    * @param opts.agent 是否启用工具调用（智能体模式）
    * @param opts.activeTerminalId 当前活动终端（agent 模式上下文）
-   * @param opts.activeDbConnId 当前活动 MySQL 连接
+   * @param opts.activeDbConnId 当前活动数据库连接（MySQL / PostgreSQL）
    * @param opts.activeDesktopId 当前活动内嵌 RDP 会话（桌面助手上下文）
    * @param opts.domain 请求所属助手域（"ssh" | "db" | "desktop"），文件工具据此取工作目录
    * @param opts.images 附带的多模态图片（仅多模态模型下使用）
@@ -293,6 +361,8 @@ export const makeAiStore = (id: string) =>
     // 新用户消息 = 新回合开始：清空上一任务的任务清单（借鉴 dsh tool-todo 的
     // standing-plan 语义——旧清单只属于上一个任务，新回合从空白清单重新开始）。
     conv.todos = [];
+    // 记录最后活动时间（历史会话列表按此排序/展示）。
+    conv.updatedAt = Date.now();
 
     const userMsg: AiMessage = {
       id: genId(),
@@ -478,6 +548,20 @@ export const makeAiStore = (id: string) =>
   function onStopped(requestId: string) {
     const conv = convForRequest(requestId);
     if (!conv) return;
+    finalizeStopped(conv, requestId);
+    persist();
+  }
+
+  /**
+   * 对指定会话执行「已终止」收尾：结束流式、待确认卡片转 rejected、复位
+   * sending / activeRequestId 并清理路由映射。
+   *
+   * onStopped（事件路径）与 closeConversation 共用：后者在会话被移出
+   * conversations（进 archives）后，onStopped 经 convForRequest 将查不到它，
+   * 必须直接对会话对象收尾——否则会话带着 sending=true 入档，恢复后 send()
+   * 因互斥守卫静默拒绝，requestToCid 映射也永久泄漏。
+   */
+  function finalizeStopped(conv: Conversation, requestId: string) {
     const m = lastAssistant(conv);
     if (m) {
       m.streaming = false;
@@ -502,7 +586,6 @@ export const makeAiStore = (id: string) =>
     conv.sending = false;
     conv.activeRequestId = null;
     requestToCid.delete(requestId);
-    persist();
   }
 
   /** 用户点击"终止"按钮：调用后端 ai_stop。默认停当前对话；关闭对话时传显式 requestId。 */
@@ -633,12 +716,15 @@ export const makeAiStore = (id: string) =>
     persist();
   }
 
-  /** token 用量上报（单次请求，ai:usage 事件）：累加到会话级统计。 */
+  /**
+   * token 用量上报（单次请求，ai:usage 事件）：记录**最近一次**模型返回的
+   * 用量（last-write-wins 覆盖，不累加）。agent 多轮工具调用会产生多次事件，
+   * 以最后一次为准——输入框上方展示的是"最近一次请求"的输入/输出 token。
+   */
   function onUsage(requestId: string, promptTokens: number, completionTokens: number) {
     const conv = convForRequest(requestId);
     if (!conv) return;
-    conv.usage.prompt += promptTokens;
-    conv.usage.completion += completionTokens;
+    conv.usage = { prompt: promptTokens, completion: completionTokens };
     persist();
   }
 
@@ -660,21 +746,31 @@ export const makeAiStore = (id: string) =>
     persist();
   }
 
-  /** 用户点击"执行"。本地立即更新卡片状态为 approved，并通知后端。 */
-  async function approveToolCall(toolCallId: string) {
+  /** 用户点击"执行"。本地立即更新卡片状态为 approved，并通知后端。
+   * @returns 是否成功（false = 僵尸卡片/执行失败，UI 应提示）。 */
+  async function approveToolCall(toolCallId: string): Promise<boolean> {
     // 桌面工具：批准即执行——执行体在前端 RDP 会话（后端桥接只透传字节），
     // 由桌面助手面板注册的执行器负责执行并把「批准+结果」一体回执发给后端。
     const item = findToolCallItem(toolCallId);
     if (item && isDesktopTool(item.name) && desktopToolExecutor) {
       updateToolCallStatus(toolCallId, "approved");
-      await desktopToolExecutor(
-        toolCallId,
-        true,
-        item.name,
-        item.arguments,
-        item.desktopId ?? null
-      );
-      return;
+      try {
+        await desktopToolExecutor(
+          toolCallId,
+          true,
+          item.name,
+          item.arguments,
+          item.desktopId ?? null
+        );
+        return true;
+      } catch (e) {
+        // 执行器异常（RDP 会话不可用/截图失败等）：回滚为待确认并返回失败，
+        // 由 UI 提示——否则异常上抛成未处理拒绝、卡片永停"执行中"
+        // （后端等待项由其 5 分钟超时兜底自动拒绝）。
+        console.error("桌面工具执行失败:", e);
+        updateToolCallStatus(toolCallId, "pending");
+        return false;
+      }
     }
     updateToolCallStatus(toolCallId, "approved");
     // 批准下发失败（僵尸卡片：轮次已超时/请求已结束）：回滚状态并告知调用方，
@@ -878,6 +974,11 @@ export const makeAiStore = (id: string) =>
     createConversation,
     switchConversation,
     closeConversation,
+    // 历史归档
+    archives,
+    restoreConversation,
+    deleteConversation,
+    clearArchives,
     // 兼容（代理到活动会话）
     messages,
     sending,

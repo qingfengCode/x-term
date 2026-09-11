@@ -107,6 +107,12 @@ pub const SSH_HOST_KEY_CHALLENGE: &str = "ssh:host_key_challenge";
 /// 前端据此实时更新"运行中/已停止"标签，不再依赖进页面时的一次性拉取。
 pub const FORWARD_STATE: &str = "forward:state";
 
+/// 服务器监控数据事件（每 3s 一帧）。payload: [`MonitorDataEvent`]。
+pub const MONITOR_DATA: &str = "monitor:data";
+
+/// 服务器监控结束（停止/断开/连续失败）。payload: [`MonitorClosedEvent`]。
+pub const MONITOR_CLOSED: &str = "monitor:closed";
+
 // ===========================================================================
 // 事件 payload 结构体
 // ===========================================================================
@@ -140,6 +146,10 @@ pub struct TerminalDataEvent {
 #[serde(rename_all = "camelCase")]
 pub struct TerminalClosedEvent {
     pub session_id: String,
+    /// 断开原因（SSH 会话时由 handler 的 `disconnected` 回调记录：服务器
+    /// DISCONNECT 的原因文字 / 保活超时等）；本地会话为 `None`。
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 /// 终端进程退出。
@@ -439,6 +449,32 @@ pub struct ForwardStateEvent {
     /// 是否运行中。
     pub running: bool,
     /// 状态变化原因（如 "started" / "stopped" / "ssh 连接断开"），用于展示/日志。
+    pub reason: String,
+}
+
+/// 服务器监控数据（一帧）。字段模型复用 [`crate::monitor`] 的定义。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MonitorDataEvent {
+    pub monitor_id: String,
+    /// 采样时刻（epoch 毫秒）。
+    pub ts: u64,
+    pub host: Option<crate::monitor::MonitorHost>,
+    pub cpu: crate::monitor::MonitorCpu,
+    pub mem: crate::monitor::MonitorMem,
+    pub load: Option<crate::monitor::MonitorLoad>,
+    pub uptime_secs: u64,
+    pub net: crate::monitor::MonitorNet,
+    pub disks: Vec<crate::monitor::MonitorDisk>,
+    pub processes: Vec<crate::monitor::MonitorProcess>,
+}
+
+/// 服务器监控结束。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MonitorClosedEvent {
+    pub monitor_id: String,
+    /// 结束原因（已停止 / 连接失败 / 连续采集失败等）。
     pub reason: String,
 }
 

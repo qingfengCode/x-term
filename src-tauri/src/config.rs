@@ -67,6 +67,31 @@ pub struct TerminalSettings {
     /// 默认 false：与官方 Gateway 客户端一致不校验（凭据经 CredSSP 保护）。
     #[serde(default)]
     pub rdp_verify_cert: bool,
+    /// 默认下载目录（终端 sz / SFTP / 对象存储下载共用）。
+    /// 空 = 每次下载弹保存对话框选择路径；
+    /// 非空 = 直接落盘到该目录（同名文件自动加 " (n)" 后缀）。
+    /// alias 兼容旧字段名 `zmodemDownloadDir`（历史版本仅 ZMODEM 使用）。
+    #[serde(default, alias = "zmodemDownloadDir")]
+    pub download_dir: String,
+    /// 终端智能补全：输入时按历史命令 + 快捷命令给出建议弹窗。
+    #[serde(default = "default_suggest_history")]
+    pub suggest_history: bool,
+    /// 智能补全附带 AI 建议项（占位显示，方向键选中才真正调用模型）。
+    #[serde(default = "default_suggest_ai")]
+    pub suggest_ai: bool,
+    /// 安全粘贴：多行 / 危险内容粘贴前弹确认。
+    #[serde(default = "default_true")]
+    pub paste_confirm: bool,
+    /// 终端输出日志落盘（logs/ 目录，"可打印文本"模式）。对之后新建的
+    /// 终端会话生效。
+    #[serde(default)]
+    pub output_log: bool,
+    /// 终端字符编码（远端服务器的 locale 编码，如 "gbk"）。
+    ///
+    /// 输出方向由前端按此设置流式解码；输入方向由 `terminal_write` 转换
+    /// （本地终端 ConPTY 恒 UTF-8，不受影响）。默认 "utf-8" 不转码。
+    #[serde(default = "default_terminal_encoding")]
+    pub encoding: String,
 }
 
 /// 内嵌桌面客户端模式常量（终端页标签页打开，无需安装客户端）。
@@ -106,6 +131,12 @@ fn default_copy_on_select() -> bool {
 }
 fn default_enable_webgl() -> bool {
     true
+}
+fn default_suggest_history() -> bool {
+    false
+}
+fn default_suggest_ai() -> bool {
+    false
 }
 fn default_ssh_idle_timeout_minutes() -> u32 {
     30
@@ -163,6 +194,12 @@ impl Default for TerminalSettings {
             local_shell: default_local_shell(),
             desktop_clients: default_desktop_clients(),
             rdp_verify_cert: false,
+            download_dir: String::new(),
+            suggest_history: default_suggest_history(),
+            suggest_ai: default_suggest_ai(),
+            paste_confirm: default_true(),
+            output_log: false,
+            encoding: default_terminal_encoding(),
         }
     }
 }
@@ -251,6 +288,11 @@ pub struct SkillConfig {
 
 fn default_true() -> bool {
     true
+}
+
+/// 终端字符编码默认值（UTF-8，不转码）。
+fn default_terminal_encoding() -> String {
+    "utf-8".to_string()
 }
 
 /// AI 设置。

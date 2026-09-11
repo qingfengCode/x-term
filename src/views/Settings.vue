@@ -12,14 +12,16 @@ import { computed, h, onMounted, reactive, ref, watch } from "vue";
 import { onBeforeRouteLeave } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 import type { FormInstance, FormRules, TabsInstance } from "element-plus";
-import { Delete, Plus, Refresh, Folder, Setting, Download, Upload } from "@element-plus/icons-vue";
+import { Delete, Plus, Refresh, Folder, Setting, Download, Upload, FolderOpened } from "@element-plus/icons-vue";
 import HelpTip from "@/components/HelpTip.vue";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { setWorkspaceDir } from "@/api/ai";
 import * as backupApi from "@/api/backup";
 import type { BackupInfo } from "@/api/backup";
+import { openLogsDir } from "@/api/config";
 import { localTerminalShells } from "@/api/local";
 import type { LocalShellInfo } from "@/api/local";
+import { zmodemPickFolder } from "@/api/terminal";
 import { useSettingsStore } from "@/stores/settings";
 import { useUpdateStore } from "@/stores/update";
 import { useVaultStore } from "@/stores/vault";
@@ -154,11 +156,23 @@ function onRecordKeydown(e: KeyboardEvent) {
 
 /** 保存应用快捷键。 */
 /** 终端操作开关（快捷键 tab）：即时写回 store 并保存。 */
-function setTermOp(key: "copyOnSelect" | "rightClickPaste", v: boolean) {
+function setTermOp(
+  key: "copyOnSelect" | "rightClickPaste" | "suggestHistory" | "suggestAi" | "pasteConfirm",
+  v: boolean,
+) {
   settings.setTerminal({ [key]: v });
   void settings.save().catch(() => {
     /* 保存失败不阻断开关效果（内存已生效），下次保存会补写 */
   });
+}
+
+/** 打开终端输出日志目录。 */
+async function onOpenLogsDir() {
+  try {
+    await openLogsDir();
+  } catch (e) {
+    ElMessage.error("打开日志目录失败: " + String(e));
+  }
 }
 
 async function saveAppShortcuts() {
@@ -225,6 +239,16 @@ const fontOptions = computed(() => {
   }
   return [...FONT_PRESETS, { label: `自定义：${termForm.fontFamily}`, value: termForm.fontFamily }];
 });
+
+/** 终端字符编码选项（远端服务器 locale；输出前端解码 / 输入后端转码）。 */
+const ENCODING_OPTIONS: { label: string; value: string }[] = [
+  { label: "UTF-8（默认）", value: "utf-8" },
+  { label: "GBK（简体中文）", value: "gbk" },
+  { label: "GB18030（简体中文超集）", value: "gb18030" },
+  { label: "Big5（繁体中文）", value: "big5" },
+  { label: "Shift-JIS（日文）", value: "shift-jis" },
+  { label: "EUC-KR（韩文）", value: "euc-kr" },
+];
 
 // 添加/编辑 provider 弹窗
 const providerDialogVisible = ref(false);
@@ -509,6 +533,25 @@ function resetTerminal() {
   Object.assign(termForm, settings.terminal);
   termForm.desktopClients = { ...settings.terminal.desktopClients };
   toggleDarkClass(termForm.theme);
+}
+
+// 标题栏「下载」抽屉可直达修改默认下载目录（不走本表单）：表单值跟随同步，
+// 避免用户在设置页打开抽屉改了目录后点「应用」，旧快照把新值整体覆盖回空。
+watch(
+  () => settings.terminal.downloadDir,
+  (v) => {
+    termForm.downloadDir = v;
+  },
+);
+
+/** 选择默认下载目录（无父窗口原生目录框，规避光标消失问题）。 */
+async function pickZmodemDownloadDir() {
+  try {
+    const dir = await zmodemPickFolder("选择默认下载目录");
+    if (dir) termForm.downloadDir = dir;
+  } catch {
+    // 后端错误按取消处理
+  }
 }
 
 // --- 快捷命令 / 快捷键 ---------------------------------------------------
@@ -992,6 +1035,20 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
               <el-form-item label="启用WebGL">
                 <el-switch v-model="termForm.enableWebgl" />
               </el-form-item>
+
+              <el-form-item>
+                <template #label>
+                  <HelpTip content="把终端输出以可读文本记入 logs 目录（去除颜色码，进度条只留最终状态）。对之后新建的会话生效">
+                    输出日志
+                  </HelpTip>
+                </template>
+                <div class="output-log-row">
+                  <el-switch v-model="termForm.outputLog" />
+                  <el-button size="small" plain :icon="'FolderOpened'" @click="onOpenLogsDir">
+                    打开日志目录
+                  </el-button>
+                </div>
+              </el-form-item>
             </el-form>
           </div>
 
@@ -1035,6 +1092,20 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
                   controls-position="right"
                 />
                 <span class="unit-hint">秒</span>
+              </el-form-item>
+
+              <el-form-item>
+                <template #label>
+                  <HelpTip content="远端服务器的字符编码（对应其 locale）。连接 GBK 等老服务器出现乱码时切换；对已打开的终端实时生效（本地终端不受影响）">终端编码</HelpTip>
+                </template>
+                <el-select v-model="termForm.encoding" style="width: 220px">
+                  <el-option
+                    v-for="e in ENCODING_OPTIONS"
+                    :key="e.value"
+                    :label="e.label"
+                    :value="e.value"
+                  />
+                </el-select>
               </el-form-item>
 
               <el-form-item>
@@ -1084,6 +1155,25 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
                   <HelpTip content="程序内嵌连接时是否校验服务器证书链（严格模式用系统信任根验证）。默认关闭，与官方 mstsc 直连行为一致">RDP 证书校验</HelpTip>
                 </template>
                 <el-switch v-model="termForm.rdpVerifyCert" />
+              </el-form-item>
+
+              <el-form-item>
+                <template #label>
+                  <HelpTip content="下载的默认保存目录（终端 sz、SFTP、对象存储下载共用）。设置后下载不再弹保存对话框，直接落盘到该目录（同名文件自动加 (n) 后缀）；留空则每次下载时选择路径。下载记录可在标题栏的「下载」列表中查看">默认下载目录</HelpTip>
+                </template>
+                <div class="zmodem-dir-row">
+                  <el-input
+                    v-model="termForm.downloadDir"
+                    placeholder="留空 = 每次下载时选择路径"
+                    readonly
+                    clearable
+                  >
+                    <template #prefix>
+                      <el-icon><FolderOpened /></el-icon>
+                    </template>
+                  </el-input>
+                  <el-button :icon="FolderOpened" @click="pickZmodemDownloadDir">浏览</el-button>
+                </div>
               </el-form-item>
             </el-form>
           </div>
@@ -1260,6 +1350,39 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
                 @update:model-value="setTermOp('rightClickPaste', $event as boolean)"
               />
             </div>
+            <div class="term-op-row">
+              <div class="app-shortcut-info">
+                <div class="app-shortcut-label">粘贴保护</div>
+                <div class="app-shortcut-desc">
+                  粘贴多行内容或含高危命令（rm -rf、dd of=、mkfs 等）的文本时先弹窗确认，
+                  避免剪贴板里整段脚本被一次回车全部执行
+                </div>
+              </div>
+              <el-switch
+                :model-value="settings.terminal.pasteConfirm"
+                @update:model-value="setTermOp('pasteConfirm', $event as boolean)"
+              />
+            </div>
+            <div class="term-op-row">
+              <div class="app-shortcut-info">
+                <div class="app-shortcut-label">智能补全</div>
+                <div class="app-shortcut-desc">终端输入时按历史命令与快捷命令弹出建议；↑↓ 选择、Tab 采纳、Esc 关闭</div>
+              </div>
+              <el-switch
+                :model-value="settings.terminal.suggestHistory"
+                @update:model-value="setTermOp('suggestHistory', $event as boolean)"
+              />
+            </div>
+            <div class="term-op-row">
+              <div class="app-shortcut-info">
+                <div class="app-shortcut-label">补全附带 AI 建议</div>
+                <div class="app-shortcut-desc">建议列表底部追加 AI 补全项，方向键选中后才调用模型（需已配置 AI 模型）</div>
+              </div>
+              <el-switch
+                :model-value="settings.terminal.suggestAi"
+                @update:model-value="setTermOp('suggestAi', $event as boolean)"
+              />
+            </div>
           </div>
       </el-tab-pane>
 
@@ -1382,7 +1505,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
         <!-- SQL 智能体配置 -->
         <div class="form-card">
           <div class="card-title">
-            <HelpTip content="控制 AI 在 MySQL 上执行 SQL 的行为：执行模式与运行模式。">SQL 智能体（数据库语句执行）</HelpTip>
+            <HelpTip content="控制 AI 在数据库（MySQL / PostgreSQL）上执行 SQL 的行为：执行模式与运行模式。">SQL 智能体（数据库语句执行）</HelpTip>
           </div>
             <div class="switch-row">
               <div class="switch-label">
@@ -1920,6 +2043,13 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
 }
 
+/* 输出日志开关 + 打开目录按钮同行 */
+.output-log-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
 /* 多卡片网格布局（两列并排，窄屏回退单列）。AI 助手 Tab 复用同一网格。 */
 .card-grid,
 .ai-pane {
@@ -2084,6 +2214,17 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
   margin-left: 8px;
   color: var(--el-text-color-secondary);
   font-size: 13px;
+}
+
+/* ZMODEM 默认下载目录：路径输入 + 浏览按钮同行。 */
+.zmodem-dir-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+.zmodem-dir-row .el-input {
+  flex: 1;
 }
 
 /* 配色方案下拉项：名称 + 6 色预览点 */

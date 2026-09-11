@@ -1,10 +1,18 @@
 import { defineStore } from "pinia";
 import { computed, reactive, ref } from "vue";
 import * as dbApi from "@/api/db";
-import type { DbProfile } from "@/api/types";
+import type { DbKind, DbProfile } from "@/api/types";
+
+/** profile.kind 归一化：postgres 系 → postgres，sqlite 系 → sqlite，其余按 mysql。 */
+function normalizeKind(kind?: string | null): DbKind {
+  const v = (kind ?? "").toLowerCase();
+  if (v === "postgres" || v === "postgresql" || v === "pg") return "postgres";
+  if (v === "sqlite" || v === "sqlite3") return "sqlite";
+  return "mysql";
+}
 
 /**
- * MySQL 连接的多标签全局状态。
+ * 数据库连接（MySQL / PostgreSQL）的多标签全局状态。
  *
  * 与 [`useTerminalsStore`] 对称：每个标签 = 一个独立的后端连接（connId），
  * 标签绑定一个库（schema），SQL 控制台每个标签一个执行界面。
@@ -19,6 +27,8 @@ export interface DbTab {
   profileId: string;
   /** profile 展示名（标签标题兜底用）。 */
   profileName: string;
+  /** 数据库类型（mysql / postgres / sqlite，由 profile.kind 归一化；供提示符/方言使用）。 */
+  kind: DbKind;
   /**
    * 标签绑定的库（schema）。由用户在左侧表树点击库节点时自动 USE 并绑定；
    * `null` 表示未绑定（走连接 URL 的默认库）。标签内也可通过 `USE xxx`
@@ -42,6 +52,8 @@ export const useDbStore = defineStore("db", () => {
   const activeConnId = computed<string | null>(() => activeTab.value?.connId ?? null);
   /** 活动标签绑定的库（供 AiPanel 显示上下文 / 注入 system prompt）。 */
   const activeDatabase = computed<string | null>(() => activeTab.value?.database ?? null);
+  /** 活动标签的数据库类型（mysql / postgres，供提示词/编辑器方言选择）。 */
+  const activeKind = computed<DbKind>(() => activeTab.value?.kind ?? "mysql");
 
   /** 进行中的连接 promise：key=`${profileId}|${database ?? ""}`，并发打开同一标签时复用。 */
   const opening = new Map<string, Promise<string>>();
@@ -98,6 +110,7 @@ export const useDbStore = defineStore("db", () => {
       connId: null,
       profileId: profile.id,
       profileName: profile.name,
+      kind: normalizeKind(profile.kind),
       database,
       connecting: true,
       error: null,
@@ -126,7 +139,7 @@ export const useDbStore = defineStore("db", () => {
       const idx = tabs.value.indexOf(tab);
       if (idx >= 0) tabs.value.splice(idx, 1);
       // 连接已建立但绑定库（自动 USE）失败：必须断开后端连接，否则连接
-      // 留在 mysql_conns 里泄漏（反复点一个无权限的库会把连接池撑满）。
+      // 留在 db_conns 里泄漏（反复点一个无权限的库会把连接池撑满）。
       if (tab.connId) {
         try {
           await dbApi.dbDisconnect(tab.connId);
@@ -196,6 +209,7 @@ export const useDbStore = defineStore("db", () => {
     activeTab,
     activeConnId,
     activeDatabase,
+    activeKind,
     openTab,
     closeTab,
     setActive,

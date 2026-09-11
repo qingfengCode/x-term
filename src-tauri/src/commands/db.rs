@@ -1,20 +1,21 @@
-//! DB（MySQL）相关的 Tauri 命令。
+//! DB（MySQL / PostgreSQL）相关的 Tauri 命令。
 //!
 //! 命令一览：
 //! - [`db_list_profiles`] / [`db_save_profile`] / [`db_delete_profile`]：profile CRUD。
-//! - [`db_connect`]：按 profile 建立连接（直连或 SSH 隧道），返回 connId。
+//! - [`db_connect`]：按 profile 建立连接（按 kind 分发方言，直连或 SSH 隧道），
+//!   返回 connId。
 //! - [`db_disconnect`]：断开连接。
 //! - [`db_exec_sql`]：执行 SQL，结果通过 `db:query_result` 事件推送。
-//! - [`db_list_tables`]：列出表。
-//! - [`db_describe_table`]：表结构。
+//! - [`db_list_tables`] / [`db_list_databases`] / [`db_describe_table`] /
+//!   [`db_show_create_table`]：元数据（按方言生成 SQL，见
+//!   [`crate::database::DbConnHandle`]）。
 
-use std::sync::Arc;
 use std::time::Instant;
 
 use tauri::{AppHandle, State};
 
-use crate::database::mysql::{connect_direct, connect_via_ssh, MySqlConn};
 use crate::database::profiles::{list_db_profiles, upsert_db_profile, DbGroup, DbProfile};
+use crate::database::DbConnHandle;
 use crate::error::{AppError, AppResult};
 use crate::events::{emit, DbQueryResultEvent, DB_QUERY_RESULT};
 use crate::state::AppState;
@@ -70,22 +71,47 @@ pub fn db_delete_group(id: String, state: State<'_, AppState>) -> AppResult<()> 
 
 /// 建立数据库连接，返回 connId。
 ///
-/// 根据 profile 是否设置了 `ssh_session_config_id` 选择直连或 SSH 隧道。
-/// 建好的 [`MySqlConn`] 存入 `state.mysql_conns`。
+/// 按 profile.kind 分发到 MySQL / PostgreSQL 实现；根据 profile 是否设置了
+/// `ssh_session_config_id` 选择直连或 SSH 隧道。建好的 [`DbConnHandle`]
+/// 存入 `state.db_conns`。
 ///
 /// 同步的 SQLite 查询与 vault 解析放进 `spawn_blocking`：async 命令直接在
 /// tokio worker 线程上执行同步 IO，会话并发时会造成运行时抖动。
 #[tauri::command]
 pub async fn db_connect(profile_id: String, state: State<'_, AppState>) -> AppResult<String> {
-    // 1+2. 取 profile、解析 MySQL 密码（同步 IO → 阻塞线程池）。
+    // SQLite（本地文件）无需凭据，走独立分支：profile.host 即文件路径。
+    {
+        let sqlite_path = {
+            let conn = state.conn()?;
+            crate::database::profiles::get_db_profile(&conn, &profile_id)?
+                .filter(|p| crate::database::normalize_kind(&p.kind) == "sqlite")
+                .map(|p| p.host.clone())
+        };
+        if let Some(path) = sqlite_path {
+            if path.trim().is_empty() {
+                return Err(AppError::InvalidInput(
+                    "SQLite profile 的 host 字段需填数据库文件路径".into(),
+                ));
+            }
+            let conn_obj = DbConnHandle::Sqlite(std::sync::Arc::new(
+                crate::database::sqlite::SqliteConn::open(&path)?,
+            ));
+            let conn_id = uuid::Uuid::new_v4().to_string();
+            state.db_conns.lock().insert(conn_id.clone(), conn_obj);
+            log::info!("[db_connect] SQLite 已连接: {path}");
+            return Ok(conn_id);
+        }
+    }
+
+    // 1+2. 取 profile、解析数据库密码（同步 IO → 阻塞线程池）。
     let st = state.inner().clone();
-    let (profile, mysql_pass) = tokio::task::spawn_blocking(move || -> AppResult<_> {
+    let (profile, db_pass) = tokio::task::spawn_blocking(move || -> AppResult<_> {
         let profile = {
             let conn = st.conn()?;
             crate::database::profiles::get_db_profile(&conn, &profile_id)?
-                .ok_or_else(|| AppError::NotFound(format!("DB profile {} 不存在", profile_id)))?
+                .ok_or_else(|| AppError::NotFound(format!("DB profile {profile_id} 不存在")))?
         };
-        let mysql_pass = {
+        let db_pass = {
             let cred_id = profile
                 .credential_id
                 .as_ref()
@@ -97,95 +123,130 @@ pub async fn db_connect(profile_id: String, state: State<'_, AppState>) -> AppRe
                 .clone();
             drop(vault_guard);
             let conn = st.conn()?;
-            crate::database::mysql::fetch_mysql_password(&conn, cred_id, &vault)?
+            crate::database::fetch_db_password(&conn, cred_id, &vault)?
         };
-        Ok((profile, mysql_pass))
+        Ok((profile, db_pass))
     })
     .await
     .map_err(|e| AppError::Storage(format!("后台任务失败: {}", e)))??;
 
-    // 3. 建立连接。
-    let conn_obj: MySqlConn = if let Some(ssh_id) = &profile.ssh_session_config_id {
-        // SSH 隧道模式。
-        let ssh_config = {
-            let conn = state.conn()?;
-            get_session(&conn, ssh_id)?
-                .ok_or_else(|| AppError::NotFound(format!("SSH 会话 {} 不存在", ssh_id)))?
-        };
-        // 解析 SSH 凭据。
-        let resolved = {
-            let vault_guard = state.vault_read()?;
-            let vault = vault_guard
-                .as_ref()
-                .ok_or_else(|| AppError::Auth("保险库未解锁".to_string()))?
-                .clone();
-            drop(vault_guard);
-            let conn = state.conn()?;
-            crate::ssh::session::resolve_credential(&ssh_config, &vault, &conn)?
-        };
-
-        connect_via_ssh(
-            &ssh_config,
-            resolved,
-            &profile.host,
-            profile.port,
-            &profile.username,
-            &mysql_pass,
-            profile.default_database.as_deref(),
-            state.inner().clone(),
-        )
-        .await?
-    } else {
-        // 直连。
-        connect_direct(
-            &profile.host,
-            profile.port,
-            &profile.username,
-            &mysql_pass,
-            profile.default_database.as_deref(),
-        )
-        .await?
+    // 3. 建立连接（SSH 隧道参数在两种方言下共用，仅建连函数不同）。
+    let conn_obj: DbConnHandle = match crate::database::normalize_kind(&profile.kind) {
+        "postgres" => {
+            let pg = if let Some(ssh_id) = &profile.ssh_session_config_id {
+                let (ssh_config, resolved) = resolve_ssh(&state, ssh_id)?;
+                crate::database::postgres::connect_via_ssh(
+                    &ssh_config,
+                    resolved,
+                    &profile.host,
+                    profile.port,
+                    &profile.username,
+                    &db_pass,
+                    profile.default_database.as_deref(),
+                    state.inner().clone(),
+                )
+                .await?
+            } else {
+                crate::database::postgres::connect_direct(
+                    &profile.host,
+                    profile.port,
+                    &profile.username,
+                    &db_pass,
+                    profile.default_database.as_deref(),
+                )
+                .await?
+            };
+            DbConnHandle::Postgres(std::sync::Arc::new(pg))
+        }
+        _ => {
+            let my = if let Some(ssh_id) = &profile.ssh_session_config_id {
+                let (ssh_config, resolved) = resolve_ssh(&state, ssh_id)?;
+                crate::database::mysql::connect_via_ssh(
+                    &ssh_config,
+                    resolved,
+                    &profile.host,
+                    profile.port,
+                    &profile.username,
+                    &db_pass,
+                    profile.default_database.as_deref(),
+                    state.inner().clone(),
+                )
+                .await?
+            } else {
+                crate::database::mysql::connect_direct(
+                    &profile.host,
+                    profile.port,
+                    &profile.username,
+                    &db_pass,
+                    profile.default_database.as_deref(),
+                )
+                .await?
+            };
+            DbConnHandle::MySql(std::sync::Arc::new(my))
+        }
     };
 
     // 4. 登记。
     let conn_id = uuid::Uuid::new_v4().to_string();
-    state.mysql_conns.lock().insert(conn_id.clone(), Arc::new(conn_obj));
+    state.db_conns.lock().insert(conn_id.clone(), conn_obj);
 
     Ok(conn_id)
+}
+
+/// 解析 SSH 隧道所需的会话配置与凭据（MySQL / PG 共用）。
+fn resolve_ssh(
+    state: &State<'_, AppState>,
+    ssh_id: &str,
+) -> AppResult<(crate::storage::sessions_repo::Session, crate::ssh::session::ResolvedCredential)> {
+    let ssh_config = {
+        let conn = state.conn()?;
+        get_session(&conn, ssh_id)?
+            .ok_or_else(|| AppError::NotFound(format!("SSH 会话 {ssh_id} 不存在")))?
+    };
+    let resolved = {
+        let vault_guard = state.vault_read()?;
+        let vault = vault_guard
+            .as_ref()
+            .ok_or_else(|| AppError::Auth("保险库未解锁".to_string()))?
+            .clone();
+        drop(vault_guard);
+        let conn = state.conn()?;
+        crate::ssh::session::resolve_credential(&ssh_config, &vault, &conn)?
+    };
+    Ok((ssh_config, resolved))
 }
 
 /// 断开连接。
 #[tauri::command]
 pub async fn db_disconnect(conn_id: String, state: State<'_, AppState>) -> AppResult<()> {
     let conn_obj = state
-        .mysql_conns
+        .db_conns
         .lock()
         .remove(&conn_id)
-        .ok_or_else(|| AppError::NotFound(format!("DB 连接 {} 不存在", conn_id)))?;
+        .ok_or_else(|| AppError::NotFound(format!("DB 连接 {conn_id} 不存在")))?;
     conn_obj.close().await;
     Ok(())
 }
 
 /// 切换连接的当前库（schema）。前端点库节点 / 新建库标签时调用。
 ///
-/// 之后该连接上的所有查询都会自动带 `USE \`db\``（见 [`MySqlConn::execute`]），
-/// SQL 里无需再写库前缀。传 `None` 清除（回落到连接 URL 里的默认库）。
+/// MySQL：记录 current_db，之后该连接上的所有查询都自动带
+/// `USE \`db\``（见 [`crate::database::mysql::MySqlConn::execute`]）。
+/// PostgreSQL：换库重连（pool 替换，见 [`crate::database::postgres::PgConn::use_database`]）。
+/// 传 `None` 清除（回落到 profile 的默认库）。
 #[tauri::command]
 pub async fn db_use_database(
     conn_id: String,
     database: Option<String>,
     state: State<'_, AppState>,
 ) -> AppResult<()> {
-    if let Some(db) = &database {
-        crate::database::mysql::validate_database_identifier(db)?;
-    }
     let conn_obj = state
-        .mysql_conns
+        .db_conns
         .lock()
         .get(&conn_id)
         .cloned()
-        .ok_or_else(|| AppError::NotFound(format!("DB 连接 {} 不存在", conn_id)))?;
-    conn_obj.set_current_db(database);
+        .ok_or_else(|| AppError::NotFound(format!("DB 连接 {conn_id} 不存在")))?;
+    conn_obj.use_database(database.as_deref()).await?;
     Ok(())
 }
 
@@ -197,11 +258,14 @@ pub async fn db_use_database(
 /// 形式绕过，必须由后端按实际收到的 SQL 复核）。
 ///
 /// 逐条检查输入里的每条非空语句：必须通过 [`crate::ai::tools::is_readonly_sql`]
-/// （SELECT/SHOW/EXPLAIN/DESCRIBE/DESC，WITH 引导的 CTE 由 sql_first_keyword
-/// 解析成主语句关键字后再判定），并拒绝 `SELECT ... INTO OUTFILE/DUMPFILE`
-/// （会在服务器文件系统上写文件）。违反任一即返回错误。
+/// （SELECT/SHOW/EXPLAIN/DESCRIBE/DESC/TABLE/VALUES，WITH 引导的 CTE 由
+/// sql_first_keyword 解析成主语句关键字后再判定），并拒绝
+/// `SELECT ... INTO OUTFILE/DUMPFILE`（会在服务器文件系统上写文件）。
+/// 违反任一即返回错误。
 fn enforce_read_only(sql: &str) -> AppResult<()> {
-    for stmt in sql.split(';') {
+    // 引号感知切分：字符串字面量内的分号不是语句边界（裸 split(';') 会把
+    // `WHERE c='a;b'` 的残段 `b'` 切出来，首关键字判定必失败、误拒合法查询）。
+    for stmt in crate::database::script_split::top_level_fragments(sql) {
         let s = stmt.trim();
         if s.is_empty() {
             continue;
@@ -246,22 +310,20 @@ pub async fn db_exec_sql(
         if sql.chars().count() > 200 { "…" } else { "" }
     );
 
-    // USE 语句拦截：pool 语义下直接执行 USE 只对单条连接生效，必须由本层记录
-    // 当前库，并在每次查询前自动带上（见 MySqlConn::execute 的 db 参数）。
+    // 取出 conn 句柄（enum 克隆，不持有锁跨 await）；db_conns 的值可克隆，
+    // 多个命令可并发操作同一连接，不会互相 remove/insert 竞争。
+    let conn_obj = state
+        .db_conns
+        .lock()
+        .get(&conn_id)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(format!("DB 连接 {conn_id} 不存在")))?;
+
+    // USE 语句拦截：pool 语义下直接执行 USE 只对单条连接生效（MySQL），
+    // PG 则没有 USE 语句——统一由本层处理：MySQL 记录当前库、PG 换库重连
+    // （见 DbConnHandle::use_database），语句本身不再发给数据库。
     if let Some(use_db) = crate::database::mysql::parse_use_statement(&sql) {
-        let set_res: AppResult<()> = (|| {
-            if let Some(db) = &use_db {
-                crate::database::mysql::validate_database_identifier(db)?;
-            }
-            let conn_obj = state
-                .mysql_conns
-                .lock()
-                .get(&conn_id)
-                .cloned()
-                .ok_or_else(|| AppError::NotFound(format!("DB 连接 {} 不存在", conn_id)))?;
-            conn_obj.set_current_db(use_db.clone());
-            Ok(())
-        })();
+        let set_res = conn_obj.use_database(use_db.as_deref()).await;
         let event = match set_res {
             Ok(()) => {
                 log::info!(
@@ -292,7 +354,7 @@ pub async fn db_exec_sql(
         return Ok(());
     }
 
-    // 只读模式强制校验：USE 放行（纯切库无副作用），其余语句逐条复核。
+    // 只读模式强制校验：USE 已放行（纯切库无副作用），其余语句逐条复核。
     if read_only {
         if let Err(e) = enforce_read_only(&sql) {
             log::info!("[db_exec_sql] 只读模式拦截: query_id={}, {}", query_id, e);
@@ -310,20 +372,11 @@ pub async fn db_exec_sql(
         }
     }
 
-    // 取出 conn 句柄（Arc 克隆，不持有锁跨 await）；mysql_conns 的值是
-    // Arc<MySqlConn>，多个命令可并发操作同一连接，不会互相 remove/insert 竞争。
-    let conn_obj = state
-        .mysql_conns
-        .lock()
-        .get(&conn_id)
-        .cloned()
-        .ok_or_else(|| AppError::NotFound(format!("DB 连接 {} 不存在", conn_id)))?;
     log::info!("[db_exec_sql] 取出 conn 成功，开始执行");
 
     let start = Instant::now();
-    // 带当前库执行：连接上的每条查询都先 USE，保证落在当前库上。
-    let cur_db = conn_obj.current_db();
-    let res = conn_obj.execute(&sql, 1000, cur_db.as_deref()).await;
+    // MySQL 自动带当前库执行（每条查询前 USE）；PG 的库在连接层已确定。
+    let res = conn_obj.execute(&sql, 1000).await;
     let elapsed_ms = start.elapsed().as_millis() as u64;
     log::info!(
         "[db_exec_sql] 执行完成, 耗时 {}ms, 结果: {}",
@@ -360,9 +413,7 @@ pub async fn db_exec_sql(
 // 辅助查询
 // ===========================================================================
 
-/// 列出表（`SHOW TABLES`，可选指定库 `SHOW TABLES FROM <database>`）。
-///
-/// `database` 为 None 时列当前库的表（兼容旧行为）；Some 时列指定库。
+/// 列出表（可选指定库；方言差异由 [`DbConnHandle::list_tables`] 处理）。
 #[tauri::command]
 pub async fn db_list_tables(
     conn_id: String,
@@ -370,82 +421,51 @@ pub async fn db_list_tables(
     state: State<'_, AppState>,
 ) -> AppResult<Vec<String>> {
     let conn_obj = state
-        .mysql_conns
+        .db_conns
         .lock()
         .get(&conn_id)
         .cloned()
-        .ok_or_else(|| AppError::NotFound(format!("DB 连接 {} 不存在", conn_id)))?;
-
-    // 构造 SQL：指定库时用 SHOW TABLES FROM <db>。库名走统一白名单校验
-    // （与 db_use_database / db_show_create_table 一致，黑名单易随修改失效）。
-    let sql = match &database {
-        Some(db) => {
-            crate::database::mysql::validate_database_identifier(db)?;
-            format!("SHOW TABLES FROM `{}`", db)
-        }
-        None => "SHOW TABLES".into(),
-    };
-    // 未指定库时按连接当前库执行（USE 自动带上，SHOW TABLES 即当前库的表）。
-    let cur_db = conn_obj.current_db();
-    let res = conn_obj.execute(&sql, 10_000, cur_db.as_deref()).await;
-
-    let qr = res?;
-    // SHOW TABLES 只有一列：表名。
-    let tables: Vec<String> = qr.rows.into_iter().filter_map(|mut r| r.pop()).collect();
-    Ok(tables)
+        .ok_or_else(|| AppError::NotFound(format!("DB 连接 {conn_id} 不存在")))?;
+    conn_obj.list_tables(database.as_deref()).await
 }
 
-/// 列出服务器上所有可访问的数据库（`SHOW DATABASES`）。
+/// 列出服务器上所有可访问的数据库。
 #[tauri::command]
 pub async fn db_list_databases(
     conn_id: String,
     state: State<'_, AppState>,
 ) -> AppResult<Vec<String>> {
     let conn_obj = state
-        .mysql_conns
+        .db_conns
         .lock()
         .get(&conn_id)
         .cloned()
-        .ok_or_else(|| AppError::NotFound(format!("DB 连接 {} 不存在", conn_id)))?;
-
-    let res = conn_obj.execute("SHOW DATABASES", 1_000, None).await;
-
-    let qr = res?;
-    let dbs: Vec<String> = qr.rows.into_iter().filter_map(|mut r| r.pop()).collect();
-    Ok(dbs)
+        .ok_or_else(|| AppError::NotFound(format!("DB 连接 {conn_id} 不存在")))?;
+    conn_obj.list_databases().await
 }
 
-/// 表结构（`DESCRIBE <table>`）。
+/// 表结构（方言差异由 [`DbConnHandle::describe_table`] 处理）。
 ///
-/// `table` 支持 `db.table` 限定名或仅 `table`；标识符校验与限定名拼接由
-/// [`crate::database::mysql::qualify_table_identifier`] 统一处理。
+/// `table` 支持 `db.table`（PG 为 `schema.table`）限定名或仅 `table`。
 #[tauri::command]
 pub async fn db_describe_table(
     conn_id: String,
     table: String,
     state: State<'_, AppState>,
-) -> AppResult<crate::database::mysql::QueryResult> {
-    let qualified = crate::database::mysql::qualify_table_identifier(&table)?;
-    let sql = format!("DESCRIBE {qualified}");
-
+) -> AppResult<crate::database::QueryResult> {
     let conn_obj = state
-        .mysql_conns
+        .db_conns
         .lock()
         .get(&conn_id)
         .cloned()
-        .ok_or_else(|| AppError::NotFound(format!("DB 连接 {} 不存在", conn_id)))?;
-
-    // 未限定库名的 DESCRIBE（`DESCRIBE \`table\``）按连接当前库执行。
-    let cur_db = conn_obj.current_db();
-    let res = conn_obj.execute(&sql, 1000, cur_db.as_deref()).await;
-
-    res
+        .ok_or_else(|| AppError::NotFound(format!("DB 连接 {conn_id} 不存在")))?;
+    conn_obj.describe_table(&table).await
 }
 
-/// 获取表的 `SHOW CREATE TABLE` 语句（用于 AI 拖表附加表结构上下文）。
+/// 获取建表 DDL（用于 AI 拖表附加表结构上下文）。
 ///
-/// 返回 DDL 文本（从结果集第一行第二列提取，MySQL 该语句返回
-/// `['Table', 'Create Table']` 两列）。
+/// MySQL 为 `SHOW CREATE TABLE` 原文；PG 由 pg_catalog 生成近似 DDL
+/// （见 [`DbConnHandle::table_ddl`]）。
 #[tauri::command]
 pub async fn db_show_create_table(
     conn_id: String,
@@ -453,38 +473,147 @@ pub async fn db_show_create_table(
     table: String,
     state: State<'_, AppState>,
 ) -> AppResult<String> {
-    // 严格的标识符白名单校验：字母、数字、下划线、点、$。
-    // 注意：禁空白/分号/注释/反引号；库名表名都用反引号包裹后拼接。
-    let ident_re = regex::Regex::new(r"^[A-Za-z0-9_.$]+$").unwrap();
-    if !ident_re.is_match(&table) {
-        return Err(AppError::InvalidInput(format!("非法表名: {}", table)));
-    }
-    if let Some(db) = &database {
-        if !ident_re.is_match(db) {
-            return Err(AppError::InvalidInput(format!("非法库名: {}", db)));
-        }
-    }
-    let qualified = match &database {
-        Some(db) => format!("`{}`.`{}`", db, table),
-        None => format!("`{}`", table),
-    };
-    let sql = format!("SHOW CREATE TABLE {}", qualified);
-
     let conn_obj = state
-        .mysql_conns
+        .db_conns
         .lock()
         .get(&conn_id)
         .cloned()
-        .ok_or_else(|| AppError::NotFound(format!("DB 连接 {} 不存在", conn_id)))?;
+        .ok_or_else(|| AppError::NotFound(format!("DB 连接 {conn_id} 不存在")))?;
+    conn_obj.table_ddl(database.as_deref(), &table).await
+}
 
-    // 未限定库名时按连接当前库执行。
-    let cur_db = conn_obj.current_db();
-    let res = conn_obj.execute(&sql, 1, cur_db.as_deref()).await;
+// ===========================================================================
+// 多厂商扩展（P1）：能力开关 / 浏览模式分页 SQL / 脚本执行
+// ===========================================================================
 
-    let result = res?;
-    // SHOW CREATE TABLE 返回一行两列：[表名, DDL 文本]。
-    if result.rows.is_empty() || result.rows[0].len() < 2 {
-        return Ok(format!("-- 无法获取 {} 的建表语句", qualified));
+/// 连接的方言能力（前端 UI 显隐的单一事实来源）。
+#[tauri::command]
+pub fn db_capabilities(
+    conn_id: String,
+    state: State<'_, AppState>,
+) -> AppResult<crate::database::DbCapabilities> {
+    let caps = {
+        let conns = state.db_conns.lock();
+        let conn_obj = conns
+            .get(&conn_id)
+            .ok_or_else(|| AppError::NotFound(format!("DB 连接 {conn_id} 不存在")))?;
+        conn_obj.capabilities().clone()
+    };
+    Ok(caps)
+}
+
+/// 生成"浏览模式"的分页 SELECT（只生成文本，前端放进编辑器执行）。
+///
+/// 点表浏览数据 / 翻页时调用：方言分页差异（LIMIT/OFFSET vs FETCH vs TOP）
+/// 收敛在后端，前端 UI 完全不感知方言。
+#[tauri::command]
+pub fn db_default_table_query(
+    conn_id: String,
+    table: String,
+    limit: u32,
+    offset: u32,
+    state: State<'_, AppState>,
+) -> AppResult<String> {
+    let sql = {
+        let conns = state.db_conns.lock();
+        let conn_obj = conns
+            .get(&conn_id)
+            .ok_or_else(|| AppError::NotFound(format!("DB 连接 {conn_id} 不存在")))?;
+        conn_obj.default_table_query(&table, limit, offset)?
+    };
+    Ok(sql)
+}
+
+/// 一条脚本语句的执行结果（脚本模式）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScriptStmtResult {
+    pub line: u32,
+    /// 语句前 200 字符（失败定位展示）。
+    pub sql_preview: String,
+    pub affected: u64,
+    /// 出错时的错误信息；None = 成功。
+    pub error: Option<String>,
+}
+
+/// 按方言切分 SQL 脚本并逐条执行（首错即停）。
+///
+/// 切分器见 [`crate::database::script_split`]（字符串/注释/MySQL DELIMITER/
+/// PG dollar-quoting/SQL Server GO）。同步返回每条结果；失败条目带行号。
+#[tauri::command]
+pub async fn db_execute_script(
+    conn_id: String,
+    script: String,
+    read_only: bool,
+    state: State<'_, AppState>,
+) -> AppResult<Vec<ScriptStmtResult>> {
+    let conn_obj = state
+        .db_conns
+        .lock()
+        .get(&conn_id)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(format!("DB 连接 {conn_id} 不存在")))?;
+
+    let kind = conn_obj.kind();
+    let stmts = crate::database::script_split::split_sql_script(&script, kind);
+    let mut out = Vec::with_capacity(stmts.len());
+    for stmt in stmts {
+        // USE 拦截（与 db_exec_sql 一致）：MySQL 预处理协议执行 USE 必报 1295，
+        // 且只读模式下 USE 属纯切库无副作用，先行放行由句柄层统一处理。
+        if let Some(use_db) = crate::database::mysql::parse_use_statement(&stmt.sql) {
+            let res = conn_obj.use_database(use_db.as_deref()).await;
+            let err = res.err().map(|e| e.to_string());
+            out.push(ScriptStmtResult {
+                line: stmt.line,
+                sql_preview: preview(&stmt.sql),
+                affected: 0,
+                error: err,
+            });
+            if out.last().and_then(|r| r.error.as_ref()).is_some() {
+                // 切库失败同样首错即停。
+                break;
+            }
+            continue;
+        }
+        // 只读校验（与 db_exec_sql 同一规则）。
+        if read_only {
+            if let Err(e) = enforce_read_only(&stmt.sql) {
+                out.push(ScriptStmtResult {
+                    line: stmt.line,
+                    sql_preview: preview(&stmt.sql),
+                    affected: 0,
+                    error: Some(e.to_string()),
+                });
+                break;
+            }
+        }
+        match conn_obj.execute(&stmt.sql, 1000).await {
+            Ok(qr) => out.push(ScriptStmtResult {
+                line: stmt.line,
+                sql_preview: preview(&stmt.sql),
+                affected: qr.affected,
+                error: None,
+            }),
+            Err(e) => {
+                out.push(ScriptStmtResult {
+                    line: stmt.line,
+                    sql_preview: preview(&stmt.sql),
+                    affected: 0,
+                    error: Some(e.to_string()),
+                });
+                // 首错即停（与 uniterm ExecuteScript 语义一致）。
+                break;
+            }
+        }
     }
-    Ok(result.rows[0][1].clone())
+    Ok(out)
+}
+
+/// 语句预览（前 200 字符）。
+fn preview(sql: &str) -> String {
+    let mut p: String = sql.chars().take(200).collect();
+    if sql.chars().count() > 200 {
+        p.push('…');
+    }
+    p
 }

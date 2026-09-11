@@ -8,15 +8,30 @@
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useUpdateStore } from "@/stores/update";
+import { useTransferStore } from "@/stores/transfer";
+import DownloadDrawer from "@/components/DownloadDrawer.vue";
 
 const emit = defineEmits<{ about: [] }>();
 
 const appWindow = getCurrentWindow();
 const updater = useUpdateStore();
+const transfer = useTransferStore();
 
 /** 是否存在可用新版本（关于按钮上的红点提示；含下载中/已下载态）。 */
 const hasUpdate = computed(() =>
   ["update-available", "downloading", "downloaded"].includes(updater.status),
+);
+
+// --- 下载列表（ZMODEM sz / SFTP 下载记录） ----------------------------------
+// 呼出按钮放在「关于」左侧：属于全局工具入口，与窗口级动作同排更符合预期
+// （原先在左侧导航栏顶部，与页面导航语义混在一起）。
+const downloadVisible = ref(false);
+/** 进行中的下载数（badge 提示；含 ZMODEM 与 SFTP）。 */
+const runningDownloads = computed(
+  () =>
+    transfer.tasks.filter(
+      (t) => t.direction === "download" && (t.status === "running" || t.status === "pending"),
+    ).length,
 );
 
 /** 当前是否最大化（控制按钮切换 最大化/还原 图标与提示）。 */
@@ -62,6 +77,17 @@ onBeforeUnmount(() => unlisten?.());
     <!-- 中部拖拽区（双击最大化/还原由 Tauri 拖拽区内置行为处理） -->
     <div class="drag-region" data-tauri-drag-region />
 
+    <!-- 下载列表入口（在「关于」左侧；进行中下载数用 badge 提示） -->
+    <button
+      class="tb-btn download-btn"
+      title="下载列表（ZMODEM / SFTP 下载记录）"
+      @click="downloadVisible = true"
+    >
+      <el-badge :value="runningDownloads" :hidden="runningDownloads === 0" :max="99">
+        <el-icon><Download /></el-icon>
+      </el-badge>
+    </button>
+
     <!-- 关于入口（有新版本时红点提示） -->
     <button
       class="tb-btn about-btn"
@@ -90,6 +116,9 @@ onBeforeUnmount(() => unlisten?.());
         <el-icon><Close /></el-icon>
       </button>
     </div>
+
+    <!-- 全局下载列表抽屉（append-to-body，挂在标题栏内以复用其呼出按钮状态） -->
+    <DownloadDrawer v-model:visible="downloadVisible" />
   </div>
 </template>
 
@@ -139,15 +168,14 @@ onBeforeUnmount(() => unlisten?.());
   height: 100%;
 }
 
-/* --- 关于按钮（窗口控制左侧，圆角小按钮） --- */
-.about-btn {
+/* --- 标题栏小按钮（下载 / 关于；位于窗口控制左侧） --- */
+.tb-btn {
   position: relative;
   display: flex;
   align-items: center;
   justify-content: center;
   width: 32px;
   height: 26px;
-  margin-right: 10px;
   border: none;
   border-radius: 6px;
   background: transparent;
@@ -157,13 +185,30 @@ onBeforeUnmount(() => unlisten?.());
   flex-shrink: 0;
   transition: background-color 0.12s ease, color 0.12s ease;
 }
-.about-btn .el-icon {
+.tb-btn .el-icon {
   font-size: 16px;
 }
-.about-btn:hover {
+.tb-btn:hover {
   background: var(--el-fill-color);
   color: var(--el-color-primary);
 }
+.tb-btn:active {
+  background: var(--el-fill-color-dark);
+}
+/* 关于按钮：与窗口控制之间留出间距；下载按钮紧邻其左侧 */
+.about-btn {
+  margin-right: 10px;
+}
+.download-btn {
+  margin-right: 2px;
+}
+/* 下载 badge：与图标居中对齐（badge 自带右上偏移，容器改为 inline-flex 防撑高） */
+.download-btn :deep(.el-badge) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
 /* 有新版本时的红点（带底色描边，避免与背景融为一体） */
 .update-dot {
   position: absolute;

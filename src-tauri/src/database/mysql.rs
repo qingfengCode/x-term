@@ -14,26 +14,20 @@
 //!
 //! 为避免 SSH 上开太多 channel，pool 大小限制为 2。
 
-use serde::{Deserialize, Serialize};
 use sqlx::mysql::types::MySqlTime;
 use sqlx::mysql::{MySqlPoolOptions, MySqlRow};
 use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use sqlx::types::{Decimal, JsonValue};
 use sqlx::{Column, Connection, MySqlPool, Row};
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::copy_bidirectional;
-use tokio::net::TcpListener;
-
-use russh::client::Handle;
 
 use crate::error::{AppError, AppResult};
-use crate::ssh::client::ClientHandler;
 use crate::ssh::session::ResolvedCredential;
 use crate::state::AppState;
-use crate::storage::db::DbConn;
-use crate::storage::secure::CredentialVault;
 use crate::storage::sessions_repo::Session;
+
+pub use super::QueryResult;
+use super::url_encode_component;
 
 // ===========================================================================
 // 标识符解析
@@ -122,7 +116,8 @@ pub fn parse_use_statement(sql: &str) -> Option<Option<String>> {
     if !kw.eq_ignore_ascii_case("USE") {
         return None;
     }
-    // 库名 token：到空白或分号为止，去掉可能包裹的反引号。
+    // 库名 token：到空白或分号为止，去掉可能包裹的反引号（MySQL）或
+    // 双引号（PostgreSQL `USE "db"` 习惯写法；本函数为两方言共用的拦截器）。
     let mut end = 0;
     for (i, c) in rest.char_indices() {
         if c.is_whitespace() || c == ';' {
@@ -131,7 +126,9 @@ pub fn parse_use_statement(sql: &str) -> Option<Option<String>> {
         }
         end = i + c.len_utf8();
     }
-    let name = rest[..end].trim_matches('`').to_string();
+    let name = rest[..end]
+        .trim_matches(|c| c == '`' || c == '"')
+        .to_string();
     if name.is_empty() {
         return Some(None); // `USE` 后没有库名：语法错误，由上层报错
     }
@@ -278,22 +275,6 @@ impl MySqlConn {
     }
 }
 
-/// 查询结果（命令返回 / 事件 payload 共用）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct QueryResult {
-    pub columns: Vec<String>,
-    /// 每行每列的值已 `to_string`；BLOB 等无法 decode 为 String 的列填 `"<binary>"`。
-    pub rows: Vec<Vec<String>>,
-    /// 非 SELECT 语句的影响行数（SELECT 为返回的行数）。
-    pub affected: u64,
-    /// 结果是否被 limit 截断（查询实际返回超过 limit 行时置 true）。
-    ///
-    /// `serde(default)` 保证旧前端/旧数据缺字段也能解析。
-    #[serde(default)]
-    pub truncated: bool,
-}
-
 // ===========================================================================
 // 连接
 // ===========================================================================
@@ -336,7 +317,8 @@ pub async fn connect_direct(
 /// 流程：
 /// 1. 用 `ssh_session_config` 建立 SSH 连接（凭据由 `resolved_credential` 提供）。
 /// 2. 在 `127.0.0.1:0` 起本地 listener，对每条入站 TCP 连接开一个新的
-///    `channel_open_direct_tcpip(mysql_host, mysql_port)`，spawn 双向桥接。
+///    `channel_open_direct_tcpip(mysql_host, mysql_port)`，spawn 双向桥接
+///    （见 [`super::open_ssh_tunnel`]）。
 /// 3. sqlx 连本地 listener 的随机端口。
 ///
 /// `state` 用于 SSH 事件 handler、日志与二次认证挑战注册。
@@ -351,71 +333,10 @@ pub async fn connect_via_ssh(
     mysql_db: Option<&str>,
     state: AppState,
 ) -> AppResult<MySqlConn> {
-    // 1. 建立 SSH 连接。
-    let handle = crate::ssh::client::connect_direct(
-        &ssh_session_config.host,
-        ssh_session_config.port,
-        &ssh_session_config.username,
-        &ssh_session_config.id,
-        resolved_credential.auth_method,
-        state,
-    )
-    .await?;
-
-    // 2. 本地随机端口 listener。
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .map_err(|e| AppError::Ssh(format!("绑定本地隧道监听失败: {}", e)))?;
-    let local_port = listener
-        .local_addr()
-        .map_err(|e| AppError::Ssh(format!("获取本地端口失败: {}", e)))?
-        .port();
-
-    // handle 未实现 Clone，包成 Arc，accept 循环里每条入站连接克隆一份。
-    let handle_arc: Arc<Handle<ClientHandler>> = Arc::new(handle);
-    let remote_host = mysql_host.to_string();
-    let remote_port = mysql_port as u32;
-
-    let tunnel_handle = tokio::spawn(async move {
-        loop {
-            let accept = listener.accept().await;
-            let (mut tcp, peer) = match accept {
-                Ok(v) => v,
-                Err(e) => {
-                    log::warn!("MySQL 隧道 accept 失败: {}", e);
-                    continue;
-                }
-            };
-
-            let handle = handle_arc.clone();
-            let remote_host = remote_host.clone();
-            tokio::spawn(async move {
-                let origin_host = peer.ip().to_string();
-                let origin_port = peer.port() as u32;
-
-                let channel = match handle
-                    .channel_open_direct_tcpip(
-                        remote_host.clone(),
-                        remote_port,
-                        origin_host,
-                        origin_port,
-                    )
-                    .await
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        log::warn!("MySQL 隧道 channel_open_direct_tcpip 失败: {}", e);
-                        return;
-                    }
-                };
-
-                let mut stream = channel.into_stream();
-                if let Err(e) = copy_bidirectional(&mut tcp, &mut stream).await {
-                    log::warn!("MySQL 隧道桥接出错: {}", e);
-                }
-            });
-        }
-    });
+    // 1+2. 建立 SSH 连接并在本地随机端口起桥接 listener。
+    let (tunnel_handle, local_port) =
+        super::open_ssh_tunnel(ssh_session_config, resolved_credential, mysql_host, mysql_port, state)
+            .await?;
 
     // 3. sqlx 连本地端口。
     let url = build_mysql_url("127.0.0.1", local_port, mysql_user, mysql_pass, mysql_db);
@@ -449,48 +370,6 @@ pub async fn connect_via_ssh(
         _tunnel_handle: Some(tunnel_handle),
         current_db: parking_lot::Mutex::new(mysql_db.map(|s| s.to_string())),
     })
-}
-
-// ===========================================================================
-// 凭据解析
-// ===========================================================================
-
-/// `credentials.enc_data` 解密后的明文 JSON 结构（mysql_password 用）。
-#[derive(Debug, Deserialize)]
-struct MysqlCredentialData {
-    kind: String,
-    value: String,
-}
-
-/// 从 `credentials` 表取出指定 id 的加密 blob，解密并解析为 MySQL 密码。
-///
-/// 约定凭据 JSON 形如 `{"kind":"mysql_password","value":"<密码>"}`。
-pub fn fetch_mysql_password(
-    conn: &DbConn,
-    cred_id: &str,
-    vault: &CredentialVault,
-) -> AppResult<String> {
-    let enc_data: String = match conn.query_row(
-        "SELECT enc_data FROM credentials WHERE id = ?1",
-        rusqlite::params![cred_id],
-        |r| r.get::<_, String>(0),
-    ) {
-        Ok(s) => s,
-        Err(rusqlite::Error::QueryReturnedNoRows) => {
-            return Err(AppError::NotFound(format!("凭据 {} 不存在", cred_id)));
-        }
-        Err(e) => return Err(e.into()),
-    };
-    let blob = CredentialVault::decode_blob(&enc_data)?;
-    let plain = vault.decrypt_str(&blob)?;
-    let data: MysqlCredentialData = serde_json::from_str(&plain)?;
-    if data.kind != "mysql_password" {
-        return Err(AppError::Auth(format!(
-            "凭据类型不匹配：期望 mysql_password，实际 {}",
-            data.kind
-        )));
-    }
-    Ok(data.value)
 }
 
 // ===========================================================================
@@ -576,7 +455,8 @@ fn cell_to_string(row: &MySqlRow, idx: usize) -> String {
     "<binary>".to_string()
 }
 
-/// 构造 `mysql://user:pass@host:port/db` URL，密码做百分号编码。
+/// 构造 `mysql://user:pass@host:port/db` URL，密码做百分号编码
+/// （见 [`super::url_encode_component`]）。
 fn build_mysql_url(
     host: &str,
     port: u16,
@@ -585,9 +465,9 @@ fn build_mysql_url(
     database: Option<&str>,
 ) -> String {
     let mut url = String::from("mysql://");
-    url.push_str(&url_encode(username));
+    url.push_str(&url_encode_component(username));
     url.push(':');
-    url.push_str(&url_encode_password(password));
+    url.push_str(&url_encode_component(password));
     url.push('@');
     url.push_str(host);
     url.push(':');
@@ -595,32 +475,4 @@ fn build_mysql_url(
     url.push('/');
     url.push_str(database.unwrap_or(""));
     url
-}
-
-/// 对密码做最小百分号编码：把 URI 保留/不安全字符转义。
-///
-/// 项目未引入 `percent-encoding` crate，这里手工处理一组常见字符即可满足
-/// MySQL 密码 URL 编码需求。未被列入的可打印 ASCII 原样保留。
-fn url_encode_password(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'@' | b':' | b'#' | b'?' | b'/' | b'%' | b' ' | b'&' | b'+' | b'=' => {
-                out.push('%');
-                out.push_str(&format!("{:02X}", b));
-            }
-            // 非可打印 ASCII 或 > 127：UTF-8 字节按需编码。
-            0x00..=0x1F | 0x7F..=0xFF => {
-                out.push('%');
-                out.push_str(&format!("{:02X}", b));
-            }
-            _ => out.push(b as char),
-        }
-    }
-    out
-}
-
-/// 通用 URL 用户名编码（用户名一般不含特殊字符，复用同一套规则）。
-fn url_encode(s: &str) -> String {
-    url_encode_password(s)
 }

@@ -32,6 +32,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { homeDir, join, sep as pathSep, dirname, basename } from "@tauri-apps/api/path";
 import { useSessionsStore } from "@/stores/sessions";
 import { useTransferStore } from "@/stores/transfer";
+import { uniquePathIn, usableDownloadDir } from "@/utils/downloadPath";
 import { formatSize } from "@/utils/format";
 import type { Session, FileEntry } from "@/api/types";
 import {
@@ -644,7 +645,8 @@ function isPointInRemotePane(pos?: { x: number; y: number }): boolean {
   );
 }
 
-// 下载：从远程选中条目下载，用 save 对话框选择保存位置。
+// 下载：从远程选中条目下载。设置了「默认下载目录」时直接落盘（同名自动加
+// (n) 后缀，不弹框），否则用 save 对话框选择保存位置。
 async function downloadSelected() {
   if (!sftpId.value) {
     ElMessage.warning("请先打开 SFTP 连接");
@@ -656,18 +658,23 @@ async function downloadSelected() {
     return;
   }
   const remoteAbs = joinRemote(remoteFile.name);
-  // 默认保存到本地当前目录。
-  const defaultSave = await joinLocal(remoteFile.name);
   let savePath: string;
-  try {
-    const picked = await saveFileDialog({
-      defaultPath: defaultSave,
-    });
-    if (!picked) return;
-    savePath = picked;
-  } catch (e) {
-    ElMessage.error("选择保存位置失败: " + String(e));
-    return;
+  const dir = await usableDownloadDir();
+  if (dir) {
+    savePath = await uniquePathIn(dir, remoteFile.name);
+  } else {
+    // 未设置默认目录：回退对话框，默认落在本地当前浏览目录。
+    const defaultSave = await joinLocal(remoteFile.name);
+    try {
+      const picked = await saveFileDialog({
+        defaultPath: defaultSave,
+      });
+      if (!picked) return;
+      savePath = picked;
+    } catch (e) {
+      ElMessage.error("选择保存位置失败: " + String(e));
+      return;
+    }
   }
   const taskId = crypto.randomUUID();
   transfer.add({
@@ -678,6 +685,8 @@ async function downloadSelected() {
     total: remoteFile.size || 0,
     status: "pending",
     cancellable: true,
+    source: "sftp",
+    localPath: savePath,
   });
   transfer.update(taskId, { status: "running" });
   try {
@@ -708,6 +717,8 @@ async function downloadOne(remoteAbs: string, name: string) {
     total: 0,
     status: "pending",
     cancellable: true,
+    source: "sftp",
+    localPath: localAbs,
   });
   transfer.update(taskId, { status: "running" });
   try {

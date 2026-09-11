@@ -28,9 +28,9 @@
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use russh::client::{Handle, Msg};
-use russh::{Channel, ChannelMsg, Disconnect};
+use russh::{Channel, ChannelMsg, Disconnect, Pty};
 use serde::Deserialize;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{mpsc, oneshot};
 
@@ -318,8 +318,9 @@ pub struct SshSession {
     pub id: String,
     /// 对应的会话配置 ID（即 [`Session::id`]）。
     pub session_config_id: String,
-    /// russh 客户端句柄，可用于打开新 channel、SFTP、端口转发。
-    pub handle: Handle<ClientHandler>,
+    /// russh 客户端句柄（多会话共享，见 [`Self::conn_refs`]），可用于打开新
+    /// channel、SFTP、端口转发。
+    pub handle: Arc<Handle<ClientHandler>>,
     /// 已打开的 PTY channel；`spawn_reader` 后为 `None`。
     pub channel: Option<Channel<Msg>>,
     /// Tauri 应用句柄。
@@ -330,6 +331,36 @@ pub struct SshSession {
     input_tx: Option<mpsc::UnboundedSender<InputMsg>>,
     /// 共享输出环形缓冲，reader 写入、命令层读取（AI 上下文）。
     pub output_buffer: SharedOutputRing,
+    /// 本会话在断开原因注册表中的键（`host:port`）。
+    pub disconnect_key: String,
+    /// 断开原因注册表（与 [`AppState::ssh_disconnect_reasons`] 共享）。
+    ///
+    /// reader 退出时取出（take）本会话的断开原因，随 `terminal:closed` 事件
+    /// 发往前端并写日志（服务器 DISCONNECT 的文字 / 保活超时等）。
+    pub disconnect_reasons: Arc<parking_lot::Mutex<HashMap<String, String>>>,
+    /// 共享同一条底层连接（Handle）的存活会话计数。
+    ///
+    /// 首个会话（[`SshSession::open`]）创建时为 1；「复制通道」
+    /// （[`SshSession::open_channel_on`]）在同一连接上开新 channel 时递增。
+    /// `close` 时递减——**只有最后一个关闭者才 disconnect 传输层**，否则复制
+    /// 出来的 tab 会被源 tab 的关闭一起断掉。
+    pub conn_refs: Arc<std::sync::atomic::AtomicUsize>,
+    /// 输出日志（可选，设置开启时由命令层装配）。
+    pub output_log: crate::output_log::SharedOutputLog,
+}
+
+/// 复制通道所需的共享部件。
+///
+/// 从源 [`SshSession`] 克隆（全部是 `Arc` / `String`，克隆廉价）。抽出这个
+/// 结构是为了**不持有 `state.terminals` 锁跨 await**：`channel_open_session`
+/// 是网络操作，锁内 await 会冻结所有终端的读写命令。
+pub struct SharedTransport {
+    pub handle: Arc<Handle<ClientHandler>>,
+    pub session_config_id: String,
+    pub app: tauri::AppHandle,
+    pub disconnect_key: String,
+    pub disconnect_reasons: Arc<parking_lot::Mutex<HashMap<String, String>>>,
+    pub conn_refs: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// 输出缓冲容量（字节），约 256 KiB，可保留数千行终端输出。
@@ -358,6 +389,73 @@ const TERMINAL_BATCH_INTERVAL: std::time::Duration = std::time::Duration::from_m
 /// 终端输出批量 emit 大小阈值（字节）：积满即冲刷，避免超大事件卡住 IPC。
 const TERMINAL_BATCH_MAX_BYTES: usize = 64 * 1024;
 
+/// 与 OpenSSH 客户端一致的默认终端模式（pty-req 的 terminal modes）。
+///
+/// OpenSSH 请求 PTY 时发送完整的 termios 参数；传空切片则 modes 为空串
+/// （只有 0 终止符）。个别 SSH 服务器（如 JumpServer koko）的会话/空闲检测
+/// 依赖 PTY 参数，空 modes 可能被判定异常导致会话被提前清理——这里对齐
+/// OpenSSH 的默认值（Linux 常见配置，38400 波特率）。
+fn default_pty_modes() -> Vec<(Pty, u32)> {
+    vec![
+        (Pty::VINTR, 3),
+        (Pty::VQUIT, 28),
+        (Pty::VERASE, 127),
+        (Pty::VKILL, 21),
+        (Pty::VEOF, 4),
+        (Pty::VEOL, 0),
+        (Pty::VEOL2, 0),
+        (Pty::VSTART, 17),
+        (Pty::VSTOP, 19),
+        (Pty::VSUSP, 26),
+        (Pty::VDSUSP, 0),
+        (Pty::VREPRINT, 18),
+        (Pty::VWERASE, 23),
+        (Pty::VLNEXT, 22),
+        (Pty::VFLUSH, 0),
+        (Pty::VSWTCH, 0),
+        (Pty::VSTATUS, 0),
+        (Pty::VDISCARD, 0),
+        (Pty::IGNPAR, 0),
+        (Pty::PARMRK, 0),
+        (Pty::INPCK, 0),
+        (Pty::ISTRIP, 0),
+        (Pty::INLCR, 0),
+        (Pty::IGNCR, 0),
+        (Pty::ICRNL, 1),
+        (Pty::IUCLC, 0),
+        (Pty::IXON, 1),
+        (Pty::IXANY, 0),
+        (Pty::IXOFF, 0),
+        (Pty::IMAXBEL, 1),
+        (Pty::IUTF8, 1),
+        (Pty::ISIG, 1),
+        (Pty::ICANON, 1),
+        (Pty::XCASE, 0),
+        (Pty::ECHO, 1),
+        (Pty::ECHOE, 1),
+        (Pty::ECHOK, 1),
+        (Pty::ECHONL, 0),
+        (Pty::NOFLSH, 0),
+        (Pty::TOSTOP, 0),
+        (Pty::IEXTEN, 1),
+        (Pty::ECHOCTL, 1),
+        (Pty::ECHOKE, 1),
+        (Pty::PENDIN, 0),
+        (Pty::OPOST, 1),
+        (Pty::OLCUC, 0),
+        (Pty::ONLCR, 1),
+        (Pty::OCRNL, 0),
+        (Pty::ONOCR, 0),
+        (Pty::ONLRET, 0),
+        (Pty::CS7, 0),
+        (Pty::CS8, 1),
+        (Pty::PARENB, 0),
+        (Pty::PARODD, 0),
+        (Pty::TTY_OP_ISPEED, 38400),
+        (Pty::TTY_OP_OSPEED, 38400),
+    ]
+}
+
 impl SshSession {
     /// 打开一个新的交互式终端会话。
     ///
@@ -375,13 +473,24 @@ impl SshSession {
         state: AppState,
     ) -> AppResult<Self> {
         let app = state.app.clone();
-        let handle = client::connect_direct(
+        // 断开原因注册表引用（connect_direct 会 move 走 state，先 clone）。
+        let disconnect_reasons = state.ssh_disconnect_reasons.clone();
+        // 键含随机后缀：同一 host:port 的多条连接（监控/SFTP/隧道/第二个
+        // 标签）互不覆盖，reader 只取本连接自己的断开原因。
+        let disconnect_key = format!(
+            "{}:{}#{}",
+            session_config.host,
+            session_config.port,
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        );
+        let handle = client::connect_direct_terminal(
             &session_config.host,
             session_config.port,
             &session_config.username,
             &session_config.id,
             resolved_credential.auth_method,
             state,
+            disconnect_key.clone(),
         )
         .await?;
 
@@ -391,9 +500,12 @@ impl SshSession {
             .await
             .map_err(|e| AppError::Ssh(format!("打开 channel 失败: {}", e)))?;
 
-        // 请求 PTY。terminal_modes 传空切片（russh 会补一个合理的默认 ECHO 等）。
+        // 请求 PTY。terminal modes 对齐 OpenSSH 客户端默认值（完整 termios
+        // 参数）：russh 传空切片时 modes 为空串，个别服务器（如 JumpServer
+        // koko）的会话/空闲检测依赖 PTY 参数，空 modes 可能被判定异常。
+        // want_reply 用 true 与 OpenSSH 一致（russh 不等待服务器确认）。
         channel
-            .request_pty(false, "xterm-256color", 80, 24, 0, 0, &[])
+            .request_pty(true, "xterm-256color", 80, 24, 0, 0, &default_pty_modes())
             .await
             .map_err(|e| AppError::Ssh(format!("请求 PTY 失败: {}", e)))?;
 
@@ -406,12 +518,75 @@ impl SshSession {
         Ok(SshSession {
             id: uuid::Uuid::new_v4().to_string(),
             session_config_id: session_config.id.clone(),
-            handle,
+            handle: Arc::new(handle),
             channel: Some(channel),
             app,
             reader_handle: None,
             input_tx: None,
             output_buffer: Arc::new(StdMutex::new(OutputRing::new(OUTPUT_BUFFER_CAP))),
+            disconnect_key,
+            disconnect_reasons,
+            conn_refs: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            output_log: Arc::new(StdMutex::new(None)),
+        })
+    }
+
+    /// 提取复制通道所需的共享部件（同步、廉价克隆；调用方持锁取出后应立即
+    /// 释放锁，再在锁外 await [`SshSession::open_channel_on`]）。
+    pub fn shared_transport(&self) -> SharedTransport {
+        SharedTransport {
+            handle: self.handle.clone(),
+            session_config_id: self.session_config_id.clone(),
+            app: self.app.clone(),
+            disconnect_key: self.disconnect_key.clone(),
+            disconnect_reasons: self.disconnect_reasons.clone(),
+            conn_refs: self.conn_refs.clone(),
+        }
+    }
+
+    /// 「复制通道」：在同一条**已认证**连接上打开新 session channel
+    /// （PTY + shell），构造一个可独立读写的终端会话。
+    ///
+    /// 与 [`SshSession::open`] 的区别：不新建 TCP 连接、不重新认证——二次
+    /// 认证（口令码/动态口令）服务器上复制通道无需再次输入验证码。
+    /// 连接生命周期由 [`Self::conn_refs`] 计数共享：任一副本关闭只递减计数，
+    /// 最后一个关闭者才真正断开传输层。
+    pub async fn open_channel_on(src: SharedTransport) -> AppResult<Self> {
+        // 打开 session channel（复用源会话的已认证 Handle）。
+        let channel = src
+            .handle
+            .channel_open_session()
+            .await
+            .map_err(|e| AppError::Ssh(format!("打开 channel 失败: {}", e)))?;
+
+        // PTY / shell 请求与 open() 一致（80×24 起步，前端 attach 后会按
+        // 实际尺寸 window_change）。terminal modes 对齐 OpenSSH 默认值
+        // （见 open() 内注释：个别服务器依赖完整 PTY 参数）。
+        channel
+            .request_pty(true, "xterm-256color", 80, 24, 0, 0, &default_pty_modes())
+            .await
+            .map_err(|e| AppError::Ssh(format!("请求 PTY 失败: {}", e)))?;
+        channel
+            .request_shell(true)
+            .await
+            .map_err(|e| AppError::Ssh(format!("请求 shell 失败: {}", e)))?;
+
+        src.conn_refs
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+
+        Ok(SshSession {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_config_id: src.session_config_id,
+            handle: src.handle,
+            channel: Some(channel),
+            app: src.app,
+            reader_handle: None,
+            input_tx: None,
+            output_buffer: Arc::new(StdMutex::new(OutputRing::new(OUTPUT_BUFFER_CAP))),
+            disconnect_key: src.disconnect_key,
+            disconnect_reasons: src.disconnect_reasons,
+            conn_refs: src.conn_refs,
+            output_log: Arc::new(StdMutex::new(None)),
         })
     }
 
@@ -557,6 +732,11 @@ impl SshSession {
         let session_id = self.id.clone();
         // 共享输出缓冲的克隆，移入 reader 任务持续写入。
         let output_buffer = self.output_buffer.clone();
+        // 输出日志（可选）：reader 输出喂入三级流水线；退出时 close 落盘尾行。
+        let output_log = self.output_log.clone();
+        // 断开原因：reader 退出时取出随事件发给前端。
+        let disconnect_key = self.disconnect_key.clone();
+        let disconnect_reasons = self.disconnect_reasons.clone();
 
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<InputMsg>();
         self.input_tx = Some(input_tx);
@@ -638,6 +818,12 @@ impl SshSession {
                                     // 批次起点 = 本块写入前的累计字节数（上批终点）。
                                     batch_start_total = batch_total;
                                 }
+                                // 同步喂输出日志（三级流水线），与 Telnet/本地一致。
+                                if let Ok(mut logger) = output_log.lock() {
+                                    if let Some(l) = logger.as_mut() {
+                                        l.feed(data.as_ref());
+                                    }
+                                }
                                 if let Some(total) = record_output(data.as_ref()) {
                                     batch_total = total;
                                 }
@@ -653,6 +839,11 @@ impl SshSession {
                             Some(ChannelMsg::ExtendedData { ref data, .. }) => {
                                 if batch.is_empty() {
                                     batch_start_total = batch_total;
+                                }
+                                if let Ok(mut logger) = output_log.lock() {
+                                    if let Some(l) = logger.as_mut() {
+                                        l.feed(data.as_ref());
+                                    }
                                 }
                                 if let Some(total) = record_output(data.as_ref()) {
                                     batch_total = total;
@@ -734,6 +925,14 @@ impl SshSession {
                 }
             }
 
+            // 关闭输出日志（冲刷未换行尾行 + 缓冲落盘）。
+            if let Ok(mut logger) = output_log.lock() {
+                if let Some(l) = logger.as_mut() {
+                    l.close();
+                }
+                *logger = None;
+            }
+
             // 通知前端进程退出。
             events::emit(
                 &app,
@@ -743,7 +942,20 @@ impl SshSession {
                     code: exit_code.map(|c| c as i32),
                 },
             );
-            events::emit(&app, TERMINAL_CLOSED, TerminalClosedEvent { session_id });
+            // 取出本会话的断开原因（handler 的 disconnected 回调已写入），
+            // 随关闭事件透出并写日志——便于定位"连上后很快被断开"的问题。
+            let reason = disconnect_reasons.lock().remove(&disconnect_key);
+            if let Some(ref r) = reason {
+                log::warn!("终端会话 {} 关闭原因: {}", session_id, r);
+            }
+            events::emit(
+                &app,
+                TERMINAL_CLOSED,
+                TerminalClosedEvent {
+                    session_id,
+                    reason,
+                },
+            );
         });
 
         self.reader_handle = Some(join);
@@ -771,22 +983,31 @@ pub async fn close(&mut self) -> AppResult<()> {
             let _ = channel.close().await;
         }
 
-        // 断开传输层。disconnect 经内部有界 channel 投递，底层任务卡死时永久
-        // 挂起（关 tab 永远转圈），加超时兜底：超时后放弃等待，SshSession 被
-        // drop 时 Handle 随之释放，连接最终被清理。
-        match tokio::time::timeout(
-            DISCONNECT_TIMEOUT,
-            self.handle
-                .disconnect(Disconnect::ByApplication, "bye", "en"),
-        )
-        .await
+        // 共享连接计数递减：仍有其它会话复用这条连接（复制通道）时**不断开**
+        // 传输层——否则源 tab 关闭会把复制出来的 tab 一起断掉；最后一个
+        // 关闭者负责 disconnect。
+        if self
+            .conn_refs
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
         {
-            Ok(res) => res.map_err(|e| AppError::Ssh(format!("disconnect 失败: {}", e)))?,
-            Err(_) => {
-                log::warn!(
-                    "disconnect 超过 {} 秒未完成，放弃等待（连接由 handle 释放兜底）",
-                    DISCONNECT_TIMEOUT.as_secs()
-                );
+            // 断开传输层。disconnect 经内部有界 channel 投递，底层任务卡死时永久
+            // 挂起（关 tab 永远转圈），加超时兜底：超时后放弃等待，SshSession 被
+            // drop 时 Handle 随之释放，连接最终被清理。
+            match tokio::time::timeout(
+                DISCONNECT_TIMEOUT,
+                self.handle
+                    .disconnect(Disconnect::ByApplication, "bye", "en"),
+            )
+            .await
+            {
+                Ok(res) => res.map_err(|e| AppError::Ssh(format!("disconnect 失败: {}", e)))?,
+                Err(_) => {
+                    log::warn!(
+                        "disconnect 超过 {} 秒未完成，放弃等待（连接由 handle 释放兜底）",
+                        DISCONNECT_TIMEOUT.as_secs()
+                    );
+                }
             }
         }
 

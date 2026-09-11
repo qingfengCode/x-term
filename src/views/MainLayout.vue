@@ -87,6 +87,10 @@ function go(key: string) {
   router.push({ name: key });
 }
 
+// --- 全局下载列表（ZMODEM sz / SFTP 下载记录） --------------------------------
+// 呼出按钮与抽屉在 TitleBar（标题栏「关于」左侧），本组件只负责进度事件的
+// store 更新（见下方 transfer:* 事件订阅）。
+
 // --- AI / 传输 / MCP 事件订阅的注销句柄 ----------------------------------
 // 必须在 setup 顶层（onMounted 之外）声明并注册 onBeforeUnmount：
 // onMounted 传入的 async 回调在首个 await 之后失去组件实例上下文，此时才
@@ -289,10 +293,10 @@ function switchTab(delta: 1 | -1) {
   if (activeNav.value !== "terminals") return;
   const tabs = terminalsStore.tabs;
   if (tabs.length === 0) return;
-  const curIdx = tabs.findIndex((t) => t.instanceId === terminalsStore.activeId);
+  const curIdx = tabs.findIndex((t) => t.id === terminalsStore.activeTabId);
   const nextIdx = (curIdx + delta + tabs.length) % tabs.length;
   const target = tabs[nextIdx];
-  if (target?.instanceId) terminalsStore.setActive(target.instanceId);
+  if (target) terminalsStore.setActive(target.id);
 }
 
 /** 新建终端（Ctrl+T）：快速连接最近一次成功连接的会话。 */
@@ -319,7 +323,7 @@ useAppShortcuts({
   },
   closeTab: () => {
     if (activeNav.value !== "terminals") return;
-    const id = terminalsStore.activeId;
+    const id = terminalsStore.activeTabId;
     if (id) void terminalsStore.close(id);
   },
   nextTab: () => switchTab(1),
@@ -372,9 +376,9 @@ function onNumberKeydown(e: KeyboardEvent) {
   if (!(e.ctrlKey || e.metaKey) || !/^[1-9]$/.test(e.key)) return;
   const tabs = terminalsStore.tabs;
   const idx = Number(e.key) - 1;
-  if (idx < tabs.length && tabs[idx].instanceId) {
+  if (idx < tabs.length) {
     e.preventDefault();
-    terminalsStore.setActive(tabs[idx].instanceId);
+    terminalsStore.setActive(tabs[idx].id);
   }
 }
 onMounted(() => window.addEventListener("keydown", onNumberKeydown));
@@ -541,6 +545,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onNumberKeydown));
   margin-bottom: 2px;
   transition: background-color 0.15s ease, color 0.15s ease;
 }
+/* 下载呼出按钮（badge 与图标对齐）已移至 TitleBar，样式随之迁移。 */
 .nav-item:hover {
   background: var(--el-fill-color-light);
   color: var(--el-text-color-primary);

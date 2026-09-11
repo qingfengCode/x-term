@@ -44,6 +44,8 @@ export interface FullResult {
 }
 
 // 只读/危险关键字（execute 用）——与视图解耦后仍需这些判定。
+// 含 PostgreSQL 的维护性写语句（VACUUM/REINDEX/ANALYZE/CLUSTER 会改写物理存储
+// 或统计信息）。
 const WRITE_KEYWORDS = new Set([
   "INSERT",
   "UPDATE",
@@ -54,16 +56,23 @@ const WRITE_KEYWORDS = new Set([
   "CREATE",
   "GRANT",
   "REVOKE",
+  "VACUUM",
+  "REINDEX",
+  "ANALYZE",
+  "CLUSTER",
+  "REFRESH",
+  "CALL",
 ]);
 const DANGEROUS_KEYWORDS = new Set(["DROP", "TRUNCATE"]);
 
 /**
- * 单条 USE 语句（库名允许反引号，可带尾分号/尾注释）。
+ * 单条 USE 语句（库名允许反引号/双引号包裹——MySQL 用反引号、PostgreSQL 习惯
+ * 双引号，可带尾分号/尾注释）。
  * 与后端 parse_use_statement 语义一致：只有「纯 USE 语句」才会被后端拦截；
  * `USE db; SELECT ...` 这类多语句后端不拦截，因此前端必须先把 USE 提取出来
  * 单独切库，再执行剩余语句。
  */
-const USE_STMT_RE = /^\s*use\s+`?([A-Za-z0-9_]+)`?\s*(;|--.*|#.*|\/\*[\s\S]*\*\/)?$/i;
+const USE_STMT_RE = /^\s*use\s+["`]?([A-Za-z0-9_$-]+)["`]?\s*(;|--.*|#.*|\/\*[\s\S]*\*\/)?$/i;
 
 /**
  * 去掉 SQL 开头的注释（`--` 行注释 / `#` 行注释 / `斜杠星号` 块注释，可连续多层）。

@@ -8,3 +8,15 @@
 export function isAuthError(e: unknown): boolean {
   return String(e).includes("认证错误");
 }
+
+/**
+ * 判断错误是否为「用户主动取消了认证输入」（后端文本「二次认证已取消」）。
+ *
+ * 用户在二次认证弹窗点「取消」= 明确放弃本次连接：调用方不应再自动弹
+ * 重试框（取消后立即再弹一个对话框，两个 append-to-body 的 Dialog 快速
+ * 关/开会让 Element Plus 遮罩/焦点陷阱清理交错残留，导致后续页面点击
+ * 失效），应直接清理占位 tab 恢复原状。
+ */
+export function isAuthCancelled(e: unknown): boolean {
+  return String(e).includes("已取消");
+}

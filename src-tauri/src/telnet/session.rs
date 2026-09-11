@@ -62,12 +62,17 @@ pub struct TelnetSession {
     reader_handle: Option<JoinHandle<()>>,
     input_tx: Option<mpsc::UnboundedSender<TelnetInput>>,
     pub output_buffer: SharedOutputRing,
+    /// 输出日志（可选，设置开启时由命令层装配）。
+    pub output_log: crate::output_log::SharedOutputLog,
 }
 
 impl TelnetSession {
     pub fn snapshot(&self, max_bytes: usize) -> String {
+        // 0 表示默认 8 KiB（与 SSH/Local 的 snapshot 契约一致；直接透传 0
+        // 会让 OutputRing::snapshot 取 0 字节，恒返回空串）。
+        let n = if max_bytes == 0 { 8 * 1024 } else { max_bytes };
         match self.output_buffer.lock() {
-            Ok(buf) => buf.snapshot(max_bytes),
+            Ok(buf) => buf.snapshot(n),
             Err(_) => String::new(),
         }
     }
@@ -149,6 +154,8 @@ impl TelnetSession {
         let app = self.app.clone();
         let session_id = self.id.clone();
         let output_buffer = self.output_buffer.clone();
+        // 输出日志（可选）：reader 输出喂入；退出时 close。
+        let output_log = self.output_log.clone();
 
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<TelnetInput>();
         self.input_tx = Some(input_tx);
@@ -224,6 +231,12 @@ impl TelnetSession {
                                     }
                                     // 写入输出缓冲（锁内取追加后的累计字节数，
                                     // 随批次事件 emit 供前端 attach 回放去重）。
+                                    // 同步喂输出日志。
+                                    if let Ok(mut logger) = output_log.lock() {
+                                        if let Some(l) = logger.as_mut() {
+                                            l.feed(&clean);
+                                        }
+                                    }
                                     if let Some(total) = output_buffer.lock().ok().map(|mut ob| {
                                         ob.push(&clean);
                                         ob.total_bytes()
@@ -248,12 +261,14 @@ impl TelnetSession {
                     inp = input_rx.recv() => {
                         match inp {
                             Some(TelnetInput::Write(data)) => {
-                                if write_half.write_all(&data).await.is_err() {
-                                    // 写失败 = 连接已断：冲刷残留批次再退出。
+                                if write_all_timeout(&mut write_half, &data).await.is_err() {
+                                    // 写失败/超时 = 连接已断或对端长期不读：
+                                    // 冲刷残留批次再退出（无超时的话 write_all
+                                    // 挂起会冻结整个 reader 循环：读、resize、
+                                    // flush 全部停摆，终端假死）。
                                     flush_batch(&mut batch, batch_start_total, batch_total);
                                     break;
                                 }
-                                let _ = write_half.flush().await;
                             }
                             Some(TelnetInput::Resize { cols: c, rows: r }) => {
                                 cols = c;
@@ -273,12 +288,20 @@ impl TelnetSession {
                     }
                 }
             }
+            // 关闭输出日志（冲刷尾行 + 落盘），再 emit closed。
+            if let Ok(mut logger) = output_log.lock() {
+                if let Some(l) = logger.as_mut() {
+                    l.close();
+                }
+                *logger = None;
+            }
             // 连接断开 → emit closed。
             emit(
                 &app,
                 TERMINAL_CLOSED,
                 TerminalClosedEvent {
                     session_id: session_id.clone(),
+                    reason: None,
                 },
             );
             log::info!("[telnet:{}] 会话结束", session_id);
@@ -448,8 +471,8 @@ async fn process_iac(
 ) -> Vec<u8> {
     let parsed = parser.push(data);
     if !parsed.responses.is_empty() {
-        let _ = write_half.write_all(&parsed.responses).await;
-        let _ = write_half.flush().await;
+        // 带超时：对端接收窗口为 0 时协商写挂起会冻结整个 reader 循环。
+        let _ = write_all_timeout(write_half, &parsed.responses).await;
     }
     parsed.data
 }
@@ -466,8 +489,26 @@ async fn send_naws(
     msg.push((rows >> 8) as u8);
     msg.push((rows & 0xff) as u8);
     msg.extend_from_slice(&[IAC, SE]);
-    write_half.write_all(&msg).await?;
-    write_half.flush().await?;
+    write_all_timeout(write_half, &msg).await
+}
+
+/// 写超时：TCP 发送缓冲满（对端停止读取）时 `write_all` 会无限挂起，且
+/// 它运行在 reader 的 select 分支内——挂起即冻结整个循环（读、Resize、
+/// FlushOutput 全部停摆，终端假死）。与 SSH 侧的分块写超时语义对齐。
+const TELNET_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 带超时的 write_all + flush；任一超时或失败均返回 Err。
+async fn write_all_timeout(
+    write_half: &mut tokio::net::tcp::OwnedWriteHalf,
+    data: &[u8],
+) -> std::io::Result<()> {
+    let timed = |e| std::io::Error::new(std::io::ErrorKind::TimedOut, e);
+    tokio::time::timeout(TELNET_WRITE_TIMEOUT, write_half.write_all(data))
+        .await
+        .map_err(|_| timed("telnet write timeout"))??;
+    tokio::time::timeout(TELNET_WRITE_TIMEOUT, write_half.flush())
+        .await
+        .map_err(|_| timed("telnet flush timeout"))??;
     Ok(())
 }
 
@@ -509,6 +550,7 @@ impl TelnetSession {
             reader_handle: None,
             input_tx: None,
             output_buffer: Arc::new(StdMutex::new(OutputRing::new(OUTPUT_BUFFER_CAP))),
+            output_log: Arc::new(StdMutex::new(None)),
         };
         session.spawn_reader(stream)?;
         Ok(session)

@@ -34,7 +34,7 @@ const services = computed(() => [
     kind: "db" as const,
     icon: "Coin",
     title: "DB MCP",
-    desc: "SQL 查询执行",
+    desc: "SQL 语句执行",
     running: mcp.dbStatus.running,
     port: mcp.dbConfig.port,
   },
@@ -317,7 +317,7 @@ onMounted(async () => {
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(380px, 470px) 1fr;
+  grid-template-columns: minmax(320px, 380px) 1fr;
   gap: 14px;
   padding: 12px 18px 16px;
 }

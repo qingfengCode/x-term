@@ -77,6 +77,58 @@ export function dbShowCreateTable(
   return invoke<string>("db_show_create_table", { connId, database, table });
 }
 
+// ---------------------------------------------------------------------------
+// 多厂商扩展（能力开关 / 浏览模式 / 脚本执行）
+// ---------------------------------------------------------------------------
+
+/** 连接的方言能力（UI 显隐的单一事实来源，前端不写 if kind ===）。 */
+export interface DbCapabilities {
+  supportsComment: boolean;
+  supportsAutoIncrement: boolean;
+  supportsCreateDatabase: boolean;
+  multipleDatabases: boolean;
+  /** 类型建议列表（建表/改列 UI 用）。 */
+  columnTypes: string[];
+}
+
+/** 连接的方言能力。 */
+export function dbCapabilities(connId: string): Promise<DbCapabilities> {
+  return invoke<DbCapabilities>("db_capabilities", { connId });
+}
+
+/**
+ * 生成分页浏览 SELECT（只生成文本不执行）：方言分页差异（LIMIT/OFFSET vs
+ * FETCH）收敛在后端。点表浏览/翻页时调用。
+ */
+export function dbDefaultTableQuery(
+  connId: string,
+  table: string,
+  limit: number,
+  offset: number
+): Promise<string> {
+  return invoke<string>("db_default_table_query", { connId, table, limit, offset });
+}
+
+/** 脚本中一条语句的执行结果。 */
+export interface ScriptStmtResult {
+  /** 语句起始行号（1-based，失败定位）。 */
+  line: number;
+  /** 语句前 200 字符预览。 */
+  sqlPreview: string;
+  affected: number;
+  /** 出错信息；null = 成功。 */
+  error: string | null;
+}
+
+/** 按方言切分 SQL 脚本并逐条执行（首错即停）。 */
+export function dbExecuteScript(
+  connId: string,
+  script: string,
+  readOnly: boolean
+): Promise<ScriptStmtResult[]> {
+  return invoke<ScriptStmtResult[]>("db_execute_script", { connId, script, readOnly });
+}
+
 /** 拖拽数据传输用的表节点载荷类型。 */
 export interface DraggedTable {
   /** 来源连接 id，用于校验是否与 AI 面板当前连接一致。 */

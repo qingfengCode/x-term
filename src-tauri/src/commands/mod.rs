@@ -11,18 +11,23 @@ pub mod config;
 pub mod db;
 pub mod file_backend;
 pub mod forward;
+pub mod history;
 pub mod local;
 pub mod mcp;
+pub mod monitor;
+pub mod output_log;
 pub mod rdp;
 pub mod remote_desktop;
 pub mod session;
 pub mod sftp;
 pub mod ssh_key;
+pub mod system;
 pub mod terminal;
 pub mod totp;
 pub mod update;
 pub mod vault;
 pub mod vnc;
+pub mod zmodem;
 
 /// 把所有命令注册到给定的 [`tauri::Builder`] 上，返回 builder 自身以便链式调用。
 pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
@@ -59,6 +64,7 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
         crate::commands::session::delete_group,
         crate::commands::session::connect_session,
         crate::commands::session::connect_session_with_manual_auth,
+        crate::commands::session::clone_terminal_session,
         crate::commands::session::disconnect_session,
         crate::commands::session::open_sftp_for_session,
         crate::commands::session::ssh_auth_respond,
@@ -68,6 +74,20 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
         crate::commands::terminal::terminal_resize,
         crate::commands::terminal::terminal_attach,
         crate::commands::terminal::terminal_snapshot,
+        // history（终端智能补全的命令历史）
+        crate::commands::history::history_add,
+        crate::commands::history::history_recent,
+        crate::commands::history::history_delete,
+        crate::commands::history::history_search,
+        // monitor（服务器监控面板）
+        crate::commands::monitor::monitor_start,
+        crate::commands::monitor::monitor_stop,
+        // output log（终端输出日志落盘）
+        crate::commands::output_log::open_logs_dir,
+        // zmodem（rz/sz 无父窗口原生对话框，规避光标消失）
+        crate::commands::zmodem::zmodem_pick_files,
+        crate::commands::zmodem::zmodem_save_file,
+        crate::commands::zmodem::zmodem_pick_folder,
         // sftp
         crate::commands::sftp::sftp_list,
         crate::commands::sftp::sftp_stat,
@@ -116,6 +136,7 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
         crate::commands::ai::ai_ask_user_respond,
         crate::commands::ai::ai_stop,
         crate::commands::ai::ai_add_to_whitelist,
+        crate::commands::ai::ai_complete_command,
         crate::commands::ai::set_workspace_dir,
         crate::commands::ai::ai_list_conversations,
         crate::commands::ai::ai_save_conversations,
@@ -144,6 +165,9 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
         crate::commands::db::db_list_databases,
         crate::commands::db::db_describe_table,
         crate::commands::db::db_show_create_table,
+        crate::commands::db::db_capabilities,
+        crate::commands::db::db_default_table_query,
+        crate::commands::db::db_execute_script,
         // mcp
         crate::commands::mcp::mcp_start,
         crate::commands::mcp::mcp_stop,
@@ -153,6 +177,7 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
         crate::commands::mcp::mcp_generate_token,
         crate::commands::mcp::mcp_respond_approval,
         crate::commands::mcp::mcp_rebind,
+        crate::commands::mcp::mcp_rebind_multi,
         crate::commands::mcp::mcp_log,
         // update（应用自更新）
         crate::commands::update::update_get_info,
@@ -165,5 +190,7 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
         crate::commands::backup::backup_export,
         crate::commands::backup::backup_inspect,
         crate::commands::backup::backup_import,
+        // system（系统集成：文件管理器中定位文件）
+        crate::commands::system::reveal_in_folder,
     ])
 }

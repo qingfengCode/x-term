@@ -36,11 +36,16 @@ export interface McpInstanceConfig {
    */
   resourceId?: string;
   /**
-   * 资源模式："bound"（绑定本地资源，默认）| "client"（客户端直连，免绑定实例）。
+   * 多机模式（resourceMode="multi"，仅 SSH）勾选的 SSH 会话 id 集合。
+   */
+  resourceIds?: string[];
+  /**
+   * 资源模式："bound"（绑定本地资源，默认）| "client"（客户端直连，免绑定实例）
+   * | "multi"（多机模式，仅 SSH：勾选一组机器，由外部 AI 按工具参数 target 自选目标）。
    * client 模式下调用方需在工具参数中传 host/port/username/password，
    * 凭据仅本次调用有效、不存储不落日志。
    */
-  resourceMode: "bound" | "client";
+  resourceMode: "bound" | "client" | "multi";
   /**
    * 绑定来源（仅 bound 模式）："config"（会话配置，默认）| "terminal"（终端标签页）。
    * terminal 来源下命令写入该终端 PTY 执行，支持 A→B→C 跳板嵌套。
@@ -48,8 +53,13 @@ export interface McpInstanceConfig {
   boundSource: McpBoundSource;
   /** 绑定的具体数据库名（仅 db kind）。设置后 exec_sql 只针对该库。 */
   boundDatabase?: string;
-  /** 自动放行：开启后 exec_ssh/exec_sql 跳过人工确认直接执行。默认 false。 */
-  autoApprove: boolean;
+  /**
+   * 运行模式（与 AI 助手的执行模式语义一致）：
+   * - "manual"（默认）：所有写/执行类调用人工确认；
+   * - "whitelist"：白名单内自动放行（SSH=命令白名单、DB=只读 SQL），其余确认；
+   * - "auto"：全部自动执行（文件传输工具仍强制人工确认）。
+   */
+  runMode: "manual" | "whitelist" | "auto";
   /** 是否记录执行日志到文本文件（每次启动生成一个日志文件）。默认 true。 */
   enableLog: boolean;
 }
@@ -104,6 +114,15 @@ export function mcpRebind(
   resourceId: string,
 ): Promise<void> {
   return invoke<void>("mcp_rebind", { kind, boundSource, resourceId });
+}
+
+/**
+ * 运行中热切换多机模式的机器集合（仅 ssh kind + multi 模式）。
+ * 返回 true = 已热切换即时生效；false = 未热切换（服务未运行或以其它模式
+ * 运行），配置已保存、（重）启动时生效。同时持久化到 mcp.json。
+ */
+export function mcpRebindMulti(kind: McpKind, resourceIds: string[]): Promise<boolean> {
+  return invoke<boolean>("mcp_rebind_multi", { kind, resourceIds });
 }
 
 /** 为指定 kind 生成随机 token（写入 mcp.json）并返回。 */

@@ -48,6 +48,18 @@ const defaultTerminal: TerminalSettings = {
   localShell: "cmd",
   desktopClients: { vnc: "app", rdp: "system" },
   rdpVerifyCert: false,
+  /** 默认下载目录（终端 sz / SFTP / 对象存储共用）：空 = 每次弹保存框选择。 */
+  downloadDir: "",
+  /** 终端智能补全：历史命令 + 快捷命令建议弹窗（默认关闭）。 */
+  suggestHistory: false,
+  /** 智能补全附带 AI 建议项（默认关闭）。 */
+  suggestAi: false,
+  /** 安全粘贴：多行 / 危险内容粘贴前弹确认。 */
+  pasteConfirm: true,
+  /** 终端输出日志落盘（对新会话生效）。 */
+  outputLog: false,
+  /** 终端字符编码（远端服务器 locale；默认 UTF-8 不转码，GBK 老服务器切换）。 */
+  encoding: "utf-8",
 };
 
 export const useSettingsStore = defineStore("settings", () => {

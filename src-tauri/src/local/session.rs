@@ -208,6 +208,8 @@ pub struct LocalSession {
     reader_handle: Option<tauri::async_runtime::JoinHandle<()>>,
     /// 共享输出环形缓冲（与 SSH / Telnet 相同类型，AI 上下文感知直接复用）。
     pub output_buffer: SharedOutputRing,
+    /// 输出日志（可选，设置开启时由命令层装配）。
+    pub output_log: crate::output_log::SharedOutputLog,
 }
 
 impl LocalSession {
@@ -269,6 +271,7 @@ impl LocalSession {
             child: Arc::new(StdMutex::new(Some(child))),
             reader_handle: None,
             output_buffer: Arc::new(StdMutex::new(OutputRing::new(OUTPUT_BUFFER_CAP))),
+            output_log: Arc::new(StdMutex::new(None)),
         };
         session.spawn_reader()?;
         Ok(session)
@@ -279,6 +282,7 @@ impl LocalSession {
         let app = self.app.clone();
         let session_id = self.id.clone();
         let output_buffer = self.output_buffer.clone();
+        let output_log = self.output_log.clone();
         let child = self.child.clone();
 
         let reader = self
@@ -295,6 +299,12 @@ impl LocalSession {
                     Ok(0) | Err(_) => break, // 子进程退出 / PTY 关闭
                     Ok(n) => {
                         let data = &buf[..n];
+                        // 同步喂输出日志（未启用时 Option 为 None，零开销）。
+                        if let Ok(mut logger) = output_log.lock() {
+                            if let Some(l) = logger.as_mut() {
+                                l.feed(data);
+                            }
+                        }
                         // 写入输出环形缓冲（锁内取追加后的累计字节数，随事件
                         // emit 供前端 attach 回放去重；如果锁不可用则计 0）。
                         let end = output_buffer.lock().ok().map(|mut ob| {
@@ -325,6 +335,13 @@ impl LocalSession {
                 .ok()
                 .and_then(|mut guard| guard.as_mut().and_then(|c| c.wait().ok()))
                 .map(|status| status.exit_code() as i32);
+            // 关闭输出日志（冲刷尾行 + 落盘）。
+            if let Ok(mut logger) = output_log.lock() {
+                if let Some(l) = logger.as_mut() {
+                    l.close();
+                }
+                *logger = None;
+            }
             emit(
                 &app,
                 TERMINAL_EXIT,
@@ -333,7 +350,7 @@ impl LocalSession {
                     code: exit_code,
                 },
             );
-            emit(&app, TERMINAL_CLOSED, TerminalClosedEvent { session_id });
+            emit(&app, TERMINAL_CLOSED, TerminalClosedEvent { session_id, reason: None });
             log::info!("[local] 会话结束，退出码: {:?}", exit_code);
         });
 

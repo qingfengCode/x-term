@@ -27,6 +27,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { homeDir, join, dirname, basename } from "@tauri-apps/api/path";
 
 import { useTransferStore } from "@/stores/transfer";
+import { uniquePathIn, usableDownloadDir } from "@/utils/downloadPath";
 import { formatSize } from "@/utils/format";
 import type { FileEntry } from "@/api/types";
 import {
@@ -528,19 +529,26 @@ async function uploadOne(localAbs: string, name: string) {
 
 async function downloadOne(remoteName: string) {
   if (!backendId.value) return;
-  // 选择本地保存路径。
-  let savePath: string;
-  try {
-    const picked = await openFileDialog({
-      defaultPath: localPath.value,
-      directory: true,
-    });
-    if (!picked) return;
-    savePath = picked as string;
-  } catch {
-    return;
+  // 保存位置：设置了「默认下载目录」时直接落盘（同名自动加 (n) 后缀，不弹框），
+  // 否则弹目录选择框。
+  let full: string;
+  const dir = await usableDownloadDir();
+  if (dir) {
+    full = await uniquePathIn(dir, remoteName);
+  } else {
+    let savePath: string;
+    try {
+      const picked = await openFileDialog({
+        defaultPath: localPath.value,
+        directory: true,
+      });
+      if (!picked) return;
+      savePath = picked as string;
+    } catch {
+      return;
+    }
+    full = await join(savePath, remoteName);
   }
-  const full = await join(savePath, remoteName);
   // 覆盖保护：旧实现直接写盘覆盖本地同名文件，可能丢失本地数据。
   if (!(await confirmLocalOverwrite(full, remoteName))) return;
   const taskId = crypto.randomUUID();
@@ -551,6 +559,8 @@ async function downloadOne(remoteName: string) {
     transferred: 0,
     total: 0,
     status: "pending",
+    source: "sftp",
+    localPath: full,
   });
   // 同 uploadOne：后端命令整体 await，"运行中"需在发起前标记。
   transfer.update(taskId, { status: "running" });

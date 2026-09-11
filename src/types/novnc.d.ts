@@ -32,6 +32,8 @@ declare module "@novnc/novnc" {
     removeEventListener(type: string, callback: (e: CustomEvent) => void): void;
     /** 断开连接。 */
     disconnect(): void;
+    /** 认证握手要求凭据时提交（macOS 屏幕共享 ARD 需 username+password）。 */
+    sendCredentials(credentials: { username?: string; password?: string; target?: string }): void;
     /** 发送 Ctrl+Alt+Del 组合键（Windows VNC 解锁登录屏常用）。 */
     sendCtrlAltDel(): void;
     /** 把本地剪贴板文本粘贴给远端（ClientCutText）。 */
