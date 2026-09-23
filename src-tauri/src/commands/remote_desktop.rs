@@ -6,7 +6,7 @@
 
 use std::process::Command;
 
-use tauri::State;
+use tauri::{Manager, State};
 
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
@@ -16,8 +16,11 @@ use crate::state::AppState;
 /// - `protocol`: "rdp" 或 "vnc"
 /// - `host`/`port`: 目标地址
 /// - `username`/`password`: 可选凭据（RDP 写入 .rdp 文件；VNC 多数客户端不支持命令行传密码）
+///
+/// async + `spawn_blocking`：写临时 .rdp 文件、CredWriteW、启动外部客户端均为
+/// 阻塞系统调用（进程创建在杀软环境下可达数百毫秒），跑在主线程会冻结 UI。
 #[tauri::command]
-pub fn remote_desktop_launch(
+pub async fn remote_desktop_launch(
     protocol: String,
     host: String,
     port: u16,
@@ -25,17 +28,21 @@ pub fn remote_desktop_launch(
     password: Option<String>,
     _state: State<'_, AppState>,
 ) -> AppResult<String> {
-    let addr = if (protocol == "rdp" && port == 3389) || (protocol == "vnc" && port == 5900) {
-        host.clone()
-    } else {
-        format!("{}:{}", host, port)
-    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let addr = if (protocol == "rdp" && port == 3389) || (protocol == "vnc" && port == 5900) {
+            host.clone()
+        } else {
+            format!("{}:{}", host, port)
+        };
 
-    match protocol.as_str() {
-        "rdp" => launch_rdp(&addr, username.as_deref(), password.as_deref()),
-        "vnc" => launch_vnc(&addr),
-        other => Err(AppError::InvalidInput(format!("不支持的桌面协议: {other}"))),
-    }
+        match protocol.as_str() {
+            "rdp" => launch_rdp(&addr, username.as_deref(), password.as_deref()),
+            "vnc" => launch_vnc(&addr),
+            other => Err(AppError::InvalidInput(format!("不支持的桌面协议: {other}"))),
+        }
+    })
+    .await
+    .map_err(|e| AppError::Ssh(format!("启动远程桌面任务失败: {}", e)))?
 }
 
 /// Windows RDP：生成临时 .rdp 文件并用 mstsc 打开。
@@ -232,51 +239,95 @@ fn launch_vnc(addr: &str) -> AppResult<String> {
 // 桌面会话 CRUD（独立于终端 sessions）
 // ---------------------------------------------------------------------------
 
+// 全部 async + `spawn_blocking`：取连接 + SQLite 语句跑在主线程会冻结整个窗口。
+
 use crate::storage::desktops_repo::{Desktop, DesktopGroup};
 
 #[tauri::command]
-pub fn desktop_list(state: State<'_, AppState>) -> AppResult<Vec<Desktop>> {
-    let conn = state.conn()?;
-    crate::storage::desktops_repo::list_desktops(&conn)
+pub async fn desktop_list(state: State<'_, AppState>) -> AppResult<Vec<Desktop>> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        crate::storage::desktops_repo::list_desktops(&conn)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("读取桌面连接列表任务失败: {}", e)))?
 }
 
 #[tauri::command]
-pub fn desktop_save(desktop: Desktop, state: State<'_, AppState>) -> AppResult<()> {
-    let conn = state.conn()?;
-    crate::storage::desktops_repo::upsert_desktop(&conn, &desktop)
+pub async fn desktop_save(desktop: Desktop, state: State<'_, AppState>) -> AppResult<()> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        crate::storage::desktops_repo::upsert_desktop(&conn, &desktop)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("保存桌面连接任务失败: {}", e)))?
 }
 
 #[tauri::command]
-pub fn desktop_delete(id: String, state: State<'_, AppState>) -> AppResult<()> {
-    let conn = state.conn()?;
-    crate::storage::desktops_repo::delete_desktop(&conn, &id)
+pub async fn desktop_delete(id: String, state: State<'_, AppState>) -> AppResult<()> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        crate::storage::desktops_repo::delete_desktop(&conn, &id)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("删除桌面连接任务失败: {}", e)))?
 }
 
 /// 记录断开时最后一次使用的 RDP 分辨率（"宽x高"），重连时恢复。
 #[tauri::command]
-pub fn desktop_save_size(
+pub async fn desktop_save_size(
     id: String,
     size: Option<String>,
     state: State<'_, AppState>,
 ) -> AppResult<()> {
-    let conn = state.conn()?;
-    crate::storage::desktops_repo::update_desktop_size(&conn, &id, size.as_deref())
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        crate::storage::desktops_repo::update_desktop_size(&conn, &id, size.as_deref())
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("保存桌面分辨率任务失败: {}", e)))?
 }
 
 #[tauri::command]
-pub fn desktop_group_list(state: State<'_, AppState>) -> AppResult<Vec<DesktopGroup>> {
-    let conn = state.conn()?;
-    crate::storage::desktops_repo::list_desktop_groups(&conn)
+pub async fn desktop_group_list(state: State<'_, AppState>) -> AppResult<Vec<DesktopGroup>> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        crate::storage::desktops_repo::list_desktop_groups(&conn)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("读取桌面分组任务失败: {}", e)))?
 }
 
 #[tauri::command]
-pub fn desktop_group_save(group: DesktopGroup, state: State<'_, AppState>) -> AppResult<()> {
-    let conn = state.conn()?;
-    crate::storage::desktops_repo::upsert_desktop_group(&conn, &group)
+pub async fn desktop_group_save(group: DesktopGroup, state: State<'_, AppState>) -> AppResult<()> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        crate::storage::desktops_repo::upsert_desktop_group(&conn, &group)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("保存桌面分组任务失败: {}", e)))?
 }
 
 #[tauri::command]
-pub fn desktop_group_delete(id: String, state: State<'_, AppState>) -> AppResult<()> {
-    let conn = state.conn()?;
-    crate::storage::desktops_repo::delete_desktop_group(&conn, &id)
+pub async fn desktop_group_delete(id: String, state: State<'_, AppState>) -> AppResult<()> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        crate::storage::desktops_repo::delete_desktop_group(&conn, &id)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("删除桌面分组任务失败: {}", e)))?
 }

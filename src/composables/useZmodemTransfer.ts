@@ -44,6 +44,10 @@ const FLUSH_THRESHOLD = 512 * 1024;
 /** 上传每次从本地文件读入的块大小（内部会再切成 8KiB 的 ZMODEM 子包）。 */
 const READ_CHUNK = 1024 * 1024;
 
+/** 末尾 "*" 暂扣的最长保留时间（见 feed 的旁路分支）。起始序列是连续突发，
+ *  静默超过该值即判定为普通输出并补写终端。 */
+const CARRY_FLUSH_MS = 50;
+
 export function useZmodemTransfer(
   getTerm: () => Terminal | null,
   sendRaw: (bytes: Uint8Array) => Promise<void>,
@@ -503,16 +507,94 @@ export function useZmodemTransfer(
   }
 
   /** 喂入远端输出字节（终端数据监听器调用）。
-   *  取消后的静默排空窗口内直接丢弃（否则远端残留协议字节刷成乱码）。 */
+   *  取消后的静默排空窗口内直接丢弃（否则远端残留协议字节刷成乱码）。
+   *
+   *  性能：Sentry.consume 会把 Uint8Array 逐字节装箱成普通数组并全量线性扫描
+   *  （zmodem.js 内部实现），高吞吐输出（cat 大文件 / 编译日志）会把主线程
+   *  钉死。ZMODEM 起始序列（`**\x18B0`）恒含 ZDLE（0x18）：不含 0x18 的批次
+   *  不可能推进检测，直接绕过 Sentry 写终端（扣住尾部 "*" 前缀防起始序列
+   *  跨批拆断漏检）；含 0x18 时分块 consume（防 push.apply 触发实参上限
+   *  RangeError 导致整批输出丢失）。会话进行中协议数据可能完全不含 0x18
+   *  （无转义字节的文件内容），必须无条件走 Sentry。 */
   function feed(bytes: Uint8Array) {
     if (!sentry) return;
     if (shouldDiscard()) return;
     try {
-      sentry.consume(bytes);
+      if (active.value || session) {
+        consumeChunked(bytes);
+        return;
+      }
+      const merged = bypassCarry.length ? concatBytes(bypassCarry, bytes) : bytes;
+      bypassCarry = new Uint8Array(0);
+      // 暂扣已并入 merged：作废待冲刷定时器（hold 命中时下面重新排程）。
+      if (carryFlushTimer) {
+        clearTimeout(carryFlushTimer);
+        carryFlushTimer = null;
+      }
+      if (merged.indexOf(0x18) === -1) {
+        // 不可能含 ZMODEM 起始序列：直写终端，扣住尾部 "*" 前缀。
+        const hold = trailingStartPrefixLen(merged);
+        if (hold > 0) {
+          bypassCarry = merged.slice(merged.length - hold);
+          writeOutput(merged.subarray(0, merged.length - hold));
+          // 起始序列是连续突发：静默超过 CARRY_FLUSH_MS 即按普通输出补写，
+          // 否则行尾 "*" 会一直不可见（要等下一个字节到达才并入输出）。
+          carryFlushTimer = setTimeout(flushCarry, CARRY_FLUSH_MS);
+        } else {
+          writeOutput(merged);
+        }
+        return;
+      }
+      consumeChunked(merged);
     } catch (err) {
       // 协议异常（如对方中止）会抛错；session_end 事件负责复位状态。
       console.warn("[zmodem] consume 异常", err);
     }
+  }
+
+  /** 分块喂 Sentry 的块大小：zsentry 内部 `cache.push.apply(cache, array_like)`
+   *  展开整块入参，块超过 JS 引擎实参上限（约 65535）会抛 RangeError，
+   *  而外层 catch 会吞掉——表现为整批输出静默丢失。 */
+  const CONSUME_CHUNK = 16 * 1024;
+
+  function consumeChunked(bytes: Uint8Array) {
+    if (!sentry) return;
+    for (let i = 0; i < bytes.length; i += CONSUME_CHUNK) {
+      sentry.consume(bytes.subarray(i, Math.min(i + CONSUME_CHUNK, bytes.length)));
+    }
+  }
+
+  /** 绕过 Sentry 直写时暂扣的尾部前缀：可能是 ZMODEM 起始序列开头（"*"|"**"）
+   *  的最长后缀长度（0/1/2），与下一批拼接后再判定，防止起始序列跨批拆断。 */
+  let bypassCarry = new Uint8Array(0);
+
+  /** 暂扣的冲刷定时器：暂扣只是"可能起头 ZMODEM 起始序列"的临时保留，
+   *  没有超时兜底的话行尾 "*"（如用户键入 `*` 的回显）会一直扣着不显示，
+   *  要等下一个字节到达并入后才写出——表现为"敲 `*` 要再按一个键才出现"。 */
+  let carryFlushTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** 清理定时器并补写暂扣字节（定时器到期时调用）。 */
+  function flushCarry() {
+    carryFlushTimer = null;
+    if (!bypassCarry.length) return;
+    const pending = bypassCarry;
+    bypassCarry = new Uint8Array(0);
+    writeOutput(pending);
+  }
+
+  function trailingStartPrefixLen(bytes: Uint8Array): number {
+    const n = bytes.length;
+    if (n >= 1 && bytes[n - 1] === 0x2a) {
+      return n >= 2 && bytes[n - 2] === 0x2a ? 2 : 1;
+    }
+    return 0;
+  }
+
+  function concatBytes(a: Uint8Array, b: Uint8Array): Uint8Array {
+    const out = new Uint8Array(a.length + b.length);
+    out.set(a);
+    out.set(b, a.length);
+    return out;
   }
 
   /** 取消当前传输（进度浮层的"取消"按钮）：中止会话 + 补发强化中止序列，
@@ -534,6 +616,10 @@ export function useZmodemTransfer(
     if (discardGapTimer) clearTimeout(discardGapTimer);
     discardGapTimer = null;
     discarding = false;
+    // 丢弃 ≤2 字节的待冲刷暂扣：其归属旧会话，写进重绑后的新画面是脏数据。
+    if (carryFlushTimer) clearTimeout(carryFlushTimer);
+    carryFlushTimer = null;
+    bypassCarry = new Uint8Array(0);
     onSessionEnd();
   }
 

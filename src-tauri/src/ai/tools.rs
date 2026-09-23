@@ -1142,19 +1142,31 @@ async fn exec_ssh_visual_unlocked(state: &AppState, session_id: &str, command: &
             .unwrap_or_default();
         crate::encoding::encode_input(&label, wrapped.as_bytes())
     };
-    let base = {
+    // 锁内只记基准 + 取写确认 receiver：本地终端的同步写在 PTY 管道满且子进程
+    // 不读时会无限阻塞，发生在 terminals 锁内会连锁冻结所有终端命令。
+    // 锁外等待写完成（15s 超时兜底）。
+    let (base, ack_rx) = {
         let terminals = state.terminals.lock();
         match terminals.get(session_id) {
             Some(ssh) => {
                 let base = ssh.total_output_bytes();
-                if let Err(e) = ssh.write(write_bytes) {
-                    return ToolResult::err(format!("写入终端失败: {e}"));
+                match ssh.write_with_ack(write_bytes) {
+                    Ok(rx) => (base, rx),
+                    Err(e) => return ToolResult::err(format!("写入终端失败: {e}")),
                 }
-                base
             }
             None => return ToolResult::err(format!("终端会话 {session_id} 不存在")),
         }
     };
+    match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => return ToolResult::err("终端 reader 已退出，写入未确认"),
+        Err(_) => {
+            return ToolResult::err(
+                "写入终端超时（15 秒），终端可能已卡死，建议断开重连",
+            )
+        }
+    }
 
     // 轮询等待命令执行完毕（最长 30 秒）。
     // 完成信号：
@@ -1176,14 +1188,26 @@ async fn exec_ssh_visual_unlocked(state: &AppState, session_id: &str, command: &
     let mut silence_since = std::time::Instant::now();
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
+        // 输出未增长时跳过 full_snapshot：无新字节则哨兵状态不可能变化，
+        // 直接复用上一轮结论——长命令挂起/等待输入期间，把轮询的锁内重活
+        // （256KiB 环形缓冲全量拷贝 + 全串哨兵扫描）降为一次计数读取。
         let (snap, total) = {
             let terminals = state.terminals.lock();
             match terminals.get(session_id) {
-                Some(ssh) => (ssh.full_snapshot(), ssh.total_output_bytes()),
+                Some(ssh) => {
+                    let total = ssh.total_output_bytes();
+                    if total == last_total {
+                        (None, total)
+                    } else {
+                        (Some(ssh.full_snapshot()), total)
+                    }
+                }
                 None => return ToolResult::err("终端会话已断开"),
             }
         };
-        snapshot = snap;
+        if let Some(s) = snap {
+            snapshot = s;
+        }
 
         let occurrences = snapshot.matches(&sentinel).count();
         // 常规 shell：回显行 + echo 输出行都出现 → 命令已结束。

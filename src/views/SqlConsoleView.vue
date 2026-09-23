@@ -1939,6 +1939,9 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 5px;
   font-size: 13px;
+  /* 撑满整行：悬停行内任意位置都能触发操作按钮（而不只是文字上） */
+  flex: 1;
+  min-width: 0;
 }
 /* 表节点可拖拽到 AI 输入框/SQL 编辑器。 */
 .tree-node.draggable {
@@ -1977,15 +1980,17 @@ onBeforeUnmount(() => {
   gap: 2px;
 }
 .node-menu {
-  display: none;
+  display: flex;
   align-items: center;
   cursor: pointer;
   padding: 2px;
   flex-shrink: 0;
+  /* 常驻占位（避免悬停时文字被挤动），默认不可见，悬停整行才显示 */
+  visibility: hidden;
 }
 .tree-node:hover .node-menu,
 .node-menu:focus-within {
-  display: flex;
+  visibility: visible;
 }
 .node-menu-icon {
   font-size: 13px;

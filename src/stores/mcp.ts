@@ -50,6 +50,12 @@ export const useMcpStore = defineStore("mcp", () => {
       boundDatabase: undefined,
       runMode: "manual",
       enableLog: true,
+      // 堡垒机模式：目标会话空闲 15 分钟自动回收（0 = 不回收）。
+      idleTimeoutMinutes: 15,
+      // 堡垒机模式：登录后命令（如 sudo su -）；默认不执行。
+      postLoginCommand: undefined,
+      // 堡垒机模式：基础连接（MFA 一次的那条）空闲保持 30 分钟（0 = 不保持）。
+      baseIdleMinutes: 30,
     };
   }
 

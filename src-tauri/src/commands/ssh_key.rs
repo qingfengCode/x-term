@@ -98,7 +98,7 @@ pub async fn ssh_key_generate(
     .await
     .map_err(|e| AppError::Ssh(format!("密钥生成任务失败: {}", e)))??;
 
-    // 4. 复用 credential_save 加密入库（State 可 Copy，直接传递）。
+    // 4. 复用 credential_save 加密入库（其自身在阻塞线程池执行）。
     let id = credential_save(
         CredentialInput {
             id: None,
@@ -108,7 +108,8 @@ pub async fn ssh_key_generate(
             passphrase,
         },
         state,
-    )?;
+    )
+    .await?;
 
     Ok(GeneratedKeyInfo {
         id,

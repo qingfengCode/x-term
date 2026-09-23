@@ -5,7 +5,7 @@
 //! （不复用终端/SFTP 连接）。
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::error::{AppError, AppResult};
 use crate::events::{self, ForwardStateEvent};
@@ -91,33 +91,42 @@ pub struct ForwardRule {
 // 持久化 CRUD
 // ---------------------------------------------------------------------------
 
+// 三条 CRUD 均 async + `spawn_blocking`：取连接（池耗尽等待上限 5s）+ SQLite
+// 写锁等待（`busy_timeout` 5000ms）跑在主线程会冻结整个窗口。
+
 #[tauri::command]
-pub fn forward_list_rules(state: State<'_, AppState>) -> AppResult<Vec<ForwardRule>> {
-    let conn = state.conn()?;
-    let mut stmt = conn.prepare(
-        "SELECT id, name, session_id, kind, local_host, local_port, remote_host, \
-         remote_port, auto_start, created_at FROM forward_rules ORDER BY created_at ASC",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        let auto: i64 = r.get(8)?;
-        Ok(ForwardRule {
-            id: r.get(0)?,
-            name: r.get(1)?,
-            session_id: r.get(2)?,
-            kind: r.get(3)?,
-            local_host: r.get(4)?,
-            local_port: port_col(r, 5)?,
-            remote_host: r.get(6)?,
-            remote_port: port_col(r, 7)?,
-            auto_start: auto != 0,
-            created_at: r.get(9)?,
-        })
-    })?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
+pub async fn forward_list_rules(state: State<'_, AppState>) -> AppResult<Vec<ForwardRule>> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, session_id, kind, local_host, local_port, remote_host, \
+             remote_port, auto_start, created_at FROM forward_rules ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let auto: i64 = r.get(8)?;
+            Ok(ForwardRule {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                session_id: r.get(2)?,
+                kind: r.get(3)?,
+                local_host: r.get(4)?,
+                local_port: port_col(r, 5)?,
+                remote_host: r.get(6)?,
+                remote_port: port_col(r, 7)?,
+                auto_start: auto != 0,
+                created_at: r.get(9)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("读取转发规则任务失败: {}", e)))?
 }
 
 /// 保存（插入或 upsert）一条转发规则，返回落库后的规则。
@@ -126,46 +135,65 @@ pub fn forward_list_rules(state: State<'_, AppState>) -> AppResult<Vec<ForwardRu
 /// 规范化，autoStart 等后续操作必须用返回值里的 id，避免自启动打到
 /// 不存在的规则上。
 #[tauri::command]
-pub fn forward_save_rule(rule: ForwardRule, state: State<'_, AppState>) -> AppResult<ForwardRule> {
-    let conn = state.conn()?;
-    conn.execute(
-        "INSERT INTO forward_rules (id, name, session_id, kind, local_host, local_port, \
-         remote_host, remote_port, auto_start, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
-         ON CONFLICT(id) DO UPDATE SET \
-            name = excluded.name, session_id = excluded.session_id, \
-            kind = excluded.kind, local_host = excluded.local_host, \
-            local_port = excluded.local_port, remote_host = excluded.remote_host, \
-            remote_port = excluded.remote_port, auto_start = excluded.auto_start",
-        rusqlite::params![
-            rule.id,
-            rule.name,
-            rule.session_id,
-            rule.kind,
-            rule.local_host,
-            rule.local_port as i64,
-            rule.remote_host,
-            rule.remote_port as i64,
-            rule.auto_start as i64,
-            rule.created_at,
-        ],
-    )?;
-    Ok(rule)
+pub async fn forward_save_rule(
+    rule: ForwardRule,
+    state: State<'_, AppState>,
+) -> AppResult<ForwardRule> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        conn.execute(
+            "INSERT INTO forward_rules (id, name, session_id, kind, local_host, local_port, \
+             remote_host, remote_port, auto_start, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+             ON CONFLICT(id) DO UPDATE SET \
+                name = excluded.name, session_id = excluded.session_id, \
+                kind = excluded.kind, local_host = excluded.local_host, \
+                local_port = excluded.local_port, remote_host = excluded.remote_host, \
+                remote_port = excluded.remote_port, auto_start = excluded.auto_start",
+            rusqlite::params![
+                rule.id,
+                rule.name,
+                rule.session_id,
+                rule.kind,
+                rule.local_host,
+                rule.local_port as i64,
+                rule.remote_host,
+                rule.remote_port as i64,
+                rule.auto_start as i64,
+                rule.created_at,
+            ],
+        )?;
+        Ok(rule)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("保存转发规则任务失败: {}", e)))?
 }
 
 #[tauri::command]
-pub fn forward_delete_rule(id: String, app: AppHandle, state: State<'_, AppState>) -> AppResult<()> {
-    let conn = state.conn()?;
-    conn.execute("DELETE FROM forward_rules WHERE id = ?1", [&id])?;
-    // 同步停止运行中的隧道。
-    if let Some(tunnel) = state.tunnels.lock().remove(&id) {
-        // 隧道停止是异步的；这里不 await，spawn 出去避免命令阻塞。
-        // 注意：同步 Tauri 命令运行在主线程（无 tokio 运行时上下文），裸
-        // tokio::spawn 会 panic 导致程序崩溃；async_runtime::spawn 任意线程可用。
-        tauri::async_runtime::spawn(crate::ssh::tunnel::stop(tunnel));
-        emit_state(&app, &id, false, "规则已删除");
-    }
-    Ok(())
+pub async fn forward_delete_rule(
+    id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    let state_app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = state_app.state::<AppState>();
+        let conn = state.conn()?;
+        conn.execute("DELETE FROM forward_rules WHERE id = ?1", [&id])?;
+        // 同步停止运行中的隧道。
+        if let Some(tunnel) = state.tunnels.lock().remove(&id) {
+            // 隧道停止是异步的；这里不 await，spawn 出去避免命令阻塞。
+            // async_runtime::spawn 任意线程可用（阻塞线程池中无 tokio 上下文，
+            // 裸 tokio::spawn 会 panic）。
+            tauri::async_runtime::spawn(crate::ssh::tunnel::stop(tunnel));
+            emit_state(&app, &id, false, "规则已删除");
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("删除转发规则任务失败: {}", e)))?
 }
 
 // ---------------------------------------------------------------------------

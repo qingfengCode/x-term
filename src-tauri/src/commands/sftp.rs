@@ -162,18 +162,24 @@ pub async fn sftp_download(
         .download(
             &params.remote_path,
             &local,
-            std::sync::Arc::new(move |transferred, total| {
-                events::emit(
-                    &app_for_progress,
-                    TRANSFER_PROGRESS,
-                    TransferProgressEvent {
-                        task_id: task_id.clone(),
-                        transferred,
-                        total,
-                        speed: 0,
-                    },
-                );
-            }) as crate::file_backend::ProgressCb,
+            {
+                let throttle = events::ProgressThrottle::new();
+                std::sync::Arc::new(move |transferred, total| {
+                    if !throttle.allow(transferred >= total) {
+                        return;
+                    }
+                    events::emit(
+                        &app_for_progress,
+                        TRANSFER_PROGRESS,
+                        TransferProgressEvent {
+                            task_id: task_id.clone(),
+                            transferred,
+                            total,
+                            speed: 0,
+                        },
+                    );
+                }) as crate::file_backend::ProgressCb
+            },
             cancel,
         )
         .await;
@@ -254,18 +260,24 @@ pub async fn sftp_upload(
         .upload(
             &local,
             &params.remote_path,
-            std::sync::Arc::new(move |transferred, total| {
-                events::emit(
-                    &app_for_progress,
-                    TRANSFER_PROGRESS,
-                    TransferProgressEvent {
-                        task_id: task_id.clone(),
-                        transferred,
-                        total,
-                        speed: 0,
-                    },
-                );
-            }) as crate::file_backend::ProgressCb,
+            {
+                let throttle = events::ProgressThrottle::new();
+                std::sync::Arc::new(move |transferred, total| {
+                    if !throttle.allow(transferred >= total) {
+                        return;
+                    }
+                    events::emit(
+                        &app_for_progress,
+                        TRANSFER_PROGRESS,
+                        TransferProgressEvent {
+                            task_id: task_id.clone(),
+                            transferred,
+                            total,
+                            speed: 0,
+                        },
+                    );
+                }) as crate::file_backend::ProgressCb
+            },
             cancel,
         )
         .await;

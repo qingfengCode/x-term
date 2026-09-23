@@ -68,6 +68,13 @@ const toolHint = computed(() => {
       ? "对外暴露 exec_ssh(host/port/username/password/command)：目标服务器由调用方在参数中指定，免绑定本地实例。"
       : "对外暴露 exec_sql(host/port/username/password/database/sql)：目标数据库由调用方在参数中指定，免绑定本地实例。";
   }
+  if (bastionMode.value) {
+    return "对外暴露 bastion_list_hosts（只读，列资产菜单）/ bastion_create_session(host)（进入目标主机，返回 sessionId）\
+/ bastion_session_exec(sessionId, command) / bastion_upload_file(sessionId, localPath, remotePath)（经会话 shell 上传本地文件到目标主机）\
+/ bastion_close_session / bastion_list_sessions（只读）。\
+AI 经下方绑定的堡垒机（SSH 会话配置）按需进出资产主机：所有主机会话复用同一条已认证连接，\
+动态口令/MFA 仅在首次建立连接时输入一次；若配置了登录后命令会先执行它。会话空闲自动回收。";
+  }
   if (multiMode.value) {
     return "对外暴露 exec_ssh(target, command) / list_files / upload_file / download_file（均需 target）\
 与只读 list_machines()（机器清单）。target 由外部 AI 从下方勾选的机器中自行选择，\
@@ -100,6 +107,9 @@ const clientMode = computed(() => !isFile.value && config.value.resourceMode ===
 /** 多机模式（仅 SSH）：勾选一组机器授权给外部 AI，由 AI 按工具参数 target 自选目标。 */
 const multiMode = computed(() => isSsh.value && config.value.resourceMode === "multi");
 
+/** 堡垒机模式（仅 SSH）：绑定堡垒机 SSH 会话配置，以「会话」为单位按需进出资产主机。 */
+const bastionMode = computed(() => isSsh.value && config.value.resourceMode === "bastion");
+
 /** 多机模式的勾选集合（旧配置无 resourceIds 字段时兜底为空数组，避免 multiple select 收到 undefined）。 */
 const selectedIds = computed<string[]>({
   get: () => config.value.resourceIds ?? [],
@@ -118,21 +128,34 @@ const boundSource = computed<McpBoundSource>(
  * - "config"：会话配置绑定（bound + boundSource=config）
  * - "terminal"：终端标签页绑定（bound + boundSource=terminal）
  * - "multi"：多机模式（resourceMode=multi，仅 SSH：勾选一组机器，AI 按 target 自选）
+ * - "bastion"：堡垒机模式（resourceMode=bastion，仅 SSH：绑定堡垒机会话配置，
+ *   以「会话」为单位按需进出资产主机）
  * - "client"：客户端直连（resourceMode=client，免绑定）
  */
-const mode = computed<"config" | "terminal" | "multi" | "client">(() => {
+const mode = computed<"config" | "terminal" | "multi" | "bastion" | "client">(() => {
   if (config.value.resourceMode === "client") return "client";
   if (config.value.resourceMode === "multi") return "multi";
+  if (config.value.resourceMode === "bastion") return "bastion";
   return boundSource.value === "terminal" ? "terminal" : "config";
 });
 
 /** 终端标签页绑定模式（SSH kind + bound 模式 + 来源为 terminal）。 */
 const terminalBound = computed(
-  () => isSsh.value && !clientMode.value && !multiMode.value && boundSource.value === "terminal",
+  () => isSsh.value && !clientMode.value && !multiMode.value && !bastionMode.value && boundSource.value === "terminal",
 );
 
 /** 模式 / 绑定方式的说明（悬浮帮助）。 */
 const modeHint = computed(() => {
+  if (bastionMode.value) {
+    return "以「会话」为单位按需进出堡垒机资产主机：AI 先用 bastion_list_hosts 查看资产菜单，\
+bastion_create_session 进入目标主机拿到 sessionId，bastion_session_exec 在该主机执行命令，\
+bastion_close_session 关闭。\n\
+连接模型：首次请求会与堡垒机建立一条连接（若账号启用动态口令/MFA，此时会弹全局验证码窗口，\
+120 秒内输入即可），之后所有目标主机都在这条已认证连接上开新通道复用，不再要求验证码；\
+连接空闲超过「连接保持」时长、或服务停止时才断开。\n\
+若配置了「登录后命令」（如 sudo su -），AI 进入主机后会先执行它，随后的命令都在该上下文执行。\n\
+会话空闲超过「会话空闲回收」时长会自动断开；切换到/离开本模式需重启服务。";
+  }
   if (multiMode.value) {
     return "勾选一组机器授权给外部 AI：每次工具调用由 AI 按机器名 / 地址 / 标签自行决定目标\
 （参数 target）。重名机器的目标名自动加 #序号 后缀；确认卡片与日志都会显示目标机器。\
@@ -253,6 +276,12 @@ function displayNamesOf(sessions: { id: string; name: string }[]): Map<string, s
 
 /** 绑定资源的展示名（用于运行状态/提示）。 */
 const boundResourceName = computed(() => {
+  if (bastionMode.value) {
+    const id = config.value.resourceId;
+    if (!id) return "";
+    const name = sshSessions.value.find((s) => s.id === id)?.name ?? "(会话已删除)";
+    return `堡垒机 · ${name}`;
+  }
   if (multiMode.value) {
     const ids = config.value.resourceIds ?? [];
     if (ids.length === 0) return "";
@@ -385,20 +414,35 @@ async function onModeChange(value: string | number | boolean) {
       ? "client"
       : value === "multi"
         ? "multi"
-        : value === "terminal"
-          ? "terminal"
-          : "config";
+        : value === "bastion"
+          ? "bastion"
+          : value === "terminal"
+            ? "terminal"
+            : "config";
   if (next === mode.value) return;
   const prev = mode.value;
   config.value.resourceMode =
-    next === "client" ? "client" : next === "multi" ? "multi" : "bound";
+    next === "client"
+      ? "client"
+      : next === "multi"
+        ? "multi"
+        : next === "bastion"
+          ? "bastion"
+          : "bound";
   config.value.boundSource = next === "terminal" ? "terminal" : "config";
   if (prev !== "client" && next !== "client") {
     // 单选 / 多选的 id 空间不同，清空重选。
     config.value.resourceId = undefined;
   }
-  if (next === "client" || prev === "client" || next === "multi" || prev === "multi") {
-    // 涉及客户端直连或多机：resource_mode 启动时固化，需重启生效。
+  if (
+    next === "client" ||
+    prev === "client" ||
+    next === "multi" ||
+    prev === "multi" ||
+    next === "bastion" ||
+    prev === "bastion"
+  ) {
+    // 涉及客户端直连 / 多机 / 堡垒机：resource_mode 启动时固化，需重启生效。
     await saveConfigAndMaybeWarn();
   } else {
     await saveConfigAndMaybeWarn({ hotRebind: true });
@@ -524,11 +568,13 @@ async function start() {
   } else if (!clientMode.value && !config.value.resourceId) {
     const resName = terminalBound.value
       ? "终端标签页"
-      : isSsh.value
-        ? "SSH 会话"
-        : isFile.value
-          ? "S3 文件账号"
-          : "数据库连接";
+      : bastionMode.value
+        ? "堡垒机会话配置"
+        : isSsh.value
+          ? "SSH 会话"
+          : isFile.value
+            ? "S3 文件账号"
+            : "数据库连接";
     ElMessage.warning(`请先选择一个${resName}，或选择「客户端直连」模式`);
     return;
   }
@@ -615,18 +661,20 @@ onMounted(async () => {
             :label="isSsh ? '会话配置（新建连接执行）' : '会话配置（绑定数据库连接）'"
           />
           <el-option v-if="isSsh" value="multi" label="多机模式（勾选多台，AI 自选目标）" />
+          <el-option v-if="isSsh" value="bastion" label="堡垒机模式（经堡垒机按需进出主机）" />
           <el-option value="client" label="客户端直连（免绑定，调用方传账密）" />
         </el-select>
       </div>
 
-      <!-- 多机模式说明 -->
-      <el-alert v-if="multiMode" type="info" :closable="false" show-icon class="alert-gap">
-        <div class="client-mode-alert">
-          <div>工具调用需传 <code>target</code> 指定目标机器，外部 AI 按机器名 / 地址 / 标签自行路由。</div>
-          <div>重名机器的目标名自动加 <code>#序号</code> 后缀；越权 target 会被直接拒绝。</div>
-          <div>运行中调整勾选<strong>即时生效</strong>；切换到 / 离开本模式需<strong>重启 MCP 服务</strong>。</div>
-        </div>
-      </el-alert>
+      <!-- 堡垒机模式说明（连接复用/MFA 一次 + 会话机制，详细说明见「模式 / 绑定方式」旁的帮助） -->
+      <div v-if="bastionMode" class="compact-hint warn">
+        <span>AI 以「会话」进出资产主机（查资产 → 建会话 → 执行 → 关闭）；所有主机会话复用同一条已认证连接，动态口令/MFA 只需在首次连接时输入一次。</span>
+      </div>
+
+      <!-- 多机模式说明（单行细提示，详细规则见「模式 / 绑定方式」旁的帮助） -->
+      <div v-if="multiMode" class="compact-hint">
+        <span>调用需传 <code>target</code> 指定目标机器（AI 自行路由，越权将被拒绝）；调整勾选即时生效，切换模式需重启。</span>
+      </div>
 
       <!-- 多机模式：勾选授权机器集合 -->
       <div v-if="multiMode" class="field-row">
@@ -651,36 +699,32 @@ onMounted(async () => {
             :value="s.id"
           />
         </el-select>
-        <div v-if="selectedIds.length > 0" class="hint-text">
-          已选 {{ selectedIds.length }} 台；重名机器的目标名将自动加 #序号 后缀。
-        </div>
       </div>
 
-      <!-- 直连模式安全提示 -->
-      <el-alert
-        v-if="clientMode"
-        type="warning"
-        :closable="false"
-        show-icon
-        class="alert-gap"
-      >
-        <div class="client-mode-alert">
-          <div>调用方需在工具参数中传 <code>host</code> / <code>port</code> /
-            <code>username</code> / <code>password</code>（DB 另可传 <code>database</code>）。</div>
-          <div>密码<strong>仅本次调用有效</strong>：不存储、不落日志、不显示在确认弹窗中。</div>
-          <div>切换本模式后需<strong>重启 MCP 服务</strong>才能生效。</div>
-        </div>
-      </el-alert>
+      <!-- 直连模式安全提示（单行细提示，详细说明见「模式 / 绑定方式」旁的帮助） -->
+      <div v-if="clientMode" class="compact-hint">
+        <span>调用方在工具参数中传 <code>host</code> / <code>port</code> / <code>username</code> / <code>password</code>，凭据仅本次调用有效、不存储不落日志；切换本模式需重启生效。</span>
+      </div>
 
       <!-- 绑定资源（仅单选绑定模式；多机模式用上方的多选集合） -->
       <div v-if="!clientMode && !multiMode" class="field-row">
         <label class="field-label">
-          绑定{{ terminalBound ? "终端标签页" : isSsh ? "SSH 会话" : isFile ? "S3 文件账号" : "数据库连接" }}
+          绑定{{
+            terminalBound
+              ? "终端标签页"
+              : bastionMode
+                ? "堡垒机会话配置（SSH 会话）"
+                : isSsh
+                  ? "SSH 会话"
+                  : isFile
+                    ? "S3 文件账号"
+                    : "数据库连接"
+          }}
           <span class="required">*</span>
         </label>
         <el-select
           v-model="config.resourceId"
-          :placeholder="`选择${terminalBound ? '一个已打开的终端标签页' : isSsh ? '一个 SSH 会话' : isFile ? '一个 S3 文件账号' : '一个数据库连接'}`"
+          :placeholder="`选择${terminalBound ? '一个已打开的终端标签页' : bastionMode ? '一个堡垒机会话配置（即堡垒机服务器的 SSH 会话）' : isSsh ? '一个 SSH 会话' : isFile ? '一个 S3 文件账号' : '一个数据库连接'}`"
           filterable
           class="field-control"
           :disabled="!hasResources"
@@ -724,6 +768,53 @@ onMounted(async () => {
         </el-select>
       </div>
 
+      <!-- 堡垒机模式：登录后命令 + 连接保持 + 会话回收 -->
+      <div v-if="bastionMode" class="field-row">
+        <label class="field-label">
+          登录后命令
+          <HelpTip content="AI 进入目标主机后自动执行一次的命令，如 sudo su -（提权到 root 登录 shell）；之后的命令都在该上下文中执行。留空 = 不执行。要求无需交互输入：提权请给该账号配置免密 sudo（NOPASSWD），否则会因等待密码而超时报错。改动需重启服务生效。" />
+        </label>
+        <el-input
+          v-model="config.postLoginCommand"
+          placeholder="如 sudo su -（留空则不执行）"
+          clearable
+          class="field-control"
+          @change="onFieldChange"
+        />
+      </div>
+
+      <div v-if="bastionMode" class="field-row">
+        <label class="field-label">
+          连接保持（分钟）
+          <HelpTip content="堡垒机的 SSH 连接会完成一次认证（含动态口令/MFA），之后所有目标主机复用这条连接开新通道，不再要求验证码。这里配置它空闲多久后断开：期间的新请求都免 MFA；0 = 不保持（最后一个会话关闭即断开，下次需要重新验证）。改动需重启服务生效。" />
+        </label>
+        <el-input-number
+          v-model="config.baseIdleMinutes"
+          :min="0"
+          :max="1440"
+          :step="5"
+          controls-position="right"
+          class="field-control"
+          @change="onFieldChange"
+        />
+      </div>
+
+      <div v-if="bastionMode" class="field-row">
+        <label class="field-label">
+          会话空闲回收（分钟）
+          <HelpTip content="目标主机会话超过该时长无活动时自动断开回收，防止 AI 遗忘关闭占满堡垒机连接数。0 = 不自动回收。改动需重启服务生效。" />
+        </label>
+        <el-input-number
+          v-model="config.idleTimeoutMinutes"
+          :min="0"
+          :max="240"
+          :step="5"
+          controls-position="right"
+          class="field-control"
+          @change="onFieldChange"
+        />
+      </div>
+
       <!-- DB MCP：绑定具体数据库（仅 db kind + 绑定模式） -->
       <div v-if="kind === 'db' && !clientMode" class="field-row">
         <label class="field-label">
@@ -744,18 +835,13 @@ onMounted(async () => {
           <el-option v-for="db in databases" :key="db" :label="db" :value="db" />
         </el-select>
       </div>
-      <el-alert
-        v-if="!clientMode && !hasResources"
-        type="warning"
-        :closable="false"
-        show-icon
-        class="alert-gap"
-        :title="
+      <div v-if="!clientMode && !hasResources" class="compact-hint warn">
+        <span>{{
           terminalBound
-            ? '暂无已打开的 SSH 终端，请先在终端页打开一个终端（可嵌套登录后绑定该终端）'
-            : `暂无可用${isSsh ? 'SSH 会话' : isFile ? 'S3 文件账号' : '数据库连接'}，请先在对应页面创建${isFile ? '' : '，或选择「客户端直连」模式'}`
-        "
-      />
+            ? "暂无已打开的 SSH 终端，请先在终端页打开一个终端（可嵌套登录后绑定该终端）"
+            : `暂无可用${isSsh ? "SSH 会话" : isFile ? "S3 文件账号" : "数据库连接"}，请先在对应页面创建${isFile ? "" : "，或选择「客户端直连」模式"}`
+        }}</span>
+      </div>
 
       <!-- 监听地址 + 端口 -->
       <div class="addr-row">
@@ -779,8 +865,8 @@ onMounted(async () => {
         </div>
       </div>
       <!-- 对外监听提示：0.0.0.0 对所有网卡开放，局域网内持有 token 者均可调用 -->
-      <div v-if="config.host === '0.0.0.0'" class="hint-text warn-inline">
-        ⚠ 0.0.0.0 表示监听所有网卡，局域网内其他机器可通过本机 IP 连接（请妥善保管 token）。
+      <div v-if="config.host === '0.0.0.0'" class="compact-hint warn">
+        <span>0.0.0.0 表示监听所有网卡，局域网内其他机器可通过本机 IP 连接（请妥善保管 token）。</span>
       </div>
     </div>
 
@@ -824,9 +910,11 @@ onMounted(async () => {
               {{
                 clientMode
                   ? "客户端直连模式 · 未绑定实例"
-                  : multiMode
-                    ? boundResourceName || "多机模式 · 未勾选机器"
-                    : `已绑定 · ${boundResourceName || "—"}`
+                  : bastionMode
+                    ? `堡垒机模式 · ${boundResourceName || "未绑定堡垒机"}`
+                    : multiMode
+                      ? boundResourceName || "多机模式 · 未勾选机器"
+                      : `已绑定 · ${boundResourceName || "—"}`
               }}
             </template>
             <template v-else>完成配置后点击「启动服务」对外提供调用</template>
@@ -901,16 +989,29 @@ onMounted(async () => {
         </HelpTip>
       </div>
       <div class="token-row">
-        <el-input :model-value="config.token ?? ''" placeholder="点击生成 token" readonly class="token-input">
+        <el-input
+          :model-value="config.token ?? ''"
+          placeholder="点击生成 token"
+          readonly
+          size="small"
+          class="token-input"
+        >
           <template #prefix><el-icon><Key /></el-icon></template>
         </el-input>
-        <el-button type="primary" :icon="'Refresh'" @click="generateToken">
+        <el-button type="primary" :icon="'Refresh'" size="small" @click="generateToken">
           {{ config.token ? "重新生成" : "生成 Token" }}
         </el-button>
-        <el-button v-if="config.token" :icon="'CopyDocument'" @click="copy(config.token, '已复制 token')">复制</el-button>
+        <el-button
+          v-if="config.token"
+          :icon="'CopyDocument'"
+          size="small"
+          @click="copy(config.token, '已复制 token')"
+        >
+          复制
+        </el-button>
       </div>
       <!-- 安全警告：保持直接展示，不收进 tooltip -->
-      <div class="token-warn">
+      <div class="compact-hint warn token-warn">
         <el-icon class="warn-ico"><WarningFilled /></el-icon>
         <span>妥善保管 token：任何持有该 token 的客户端均可调用本服务执行操作。</span>
       </div>
@@ -923,10 +1024,8 @@ onMounted(async () => {
         <span class="card-title-text">客户端配置示例</span>
         <HelpTip content="将以下配置加入 Claude Desktop 的 claude_desktop_config.json（或 Cursor 的 MCP 设置）。需先启动服务并生成 token。" />
       </div>
-      <div v-if="!status.running || !config.token" class="config-empty">
-        <el-alert type="info" :closable="false" show-icon>
-          请先完成配置（{{ clientMode ? "直连模式无需绑定实例" : multiMode ? "勾选授权机器" : "绑定资源" }}）、生成 token 并启动服务，配置将自动生成。
-        </el-alert>
+      <div v-if="!status.running || !config.token" class="compact-hint">
+        请先完成配置（{{ clientMode ? "直连模式无需绑定实例" : multiMode ? "勾选授权机器" : "绑定资源" }}）、生成 token 并启动服务，配置将自动生成。
       </div>
       <div v-else class="json-block">
         <div class="json-head">
@@ -946,7 +1045,7 @@ onMounted(async () => {
 .instance-panel {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
   padding: 2px 2px 8px;
 }
 
@@ -955,7 +1054,7 @@ onMounted(async () => {
   background: var(--el-bg-color-overlay);
   border: 1px solid var(--el-border-color-lighter);
   border-radius: 10px;
-  padding: 14px 16px 16px;
+  padding: 12px 14px 14px;
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
 }
 
@@ -964,24 +1063,24 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding-bottom: 10px;
-  margin-bottom: 14px;
+  padding-bottom: 7px;
+  margin-bottom: 12px;
   border-bottom: 1px solid var(--el-border-color-lighter);
 }
 .card-ico {
-  width: 24px;
-  height: 24px;
+  width: 20px;
+  height: 20px;
   border-radius: 6px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-size: 13px;
+  font-size: 12px;
   flex-shrink: 0;
   color: var(--el-color-primary);
   background: var(--el-color-primary-light-9);
 }
 .card-title-text {
-  font-size: 13.5px;
+  font-size: 13px;
   font-weight: 600;
   letter-spacing: 0.2px;
   color: var(--el-text-color-primary);
@@ -996,11 +1095,11 @@ onMounted(async () => {
 .field-row {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  margin-bottom: 14px;
+  gap: 5px;
+  margin-bottom: 12px;
 }
 .field-label {
-  font-size: 12.5px;
+  font-size: 12px;
   color: var(--el-text-color-regular);
   font-weight: 500;
   display: flex;
@@ -1015,7 +1114,7 @@ onMounted(async () => {
 }
 .mono-input :deep(input) {
   font-family: var(--app-font-mono);
-  font-size: 12.5px;
+  font-size: 12px;
 }
 .addr-row {
   display: flex;
@@ -1025,44 +1124,46 @@ onMounted(async () => {
   flex: 1;
 }
 .addr-row .field-row {
-  margin-bottom: 10px;
+  margin-bottom: 8px;
 }
 .port-field {
   max-width: 160px;
 }
 
-.client-mode-alert {
-  font-size: 12px;
-  line-height: 1.8;
+/* 单行细提示（替代大块 el-alert）：默认次要灰、warn 为警示色；详细说明收在 HelpTip 悬浮里 */
+.compact-hint {
+  display: flex;
+  align-items: flex-start;
+  gap: 5px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--el-text-color-secondary);
+  margin-bottom: 10px;
 }
-.client-mode-alert code {
+.compact-hint code {
   background: var(--el-fill-color-light);
-  padding: 1px 4px;
+  padding: 0 3px;
   border-radius: 3px;
   font-family: var(--app-font-mono);
+  font-size: 11px;
 }
-.hint-text {
-  font-size: 12px;
-  color: var(--el-text-color-secondary);
-  margin-bottom: 4px;
+.compact-hint.warn {
+  color: var(--el-color-warning);
 }
-.warn-inline {
-  color: var(--el-color-danger);
-}
-/* el-alert 与上方字段行间距：负上边距抵消 .field-row 的 margin-bottom，得到紧凑的 10px 间隙 */
-.alert-gap {
-  margin-top: -4px;
-  margin-bottom: 14px;
+.compact-hint .warn-ico {
+  font-size: 13px;
+  flex-shrink: 0;
+  margin-top: 1px;
 }
 
 /* --- 状态 hero --- */
 .status-hero {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 12px 14px;
+  gap: 10px;
+  padding: 10px 12px;
   border-radius: 8px;
-  margin-bottom: 12px;
+  margin-bottom: 10px;
   border: 1px solid var(--el-border-color-lighter);
   background: var(--el-fill-color-light);
   transition: background 0.25s, border-color 0.25s;
@@ -1094,7 +1195,7 @@ onMounted(async () => {
   min-width: 0;
 }
 .hero-state {
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 600;
   line-height: 1.2;
   color: var(--el-text-color-primary);
@@ -1116,7 +1217,7 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 14px;
+  margin-bottom: 10px;
   min-width: 0;
 }
 .endpoint-tag {
@@ -1146,7 +1247,7 @@ onMounted(async () => {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 11px 0;
+  padding: 9px 0;
   border-top: 1px dashed var(--el-border-color-lighter);
 }
 .switch-row:first-of-type {
@@ -1156,7 +1257,7 @@ onMounted(async () => {
   min-width: 0;
 }
 .switch-title {
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 500;
   color: var(--el-text-color-primary);
   display: flex;
@@ -1164,10 +1265,10 @@ onMounted(async () => {
   gap: 4px;
 }
 .switch-desc {
-  font-size: 12px;
+  font-size: 11.5px;
   color: var(--el-text-color-secondary);
   margin-top: 2px;
-  line-height: 1.4;
+  line-height: 1.5;
 }
 
 /* --- 令牌 --- */
@@ -1182,31 +1283,15 @@ onMounted(async () => {
 }
 .token-input :deep(input) {
   font-family: var(--app-font-mono);
-  font-size: 12.5px;
-}
-.token-warn {
-  display: flex;
-  align-items: flex-start;
-  gap: 6px;
-  margin-top: 10px;
-  padding: 8px 10px;
-  border-radius: 6px;
   font-size: 12px;
-  line-height: 1.6;
-  color: var(--el-color-warning);
-  background: var(--el-color-warning-light-9);
-  border: 1px solid var(--el-color-warning-light-8);
 }
-.warn-ico {
-  font-size: 14px;
-  flex-shrink: 0;
-  margin-top: 2px;
+/* token 安全警告：复用 compact-hint，仅补顶部间距、去掉底部间距（卡片末行） */
+.token-warn {
+  margin-top: 6px;
+  margin-bottom: 0;
 }
 
 /* --- 客户端配置 JSON 块（迷你终端窗口） --- */
-.config-empty {
-  margin-top: 4px;
-}
 .json-block {
   border-radius: 8px;
   overflow: hidden;
@@ -1217,7 +1302,7 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 10px;
+  padding: 5px 8px 5px 10px;
   background: #1c2330;
   border-bottom: 1px solid #2a3442;
 }
@@ -1256,12 +1341,20 @@ onMounted(async () => {
 .config-json {
   background: #161b22;
   color: #7ee787;
-  padding: 12px 14px;
+  padding: 10px 12px;
   font-size: 12px;
   line-height: 1.6;
   overflow: auto;
   margin: 0;
-  max-height: 260px;
+  max-height: 240px;
   font-family: var(--app-font-mono);
+}
+/* 深色 JSON 块内的细滚动条（与日志面板一致） */
+.config-json::-webkit-scrollbar {
+  width: 8px;
+}
+.config-json::-webkit-scrollbar-thumb {
+  background: #2f3a48;
+  border-radius: 4px;
 }
 </style>

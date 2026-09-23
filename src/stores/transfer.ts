@@ -119,7 +119,11 @@ export const useTransferStore = defineStore("transfer", () => {
   // 进行中的进度本来就不持久化）。
   let persistTimer: ReturnType<typeof setTimeout> | null = null;
   watch(
-    tasks,
+    // 触发源只取「任务 id:状态」签名：持久化只关心集合与状态变化（新任务 /
+    // 移除 / 结束态迁移），进度字段更新无需触发。此前 { deep: true } 会在
+    // 高速传输的**每次** progress 事件里深度遍历整个任务列表（数百次/秒），
+    // 即使落盘有 1s 防抖，遍历本身也持续占用主线程。
+    () => tasks.value.map((t) => `${t.id}:${t.status}`).join("|"),
     () => {
       if (persistTimer) clearTimeout(persistTimer);
       persistTimer = setTimeout(() => {
@@ -134,7 +138,6 @@ export const useTransferStore = defineStore("transfer", () => {
         }
       }, 1000);
     },
-    { deep: true },
   );
 
   return { tasks, add, update, remove, clearDone };

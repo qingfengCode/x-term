@@ -15,7 +15,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::error::{AppError, AppResult};
 use crate::events::{
@@ -33,30 +33,51 @@ use crate::storage::file_accounts_repo::{
 // 账号 CRUD
 // ---------------------------------------------------------------------------
 
+// 三条 CRUD 均 async + `spawn_blocking`：取连接（池耗尽等待上限 5s）+ SQLite
+// 语句跑在主线程会冻结整个窗口。
+
 /// 列出所有文件账号。
 #[tauri::command]
-pub fn file_account_list(state: State<'_, AppState>) -> AppResult<Vec<FileAccount>> {
-    let conn = state.conn()?;
-    list_file_accounts(&conn)
+pub async fn file_account_list(state: State<'_, AppState>) -> AppResult<Vec<FileAccount>> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        list_file_accounts(&conn)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("读取文件账号列表任务失败: {}", e)))?
 }
 
 /// 新增或更新文件账号（UPSERT）。
 #[tauri::command]
-pub fn file_account_save(account: FileAccount, state: State<'_, AppState>) -> AppResult<()> {
-    let conn = state.conn()?;
-    upsert_file_account(&conn, &account)
+pub async fn file_account_save(account: FileAccount, state: State<'_, AppState>) -> AppResult<()> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        upsert_file_account(&conn, &account)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("保存文件账号任务失败: {}", e)))?
 }
 
 /// 删除文件账号；同步断开该账号的运行时连接。
 #[tauri::command]
-pub fn file_account_delete(id: String, state: State<'_, AppState>) -> AppResult<()> {
-    {
-        let conn = state.conn()?;
-        delete_file_account(&conn, &id)?;
-    }
-    // 按 account_id 精确清理（S3 连接无状态，drop 即释放）。
-    state.file_backends.lock().remove(&id);
-    Ok(())
+pub async fn file_account_delete(id: String, state: State<'_, AppState>) -> AppResult<()> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        {
+            let conn = state.conn()?;
+            delete_file_account(&conn, &id)?;
+        }
+        // 按 account_id 精确清理（S3 连接无状态，drop 即释放）。
+        state.file_backends.lock().remove(&id);
+        Ok(())
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("删除文件账号任务失败: {}", e)))?
 }
 
 // ---------------------------------------------------------------------------
@@ -246,18 +267,24 @@ pub async fn file_download(
         .download(
             &params.remote_path,
             &local,
-            Arc::new(move |transferred, total| {
-                events::emit(
-                    &app_for_progress,
-                    TRANSFER_PROGRESS,
-                    TransferProgressEvent {
-                        task_id: task_id.clone(),
-                        transferred,
-                        total,
-                        speed: 0,
-                    },
-                );
-            }) as crate::file_backend::ProgressCb,
+            {
+                let throttle = events::ProgressThrottle::new();
+                Arc::new(move |transferred, total| {
+                    if !throttle.allow(transferred >= total) {
+                        return;
+                    }
+                    events::emit(
+                        &app_for_progress,
+                        TRANSFER_PROGRESS,
+                        TransferProgressEvent {
+                            task_id: task_id.clone(),
+                            transferred,
+                            total,
+                            speed: 0,
+                        },
+                    );
+                }) as crate::file_backend::ProgressCb
+            },
         )
         .await;
 
@@ -314,18 +341,24 @@ pub async fn file_upload(
         .upload(
             &local,
             &params.remote_path,
-            Arc::new(move |transferred, total| {
-                events::emit(
-                    &app_for_progress,
-                    TRANSFER_PROGRESS,
-                    TransferProgressEvent {
-                        task_id: task_id.clone(),
-                        transferred,
-                        total,
-                        speed: 0,
-                    },
-                );
-            }) as crate::file_backend::ProgressCb,
+            {
+                let throttle = events::ProgressThrottle::new();
+                Arc::new(move |transferred, total| {
+                    if !throttle.allow(transferred >= total) {
+                        return;
+                    }
+                    events::emit(
+                        &app_for_progress,
+                        TRANSFER_PROGRESS,
+                        TransferProgressEvent {
+                            task_id: task_id.clone(),
+                            transferred,
+                            total,
+                            speed: 0,
+                        },
+                    );
+                }) as crate::file_backend::ProgressCb
+            },
         )
         .await;
 

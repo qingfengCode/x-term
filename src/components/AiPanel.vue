@@ -1934,6 +1934,45 @@ function isGrowingPart(
   return m.streaming && part.kind === "text" && pIdx === (m.parts?.length ?? 0) - 1;
 }
 
+/**
+ * 给每个代码块（`<pre>`）套一层容器并插入「复制」按钮。
+ *
+ * 正文是 v-html 注入的裸 HTML，没有组件实例，按钮只能用内联元素 + 事件委托
+ * （见 [`onMdClick`]）。按钮放在 `pre` **外层**：放进 pre 内部会让
+ * `pre.textContent` 把按钮文字一起复制出去。
+ *
+ * 在 sanitize 之后执行，注入的标记不受 DOMPurify 策略限制。
+ */
+function decorateCodeBlocks(html: string): string {
+  // 无代码块时（绝大多数段落）直接返回，省掉一次 DOM 解析。
+  if (!html.includes("<pre")) return html;
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  doc.querySelectorAll("pre").forEach((pre) => {
+    const wrap = doc.createElement("div");
+    wrap.className = "md-code";
+    const btn = doc.createElement("button");
+    btn.type = "button";
+    btn.className = "md-code-copy";
+    btn.textContent = "复制";
+    pre.replaceWith(wrap);
+    wrap.append(btn, pre);
+  });
+  return doc.body.innerHTML;
+}
+
+/**
+ * 代码块「复制」按钮的点击处理（事件委托）。
+ *
+ * v-html 注入的按钮无法绑定 `@click`，故在 `.md` 容器上统一监听。取同级 `pre`
+ * 的 `textContent`——它天然保留原始缩进与换行，且不含按钮文字。
+ */
+function onMdClick(e: MouseEvent) {
+  const btn = (e.target as HTMLElement | null)?.closest(".md-code-copy");
+  if (!btn) return;
+  const code = btn.parentElement?.querySelector("pre")?.textContent ?? "";
+  if (code) void copyText(code);
+}
+
 function renderMarkdown(text: string): string {
   if (!text) return "";
   // 流式过程中同一段文本会被反复渲染，缓存避免重复解析。
@@ -1946,10 +1985,12 @@ function renderMarkdown(text: string): string {
     html = "";
   }
   const clean = DOMPurify.sanitize(html);
+  // 代码块加容器与「复制」按钮：随最终字符串一起进缓存，每条消息只处理一次。
+  const decorated = decorateCodeBlocks(clean);
   // 缓存上限 200 条，避免长对话内存膨胀。
   if (renderedCache.size > 200) renderedCache.clear();
-  renderedCache.set(text, clean);
-  return clean;
+  renderedCache.set(text, decorated);
+  return decorated;
 }
 </script>
 
@@ -2218,7 +2259,7 @@ function renderMarkdown(text: string): string {
               <template v-for="(part, pIdx) in (m.parts ?? [])" :key="pIdx">
                 <!-- 文本段：已完成的走 markdown（有缓存）；流式中的增长段走
                      纯文本（isGrowingPart 说明），流结束后自动切回 markdown。 -->
-                <div v-if="part.kind === 'text' && part.text" class="md">
+                <div v-if="part.kind === 'text' && part.text" class="md" @click="onMdClick">
                   <template v-if="isGrowingPart(m, part, pIdx)">
                     <span class="md-raw">{{ part.text }}</span><span class="stream-cursor" />
                   </template>
@@ -3377,6 +3418,40 @@ function renderMarkdown(text: string): string {
   background: none;
   color: inherit;
   padding: 0;
+}
+/* 代码块容器：承载右上角悬停显示的「复制」按钮 */
+.md :deep(.md-code) {
+  position: relative;
+  margin: 6px 0;
+}
+/* 外边距统一交给容器，避免 pre 的 margin 让悬停区与代码块错开 */
+.md :deep(.md-code pre) {
+  margin: 0;
+}
+.md :deep(.md-code-copy) {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  /* 低于消息悬停操作条的 z-index:5，消息首行即代码块时不遮挡它 */
+  z-index: 1;
+  padding: 2px 8px;
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--el-text-color-secondary);
+  background: var(--el-bg-color-overlay);
+  border: 1px solid var(--el-border-color);
+  border-radius: 4px;
+  opacity: 0;
+  transition: opacity 0.15s;
+  cursor: pointer;
+}
+.md :deep(.md-code:hover .md-code-copy) {
+  opacity: 1;
+}
+.md :deep(.md-code-copy:hover) {
+  color: var(--el-color-primary);
+  border-color: var(--el-color-primary);
 }
 /* 行内 code（非代码块内） */
 .md :deep(code:not(pre code)) {

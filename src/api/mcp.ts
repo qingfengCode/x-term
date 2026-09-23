@@ -41,11 +41,14 @@ export interface McpInstanceConfig {
   resourceIds?: string[];
   /**
    * 资源模式："bound"（绑定本地资源，默认）| "client"（客户端直连，免绑定实例）
-   * | "multi"（多机模式，仅 SSH：勾选一组机器，由外部 AI 按工具参数 target 自选目标）。
+   * | "multi"（多机模式，仅 SSH：勾选一组机器，由外部 AI 按工具参数 target 自选目标）
+   * | "bastion"（堡垒机模式，仅 SSH：绑定堡垒机会话配置，以「会话」为单位按需
+   *   进出资产主机——bastion_list_hosts / bastion_create_session / bastion_session_exec
+   *   / bastion_upload_file / bastion_close_session / bastion_list_sessions）。
    * client 模式下调用方需在工具参数中传 host/port/username/password，
    * 凭据仅本次调用有效、不存储不落日志。
    */
-  resourceMode: "bound" | "client" | "multi";
+  resourceMode: "bound" | "client" | "multi" | "bastion";
   /**
    * 绑定来源（仅 bound 模式）："config"（会话配置，默认）| "terminal"（终端标签页）。
    * terminal 来源下命令写入该终端 PTY 执行，支持 A→B→C 跳板嵌套。
@@ -62,6 +65,19 @@ export interface McpInstanceConfig {
   runMode: "manual" | "whitelist" | "auto";
   /** 是否记录执行日志到文本文件（每次启动生成一个日志文件）。默认 true。 */
   enableLog: boolean;
+  /** 堡垒机目标主机会话空闲自动回收时长（分钟，仅 ssh + bastion 模式）。0 = 不回收。默认 15。 */
+  idleTimeoutMinutes: number;
+  /**
+   * 堡垒机「登录后命令」（仅 ssh + bastion 模式）：进入目标主机后自动执行一次，
+   * 之后的命令都在其上下文（如 `sudo su -` 的 root 登录 shell）中执行。
+   * 空 / 未配置 = 不执行。要求无需交互输入（提权请配免密 sudo）。
+   */
+  postLoginCommand?: string;
+  /**
+   * 堡垒机基础连接（完成 MFA 的那条）空闲保持时长（分钟，仅 ssh + bastion 模式）。
+   * 期间新请求复用该连接、不重复要求 MFA；0 = 不保持（最后一个会话关闭即断开）。默认 30。
+   */
+  baseIdleMinutes: number;
 }
 
 /** MCP 服务端运行状态。 */

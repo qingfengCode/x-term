@@ -11,7 +11,7 @@
 //! secret 在数据库中始终以 vault 加密 blob 存储；明文仅在内存中短暂存在。
 
 use serde::Deserialize;
-use tauri::State;
+use tauri::{Manager, State};
 
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
@@ -35,10 +35,19 @@ pub struct TotpAddInput {
 }
 
 /// 列出所有 TOTP 配置（不含 secret），按 sort_order / issuer / account 排序。
+///
+/// async + `spawn_blocking`：本模块所有命令都要取 SQLite 连接，跑在主线程会
+/// 直接冻结整个窗口（前端 MFA 页每秒 tick 还会周期性触发）。
 #[tauri::command]
-pub fn totp_list(state: State<'_, AppState>) -> AppResult<Vec<totp::TotpEntry>> {
-    let conn = state.conn()?;
-    totp::list_totp(&conn)
+pub async fn totp_list(state: State<'_, AppState>) -> AppResult<Vec<totp::TotpEntry>> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        totp::list_totp(&conn)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("读取 TOTP 列表任务失败: {}", e)))?
 }
 
 /// 新增一条 TOTP 配置。
@@ -49,7 +58,18 @@ pub fn totp_list(state: State<'_, AppState>) -> AppResult<Vec<totp::TotpEntry>> 
 /// - 入库前先 `generate_now` 校验 secret 可用，失败返回 InvalidInput；
 /// - 通过 vault 加密 secret 后入库。返回不含 secret 的 entry。
 #[tauri::command]
-pub fn totp_add(input: TotpAddInput, state: State<'_, AppState>) -> AppResult<totp::TotpEntry> {
+pub async fn totp_add(input: TotpAddInput, state: State<'_, AppState>) -> AppResult<totp::TotpEntry> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        totp_add_inner(input, &state)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("新增 TOTP 任务失败: {}", e)))?
+}
+
+/// [`totp_add`] 的阻塞实现（在阻塞线程池中执行）。
+fn totp_add_inner(input: TotpAddInput, state: &AppState) -> AppResult<totp::TotpEntry> {
     // 1. 构造 entry + 待加密的明文 secret。
     let (mut entry, plain_secret) = if input.secret.trim_start().starts_with("otpauth://") {
         let parsed = totp::parse_otpauth_uri(&input.secret)?;
@@ -127,30 +147,43 @@ pub fn totp_add(input: TotpAddInput, state: State<'_, AppState>) -> AppResult<to
 
 /// 删除一条 TOTP 配置。
 #[tauri::command]
-pub fn totp_delete(id: String, state: State<'_, AppState>) -> AppResult<()> {
-    let conn = state.conn()?;
-    totp::delete_totp(&conn, &id)
+pub async fn totp_delete(id: String, state: State<'_, AppState>) -> AppResult<()> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        totp::delete_totp(&conn, &id)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("删除 TOTP 任务失败: {}", e)))?
 }
 
 /// 为已存的 entry 实时生成当前验证码（每次实时，不缓存）。
 #[tauri::command]
-pub fn totp_generate(id: String, state: State<'_, AppState>) -> AppResult<totp::TotpCode> {
-    // 取 entry + enc_secret。
-    let conn = state.conn()?;
-    let (entry, enc_secret) = totp::get_totp_secret_enc(&conn, &id)?;
-    drop(conn); // 释放连接，避免持锁过久。
+pub async fn totp_generate(id: String, state: State<'_, AppState>) -> AppResult<totp::TotpCode> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        // 取 entry + enc_secret。
+        let (entry, enc_secret) = {
+            let conn = state.conn()?;
+            totp::get_totp_secret_enc(&conn, &id)?
+        };
 
-    // 解密 secret。
-    let vault_guard = state.vault_read()?;
-    let vault = vault_guard
-        .as_ref()
-        .ok_or_else(|| AppError::Auth("保险库未解锁".into()))?;
-    let blob = CredentialVault::decode_blob(&enc_secret)?;
-    let plain_secret = vault.decrypt_str(&blob)?;
-    drop(vault_guard);
+        // 解密 secret。
+        let vault_guard = state.vault_read()?;
+        let vault = vault_guard
+            .as_ref()
+            .ok_or_else(|| AppError::Auth("保险库未解锁".into()))?;
+        let blob = CredentialVault::decode_blob(&enc_secret)?;
+        let plain_secret = vault.decrypt_str(&blob)?;
+        drop(vault_guard);
 
-    // 实时生成。
-    totp::generate_now(&plain_secret, &entry.algorithm, entry.digits, entry.period)
+        // 实时生成。
+        totp::generate_now(&plain_secret, &entry.algorithm, entry.digits, entry.period)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("生成 TOTP 验证码任务失败: {}", e)))?
 }
 
 /// 临时生成验证码（不存库）——添加对话框中预览用。
@@ -192,13 +225,27 @@ pub async fn totp_fill_terminal(
     let code = totp::generate_now(&plain_secret, &entry.algorithm, entry.digits, entry.period)?;
 
     // 2. 找到终端会话并写入。
-    let terminals = state.terminals.lock();
-    match terminals.get(&instance_id) {
-        Some(session) => session.write(code.code.into_bytes()),
-        None => Err(AppError::NotFound(format!(
-            "找不到终端会话: {}",
-            instance_id
-        ))),
+    // 锁内只取写确认 receiver：本地终端的同步写在 PTY 管道满且子进程不读时会
+    // 无限阻塞，发生在 terminals 锁内会连锁冻结所有终端命令（resize/attach/
+    // 断开全部排队）。锁外等待写完成，超时返回错误而非永久挂起。
+    let ack_rx = {
+        let terminals = state.terminals.lock();
+        match terminals.get(&instance_id) {
+            Some(session) => session.write_with_ack(code.code.into_bytes())?,
+            None => {
+                return Err(AppError::NotFound(format!(
+                    "找不到终端会话: {}",
+                    instance_id
+                )))
+            }
+        }
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(15), ack_rx).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(AppError::Ssh("终端 reader 已退出，写入未确认".into())),
+        Err(_) => Err(AppError::Ssh(
+            "写入终端超时（15 秒），终端可能已卡死，建议断开重连".into(),
+        )),
     }
 }
 

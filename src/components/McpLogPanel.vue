@@ -219,7 +219,7 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 8px 10px;
+  padding: 6px 8px 6px 10px;
   background: #1c2330;
   border-bottom: 1px solid #2a3442;
   flex-shrink: 0;
@@ -246,7 +246,7 @@ onBeforeUnmount(() => {
 .md-y { background: #febc2e; }
 .md-g { background: #28c840; }
 .head-title {
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 600;
   color: #e6edf3;
   white-space: nowrap;
@@ -313,10 +313,10 @@ onBeforeUnmount(() => {
 .log-scroller {
   flex: 1;
   overflow-y: auto;
-  padding: 10px 12px 16px;
+  padding: 8px 10px 12px;
   font-family: var(--app-font-mono);
   font-size: 12px;
-  line-height: 1.7;
+  line-height: 1.65;
 }
 .log-scroller::-webkit-scrollbar {
   width: 8px;
@@ -329,13 +329,13 @@ onBeforeUnmount(() => {
 /* 空状态 */
 .log-empty {
   text-align: center;
-  padding: 60px 20px;
+  padding: 48px 20px;
   color: #57606a;
 }
 .empty-glyph {
-  font-size: 34px;
+  font-size: 30px;
   opacity: 0.4;
-  margin-bottom: 10px;
+  margin-bottom: 8px;
 }
 .empty-text {
   font-size: 14px;
@@ -357,8 +357,8 @@ onBeforeUnmount(() => {
   border-left: 3px solid #388bfd66;
   background: #1a2230;
   border-radius: 4px;
-  padding: 8px 10px;
-  margin-bottom: 14px;
+  padding: 6px 9px;
+  margin-bottom: 12px;
 }
 .meta-line {
   color: #7d8590;

@@ -12,7 +12,7 @@
 
 use rusqlite::Transaction;
 use serde_json::Value;
-use tauri::State;
+use tauri::{Manager, State};
 
 use crate::backup::{
     decrypt_full, decrypt_payload, encrypt_payload, BackupCounts, BackupInfo, BackupPayload,
@@ -31,12 +31,33 @@ const SETTINGS_FILENAME: &str = "settings.json";
 // ===========================================================================
 
 /// 把全部用户数据导出为加密备份文件。返回各段条目数摘要。
+///
+/// async + spawn_blocking：全表读取 + 逐条 AES-GCM 解密 + Argon2 派生 + 全量
+/// JSON 序列化 + 写盘，大数据量下可达数百毫秒~数秒，不能在主线程执行。
 #[tauri::command]
-pub fn backup_export(path: String, password: String, state: State<'_, AppState>) -> AppResult<BackupSummary> {
+pub async fn backup_export(
+    path: String,
+    password: String,
+    state: State<'_, AppState>,
+) -> AppResult<BackupSummary> {
     if password.len() < 6 {
         return Err(AppError::InvalidInput("备份密码至少 6 位".into()));
     }
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        backup_export_inner(&path, &password, &state)
+    })
+    .await
+    .map_err(|e| AppError::Ssh(format!("备份导出任务失败: {}", e)))?
+}
 
+/// [`backup_export`] 的执行主体（阻塞线程池内运行）。
+fn backup_export_inner(
+    path: &str,
+    password: &str,
+    state: &AppState,
+) -> AppResult<BackupSummary> {
     let conn = state.conn()?;
     let mut payload = BackupPayload {
         sessions: crate::storage::sessions_repo::list_sessions(&conn)?,
@@ -76,12 +97,12 @@ pub fn backup_export(path: String, password: String, state: State<'_, AppState>)
     payload.settings = read_json_value(&state.settings_path.join(SETTINGS_FILENAME))?;
     payload.mcp = read_json_value(&state.settings_path.join(MCP_CONFIG_FILENAME))?;
 
-    let file = encrypt_payload(&payload, &password, env!("CARGO_PKG_VERSION"))?;
+    let file = encrypt_payload(&payload, password, env!("CARGO_PKG_VERSION"))?;
     let content = serde_json::to_string_pretty(&file)?;
-    std::fs::write(&path, content)?;
+    std::fs::write(path, content)?;
 
     Ok(BackupSummary {
-        path: path.clone(),
+        path: path.to_string(),
         counts: BackupCounts::from_payload(&payload),
         credentials_skipped,
         totp_skipped,
@@ -216,18 +237,25 @@ fn count_rows(conn: &rusqlite::Connection, sql: &str) -> AppResult<usize> {
 /// 解密备份文件并返回元数据（条目数 / 是否含凭据），不写入任何数据。
 ///
 /// 导入前调用：既校验备份密码，也向用户展示文件内容。
+///
+/// async + spawn_blocking：整文件读取 + Argon2 派生 + AES-GCM 解密是重操作，
+/// 且前端每次点"预览"都会触发，不能在主线程执行。
 #[tauri::command]
-pub fn backup_inspect(path: String, password: String) -> AppResult<BackupInfo> {
-    let content = std::fs::read_to_string(&path)?;
-    let (file, payload) = decrypt_full(&content, &password)?;
-    Ok(BackupInfo {
-        version: file.version,
-        app_version: file.app_version,
-        created_at: file.created_at,
-        counts: BackupCounts::from_payload(&payload),
-        has_credentials: !payload.credentials.is_empty(),
-        has_totp: !payload.totp_secrets.is_empty(),
+pub async fn backup_inspect(path: String, password: String) -> AppResult<BackupInfo> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let content = std::fs::read_to_string(&path)?;
+        let (file, payload) = decrypt_full(&content, &password)?;
+        Ok(BackupInfo {
+            version: file.version,
+            app_version: file.app_version,
+            created_at: file.created_at,
+            counts: BackupCounts::from_payload(&payload),
+            has_credentials: !payload.credentials.is_empty(),
+            has_totp: !payload.totp_secrets.is_empty(),
+        })
     })
+    .await
+    .map_err(|e| AppError::Ssh(format!("备份预览任务失败: {}", e)))?
 }
 
 // ===========================================================================
@@ -245,15 +273,33 @@ pub fn backup_inspect(path: String, password: String) -> AppResult<BackupInfo> {
 /// 且无法从备份恢复（多半是导出时保险库未解锁导致的残缺备份）。此时默认报错，
 /// 前端弹二次确认后传 `force = true` 才放行。
 #[tauri::command]
-pub fn backup_import(
+pub async fn backup_import(
     path: String,
     password: String,
     mode: String,
     force: bool,
     state: State<'_, AppState>,
 ) -> AppResult<BackupSummary> {
-    let content = std::fs::read_to_string(&path)?;
-    let payload = decrypt_payload(&content, &password)?;
+    // async + spawn_blocking：解密 + 事务写入 + 配置文件写回均为重操作。
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        backup_import_inner(&path, &password, &mode, force, &state)
+    })
+    .await
+    .map_err(|e| AppError::Ssh(format!("备份导入任务失败: {}", e)))?
+}
+
+/// [`backup_import`] 的执行主体（阻塞线程池内运行）。
+fn backup_import_inner(
+    path: &str,
+    password: &str,
+    mode: &str,
+    force: bool,
+    state: &AppState,
+) -> AppResult<BackupSummary> {
+    let content = std::fs::read_to_string(path)?;
+    let payload = decrypt_payload(&content, password)?;
     let overwrite = mode == "overwrite";
 
     // 凭据 / TOTP 需要保险库：先校验，未解锁直接中止。
@@ -311,7 +357,7 @@ pub fn backup_import(
     }
 
     Ok(BackupSummary {
-        path: path.clone(),
+        path: path.to_string(),
         counts: BackupCounts::from_payload(&payload),
         credentials_skipped: 0,
         totp_skipped: 0,

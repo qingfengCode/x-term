@@ -27,12 +27,17 @@ pub struct SqliteConn {
 impl SqliteConn {
     /// 打开（或创建）一个本地 SQLite 数据库文件。
     ///
-    /// 启用 WAL（并发读写更友好）与 foreign_keys（与存储层 PRAGMA 一致）。
+    /// 启用 WAL（并发读写更友好）、`busy_timeout`（与存储层一致：锁竞争时等待
+    /// 而非立即返回 SQLITE_BUSY——用户可能同时用其它工具打开同一文件）与
+    /// foreign_keys（与存储层 PRAGMA 一致）。
     pub fn open(path: &str) -> AppResult<Self> {
         let conn = Connection::open(path)
             .map_err(|e| AppError::Storage(format!("打开 SQLite 数据库失败: {e}")))?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| AppError::Storage(format!("设置 WAL 失败: {e}")))?;
+        // 忙等待上限（毫秒）：默认 0 会在其它连接/进程持写锁时立刻 SQLITE_BUSY。
+        conn.pragma_update(None, "busy_timeout", 5000)
+            .map_err(|e| AppError::Storage(format!("设置 busy_timeout 失败: {e}")))?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(|e| AppError::Storage(format!("启用外键约束失败: {e}")))?;
         Ok(Self {

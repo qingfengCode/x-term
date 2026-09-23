@@ -1,6 +1,6 @@
 [package]
 name = "x-term"
-version = "0.1.59"
+version = "0.1.66"
 description = "X-Term 现代化运维终端客户端"
 authors = ["x-term"]
 edition = "2021"
@@ -19,6 +19,9 @@ tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-os = "2"
+# 单实例：第二个进程启动时直接激活已有窗口退出，避免两个进程各建连接池
+# 并发写同一个 xterm.db（WAL 写锁竞争 + 配置最后写入者覆盖 + 迁移竞态）。
+tauri-plugin-single-instance = "2"
 # 日志：attachConsole 把 webview console 转发到后端日志，排查前端问题必备。
 tauri-plugin-log = "2"
 

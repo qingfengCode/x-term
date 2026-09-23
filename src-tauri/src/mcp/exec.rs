@@ -36,8 +36,10 @@ use crate::state::{AppState, TerminalSession};
 use crate::storage::file_accounts_repo::{fetch_s3_credential, get_file_account, FileAccount};
 use crate::storage::sessions_repo::{get_session, list_sessions, Session};
 
-/// exec_ssh 单命令执行超时（30 秒）。
-const EXEC_TIMEOUT: Duration = Duration::from_secs(30);
+/// exec_ssh 默认单命令执行超时（秒）。工具参数 timeoutSeconds 可覆盖。
+pub const DEFAULT_EXEC_TIMEOUT_SECS: u64 = 30;
+/// exec_ssh 单命令执行超时上限（秒，timeoutSeconds 参数的钳制值）。
+pub const MAX_EXEC_TIMEOUT_SECS: u64 = 300;
 /// exec_ssh 输出截断上限（16 KiB）。
 const EXEC_OUTPUT_CAP: usize = 16 * 1024;
 /// SFTP 文件操作超时（5 分钟）。文件传输比单条命令耗时，给较大余量。
@@ -306,14 +308,15 @@ pub fn multi_resolve<'a>(machines: &'a [MultiMachine], target: &str) -> AppResul
 /// 4. 循环 channel.wait() 收集 Data / ExtendedData，去 ANSI，截断 16KB。
 /// 5. disconnect，返回输出文本。
 ///
-/// 整个过程用 30s 超时包裹。`app` 用于 russh 的事件 handler。
+/// `timeout` 为单命令执行超时（工具参数 timeoutSeconds 解析而来）。
 pub async fn exec_ssh_by_name(
     state: &AppState,
     session_name: &str,
     command: &str,
+    timeout: Duration,
 ) -> AppResult<String> {
     let session_config = find_session_by_name(state, session_name)?;
-    exec_ssh_with_config(state, session_config, command).await
+    exec_ssh_with_config(state, session_config, command, timeout).await
 }
 
 /// 在指定（按 id 查到的）SSH 会话对应的服务器上执行一条命令（MCP 绑定模式）。
@@ -323,9 +326,10 @@ pub async fn exec_ssh_by_id(
     state: &AppState,
     session_id: &str,
     command: &str,
+    timeout: Duration,
 ) -> AppResult<String> {
     let session_config = find_session_by_id(state, session_id)?;
-    exec_ssh_with_config(state, session_config, command).await
+    exec_ssh_with_config(state, session_config, command, timeout).await
 }
 
 // ===========================================================================
@@ -395,6 +399,7 @@ pub async fn exec_ssh_terminal(
     state: &AppState,
     instance_id: &str,
     command: &str,
+    exec_timeout: Duration,
 ) -> AppResult<String> {
     use rand::Rng;
 
@@ -446,15 +451,18 @@ pub async fn exec_ssh_terminal(
                 .unwrap_or_default();
             crate::encoding::encode_input(&label, wrapped.as_bytes())
         };
-        let base = {
+        // 锁内只记基准 + 取写确认 receiver：本地终端的同步写在 PTY 管道满且
+        // 子进程不读时会无限阻塞，发生在 terminals 锁内会连锁冻结所有终端
+        // 命令（resize/attach/断开全部排队）。锁外等待写完成（15s 超时兜底）。
+        let (base, ack_rx) = {
             let terminals = state.terminals.lock();
             match terminals.get(instance_id) {
                 Some(t) => {
                     let base = t.total_output_bytes();
-                    if let Err(e) = t.write(write_bytes) {
-                        return Err(AppError::Ssh(format!("写入终端失败: {e}")));
+                    match t.write_with_ack(write_bytes) {
+                        Ok(rx) => (base, rx),
+                        Err(e) => return Err(AppError::Ssh(format!("写入终端失败: {e}"))),
                     }
-                    base
                 }
                 None => {
                     return Err(AppError::NotFound(format!(
@@ -463,8 +471,19 @@ pub async fn exec_ssh_terminal(
                 }
             }
         };
+        match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                return Err(AppError::Ssh("终端 reader 已退出，写入未确认".into()));
+            }
+            Err(_) => {
+                return Err(AppError::Ssh(
+                    "写入终端超时（15 秒），终端可能已卡死，建议断开重连".into(),
+                ));
+            }
+        }
 
-        // 轮询等待命令执行完毕（最长 30 秒）。
+        // 轮询等待命令执行完毕（timeoutSeconds 可调，默认 30 秒）。
         // 完成信号（与 ai::tools::exec_ssh_visual 对齐）：
         // - 哨兵出现 ≥2 次：命令回显行与 echo 输出行都已出现，命令已结束；
         // - 哨兵只出现 1 次且**不在回显行**（无回显 shell、长命令折行拆断
@@ -480,17 +499,27 @@ pub async fn exec_ssh_terminal(
         const POLL_INTERVAL: Duration = Duration::from_millis(200);
         /// 哨兵出现且输出停止后，视为执行完成的静默宽限时间。
         const SILENCE_GRACE: Duration = Duration::from_secs(1);
-        let deadline = std::time::Instant::now() + EXEC_TIMEOUT;
+        let deadline = std::time::Instant::now() + exec_timeout;
         #[allow(unused_assignments)]
         let mut snapshot = String::new();
         let mut last_total = 0usize;
         let mut silence_since = std::time::Instant::now();
         loop {
             tokio::time::sleep(POLL_INTERVAL).await;
+            // 输出未增长时跳过 full_snapshot：无新字节则哨兵状态不可能变化，
+            // 直接复用上一轮结论——长命令挂起/等待输入期间，把轮询的锁内重活
+            // （256KiB 环形缓冲全量拷贝 + 全串哨兵扫描）降为一次计数读取。
             let (snap, total) = {
                 let terminals = state.terminals.lock();
                 match terminals.get(instance_id) {
-                    Some(t) => (t.full_snapshot(), t.total_output_bytes()),
+                    Some(t) => {
+                        let total = t.total_output_bytes();
+                        if total == last_total {
+                            (None, total)
+                        } else {
+                            (Some(t.full_snapshot()), total)
+                        }
+                    }
                     None => {
                         return Err(AppError::NotFound(format!(
                             "终端会话 {instance_id} 已断开"
@@ -498,7 +527,9 @@ pub async fn exec_ssh_terminal(
                     }
                 }
             };
-            snapshot = snap;
+            if let Some(s) = snap {
+                snapshot = s;
+            }
 
             let occurrences = snapshot.matches(&sentinel).count();
             // 常规 shell：回显行 + echo 输出行都出现 → 命令已结束。
@@ -535,7 +566,8 @@ pub async fn exec_ssh_terminal(
                 };
                 let cleaned = strip_ansi(&window);
                 let mut result = format!(
-                    "命令已写入终端执行，但 30 秒内未检测到完成（可能仍在运行或等待输入）。\n目前输出：\n{}",
+                    "命令已写入终端执行，但 {} 秒内未检测到完成（可能仍在运行或等待输入）。\n目前输出：\n{}",
+                    exec_timeout.as_secs(),
                     truncate_output(&cleaned)
                 );
                 if overflow {
@@ -593,6 +625,7 @@ pub async fn exec_ssh_direct(
     password: &str,
     command: &str,
     state: AppState,
+    timeout: Duration,
 ) -> AppResult<String> {
     if command.trim().is_empty() {
         return Err(AppError::InvalidInput("command 不能为空".into()));
@@ -616,6 +649,7 @@ pub async fn exec_ssh_direct(
         AuthMethod::password(password.to_string()),
         command,
         state,
+        timeout,
     )
     .await
 }
@@ -631,6 +665,7 @@ async fn exec_ssh_with_config(
     state: &AppState,
     session_config: Session,
     command: &str,
+    timeout: Duration,
 ) -> AppResult<String> {
     if command.trim().is_empty() {
         return Err(AppError::InvalidInput("command 不能为空".into()));
@@ -665,6 +700,7 @@ async fn exec_ssh_with_config(
         resolved.auth_method,
         command,
         state.clone(),
+        timeout,
     )
     .await
 }
@@ -673,8 +709,10 @@ async fn exec_ssh_with_config(
 ///
 /// 流程：connect_direct → channel_open_session → `channel.exec(false, command)` →
 /// 循环 channel.wait() 收集 Data / ExtendedData（去 ANSI，截断 16KB）→ disconnect。
-/// 整个过程用 30s 超时包裹。`auth` 由调用方决定（vault 解析 / 参数直传）。
+/// 整个过程用 `timeout`（工具参数 timeoutSeconds，默认 30s、上限 300s）包裹。
+/// `auth` 由调用方决定（vault 解析 / 参数直传）。
 /// `session_config_id` 用于二次认证弹窗展示；直连模式传占位串。
+#[allow(clippy::too_many_arguments)]
 async fn exec_ssh_with_auth(
     host: &str,
     port: u16,
@@ -683,8 +721,9 @@ async fn exec_ssh_with_auth(
     auth: AuthMethod,
     command: &str,
     state: AppState,
+    timeout: Duration,
 ) -> AppResult<String> {
-    // 连接 + exec（30s 超时）。
+    // 连接 + exec（timeoutSeconds 可调，默认 30 秒）。
     let run = async {
         let handle = crate::ssh::client::connect_direct(
             host,
@@ -738,7 +777,7 @@ async fn exec_ssh_with_auth(
         Ok::<_, AppError>((raw, exit_code))
     };
 
-    match timeout(EXEC_TIMEOUT, run).await {
+    match tokio::time::timeout(timeout, run).await {
         Ok(Ok((raw, exit_code))) => {
             let text = strip_ansi(&String::from_utf8_lossy(&raw));
             let truncated = if text.len() > EXEC_OUTPUT_CAP {
@@ -755,7 +794,10 @@ async fn exec_ssh_with_auth(
             Ok(format!("{}{}", truncated, code_suffix))
         }
         Ok(Err(e)) => Err(e),
-        Err(_) => Err(AppError::Ssh("exec_ssh 执行超时（30s）".into())),
+        Err(_) => Err(AppError::Ssh(format!(
+            "exec_ssh 执行超时（{}s）",
+            timeout.as_secs()
+        ))),
     }
 }
 
@@ -1026,6 +1068,19 @@ pub fn arg_profile_name(args: &Value) -> AppResult<String> {
         .and_then(Value::as_str)
         .map(|s| s.to_string())
         .ok_or_else(|| AppError::InvalidInput("缺少 profileName 参数".into()))
+}
+
+/// 从工具参数取可选的 timeoutSeconds（默认 30s，钳制 1..=300s）。
+///
+/// exec_ssh / bastion_session_exec 的单命令执行超时；长耗时命令（软件包升级、
+/// 大文件统计等）由调用方显式调大，防默认 30s 截断。
+pub fn arg_timeout_seconds(args: &Value) -> Duration {
+    let secs = args
+        .get("timeoutSeconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_EXEC_TIMEOUT_SECS)
+        .clamp(1, MAX_EXEC_TIMEOUT_SECS);
+    Duration::from_secs(secs)
 }
 
 /// 解析工具参数中 `command` 字段（exec_ssh 用）。

@@ -6,7 +6,7 @@
 //! [`CredentialInput`]。
 
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{Manager, State};
 
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
@@ -20,28 +20,43 @@ pub fn vault_exists(state: State<'_, AppState>) -> AppResult<bool> {
 
 /// 首次创建保险库（设置主密码）。
 ///
-/// 要求保险库尚不存在。
+/// 要求保险库尚不存在。async：Argon2id 密钥派生（m=19MiB）单次可达数十至
+/// 数百毫秒（低配机/杀软环境更久），同步命令在主线程执行会冻结整个 UI。
 #[tauri::command]
-pub fn vault_create(passphrase: String, state: State<'_, AppState>) -> AppResult<()> {
-    if CredentialVault::exists(&state.data_dir) {
-        return Err(AppError::InvalidInput(
-            "保险库已存在，请使用解锁功能".into(),
-        ));
-    }
+pub async fn vault_create(passphrase: String, state: State<'_, AppState>) -> AppResult<()> {
     if passphrase.len() < 6 {
         return Err(AppError::InvalidInput("主密码至少 6 位".into()));
     }
-    let vault = CredentialVault::create(&state.data_dir, &passphrase)?;
-    state.set_vault(vault);
-    Ok(())
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        if CredentialVault::exists(&state.data_dir) {
+            return Err(AppError::InvalidInput(
+                "保险库已存在，请使用解锁功能".into(),
+            ));
+        }
+        let vault = CredentialVault::create(&state.data_dir, &passphrase)?;
+        state.set_vault(vault);
+        Ok(())
+    })
+    .await
+    .map_err(|e| AppError::Ssh(format!("保险库创建任务失败: {}", e)))?
 }
 
 /// 用主密码解锁已存在的保险库。
+///
+/// async：同 [`vault_create`]，Argon2id 派生不在主线程执行。
 #[tauri::command]
-pub fn vault_unlock(passphrase: String, state: State<'_, AppState>) -> AppResult<()> {
-    let vault = CredentialVault::unlock(&state.data_dir, &passphrase)?;
-    state.set_vault(vault);
-    Ok(())
+pub async fn vault_unlock(passphrase: String, state: State<'_, AppState>) -> AppResult<()> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let vault = CredentialVault::unlock(&state.data_dir, &passphrase)?;
+        state.set_vault(vault);
+        Ok(())
+    })
+    .await
+    .map_err(|e| AppError::Ssh(format!("保险库解锁任务失败: {}", e)))?
 }
 
 /// 查询保险库是否已解锁（运行时状态）。
@@ -97,99 +112,142 @@ pub struct CredentialView {
 }
 
 /// 保存一条凭据（加密后入库）。返回凭据 id。
+///
+/// async + `spawn_blocking`：AES 加密 + SQLite 写入都属阻塞操作，跑在主线程会冻结 UI。
 #[tauri::command]
-pub fn credential_save(input: CredentialInput, state: State<'_, AppState>) -> AppResult<String> {
-    // 取保险库（持锁到序列化完成为止）。
-    let vault_guard = state.vault_read()?;
-    let vault = vault_guard
-        .as_ref()
-        .ok_or_else(|| AppError::Auth("保险库未解锁".into()))?;
+pub async fn credential_save(
+    input: CredentialInput,
+    state: State<'_, AppState>,
+) -> AppResult<String> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        // 取保险库（持锁到序列化完成为止）。
+        let vault_guard = state.vault_read()?;
+        let vault = vault_guard
+            .as_ref()
+            .ok_or_else(|| AppError::Auth("保险库未解锁".into()))?;
 
-    // 构造明文 payload。
-    let payload = serde_json::json!({
-        "kind": input.kind,
-        "value": input.value,
-        "passphrase": input.passphrase,
-    });
-    let payload_str = serde_json::to_string(&payload)?;
-    let blob = vault.encrypt_str(&payload_str)?;
-    let enc_data = CredentialVault::encode_blob(&blob)?;
+        // 构造明文 payload。
+        let payload = serde_json::json!({
+            "kind": input.kind,
+            "value": input.value,
+            "passphrase": input.passphrase,
+        });
+        let payload_str = serde_json::to_string(&payload)?;
+        let blob = vault.encrypt_str(&payload_str)?;
+        let enc_data = CredentialVault::encode_blob(&blob)?;
 
-    let id = input.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let now = chrono::Utc::now().to_rfc3339();
-    drop(vault_guard); // 释放锁再操作 DB。
+        let id = input.id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let now = chrono::Utc::now().to_rfc3339();
+        drop(vault_guard); // 释放锁再操作 DB。
 
-    let conn = state.conn()?;
-    conn.execute(
-        "INSERT INTO credentials (id, name, enc_data, created_at, kind) VALUES (?1, ?2, ?3, ?4, ?5) \
-         ON CONFLICT(id) DO UPDATE SET name = excluded.name, enc_data = excluded.enc_data, kind = excluded.kind",
-        rusqlite::params![id, input.name, enc_data, now, input.kind],
-    )?;
-    Ok(id)
+        let conn = state.conn()?;
+        conn.execute(
+            "INSERT INTO credentials (id, name, enc_data, created_at, kind) VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name, enc_data = excluded.enc_data, kind = excluded.kind",
+            rusqlite::params![id, input.name, enc_data, now, input.kind],
+        )?;
+        Ok(id)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("保存凭据任务失败: {}", e)))?
 }
 
 /// 列出所有凭据（不含明文，直接读 DB 的 kind 列，不解密）。
 #[tauri::command]
-pub fn credential_list(state: State<'_, AppState>) -> AppResult<Vec<CredentialView>> {
-    let conn = state.conn()?;
-    let mut stmt = conn
-        .prepare("SELECT id, name, kind, created_at FROM credentials ORDER BY created_at DESC")?;
-    let rows = stmt.query_map([], |r| {
-        let kind: String = r.get(2).unwrap_or_else(|_| "password".into());
-        Ok(CredentialView {
-            id: r.get(0)?,
-            name: r.get(1)?,
-            kind,
-            created_at: r.get(3)?,
-        })
-    })?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
+pub async fn credential_list(state: State<'_, AppState>) -> AppResult<Vec<CredentialView>> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, kind, created_at FROM credentials ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let kind: String = r.get(2).unwrap_or_else(|_| "password".into());
+            Ok(CredentialView {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                kind,
+                created_at: r.get(3)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("读取凭据列表任务失败: {}", e)))?
 }
 
 /// 重命名凭据（仅改名称，不动密文）。
 #[tauri::command]
-pub fn credential_rename(id: String, name: String, state: State<'_, AppState>) -> AppResult<()> {
-    let conn = state.conn()?;
-    conn.execute(
-        "UPDATE credentials SET name = ?1 WHERE id = ?2",
-        rusqlite::params![name, id],
-    )?;
-    Ok(())
+pub async fn credential_rename(
+    id: String,
+    name: String,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        conn.execute(
+            "UPDATE credentials SET name = ?1 WHERE id = ?2",
+            rusqlite::params![name, id],
+        )?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("重命名凭据任务失败: {}", e)))?
 }
 
 /// 取得一条凭据的明文（仅用于内部测试 / 高级场景；前端 UI 通常不需要）。
 #[tauri::command]
-pub fn credential_get(id: String, state: State<'_, AppState>) -> AppResult<String> {
-    let vault_guard = state.vault_read()?;
-    let vault = vault_guard
-        .as_ref()
-        .ok_or_else(|| AppError::Auth("保险库未解锁".into()))?;
-
-    let conn = state.conn()?;
-    let enc_data = match conn.query_row(
-        "SELECT enc_data FROM credentials WHERE id = ?1",
-        [&id],
-        |r| r.get::<_, String>(0),
-    ) {
-        Ok(s) => s,
-        Err(rusqlite::Error::QueryReturnedNoRows) => {
-            return Err(AppError::NotFound(format!("凭据 {} 不存在", id)));
-        }
-        Err(e) => return Err(e.into()),
-    };
-    let blob = CredentialVault::decode_blob(&enc_data)?;
-    let plain = vault.decrypt_str(&blob)?;
-    Ok(plain)
+pub async fn credential_get(id: String, state: State<'_, AppState>) -> AppResult<String> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        // 先读完并释放连接，再取保险库读锁：避免持 vault 读锁去等连接池
+        // （池耗尽最坏 5s），把 vault_lock 的写锁一并卡住。
+        let enc_data = {
+            let conn = state.conn()?;
+            match conn.query_row(
+                "SELECT enc_data FROM credentials WHERE id = ?1",
+                [&id],
+                |r| r.get::<_, String>(0),
+            ) {
+                Ok(s) => s,
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    return Err(AppError::NotFound(format!("凭据 {} 不存在", id)));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
+        let vault_guard = state.vault_read()?;
+        let vault = vault_guard
+            .as_ref()
+            .ok_or_else(|| AppError::Auth("保险库未解锁".into()))?;
+        let blob = CredentialVault::decode_blob(&enc_data)?;
+        let plain = vault.decrypt_str(&blob)?;
+        Ok(plain)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("读取凭据任务失败: {}", e)))?
 }
 
 /// 删除一条凭据。
 #[tauri::command]
-pub fn credential_delete(id: String, state: State<'_, AppState>) -> AppResult<()> {
-    let conn = state.conn()?;
-    conn.execute("DELETE FROM credentials WHERE id = ?1", [&id])?;
-    Ok(())
+pub async fn credential_delete(id: String, state: State<'_, AppState>) -> AppResult<()> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        conn.execute("DELETE FROM credentials WHERE id = ?1", [&id])?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("删除凭据任务失败: {}", e)))?
 }

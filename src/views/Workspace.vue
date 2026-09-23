@@ -710,7 +710,7 @@ onBeforeUnmount(() => {
 .monitor-pane {
   height: 100%;
   overflow-y: auto;
-  padding: 14px 16px;
+  padding: 16px 20px 28px;
   box-sizing: border-box;
 }
 

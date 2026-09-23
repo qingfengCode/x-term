@@ -14,7 +14,7 @@
 //! - [`mcp_respond_approval`]：前端回 exec_ssh/exec_sql 的人工确认结果。
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::error::{AppError, AppResult};
 use crate::mcp::approval::McpKind;
@@ -90,6 +90,21 @@ pub struct McpInstanceConfig {
     /// 是否记录执行日志到文本文件（每次启动生成一个日志文件）。默认 true。
     #[serde(default = "default_enable_log")]
     pub enable_log: bool,
+    /// 堡垒机目标主机会话的空闲自动回收时长（分钟，仅 SSH + bastion 模式）。
+    /// 超时未活动的会话自动断开；0 = 不自动回收。默认 15。
+    #[serde(default = "default_idle_timeout_minutes")]
+    pub idle_timeout_minutes: u32,
+    /// 堡垒机「登录后命令」（仅 SSH + bastion 模式）：进入目标主机后自动执行一次，
+    /// 之后的命令都在其上下文（如 `sudo su -` 的 root 登录 shell）中执行。
+    /// 空 / 未配置 = 不执行。要求无需交互输入（提权请配免密 sudo）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_login_command: Option<String>,
+    /// 堡垒机基础连接（完成 MFA 的那条）的空闲保持时长（分钟，仅 SSH + bastion 模式）。
+    ///
+    /// 期间新请求复用该连接、不再要求 MFA；0 = 不保持（最后一个会话关闭即断开）。
+    /// 默认 30。上限见 [`crate::mcp::bastion::MAX_BASE_IDLE_MINUTES`]。
+    #[serde(default = "default_base_idle_minutes")]
+    pub base_idle_minutes: u32,
 }
 
 /// 默认运行模式：全部人工确认（最安全）。
@@ -118,6 +133,16 @@ fn default_enable_log() -> bool {
     true
 }
 
+/// 默认堡垒机目标主机会话空闲回收时长（分钟）。
+fn default_idle_timeout_minutes() -> u32 {
+    15
+}
+
+/// 默认堡垒机基础连接保持时长（分钟）。
+fn default_base_idle_minutes() -> u32 {
+    30
+}
+
 /// 默认资源模式：绑定本地资源（向后兼容；老 mcp.json 无此字段即视为 bound）。
 fn default_resource_mode() -> String {
     "bound".into()
@@ -128,12 +153,14 @@ fn default_bound_source() -> String {
     "config".into()
 }
 
-/// 规范化资源模式：仅 `"client"`（直连）与 `"multi"`（多机，仅 SSH）为特殊模式，
-/// 其余一律按 `"bound"` 处理（防配置文件被手动改坏导致意外直连/越权多机）。
+/// 规范化资源模式：仅 `"client"`（直连）、`"multi"`（多机，仅 SSH）与
+/// `"bastion"`（堡垒机，仅 SSH）为特殊模式，其余一律按 `"bound"` 处理
+/// （防配置文件被手动改坏导致意外直连/越权多机）。
 pub(crate) fn normalize_resource_mode(m: &str) -> String {
     match m {
         "client" => "client".into(),
         "multi" => "multi".into(),
+        "bastion" => "bastion".into(),
         _ => "bound".into(),
     }
 }
@@ -172,6 +199,9 @@ impl McpInstanceConfig {
             run_mode: default_run_mode(),
             auto_approve: false,
             enable_log: true,
+            idle_timeout_minutes: default_idle_timeout_minutes(),
+            post_login_command: None,
+            base_idle_minutes: default_base_idle_minutes(),
         }
     }
 }
@@ -286,6 +316,16 @@ pub async fn mcp_start(
     } else {
         resource_mode
     };
+    // 堡垒机模式仅 SSH kind 支持（DB/File 回退 bound 并告警）。
+    let resource_mode = if resource_mode == "bastion" && kind != McpKind::Ssh {
+        log::warn!(
+            "[mcp] {} 不支持堡垒机模式，已回退为单资源绑定",
+            kind.label()
+        );
+        "bound".to_string()
+    } else {
+        resource_mode
+    };
 
     let host = host.unwrap_or(cfg.host);
     let port = port.unwrap_or(cfg.port);
@@ -297,9 +337,10 @@ pub async fn mcp_start(
     })?;
     // bound 模式要求绑定资源；client 模式（客户端直连）不要求。
     let bound_source = normalize_bound_source(&cfg.bound_source);
-    // 终端标签页绑定仅 SSH kind 支持；其它 kind 强制回退会话配置绑定。
+    // 终端标签页绑定仅 SSH kind + bound 模式支持；其它 kind 或特殊模式
+    // （bastion）强制回退会话配置绑定。
     let bound_source = match (bound_source.as_str(), kind) {
-        ("terminal", McpKind::Ssh) => "terminal",
+        ("terminal", McpKind::Ssh) if resource_mode == "bound" => "terminal",
         ("terminal", _) => {
             log::warn!(
                 "[mcp] {} 不支持终端标签页绑定，已回退为会话配置绑定",
@@ -356,13 +397,30 @@ pub async fn mcp_start(
             AppError::Config(format!(
                 "{} 未绑定资源：请先在 MCP 页面选择一个{}，或开启「客户端直连模式」",
                 kind.label(),
-                match kind {
-                    McpKind::Ssh => "SSH 会话",
-                    McpKind::Db => "数据库连接",
-                    McpKind::File => "S3 文件账号",
+                match (kind, resource_mode.as_str()) {
+                    (McpKind::Ssh, "bastion") => "堡垒机会话配置（即堡垒机服务器的 SSH 会话）",
+                    (McpKind::Ssh, _) => "SSH 会话",
+                    (McpKind::Db, _) => "数据库连接",
+                    (McpKind::File, _) => "S3 文件账号",
                 }
             ))
         })?)
+    };
+
+    // 堡垒机运行参数（其它模式忽略）：登录后命令去空白，空的按"不执行"处理；
+    // 保持时长钳制到配置上限，防手动改坏 mcp.json 填入天文数字。
+    let bastion = crate::mcp::bastion::BastionOptions {
+        post_login_command: cfg
+            .post_login_command
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_default()
+            .to_string(),
+        base_idle_minutes: cfg
+            .base_idle_minutes
+            .min(crate::mcp::bastion::MAX_BASE_IDLE_MINUTES),
+        session_idle_minutes: cfg.idle_timeout_minutes,
     };
 
     start_mcp_server(
@@ -379,6 +437,7 @@ pub async fn mcp_start(
         resource_mode,
         cfg.run_mode,
         cfg.enable_log,
+        bastion,
     )
     .await?;
     Ok(crate::mcp::mcp_server_status(kind))
@@ -401,26 +460,44 @@ pub fn mcp_status(kind: String) -> AppResult<McpServerStatus> {
 /// 前端在用户改了绑定、地址、端口、开关后调用。**不直接重启服务**——若服务在运行，
 /// 前端应先 mcp_stop 再 mcp_start 生效（本命令只持久化配置）。
 /// 例外：`run_mode` 改动**立即生效**（更新运行时模式，无需重启）。
+///
+/// async + `spawn_blocking`：读 + 原子写 `mcp.json` 属阻塞文件 IO，跑在主线程
+/// 会冻结整个窗口。
 #[tauri::command]
-pub fn mcp_save_config(
+pub async fn mcp_save_config(
     kind: String,
     config: McpInstanceConfig,
     state: State<'_, AppState>,
 ) -> AppResult<()> {
-    let kind = McpKind::parse(&kind);
-    // host 不做地址限制：允许 0.0.0.0 / 局域网 IP 等任意监听地址（空值允许——
-    // 启动时回退默认 127.0.0.1）。
-    // run_mode 立即生效（无需重启服务）。
-    let mut config = config;
-    config.run_mode = normalize_run_mode(&config.run_mode);
-    crate::mcp::server::set_run_mode(kind, &config.run_mode);
-    set_instance_config(state.inner(), kind, config)
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let kind = McpKind::parse(&kind);
+        // host 不做地址限制：允许 0.0.0.0 / 局域网 IP 等任意监听地址（空值允许——
+        // 启动时回退默认 127.0.0.1）。
+        // run_mode 立即生效（无需重启服务）。
+        let mut config = config;
+        config.run_mode = normalize_run_mode(&config.run_mode);
+        crate::mcp::server::set_run_mode(kind, &config.run_mode);
+        set_instance_config(state.inner(), kind, config)
+    })
+    .await
+    .map_err(|e| AppError::Config(format!("保存 MCP 配置任务失败: {}", e)))?
 }
 
 /// 读取指定 kind 的配置。
 #[tauri::command]
-pub fn mcp_load_config(kind: String, state: State<'_, AppState>) -> AppResult<McpInstanceConfig> {
-    Ok(instance_config(state.inner(), McpKind::parse(&kind)))
+pub async fn mcp_load_config(
+    kind: String,
+    state: State<'_, AppState>,
+) -> AppResult<McpInstanceConfig> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        Ok(instance_config(state.inner(), McpKind::parse(&kind)))
+    })
+    .await
+    .map_err(|e| AppError::Config(format!("读取 MCP 配置任务失败: {}", e)))?
 }
 
 /// 运行中热切换绑定的资源（会话配置 / 终端标签页），立即生效无需重启。
@@ -528,13 +605,19 @@ pub async fn mcp_rebind_multi(
 
 /// 为指定 kind 生成随机 token（uuid 去横线），写入配置文件并返回。
 #[tauri::command]
-pub fn mcp_generate_token(kind: String, state: State<'_, AppState>) -> AppResult<String> {
-    let kind = McpKind::parse(&kind);
-    let mut cfg = instance_config(state.inner(), kind);
-    let token = uuid::Uuid::new_v4().simple().to_string();
-    cfg.token = Some(token.clone());
-    set_instance_config(state.inner(), kind, cfg)?;
-    Ok(token)
+pub async fn mcp_generate_token(kind: String, state: State<'_, AppState>) -> AppResult<String> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let kind = McpKind::parse(&kind);
+        let mut cfg = instance_config(state.inner(), kind);
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        cfg.token = Some(token.clone());
+        set_instance_config(state.inner(), kind, cfg)?;
+        Ok(token)
+    })
+    .await
+    .map_err(|e| AppError::Config(format!("生成 MCP token 任务失败: {}", e)))?
 }
 
 /// 前端回确认结果（exec_ssh/exec_sql 的人工确认）。
@@ -570,61 +653,86 @@ pub struct McpLogContent {
 ///
 /// 在 `mcp-logs/` 目录下按文件名（含时间戳）找到该 kind 最新的 `mcp-<kind>-*.log`，
 /// 返回最近 `max_lines` 行（默认 500）。服务未运行 / 无日志时 `exists=false`。
+///
+/// async + 只读文件尾部：日志文件可达数 MB 且前端每 1.5s 轮询一次，此前的
+/// 同步整文件 `read_to_string` + 全量行收集跑在主线程，造成周期性整窗冻结。
 #[tauri::command]
-pub fn mcp_log(
+pub async fn mcp_log(
     kind: String,
     max_lines: Option<usize>,
-    state: State<'_, AppState>,
+    app: AppHandle,
 ) -> AppResult<McpLogContent> {
-    let kind = McpKind::parse(&kind);
-    let kind_str = match kind {
-        McpKind::Ssh => "ssh",
-        McpKind::Db => "db",
-        McpKind::File => "file",
-    };
-    let log_dir = state.data_dir.join("mcp-logs");
-    let prefix = format!("mcp-{}-", kind_str);
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let kind = McpKind::parse(&kind);
+        let kind_str = match kind {
+            McpKind::Ssh => "ssh",
+            McpKind::Db => "db",
+            McpKind::File => "file",
+        };
+        let log_dir = state.data_dir.join("mcp-logs");
+        let prefix = format!("mcp-{}-", kind_str);
 
-    // 收集该 kind 的日志文件，按文件名排序（时间戳定宽，字典序即时间序）。
-    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&log_dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.starts_with(&prefix) && n.ends_with(".log"))
-                .unwrap_or(false)
-        })
-        .collect();
-    files.sort();
-
-    match files.pop() {
-        Some(path) => {
-            let full = std::fs::read_to_string(&path).unwrap_or_default();
-            let max = max_lines.unwrap_or(500);
-            let lines: Vec<&str> = full.lines().collect();
-            let tail = if lines.len() > max {
-                lines[lines.len() - max..].join("\n")
-            } else {
-                full
-            };
-            let filename = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string();
-            Ok(McpLogContent {
-                filename,
-                content: tail,
-                exists: true,
+        // 收集该 kind 的日志文件，按文件名排序（时间戳定宽，字典序即时间序）。
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&log_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with(&prefix) && n.ends_with(".log"))
+                    .unwrap_or(false)
             })
+            .collect();
+        files.sort();
+
+        match files.pop() {
+            Some(path) => {
+                let tail = tail_read_lines(&path, max_lines.unwrap_or(500)).unwrap_or_default();
+                let filename = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                Ok(McpLogContent {
+                    filename,
+                    content: tail,
+                    exists: true,
+                })
+            }
+            None => Ok(McpLogContent {
+                filename: String::new(),
+                content: String::new(),
+                exists: false,
+            }),
         }
-        None => Ok(McpLogContent {
-            filename: String::new(),
-            content: String::new(),
-            exists: false,
-        }),
+    })
+    .await
+    .map_err(|e| AppError::Ssh(format!("读取 MCP 日志任务失败: {}", e)))?
+}
+
+/// 只读文件尾部的 `max_lines` 行（按行均 2KiB 估算容量，64KiB~4MiB 限幅）。
+///
+/// 从中部起读时首行大概率被截半，直接丢弃避免渲染残行。
+fn tail_read_lines(path: &std::path::Path, max_lines: usize) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len() as usize;
+    let cap = (max_lines * 2 * 1024).clamp(64 * 1024, 4 * 1024 * 1024);
+    let start = len.saturating_sub(cap);
+    f.seek(SeekFrom::Start(start as u64))?;
+    let mut buf = vec![0u8; len - start];
+    f.read_exact(&mut buf)?;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let mut lines: Vec<&str> = text.lines().collect();
+    if start > 0 && !lines.is_empty() {
+        lines.remove(0);
     }
+    Ok(if lines.len() > max_lines {
+        lines[lines.len() - max_lines..].join("\n")
+    } else {
+        lines.join("\n")
+    })
 }

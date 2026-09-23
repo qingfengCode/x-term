@@ -40,6 +40,16 @@ pub fn run() {
     // attachConsole 转发的 webview console 输出。注意：不能再额外初始化
     // env_logger 等全局 logger，否则插件初始化会 panic（logger 已存在）。
     let builder = tauri::Builder::default()
+        // 单实例必须最先注册：第二个进程在初始化其它插件/数据库之前就退出，
+        // 否则两个进程会各自建立 r2d2 池并发写同一个 xterm.db。
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            // 已有实例在运行：唤醒并聚焦它的窗口，而不是再开一个写库的进程。
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())

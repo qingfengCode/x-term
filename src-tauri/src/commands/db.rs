@@ -9,10 +9,14 @@
 //! - [`db_list_tables`] / [`db_list_databases`] / [`db_describe_table`] /
 //!   [`db_show_create_table`]：元数据（按方言生成 SQL，见
 //!   [`crate::database::DbConnHandle`]）。
+//!
+//! 所有在本模块内访问 SQLite 的命令一律 async + `spawn_blocking`：Tauri 的非
+//! async 命令在**主线程**执行，取连接（池耗尽等待上限 5s）或 SQLite 写锁等待
+//! （`busy_timeout` 5000ms）会直接冻结整个窗口。
 
 use std::time::Instant;
 
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::database::profiles::{list_db_profiles, upsert_db_profile, DbGroup, DbProfile};
 use crate::database::DbConnHandle;
@@ -26,21 +30,39 @@ use crate::storage::sessions_repo::get_session;
 // ===========================================================================
 
 #[tauri::command]
-pub fn db_list_profiles(state: State<'_, AppState>) -> AppResult<Vec<DbProfile>> {
-    let conn = state.conn()?;
-    list_db_profiles(&conn)
+pub async fn db_list_profiles(state: State<'_, AppState>) -> AppResult<Vec<DbProfile>> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        list_db_profiles(&conn)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("读取数据库连接列表任务失败: {}", e)))?
 }
 
 #[tauri::command]
-pub fn db_save_profile(profile: DbProfile, state: State<'_, AppState>) -> AppResult<()> {
-    let conn = state.conn()?;
-    upsert_db_profile(&conn, &profile)
+pub async fn db_save_profile(profile: DbProfile, state: State<'_, AppState>) -> AppResult<()> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        upsert_db_profile(&conn, &profile)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("保存数据库连接任务失败: {}", e)))?
 }
 
 #[tauri::command]
-pub fn db_delete_profile(id: String, state: State<'_, AppState>) -> AppResult<()> {
-    let conn = state.conn()?;
-    crate::database::profiles::delete_db_profile(&conn, &id)
+pub async fn db_delete_profile(id: String, state: State<'_, AppState>) -> AppResult<()> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        crate::database::profiles::delete_db_profile(&conn, &id)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("删除数据库连接任务失败: {}", e)))?
 }
 
 // ===========================================================================
@@ -48,21 +70,39 @@ pub fn db_delete_profile(id: String, state: State<'_, AppState>) -> AppResult<()
 // ===========================================================================
 
 #[tauri::command]
-pub fn db_list_groups(state: State<'_, AppState>) -> AppResult<Vec<DbGroup>> {
-    let conn = state.conn()?;
-    crate::database::profiles::list_db_groups(&conn)
+pub async fn db_list_groups(state: State<'_, AppState>) -> AppResult<Vec<DbGroup>> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        crate::database::profiles::list_db_groups(&conn)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("读取数据库分组任务失败: {}", e)))?
 }
 
 #[tauri::command]
-pub fn db_save_group(group: DbGroup, state: State<'_, AppState>) -> AppResult<()> {
-    let conn = state.conn()?;
-    crate::database::profiles::upsert_db_group(&conn, &group)
+pub async fn db_save_group(group: DbGroup, state: State<'_, AppState>) -> AppResult<()> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        crate::database::profiles::upsert_db_group(&conn, &group)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("保存数据库分组任务失败: {}", e)))?
 }
 
 #[tauri::command]
-pub fn db_delete_group(id: String, state: State<'_, AppState>) -> AppResult<()> {
-    let conn = state.conn()?;
-    crate::database::profiles::delete_db_group(&conn, &id)
+pub async fn db_delete_group(id: String, state: State<'_, AppState>) -> AppResult<()> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        crate::database::profiles::delete_db_group(&conn, &id)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("删除数据库分组任务失败: {}", e)))?
 }
 
 // ===========================================================================

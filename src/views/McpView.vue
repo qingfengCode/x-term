@@ -130,19 +130,19 @@ onMounted(async () => {
 .mcp-header {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 14px 18px 12px;
+  gap: 10px;
+  padding: 10px 16px;
   flex-shrink: 0;
   border-bottom: 1px solid var(--el-border-color-lighter);
 }
 .header-badge {
-  width: 38px;
-  height: 38px;
-  border-radius: 10px;
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-size: 20px;
+  font-size: 15px;
   color: #fff;
   flex-shrink: 0;
   background: linear-gradient(135deg, var(--el-color-primary) 0%, var(--el-color-primary-dark-2) 100%);
@@ -161,7 +161,7 @@ onMounted(async () => {
 }
 .mcp-header h2 {
   margin: 0;
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 600;
   letter-spacing: 0.2px;
 }
@@ -209,7 +209,7 @@ onMounted(async () => {
 .service-select {
   display: flex;
   gap: 10px;
-  padding: 12px 18px 0;
+  padding: 10px 16px 0;
   flex-shrink: 0;
 }
 .service-card {
@@ -218,8 +218,8 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 10px 12px;
-  border-radius: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
   border: 1px solid var(--el-border-color-lighter);
   background: var(--el-bg-color-overlay);
   cursor: pointer;
@@ -240,13 +240,13 @@ onMounted(async () => {
   box-shadow: 0 0 0 1px var(--el-color-primary) inset;
 }
 .svc-ico {
-  width: 32px;
-  height: 32px;
-  border-radius: 8px;
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-size: 17px;
+  font-size: 14px;
   flex-shrink: 0;
   color: var(--el-text-color-secondary);
   background: var(--el-fill-color);
@@ -264,7 +264,7 @@ onMounted(async () => {
   min-width: 0;
 }
 .svc-title {
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 600;
   color: var(--el-text-color-primary);
   line-height: 1.3;
@@ -318,8 +318,8 @@ onMounted(async () => {
   min-height: 0;
   display: grid;
   grid-template-columns: minmax(320px, 380px) 1fr;
-  gap: 14px;
-  padding: 12px 18px 16px;
+  gap: 12px;
+  padding: 10px 16px 14px;
 }
 .mcp-config {
   min-height: 0;

@@ -46,6 +46,8 @@ let searchAddon: SearchAddon | null = null;
 let webglAddon: WebglAddon | null = null;
 let unlistens: UnlistenFn[] = [];
 let resizeObs: ResizeObserver | null = null;
+/** 尺寸静止计时器：RO 触发时重置，静止 150ms 后执行整屏重绘/滚动对齐/IPC。 */
+let resizeSettleTimer: ReturnType<typeof setTimeout> | null = null;
 // --- PTY 尺寸同步去重 --------------------------------------------------------
 // RO 回调高频触发（拖拽窗口每帧一次），无差别重发 resize 会造成 SIGWINCH
 // 风暴（远端 readline 逐帧重绘闪烁）+ 与 term.onResize 双份 IPC。
@@ -101,6 +103,11 @@ const ESC_SEQ_COMPLETE_RE = /^\x1b(?:\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]|[\x40
 let mouseStripCarry = "";
 
 function stripMouseReport(bytes: Uint8Array): Uint8Array {
+  // 快速否决：无暂扣前缀且整批不含 ESC —— DECSET 序列（\x1b[?...h）不可能
+  // 存在，也无需暂扣尾部，原样返回同一数组（零转换零拷贝）。普通命令输出
+  // （编译日志、ls、cat 文本）几乎全部命中此路径，跳过原先每批两次的
+  // 全量 O(n) 字节↔字符串往返。
+  if (mouseStripCarry.length === 0 && bytes.indexOf(0x1b) === -1) return bytes;
   let text = mouseStripCarry;
   mouseStripCarry = "";
   for (let i = 0; i < bytes.length; i++) text += String.fromCharCode(bytes[i]);
@@ -551,6 +558,7 @@ onMounted(async () => {
     syncPtySize();
   });
 
+  // 尺寸静止计时器声明在组件顶层（onBeforeUnmount 清理），此处只重置/排程。
   resizeObs = new ResizeObserver(() => {
     // 隐藏/半隐藏（v-show 切走、布局未完成）时不 fit：此时字符测量失效，
     // fit 会算出**偏小的 cols** 并停在这个错值——PTY/bash 仍按真实列宽输出，
@@ -563,40 +571,53 @@ onMounted(async () => {
       return;
     }
     try {
+      // 拖拽窗口边缘/分隔条期间 RO 每帧触发：fit 跟随（网格未变时开销仅为
+      // 一次测量），昂贵的整屏重绘 / 滚动对齐 / resize IPC 延迟到尺寸静止
+      // （150ms 无变化）后执行一次——否则拖拽期间每帧全视口 refresh 会
+      // 造成明显掉帧甚至"拖不动"。
       fitAddon?.fit();
-      // 容器从隐藏（切走 tab，v-show display:none）恢复可见时：
-      // 1. 全量重绘视口——隐藏期间的渲染不落盘，渲染层保留旧画面；
-      // 2. 向 PTY 重发一次 window_change（即使尺寸未变）——SSH 照发
-      //    SIGWINCH，远端 shell/readline 会**重绘当前提示符行**。
-      // 残影的根因在数据层：切换期间 readline 的局部重绘与终端状态错位，
-      // 最后一行 buffer 里就带着残缺片段（"root@… ~]# hanzy ~]#"），
-      // refresh 治不了 buffer——SIGWINCH 触发的 shell 重绘才是正解
-      //（与"按回车残影消失"同机制，但无需用户敲键）。
-      term?.refresh(0, (term?.rows ?? 1) - 1);
-      if (term) {
-        // 视口对齐：v-show 隐藏（高度 0）→ 恢复的过程中，xterm viewport 的
-        // 滚动位置会错位——底部露出半行旧内容（形如提示符后缀残影），
-        // refresh 治不了（行渲染本身是对的，错的是滚动偏移）。若切换前
-        // 就停在底部，这里重新对齐到缓冲区末尾；正在向上翻阅历史的
-        // 不打扰。
-        const buf = term.buffer.active;
-        if (buf.baseY + term.rows >= buf.length) {
-          term.scrollToBottom();
+      if (resizeSettleTimer) clearTimeout(resizeSettleTimer);
+      resizeSettleTimer = setTimeout(() => {
+        resizeSettleTimer = null;
+        if (unmounted) return;
+        try {
+          // 容器从隐藏（切走 tab，v-show display:none）恢复可见时：
+          // 1. 全量重绘视口——隐藏期间的渲染不落盘，渲染层保留旧画面；
+          // 2. 向 PTY 重发一次 window_change（即使尺寸未变）——SSH 照发
+          //    SIGWINCH，远端 shell/readline 会**重绘当前提示符行**。
+          // 残影的根因在数据层：切换期间 readline 的局部重绘与终端状态错位，
+          // 最后一行 buffer 里就带着残缺片段（"root@… ~]# hanzy ~]#"），
+          // refresh 治不了 buffer——SIGWINCH 触发的 shell 重绘才是正解
+          //（与"按回车残影消失"同机制，但无需用户敲键）。
+          term?.refresh(0, (term?.rows ?? 1) - 1);
+          if (term) {
+            // 视口对齐：v-show 隐藏（高度 0）→ 恢复的过程中，xterm viewport 的
+            // 滚动位置会错位——底部露出半行旧内容（形如提示符后缀残影），
+            // refresh 治不了（行渲染本身是对的，错的是滚动偏移）。若切换前
+            // 就停在底部，这里重新对齐到缓冲区末尾；正在向上翻阅历史的
+            // 不打扰。
+            const buf = term.buffer.active;
+            if (buf.baseY + term.rows >= buf.length) {
+              term.scrollToBottom();
+            }
+            if (pendingVisibleResync) {
+              // 恢复可见：强制重发（即使尺寸未变），触发远端提示符重绘。
+              pendingVisibleResync = false;
+              terminalApi
+                .terminalResize(props.instanceId, term.cols, term.rows)
+                .catch(() => {
+                  /* 会话已断开等场景忽略 */
+                });
+            } else {
+              // 常规尺寸变化：尺寸真正改变时才发（fit 内部触发 onResize，
+              // 这里只需兜底同发一次相同值，syncPtySize 会去重）。
+              syncPtySize();
+            }
+          }
+        } catch {
+          /* 容器隐藏时 fit 会抛错，忽略 */
         }
-        if (pendingVisibleResync) {
-          // 恢复可见：强制重发（即使尺寸未变），触发远端提示符重绘。
-          pendingVisibleResync = false;
-          terminalApi
-            .terminalResize(props.instanceId, term.cols, term.rows)
-            .catch(() => {
-              /* 会话已断开等场景忽略 */
-            });
-        } else {
-          // 常规尺寸变化：尺寸真正改变时才发（fit 内部触发 onResize，
-          // 这里只需兜底同发一次相同值，syncPtySize 会去重）。
-          syncPtySize();
-        }
-      }
+      }, 150);
     } catch {
       /* 容器隐藏时 fit 会抛错，忽略 */
     }
@@ -904,6 +925,7 @@ onBeforeUnmount(() => {
   unmounted = true;
   for (const u of unlistens) u();
   unlistens = [];
+  if (resizeSettleTimer) clearTimeout(resizeSettleTimer);
   resizeObs?.disconnect();
   window.removeEventListener("keydown", onGlobalKeydown);
   containerRef.value?.removeEventListener("mousedown", onPaneMouseDown);

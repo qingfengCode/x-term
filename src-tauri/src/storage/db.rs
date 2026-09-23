@@ -50,6 +50,11 @@ pub fn init_pool(app_data_dir: &Path) -> AppResult<DbPool> {
     });
 
     let pool = Pool::builder()
+        // 池容量与获取等待上限显式配置：r2d2 默认 connection_timeout = 30s，
+        // 池耗尽（并发命令/AI/MCP 各持连接）时主线程上的同步命令会阻塞半分钟，
+        // 表现为整个 UI 冻结；快速失败 + 明确报错体验远好于长时间冻结。
+        .max_size(10)
+        .connection_timeout(std::time::Duration::from_secs(5))
         .build(manager)
         .map_err(|e| crate::error::AppError::Storage(format!("无法建立数据库连接池: {}", e)))?;
 
@@ -113,6 +118,9 @@ pub fn run_migrations(conn: &Connection) -> AppResult<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_history_session ON history(session_id);
         CREATE INDEX IF NOT EXISTS idx_history_run_at ON history(run_at);
+        -- command 索引：add_history_dedup 每次回车执行 DELETE ... WHERE command = ?，
+        -- 无索引时全表扫描，随历史积累线性变慢（每次回车都卡一拍）。
+        CREATE INDEX IF NOT EXISTS idx_history_command ON history(command);
 
         CREATE TABLE IF NOT EXISTS forward_rules (
             id              TEXT PRIMARY KEY,

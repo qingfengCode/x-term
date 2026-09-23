@@ -1,6 +1,11 @@
 //! 会话与分组管理命令，以及终端会话的建立、断开。
+//!
+//! 分组/会话 CRUD 全部 async + `spawn_blocking`：Tauri 的非 async 命令在**主线程**
+//! 执行，而每条 CRUD 都要从 r2d2 池取连接（池耗尽等待上限 5s）并执行 SQLite 语句
+//! （`busy_timeout` 5000ms）。一旦在主线程阻塞，窗口消息循环停止，表现为整个 UI
+//! 冻结；改成 async 后阻塞发生在 tokio 阻塞线程池，界面不受影响。
 
-use tauri::State;
+use tauri::{Manager, State};
 
 use crate::error::{AppError, AppResult};
 use crate::ssh::client::{AuthMethod, PasswordAuth};
@@ -13,21 +18,39 @@ use crate::storage::sessions_repo::{Group, Session};
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub fn list_groups(state: State<'_, AppState>) -> AppResult<Vec<Group>> {
-    let conn = state.conn()?;
-    crate::storage::sessions_repo::list_groups(&conn)
+pub async fn list_groups(state: State<'_, AppState>) -> AppResult<Vec<Group>> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        crate::storage::sessions_repo::list_groups(&conn)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("读取分组任务失败: {}", e)))?
 }
 
 #[tauri::command]
-pub fn save_group(group: Group, state: State<'_, AppState>) -> AppResult<()> {
-    let conn = state.conn()?;
-    crate::storage::sessions_repo::upsert_group(&conn, &group)
+pub async fn save_group(group: Group, state: State<'_, AppState>) -> AppResult<()> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        crate::storage::sessions_repo::upsert_group(&conn, &group)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("保存分组任务失败: {}", e)))?
 }
 
 #[tauri::command]
-pub fn delete_group(id: String, state: State<'_, AppState>) -> AppResult<()> {
-    let conn = state.conn()?;
-    crate::storage::sessions_repo::delete_group(&conn, &id)
+pub async fn delete_group(id: String, state: State<'_, AppState>) -> AppResult<()> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        crate::storage::sessions_repo::delete_group(&conn, &id)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("删除分组任务失败: {}", e)))?
 }
 
 // ---------------------------------------------------------------------------
@@ -35,27 +58,51 @@ pub fn delete_group(id: String, state: State<'_, AppState>) -> AppResult<()> {
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub fn list_sessions(state: State<'_, AppState>) -> AppResult<Vec<Session>> {
-    let conn = state.conn()?;
-    crate::storage::sessions_repo::list_sessions(&conn)
+pub async fn list_sessions(state: State<'_, AppState>) -> AppResult<Vec<Session>> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        crate::storage::sessions_repo::list_sessions(&conn)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("读取会话列表任务失败: {}", e)))?
 }
 
 #[tauri::command]
-pub fn get_session(id: String, state: State<'_, AppState>) -> AppResult<Option<Session>> {
-    let conn = state.conn()?;
-    crate::storage::sessions_repo::get_session(&conn, &id)
+pub async fn get_session(id: String, state: State<'_, AppState>) -> AppResult<Option<Session>> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        crate::storage::sessions_repo::get_session(&conn, &id)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("读取会话任务失败: {}", e)))?
 }
 
 #[tauri::command]
-pub fn save_session(session: Session, state: State<'_, AppState>) -> AppResult<()> {
-    let conn = state.conn()?;
-    crate::storage::sessions_repo::upsert_session(&conn, &session)
+pub async fn save_session(session: Session, state: State<'_, AppState>) -> AppResult<()> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        crate::storage::sessions_repo::upsert_session(&conn, &session)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("保存会话任务失败: {}", e)))?
 }
 
 #[tauri::command]
-pub fn delete_session(id: String, state: State<'_, AppState>) -> AppResult<()> {
-    let conn = state.conn()?;
-    crate::storage::sessions_repo::delete_session(&conn, &id)
+pub async fn delete_session(id: String, state: State<'_, AppState>) -> AppResult<()> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        crate::storage::sessions_repo::delete_session(&conn, &id)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("删除会话任务失败: {}", e)))?
 }
 
 // ---------------------------------------------------------------------------

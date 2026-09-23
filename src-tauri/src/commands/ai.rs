@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::Value;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::ai::provider::{build_provider, ChatMessage, ChatWithToolsResult, LlmProvider, Role};
 use crate::ai::tools::{
@@ -393,33 +393,45 @@ pub async fn ai_stop(
 ///   重新保存到 settings.json。
 /// - `command` 可以是完整命令（如 `df -h`），函数只取**第一个 token**作为白名单条目
 ///   （与 `is_whitelisted` 的前缀匹配规则一致）。
+///
+/// async + `spawn_blocking`：settings.json 的读 + 写属阻塞文件 IO（缓存未命中时
+/// 必定读盘），跑在主线程会冻结整个窗口。
 #[tauri::command]
-pub fn ai_add_to_whitelist(command: String, state: State<'_, AppState>) -> AppResult<()> {
-    // 取首个 token 作为白名单前缀。
-    let prefix = command.split_whitespace().next().unwrap_or("").trim();
-    if prefix.is_empty() {
-        return Err(AppError::InvalidInput("命令前缀为空".into()));
-    }
-    let mut settings = settings_load_inner(&state)?;
-    if !settings
-        .ai
-        .ssh_agent
-        .command_whitelist
-        .iter()
-        .any(|w| w == prefix)
-    {
-        settings
+pub async fn ai_add_to_whitelist(command: String, state: State<'_, AppState>) -> AppResult<()> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        // 取首个 token 作为白名单前缀。
+        let prefix = command.split_whitespace().next().unwrap_or("").trim();
+        if prefix.is_empty() {
+            return Err(AppError::InvalidInput("命令前缀为空".into()));
+        }
+        let mut settings = settings_load_inner(state.inner())?;
+        if !settings
             .ai
             .ssh_agent
             .command_whitelist
-            .push(prefix.to_string());
-        let path = state
-            .settings_path
-            .as_path()
-            .join(crate::config::SETTINGS_FILENAME);
-        crate::storage::json_store::write_json(&path, &settings)?;
-    }
-    Ok(())
+            .iter()
+            .any(|w| w == prefix)
+        {
+            settings
+                .ai
+                .ssh_agent
+                .command_whitelist
+                .push(prefix.to_string());
+            let path = state
+                .settings_path
+                .as_path()
+                .join(crate::config::SETTINGS_FILENAME);
+            crate::storage::json_store::write_json(&path, &settings)?;
+            // 写盘后失效内存缓存（与 settings_save 同款）：settings_load_inner 命中
+            // 缓存时返回的是修改前的设置，不失效则新增条目要等下次保存或重启才生效。
+            crate::config::settings_invalidate_cache(state.inner());
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| AppError::Config(format!("写入白名单任务失败: {}", e)))?
 }
 
 /// 设置某个助手域的工作目录并持久化（设置页「本地文件读写」卡片触发）。
@@ -427,38 +439,46 @@ pub fn ai_add_to_whitelist(command: String, state: State<'_, AppState>) -> AppRe
 /// `domain` 为 "ssh"（终端助手）| "db"（数据库助手）；`path` 为绝对路径。
 /// AI 只能在该目录及子目录内读写文件（沙箱）。传空串清除配置。
 #[tauri::command]
-pub fn set_workspace_dir(
+pub async fn set_workspace_dir(
     domain: String,
     path: String,
     state: State<'_, AppState>,
 ) -> AppResult<()> {
-    if domain != "ssh" && domain != "db" {
-        return Err(AppError::InvalidInput(format!("无效的助手域: {domain}")));
-    }
-    let mut settings = settings_load_inner(&state)?;
-    if path.trim().is_empty() {
-        settings.ai.file_access.workspace_dirs.remove(&domain);
-    } else {
-        // 校验目录存在（不校验是否为目录内可达，AI 执行期会 canonicalize 复查）。
-        let p = std::path::Path::new(path.trim());
-        if !p.is_absolute() {
-            return Err(AppError::InvalidInput("工作目录必须是绝对路径".into()));
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        if domain != "ssh" && domain != "db" {
+            return Err(AppError::InvalidInput(format!("无效的助手域: {domain}")));
         }
-        if !p.exists() {
-            return Err(AppError::NotFound(format!("目录不存在: {}", p.display())));
+        let mut settings = settings_load_inner(state.inner())?;
+        if path.trim().is_empty() {
+            settings.ai.file_access.workspace_dirs.remove(&domain);
+        } else {
+            // 校验目录存在（不校验是否为目录内可达，AI 执行期会 canonicalize 复查）。
+            let p = std::path::Path::new(path.trim());
+            if !p.is_absolute() {
+                return Err(AppError::InvalidInput("工作目录必须是绝对路径".into()));
+            }
+            if !p.exists() {
+                return Err(AppError::NotFound(format!("目录不存在: {}", p.display())));
+            }
+            settings
+                .ai
+                .file_access
+                .workspace_dirs
+                .insert(domain, path.trim().to_string());
         }
-        settings
-            .ai
-            .file_access
-            .workspace_dirs
-            .insert(domain, path.trim().to_string());
-    }
-    let path = state
-        .settings_path
-        .as_path()
-        .join(crate::config::SETTINGS_FILENAME);
-    crate::storage::json_store::write_json(&path, &settings)?;
-    Ok(())
+        let path = state
+            .settings_path
+            .as_path()
+            .join(crate::config::SETTINGS_FILENAME);
+        crate::storage::json_store::write_json(&path, &settings)?;
+        // 同 ai_add_to_whitelist：失效缓存，让新工作目录立即对后续读取生效。
+        crate::config::settings_invalidate_cache(state.inner());
+        Ok(())
+    })
+    .await
+    .map_err(|e| AppError::Config(format!("设置工作目录任务失败: {}", e)))?
 }
 
 // ===========================================================================
@@ -1720,20 +1740,34 @@ fn conversations_path(domain: &str) -> AppResult<std::path::PathBuf> {
 }
 
 /// 读取指定 domain 的对话历史列表。
+///
+/// async：对话历史 JSON（含历史消息/图片 base64）可达数 MB，读盘 + 反序列化
+/// 放阻塞线程池，避免主线程卡顿。
 #[tauri::command]
-pub fn ai_list_conversations(domain: String) -> AppResult<Vec<SerializableConversation>> {
-    let path = conversations_path(&domain)?;
-    crate::storage::json_store::read_json_or_default(&path)
+pub async fn ai_list_conversations(domain: String) -> AppResult<Vec<SerializableConversation>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = conversations_path(&domain)?;
+        crate::storage::json_store::read_json_or_default(&path)
+    })
+    .await
+    .map_err(|e| AppError::Ai(format!("读取对话历史任务失败: {}", e)))?
 }
 
 /// 全量保存指定 domain 的对话历史（原子写，覆盖旧文件）。
+///
+/// async：整份历史序列化 + 写盘放阻塞线程池（前端 agent 多轮工具调用时
+/// 会高频触发持久化）。
 #[tauri::command]
-pub fn ai_save_conversations(
+pub async fn ai_save_conversations(
     domain: String,
     conversations: Vec<SerializableConversation>,
 ) -> AppResult<()> {
-    let path = conversations_path(&domain)?;
-    crate::storage::json_store::write_json(&path, &conversations)
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = conversations_path(&domain)?;
+        crate::storage::json_store::write_json(&path, &conversations)
+    })
+    .await
+    .map_err(|e| AppError::Ai(format!("保存对话历史任务失败: {}", e)))?
 }
 
 /// 非多模态模型不发送图片字段：把 `messages` 里的图片全部剥离。

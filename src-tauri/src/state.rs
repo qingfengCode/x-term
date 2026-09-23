@@ -92,7 +92,9 @@ impl TerminalSession {
 
     /// 通知 reader 立即冲刷输出批次（attach 快照前调用，保证快照与事件流
     /// 的 `total` 基线一致）。SSH/Telnet 有批量 emit，需冲刷；本地会话
-    /// 逐块 emit，无需冲刷，返回 None。
+    /// 聚合线程在**接收块时**即写入输出缓冲（emit 只是滞后 ≤16ms），
+    /// 快照基线已覆盖未 emit 的批次字节，事件按 `total <= 基线` 去重，
+    /// 无需冲刷，返回 None。
     pub fn flush_output(&self) -> Option<tokio::sync::oneshot::Receiver<()>> {
         match self {
             TerminalSession::Ssh(s) => s.flush_output(),

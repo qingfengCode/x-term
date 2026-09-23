@@ -34,8 +34,9 @@ pub const MCP_APPROVAL_REQUEST: &str = "mcp:approval_request";
 /// MCP 确认请求过期事件名（超时后 emit 给前端，通知移除对应浮层卡片）。
 pub const MCP_APPROVAL_EXPIRED: &str = "mcp:approval_expired";
 
-/// MCP 服务端种类：SSH MCP（暴露 exec_ssh + 文件工具）/ DB MCP（暴露 exec_sql）/
-/// File MCP（暴露 list_files / upload_file / download_file，基于绑定的 S3 账号）。
+/// MCP 服务端种类：SSH MCP（暴露 exec_ssh + 文件工具，多机/堡垒机模式见
+/// resource_mode）/ DB MCP（暴露 exec_sql）/ File MCP（暴露 list_files /
+/// upload_file / download_file，基于绑定的 S3 账号）。
 ///
 /// 每个 kind 各自独立的监听实例、端口、token、绑定的资源。序列化为小写字符串
 /// "ssh" / "db" / "file"（serde rename_all 在 enum 上对单元变体取小写名）。

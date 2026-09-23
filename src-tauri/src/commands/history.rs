@@ -3,8 +3,12 @@
 //! 历史在终端输入回车时记录（前端从屏幕缓冲提取命令文本），存入 SQLite
 //! `history` 表（见 [`crate::storage::history_repo`]）。补全建议读取全局
 //! 最近历史（跨会话、按命令去重），与 shell 的 Ctrl+R 体验一致。
+//!
+//! 全部 async + spawn_blocking：`history_add` 在**每次回车**时触发，同步命令
+//! 在主线程执行 SQLite 事务（含按 command 去重的 DELETE 全表扫描）会周期性
+//! 卡 UI；随历史积累变慢后愈发明显。
 
-use tauri::State;
+use tauri::{Manager, State};
 
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
@@ -16,50 +20,74 @@ const MAX_COMMAND_LEN: usize = 512;
 
 /// 新增一条命令历史（同命令只保留最新一次执行，自动去重）。
 #[tauri::command]
-pub fn history_add(
+pub async fn history_add(
     session_id: String,
     command: String,
     state: State<'_, AppState>,
 ) -> AppResult<i64> {
-    let cmd = command.trim();
+    let cmd = command.trim().to_string();
     if cmd.is_empty() {
         return Err(AppError::InvalidInput("命令不能为空".into()));
     }
     if cmd.chars().count() > MAX_COMMAND_LEN {
         return Ok(0);
     }
-    let conn = state.conn()?;
-    let entry = HistoryEntry {
-        id: None,
-        session_id,
-        command: cmd.to_string(),
-        exit_code: None,
-        run_at: chrono::Local::now().to_rfc3339(),
-    };
-    history_repo::add_history_dedup(&conn, &entry)
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        let entry = HistoryEntry {
+            id: None,
+            session_id,
+            command: cmd,
+            exit_code: None,
+            run_at: chrono::Local::now().to_rfc3339(),
+        };
+        history_repo::add_history_dedup(&conn, &entry)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("历史写入任务失败: {}", e)))?
 }
 
 /// 全局最近历史（按命令去重，新→旧），用于终端补全建议。
 #[tauri::command]
-pub fn history_recent(limit: u32, state: State<'_, AppState>) -> AppResult<Vec<HistoryEntry>> {
-    let conn = state.conn()?;
-    history_repo::list_recent_history(&conn, limit.clamp(1, 1000))
+pub async fn history_recent(limit: u32, state: State<'_, AppState>) -> AppResult<Vec<HistoryEntry>> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        history_repo::list_recent_history(&conn, limit.clamp(1, 1000))
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("历史读取任务失败: {}", e)))?
 }
 
 /// 删除一条历史（补全弹窗的删除按钮）。
 #[tauri::command]
-pub fn history_delete(id: i64, state: State<'_, AppState>) -> AppResult<()> {
-    let conn = state.conn()?;
-    history_repo::delete_history(&conn, id)
+pub async fn history_delete(id: i64, state: State<'_, AppState>) -> AppResult<()> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        history_repo::delete_history(&conn, id)
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("历史删除任务失败: {}", e)))?
 }
 
 /// 关键字模糊搜索历史（所有会话范围）。
 #[tauri::command]
-pub fn history_search(
+pub async fn history_search(
     keyword: String,
     limit: u32,
     state: State<'_, AppState>,
 ) -> AppResult<Vec<HistoryEntry>> {
-    let conn = state.conn()?;
-    history_repo::search_history(&conn, &keyword, limit.clamp(1, 1000))
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        history_repo::search_history(&conn, &keyword, limit.clamp(1, 1000))
+    })
+    .await
+    .map_err(|e| AppError::Storage(format!("历史搜索任务失败: {}", e)))?
 }

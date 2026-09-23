@@ -384,7 +384,8 @@ pub struct SshAgentSettings {
     pub auto_approve_safe: bool,
     /// 终端可视化：`true` 时 `exec_ssh` 命令写入用户活动终端的 PTY（命令和输出
     /// 实时显示在 xterm）；`false` 时走独立 `channel.exec` 连接（输出只在 AI 面板）。
-    #[serde(default)]
+    /// 默认开启。
+    #[serde(default = "default_true")]
     pub terminal_visualization: bool,
 }
 
@@ -394,7 +395,7 @@ impl Default for SshAgentSettings {
             command_whitelist: default_command_whitelist(),
             run_mode: default_run_mode(),
             auto_approve_safe: false,
-            terminal_visualization: false,
+            terminal_visualization: true,
         }
     }
 }
@@ -423,7 +424,8 @@ pub struct SqlAgentSettings {
     /// 终端可视化：`true` 时 AI 执行的 SQL 及结构化结果回显到 SQL 控制台输出流
     /// （命令行模式），就像用户自己敲的一样；`false` 时结果只在 AI 面板。
     /// 与 SSH 智能体的 [`SshAgentSettings::terminal_visualization`] 独立设置。
-    #[serde(default)]
+    /// 默认开启。
+    #[serde(default = "default_true")]
     pub terminal_visualization: bool,
 }
 
@@ -433,7 +435,7 @@ impl Default for SqlAgentSettings {
             sql_mode: default_sql_mode(),
             run_mode: default_run_mode(),
             auto_approve_safe: default_sql_auto_approve_safe(),
-            terminal_visualization: false,
+            terminal_visualization: true,
         }
     }
 }

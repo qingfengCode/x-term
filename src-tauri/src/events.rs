@@ -497,3 +497,48 @@ where
         log::warn!("发送事件 `{}` 失败: {}", event, e);
     }
 }
+
+/// 传输进度事件节流器：距上一帧 ≥100ms 才放行（完成帧恒放行）。
+///
+/// SFTP / 文件后端按 64KiB 块回调进度，百兆带宽 ≈ 1600 次/秒 IPC 事件，
+/// 前端逐事件写响应式状态并触发列表重渲染，传输大文件时会明显拖垮 UI。
+/// 节流后事件数降约两个数量级；最终进度由 `transfer:done` 事件兜底，
+/// 不依赖节流帧（进度条瞬跳到 100% 与真实完成之间无功能差异）。
+///
+/// 与 `updater.rs` 的 `PROGRESS_EMIT_INTERVAL` 同一套约定。
+#[derive(Debug)]
+pub struct ProgressThrottle {
+    last: std::sync::Mutex<std::time::Instant>,
+}
+
+impl ProgressThrottle {
+    /// 新建节流器（初始视为"很久没发过"，首帧恒放行）。
+    pub fn new() -> Self {
+        Self {
+            last: std::sync::Mutex::new(
+                std::time::Instant::now() - std::time::Duration::from_secs(10),
+            ),
+        }
+    }
+
+    /// 本帧是否应发送：`done` 表示传输已完成（transferred >= total），恒放行。
+    pub fn allow(&self, done: bool) -> bool {
+        match self.last.lock() {
+            Ok(mut last) => {
+                if !done && last.elapsed() < std::time::Duration::from_millis(100) {
+                    return false;
+                }
+                *last = std::time::Instant::now();
+                true
+            }
+            // 锁中毒（极罕见）：宁多发不丢完成帧。
+            Err(_) => true,
+        }
+    }
+}
+
+impl Default for ProgressThrottle {
+    fn default() -> Self {
+        Self::new()
+    }
+}

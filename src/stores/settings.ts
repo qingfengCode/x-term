@@ -18,12 +18,12 @@ import {
 const defaultSshAgent: SshAgentSettings = {
   commandWhitelist: ["ls", "pwd", "whoami", "date", "uptime", "df", "free", "ps", "cat", "grep"],
   runMode: "manual",
-  terminalVisualization: false,
+  terminalVisualization: true,
 };
 const defaultSqlAgent: SqlAgentSettings = {
   sqlMode: "readonly",
   runMode: "manual",
-  terminalVisualization: false,
+  terminalVisualization: true,
 };
 const defaultFileAccess: FileAccessSettings = {
   enabled: false,
@@ -129,7 +129,7 @@ export const useSettingsStore = defineStore("settings", () => {
         commandWhitelist: s.ai.commandWhitelist ?? defaultSshAgent.commandWhitelist,
         // 旧"白名单自动放行"开关 → 白名单运行模式。
         runMode: s.ai.autoApproveWhitelist ? "whitelist" : defaultSshAgent.runMode,
-        terminalVisualization: s.ai.terminalVisualization ?? false,
+        terminalVisualization: s.ai.terminalVisualization ?? defaultSshAgent.terminalVisualization,
       };
     }
     sqlAgent.value = { ...defaultSqlAgent, ...(s.ai.sqlAgent ?? {}) };

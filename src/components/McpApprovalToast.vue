@@ -10,13 +10,19 @@
   属全局事件，故用独立浮层而非对话内卡片。
 -->
 <script setup lang="ts">
+import { ref } from "vue";
 import { useMcpStore } from "@/stores/mcp";
+import { aiAddToWhitelist } from "@/api/db";
 import { ElMessage } from "element-plus";
 
 const mcp = useMcpStore();
 
+/** "加白名单并放行"按钮的本地处理中集合（不能用 store 的 respondingIds：
+ *  respond 的防重入守卫会把它当作已在处理而直接 return，放行永远发不出去）。 */
+const whitelistingIds = ref<Set<string>>(new Set());
+
 /** 该工具是否为危险操作（前端粗判，仅用于卡片高亮；后端不做拦截）。
- *  与 ai/tools.rs 的 is_dangerous 规则保持一致：危险命令/危险 SQL 红色高亮。 */
+ *  和 ai/tools.rs 的 is_dangerous 规则保持一致：危险命令/危险 SQL 红色高亮。 */
 function isDangerous(toolName: string, args: Record<string, unknown>): boolean {
   if (toolName === "exec_ssh") {
     const cmd = String(args.command ?? "");
@@ -46,6 +52,34 @@ function dangerHint(toolName: string): string {
   return "";
 }
 
+/** 是否可"加入白名单并放行"：SSH 命令类工具（复用「设置 → AI」的 SSH 命令白名单），
+ *  且非危险命令（危险命令仍走逐次确认）。 */
+function canWhitelist(kind: string, toolName: string, args: Record<string, unknown>): boolean {
+  const isSshCommandTool =
+    toolName === "exec_ssh" || toolName === "bastion_session_exec";
+  return (
+    kind === "ssh" &&
+    isSshCommandTool &&
+    !!String(args.command ?? "").trim() &&
+    !isDangerous(toolName, args)
+  );
+}
+
+/** 加入白名单（命令首 token）并放行本次执行。 */
+async function whitelistAndApprove(requestId: string, command: string) {
+  if (whitelistingIds.value.has(requestId)) return;
+  whitelistingIds.value.add(requestId);
+  try {
+    await aiAddToWhitelist(command);
+    await mcp.respond(requestId, true);
+    ElMessage.success(`已把「${command.split(/\s+/)[0]}」加入 SSH 命令白名单并放行`);
+  } catch (e) {
+    ElMessage.error("加入白名单失败：" + String(e));
+  } finally {
+    whitelistingIds.value.delete(requestId);
+  }
+}
+
 async function approve(requestId: string) {
   try {
     await mcp.respond(requestId, true);
@@ -68,6 +102,10 @@ function toolLabel(toolName: string): string {
   if (toolName === "list_files") return "列目录";
   if (toolName === "upload_file") return "上传文件";
   if (toolName === "download_file") return "下载文件";
+  if (toolName === "bastion_create_session") return "堡垒机连接主机";
+  if (toolName === "bastion_session_exec") return "堡垒机执行命令";
+  if (toolName === "bastion_close_session") return "堡垒机关闭会话";
+  if (toolName === "bastion_upload_file") return "堡垒机上传文件";
   return toolName;
 }
 
@@ -110,6 +148,18 @@ function kindLabel(kind: string): string {
       </div>
 
       <div class="card-actions">
+        <el-button
+          v-if="canWhitelist(req.kind, req.toolName, req.arguments)"
+          size="small"
+          type="success"
+          plain
+          :icon="'CirclePlus'"
+          :loading="whitelistingIds.has(req.requestId)"
+          :disabled="mcp.respondingIds.has(req.requestId)"
+          @click="whitelistAndApprove(req.requestId, String(req.arguments.command ?? ''))"
+        >
+          加白名单并放行
+        </el-button>
         <el-button
           size="small"
           :type="isDangerous(req.toolName, req.arguments) ? 'danger' : 'primary'"

@@ -2,7 +2,9 @@
 //!
 //! 用 portable-pty（Windows ConPTY）在本机启动 shell 子进程（cmd / PowerShell /
 //! Git Bash），与 SSH / Telnet 会话共用同一套事件通道与输出环形缓冲：
-//! - 后台阻塞 reader 线程从 PTY master 读输出 → 输出缓冲 + emit `terminal:data`
+//! - 读线程阻塞读 PTY master → 有界通道转发给聚合线程
+//! - 聚合线程按 16ms/64KiB 批量合并后 emit `terminal:data`（对齐 SSH/Telnet，
+//!   避免 `dir /s` 等高吞吐输出造成 IPC 事件洪泛拖死前端）
 //! - 写输入：`spawn_blocking` 里写 PTY 写端并回 ack（避免大粘贴阻塞运行时）
 //! - 子进程退出（读端 EOF）→ 取退出码 → emit `terminal:exit` + `terminal:closed`
 
@@ -21,6 +23,11 @@ use crate::events::{
     TERMINAL_DATA, TERMINAL_EXIT,
 };
 use crate::ssh::session::{OutputRing, SharedOutputRing, OUTPUT_BUFFER_CAP};
+
+/// 本地终端输出批量 emit 间隔（毫秒，与 SSH / Telnet 会话一致）。
+const TERMINAL_BATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+/// 批量 emit 的批次大小上限（字节，与 SSH / Telnet 会话一致）。
+const TERMINAL_BATCH_MAX_BYTES: usize = 64 * 1024;
 
 // ===========================================================================
 // Shell 检测与解析
@@ -204,8 +211,8 @@ pub struct LocalSession {
     writer: Arc<StdMutex<Option<Box<dyn Write + Send>>>>,
     /// 子进程。wait/kill 需要 `&mut`，用 Mutex 包装以便从 `&self` 调用。
     child: Arc<StdMutex<Option<Box<dyn Child + Send + Sync>>>>,
-    /// 后台 reader 任务（spawn_blocking 阻塞读）。
-    reader_handle: Option<tauri::async_runtime::JoinHandle<()>>,
+    /// 后台聚合线程句柄（读线程独立 detach；kill 子进程 → PTY EOF → 两线程自然退出）。
+    reader_handle: Option<std::thread::JoinHandle<()>>,
     /// 共享输出环形缓冲（与 SSH / Telnet 相同类型，AI 上下文感知直接复用）。
     pub output_buffer: SharedOutputRing,
     /// 输出日志（可选，设置开启时由命令层装配）。
@@ -277,7 +284,21 @@ impl LocalSession {
         Ok(session)
     }
 
-    /// 启动后台 reader：阻塞读 PTY 输出 → 缓冲 + emit；EOF 后取退出码 emit 退出事件。
+    /// 启动后台 reader：读线程阻塞读 PTY → 聚合线程批量 emit；EOF 后取退出码
+    /// emit 退出事件。
+    ///
+    /// 线程模型（修复两类隐患）：
+    /// - **IPC 洪泛**：此前逐 4KiB 块 emit，本地高吞吐输出（`dir /s`、`type` 大
+    ///   文件、编译日志）每秒可产生上万次事件，前端逐事件做 base64 解码 +
+    ///   ZMODEM 哨兵扫描，主线程被钉死表现为整个软件卡死。现与 SSH/Telnet 对齐，
+    ///   按 16ms / 64KiB 批量冲刷，事件数降 1~2 个数量级。
+    /// - **阻塞线程池占用**：此前 reader 跑在 `spawn_blocking` 里、整个会话周期
+    ///   常驻占用 tokio 阻塞线程池配额，多本地标签并存时会挤占 SQL 控制台 /
+    ///   密钥生成等 `spawn_blocking` 路径。改用独立 `std::thread`，不占配额。
+    ///
+    /// 两线程分工：读线程只做阻塞读 + 有界通道转发（满时自然背压）；聚合线程
+    /// 持批次缓冲，`recv_timeout` 睡到冲刷截止点——保证突发输出结束后尾批最多
+    /// 延迟 16ms 上屏（单线程做不到：阻塞读无法按时间醒来冲刷残留批次）。
     fn spawn_reader(&mut self) -> AppResult<()> {
         let app = self.app.clone();
         let session_id = self.id.clone();
@@ -291,70 +312,161 @@ impl LocalSession {
             .and_then(|m| m.try_clone_reader().ok())
             .ok_or_else(|| AppError::Ssh("获取终端读端失败".into()))?;
 
-        let join = tauri::async_runtime::spawn_blocking(move || {
-            let mut reader = reader;
-            let mut buf = [0u8; 4096];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break, // 子进程退出 / PTY 关闭
-                    Ok(n) => {
-                        let data = &buf[..n];
-                        // 同步喂输出日志（未启用时 Option 为 None，零开销）。
-                        if let Ok(mut logger) = output_log.lock() {
-                            if let Some(l) = logger.as_mut() {
-                                l.feed(data);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
+        std::thread::Builder::new()
+            .name(format!("local-pty-read-{session_id}"))
+            .spawn(move || {
+                let mut reader = reader;
+                // 64KiB 读块：高吞吐场景减少系统调用次数。
+                let mut buf = vec![0u8; TERMINAL_BATCH_MAX_BYTES];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) | Err(_) => break, // 子进程退出 / PTY 关闭
+                        Ok(n) => {
+                            // 聚合线程消费慢时此处阻塞等待（背压），丢弃 tx 即退出。
+                            if tx.send(buf[..n].to_vec()).is_err() {
+                                break;
                             }
                         }
-                        // 写入输出环形缓冲（锁内取追加后的累计字节数，随事件
-                        // emit 供前端 attach 回放去重；如果锁不可用则计 0）。
-                        let end = output_buffer.lock().ok().map(|mut ob| {
-                            ob.push(data);
-                            ob.total_bytes()
-                        });
-                        // emit 给前端（base64；本地逐块 emit，区间 [start,end)）。
-                        let end = end.unwrap_or(0);
-                        let start = end.saturating_sub(n);
-                        let b64 = base64::engine::general_purpose::STANDARD.encode(data);
-                        emit(
-                            &app,
-                            TERMINAL_DATA,
-                            TerminalDataEvent {
-                                session_id: session_id.clone(),
-                                data: b64,
-                                start_total: start,
-                                total: end,
-                            },
-                        );
                     }
                 }
-            }
+            })
+            .map_err(|e| AppError::Ssh(format!("启动本地终端读线程失败: {}", e)))?;
 
-            // 读端 EOF：等待子进程结束取退出码（此时进程已退出，wait 立即返回）。
-            let exit_code = child
-                .lock()
-                .ok()
-                .and_then(|mut guard| guard.as_mut().and_then(|c| c.wait().ok()))
-                .map(|status| status.exit_code() as i32);
-            // 关闭输出日志（冲刷尾行 + 落盘）。
-            if let Ok(mut logger) = output_log.lock() {
-                if let Some(l) = logger.as_mut() {
-                    l.close();
+        let batcher = std::thread::Builder::new()
+            .name(format!("local-pty-batch-{session_id}"))
+            .spawn(move || {
+                // 输出批次缓冲（账本与 SSH 的 flush_batch 一致）：事件携带半开
+                // 区间 [start_total, total)，前端 attach 回放按快照基线去重。
+                let mut batch: Vec<u8> = Vec::with_capacity(4096);
+                let mut batch_start_total: usize = 0;
+                let mut batch_total: usize = 0;
+                let mut deadline: Option<std::time::Instant> = None;
+
+                let flush = |batch: &mut Vec<u8>, start: usize, end: usize| {
+                    if batch.is_empty() {
+                        return;
+                    }
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(batch.as_slice());
+                    emit(
+                        &app,
+                        TERMINAL_DATA,
+                        TerminalDataEvent {
+                            session_id: session_id.clone(),
+                            data: b64,
+                            start_total: start,
+                            total: end,
+                        },
+                    );
+                    batch.clear();
+                };
+
+                loop {
+                    let chunk = match deadline {
+                        // 有积压：最多睡到冲刷截止点，超时即到点冲刷。
+                        Some(dl) => {
+                            match rx.recv_timeout(
+                                dl.saturating_duration_since(std::time::Instant::now()),
+                            ) {
+                                Ok(c) => Some(c),
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                            }
+                        }
+                        // 无积压：阻塞等下一块数据。
+                        None => match rx.recv() {
+                            Ok(c) => Some(c),
+                            Err(std::sync::mpsc::RecvError) => break,
+                        },
+                    };
+
+                    match chunk {
+                        Some(data) => {
+                            // 同步喂输出日志（未启用时 Option 为 None，零开销）。
+                            if let Ok(mut logger) = output_log.lock() {
+                                if let Some(l) = logger.as_mut() {
+                                    l.feed(&data);
+                                }
+                            }
+                            // 写入输出环形缓冲（锁内取追加后的累计字节数，随事件
+                            // emit 供前端 attach 回放去重）。
+                            match output_buffer.lock() {
+                                Ok(mut ob) => {
+                                    ob.push(&data);
+                                    if batch.is_empty() {
+                                        // 批次起点 = 本块写入前的累计字节数（上批终点）。
+                                        batch_start_total = batch_total;
+                                    }
+                                    batch_total = ob.total_bytes();
+                                }
+                                Err(_) => {
+                                    // 缓冲锁不可用（极罕见，仅中毒）：退化为立即
+                                    // 整块 emit、区间置 0（前端按无基线全量渲染，
+                                    // 宁可重复不可丢失）。
+                                    flush(&mut batch, batch_start_total, batch_total);
+                                    let b64 = base64::engine::general_purpose::STANDARD
+                                        .encode(data.as_slice());
+                                    emit(
+                                        &app,
+                                        TERMINAL_DATA,
+                                        TerminalDataEvent {
+                                            session_id: session_id.clone(),
+                                            data: b64,
+                                            start_total: 0,
+                                            total: 0,
+                                        },
+                                    );
+                                    deadline = None;
+                                    continue;
+                                }
+                            }
+                            batch.extend_from_slice(&data);
+                            if deadline.is_none() {
+                                deadline = Some(std::time::Instant::now() + TERMINAL_BATCH_INTERVAL);
+                            }
+                            if batch.len() >= TERMINAL_BATCH_MAX_BYTES {
+                                flush(&mut batch, batch_start_total, batch_total);
+                                deadline = None;
+                            }
+                        }
+                        None => {
+                            // 到点：冲刷积压批次。
+                            flush(&mut batch, batch_start_total, batch_total);
+                            deadline = None;
+                        }
+                    }
                 }
-                *logger = None;
-            }
-            emit(
-                &app,
-                TERMINAL_EXIT,
-                TerminalExitEvent {
-                    session_id: session_id.clone(),
-                    code: exit_code,
-                },
-            );
-            emit(&app, TERMINAL_CLOSED, TerminalClosedEvent { session_id, reason: None });
-            log::info!("[local] 会话结束，退出码: {:?}", exit_code);
-        });
 
-        self.reader_handle = Some(join);
+                // 通道关闭（读端 EOF）：冲刷尾批，避免最后一批输出丢失。
+                flush(&mut batch, batch_start_total, batch_total);
+
+                // 读端 EOF：等待子进程结束取退出码（此时进程已退出，wait 立即返回）。
+                let exit_code = child
+                    .lock()
+                    .ok()
+                    .and_then(|mut guard| guard.as_mut().and_then(|c| c.wait().ok()))
+                    .map(|status| status.exit_code() as i32);
+                // 关闭输出日志（冲刷尾行 + 落盘）。
+                if let Ok(mut logger) = output_log.lock() {
+                    if let Some(l) = logger.as_mut() {
+                        l.close();
+                    }
+                    *logger = None;
+                }
+                emit(
+                    &app,
+                    TERMINAL_EXIT,
+                    TerminalExitEvent {
+                        session_id: session_id.clone(),
+                        code: exit_code,
+                    },
+                );
+                emit(&app, TERMINAL_CLOSED, TerminalClosedEvent { session_id, reason: None });
+                log::info!("[local] 会话结束，退出码: {:?}", exit_code);
+            })
+            .map_err(|e| AppError::Ssh(format!("启动本地终端聚合线程失败: {}", e)))?;
+
+        self.reader_handle = Some(batcher);
         Ok(())
     }
 
@@ -466,32 +578,29 @@ impl LocalSession {
         }
     }
 
-    /// 关闭会话：kill 子进程（读端 EOF → reader 自然退出并 emit closed），
-    /// 再 abort reader 兜底。Drop 里同样兜底，防孤儿进程。
+    /// 关闭会话：kill 子进程（读端 EOF → reader/聚合线程自然退出并 emit closed）。
+    /// Drop 里同样兜底，防孤儿进程。
     pub fn close(&mut self) -> AppResult<()> {
         if let Ok(mut guard) = self.child.lock() {
             if let Some(child) = guard.as_mut() {
                 let _ = child.kill();
             }
         }
-        if let Some(handle) = self.reader_handle.take() {
-            handle.abort();
-        }
+        self.reader_handle.take();
         Ok(())
     }
 }
 
 impl Drop for LocalSession {
     fn drop(&mut self) {
-        // 兜底：kill 子进程并 abort reader，防止本地 shell 成为孤儿进程。
+        // 兜底：kill 子进程防孤儿进程；master 随 Drop 释放，PTY 关闭后
+        // 读线程收到 EOF 自然退出（std 线程无法 abort，靠 EOF 收尾）。
         if let Ok(mut guard) = self.child.lock() {
             if let Some(child) = guard.as_mut() {
                 let _ = child.kill();
             }
         }
-        if let Some(handle) = self.reader_handle.take() {
-            handle.abort();
-        }
+        self.reader_handle.take();
     }
 }
 

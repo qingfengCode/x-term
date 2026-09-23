@@ -7,7 +7,7 @@
 //! - [`update_download`]：下载安装包（进度经 `update:progress` 事件推送）。
 //! - [`update_install_and_exit`]：拉起安装器并退出应用。
 
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::config::APP_CONFIG_FILENAME;
 use crate::error::{AppError, AppResult};
@@ -38,32 +38,52 @@ fn current_version(app: &AppHandle) -> String {
     app.package_info().version.to_string()
 }
 
+// 以下命令均 async + `spawn_blocking`：app.json 的读写与安装器进程拉起都是
+// 阻塞 IO，跑在主线程（Tauri 非 async 命令的默认行为）会冻结整个窗口。
+
 /// 返回关于页所需的应用信息。
 #[tauri::command]
-pub fn update_get_info(app: AppHandle, state: State<'_, AppState>) -> AppResult<UpdateInfo> {
-    let cfg = crate::config::app_config_load_inner(&app_config_path(&state))?;
-    Ok(UpdateInfo {
-        current_version: current_version(&app),
-        manifest_url: cfg.update.manifest_url,
-        data_dir: state.data_dir.display().to_string(),
-        tauri_version: tauri::VERSION.to_string(),
+pub async fn update_get_info(app: AppHandle) -> AppResult<UpdateInfo> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let cfg = crate::config::app_config_load_inner(&app_config_path(&state))?;
+        Ok(UpdateInfo {
+            current_version: current_version(&app),
+            manifest_url: cfg.update.manifest_url,
+            data_dir: state.data_dir.display().to_string(),
+            tauri_version: tauri::VERSION.to_string(),
+        })
     })
+    .await
+    .map_err(|e| AppError::Update(format!("读取应用信息任务失败: {}", e)))?
 }
 
 /// 读取更新源地址。
 #[tauri::command]
-pub fn update_get_manifest_url(state: State<'_, AppState>) -> AppResult<String> {
-    let cfg = crate::config::app_config_load_inner(&app_config_path(&state))?;
-    Ok(cfg.update.manifest_url)
+pub async fn update_get_manifest_url(state: State<'_, AppState>) -> AppResult<String> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let cfg = crate::config::app_config_load_inner(&app_config_path(&state))?;
+        Ok(cfg.update.manifest_url)
+    })
+    .await
+    .map_err(|e| AppError::Update(format!("读取更新源任务失败: {}", e)))?
 }
 
 /// 保存更新源地址。
 #[tauri::command]
-pub fn update_set_manifest_url(url: String, state: State<'_, AppState>) -> AppResult<()> {
-    let path = app_config_path(&state);
-    let mut cfg = crate::config::app_config_load_inner(&path)?;
-    cfg.update.manifest_url = url.trim().to_string();
-    crate::config::app_config_save_inner(&path, &cfg)
+pub async fn update_set_manifest_url(url: String, state: State<'_, AppState>) -> AppResult<()> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let path = app_config_path(&state);
+        let mut cfg = crate::config::app_config_load_inner(&path)?;
+        cfg.update.manifest_url = url.trim().to_string();
+        crate::config::app_config_save_inner(&path, &cfg)
+    })
+    .await
+    .map_err(|e| AppError::Update(format!("保存更新源任务失败: {}", e)))?
 }
 
 /// 检查更新：返回可用清单，若已是最新返回 `None`（前端收到 null）。
@@ -96,7 +116,11 @@ pub async fn update_download(
 
 /// 拉起安装器并退出应用（不可逆）。
 #[tauri::command]
-pub fn update_install_and_exit(app: AppHandle, path: String) -> AppResult<()> {
-    let installer = std::path::PathBuf::from(path);
-    crate::updater::install_and_exit(&app, &installer)
+pub async fn update_install_and_exit(app: AppHandle, path: String) -> AppResult<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let installer = std::path::PathBuf::from(path);
+        crate::updater::install_and_exit(&app, &installer)
+    })
+    .await
+    .map_err(|e| AppError::Update(format!("启动安装器任务失败: {}", e)))?
 }
