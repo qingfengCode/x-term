@@ -487,6 +487,10 @@ async function loadTreeNode(node: any, resolve: (children: TreeNode[]) => void, 
           isLeaf: true,
         }));
       });
+      // 登记表名进补全映射（字段在点表预拉 DESCRIBE 时回填）。
+      for (const t of nodes) {
+        if (!(t.value in tableSchema.value)) tableSchema.value[t.value] = [];
+      }
       resolve(nodes);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -644,6 +648,8 @@ async function onTreeNodeClick(data: TreeNode) {
     if (desc) {
       const cols = desc.rows.map((r) => r[0]).filter(Boolean);
       data.columns = cols;
+      // 回填进补全映射（treeData 遍历收集不到懒加载节点，见 tableSchema 声明处）。
+      tableSchema.value[data.value] = cols;
     }
     return;
   }
@@ -964,18 +970,17 @@ const activeSqlText = computed({
     if (s) s.sqlText.value = v;
   },
 });
-// 从已加载的树节点收集 表→字段 映射，供 CodeMirror SQL 自动补全（表名 + 字段名）。
-// 字段来自点表时预拉的 DESCRIBE；未点过的表字段为空（仅补表名）。
-const tableSchema = computed(() => {
-  const map: Record<string, string[]> = {};
-  for (const inst of treeData.value) {
-    for (const dbNode of inst.children ?? []) {
-      for (const tbl of dbNode.children ?? []) {
-        if (tbl.type === "table") map[tbl.value] = tbl.columns ?? [];
-      }
-    }
-  }
-  return map;
+// 表→字段 映射，供 CodeMirror SQL 自动补全（表名 + 字段名）。
+// 不能从 treeData 遍历收集：el-tree 懒加载的子节点只进 TreeStore 的
+// childNodes，不回写源数据的 children（doCreateChildren 走 batch 插入，
+// 刻意跳过回写）——源 children 永远是建树时的 []，遍历恒为空、补全从未
+// 生效。改为独立响应式映射：加载表列表时登记表名（字段为空、仅补表名），
+// 点表预拉 DESCRIBE 时回填字段（useCodeMirror 对该 ref 是 deep watch，
+// 嵌套变更即重配补全扩展）。
+const tableSchema = ref<Record<string, string[]>>({});
+// 树重建（profile/分组变化）时清空：表清单随新树重新加载登记。
+watch(treeData, () => {
+  tableSchema.value = {};
 });
 const { mount: mountSqlEditor, remount: remountSqlEditor, getView: getSqlView } = useCodeMirror(
   sqlEditorRef,

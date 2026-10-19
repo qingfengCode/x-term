@@ -302,10 +302,11 @@ pub async fn db_use_database(
 /// sql_first_keyword 解析成主语句关键字后再判定），并拒绝
 /// `SELECT ... INTO OUTFILE/DUMPFILE`（会在服务器文件系统上写文件）。
 /// 违反任一即返回错误。
-fn enforce_read_only(sql: &str) -> AppResult<()> {
-    // 引号感知切分：字符串字面量内的分号不是语句边界（裸 split(';') 会把
-    // `WHERE c='a;b'` 的残段 `b'` 切出来，首关键字判定必失败、误拒合法查询）。
-    for stmt in crate::database::script_split::top_level_fragments(sql) {
+fn enforce_read_only(sql: &str, kind: &str) -> AppResult<()> {
+    // 引号与注释感知切分（方言由 kind 决定）：字符串字面量/注释内的分号不是
+    // 语句边界——裸 split(';') 会把 `WHERE c='a;b'` 的残段或注释里的后文切
+    // 出来，首关键字判定必失败、误拒合法查询（如 `SELECT 1 -- note; later`）。
+    for stmt in crate::database::script_split::top_level_fragments(sql, kind) {
         let s = stmt.trim();
         if s.is_empty() {
             continue;
@@ -363,13 +364,27 @@ pub async fn db_exec_sql(
     // PG 则没有 USE 语句——统一由本层处理：MySQL 记录当前库、PG 换库重连
     // （见 DbConnHandle::use_database），语句本身不再发给数据库。
     if let Some(use_db) = crate::database::mysql::parse_use_statement(&sql) {
-        let set_res = conn_obj.use_database(use_db.as_deref()).await;
+        // 裸 `USE`（无库名）是语法错误：parse_use_statement 以 Some(None) 标记、
+        // 约定由本层报错——不能与 use_database 的合法 None（显式清库，仅
+        // db_use_database 命令使用）混同，否则用户得到"切换成功"，当前库
+        // 还被静默重置回连接默认库。
+        let Some(use_db) = use_db else {
+            let event = DbQueryResultEvent {
+                query_id,
+                columns: Vec::new(),
+                rows: Vec::new(),
+                affected: 0,
+                truncated: false,
+                error: Some("USE 语句缺少库名".to_string()),
+                elapsed_ms: 0,
+            };
+            emit(&app, DB_QUERY_RESULT, event);
+            return Ok(());
+        };
+        let set_res = conn_obj.use_database(Some(use_db.as_str())).await;
         let event = match set_res {
             Ok(()) => {
-                log::info!(
-                    "[db_exec_sql] USE 切换当前库: {}",
-                    use_db.as_deref().unwrap_or("(空)")
-                );
+                log::info!("[db_exec_sql] USE 切换当前库: {}", use_db);
                 DbQueryResultEvent {
                     query_id,
                     columns: Vec::new(),
@@ -396,7 +411,7 @@ pub async fn db_exec_sql(
 
     // 只读模式强制校验：USE 已放行（纯切库无副作用），其余语句逐条复核。
     if read_only {
-        if let Err(e) = enforce_read_only(&sql) {
+        if let Err(e) = enforce_read_only(&sql, conn_obj.kind()) {
             log::info!("[db_exec_sql] 只读模式拦截: query_id={}, {}", query_id, e);
             let event = DbQueryResultEvent {
                 query_id,
@@ -601,7 +616,13 @@ pub async fn db_execute_script(
         // USE 拦截（与 db_exec_sql 一致）：MySQL 预处理协议执行 USE 必报 1295，
         // 且只读模式下 USE 属纯切库无副作用，先行放行由句柄层统一处理。
         if let Some(use_db) = crate::database::mysql::parse_use_statement(&stmt.sql) {
-            let res = conn_obj.use_database(use_db.as_deref()).await;
+            // 裸 `USE`（无库名）是语法错误（Some(None) 约定由本层报错），
+            // 不得与 use_database 的合法 None（清库）混同，否则静默重置
+            // 当前库还报成功。
+            let res = match use_db {
+                Some(db) => conn_obj.use_database(Some(db.as_str())).await,
+                None => Err(AppError::InvalidInput("USE 语句缺少库名".to_string())),
+            };
             let err = res.err().map(|e| e.to_string());
             out.push(ScriptStmtResult {
                 line: stmt.line,
@@ -617,7 +638,7 @@ pub async fn db_execute_script(
         }
         // 只读校验（与 db_exec_sql 同一规则）。
         if read_only {
-            if let Err(e) = enforce_read_only(&stmt.sql) {
+            if let Err(e) = enforce_read_only(&stmt.sql, kind) {
                 out.push(ScriptStmtResult {
                     line: stmt.line,
                     sql_preview: preview(&stmt.sql),

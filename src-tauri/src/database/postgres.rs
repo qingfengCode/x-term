@@ -336,7 +336,7 @@ async fn exec_on_conn(
 /// 形式；DESC/DESCRIBE 在 PG 侧不可用（元数据命令走 information_schema），
 /// 保留匹配是为了与 MySQL 侧判定一致（误判只会走 execute 分支报语法错误）。
 fn is_query_stmt(sql: &str) -> bool {
-    let trimmed = sql.trim_start();
+    let trimmed = crate::database::script_split::strip_leading_comments(sql).trim_start();
     let first = trimmed
         .split(|c: char| c.is_whitespace())
         .next()

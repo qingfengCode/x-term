@@ -1170,6 +1170,8 @@ async fn run_agent_loop(
         // （Rejected）与执行完成（Run，outcomes 按 active 顺序对位）在这里按
         // items 的原始顺序交织输出。
         let mut outcome_iter = outcomes.into_iter();
+        // 本轮桌面工具回传的截图（tool_call_id, 图片）：收集到轮末统一插入。
+        let mut round_screenshots: Vec<(String, crate::ai::provider::ImagePart)> = Vec::new();
         for item in &items {
             let (call_id, result, screenshot_image) = match item {
                 RoundItem::Rejected { call, msg } => (
@@ -1204,23 +1206,32 @@ async fn run_agent_loop(
                 role: crate::ai::provider::Role::Tool,
                 content: compress_tool_output_for_context(&result.output),
                 tool_calls: None,
-                tool_call_id: Some(call_id),
+                tool_call_id: Some(call_id.clone()),
                 images: None,
             });
             // 截图回填：role=tool 消息不允许携带图片（image_url 块只能出现在
-            // user 消息里），因此把 desktop_screenshot 捕获的
-            // 截图作为紧随其后的 user 消息图片块交给多模态模型查看。
+            // user 消息里），先收集、轮末统一以 user 消息插入。
             if let Some(img) = screenshot_image {
-                messages.push(ChatMessage {
-                    role: Role::User,
-                    content: "（这是刚才 desktop_screenshot 工具捕获的 RDP 桌面截图，\
-请据此分析当前界面并继续下一步操作。）"
-                        .into(),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    images: Some(vec![img]),
-                });
+                round_screenshots.push((call_id, img));
             }
+        }
+        // 截图 user 消息必须在**整轮 tool 结果结束之后**插入：协议要求
+        // role=tool 消息紧跟 assistant(tool_calls) 且彼此连续，在序列中间
+        // 插入 user（截图）会让严格网关（OpenAI/DeepSeek 等）对后续 tool
+        // 消息校验失败直接 400——而桌面助手的常规模式正是"截图 → 点击"
+        // 同轮多调用，每次都会踩中。截图与调用的对应关系由文案中的
+        // tool_call_id 标明。
+        for (call_id, img) in round_screenshots {
+            messages.push(ChatMessage {
+                role: Role::User,
+                content: format!(
+                    "（这是本轮 desktop_screenshot 工具调用 {call_id} 捕获的 RDP 桌面\
+截图，请据此分析当前界面并继续下一步操作。）"
+                ),
+                tool_calls: None,
+                tool_call_id: None,
+                images: Some(vec![img]),
+            });
         }
         // 轮末注入重复调用提醒：作为 user 消息追加在 tool 结果序列之后（不破坏
         // assistant(tool_calls) → tool 消息的协议顺序），下一轮模型即可看到；

@@ -112,7 +112,7 @@ x-term/
 ### 环境要求
 
 - **Node.js** ≥ 20（推荐 24）、**pnpm** ≥ 10
-- **Rust** ≥ 1.77（stable，MSVC 工具链 `x86_64-pc-windows-msvc`）
+- **Rust** ≥ 1.90（stable，MSVC 工具链 `x86_64-pc-windows-msvc`）
 - **Microsoft Visual Studio 2022**（含 "Desktop development with C++" 工作负载）或 Build Tools
 - **Windows 10/11 SDK**
 

@@ -707,6 +707,10 @@ impl Drop for SseCleanupGuard {
 struct MessagesQuery {
     /// 可选 token（与 Authorization 头二选一）。
     token: Option<String>,
+    /// SSE endpoint 事件下发的端点是 `/messages?sessionId=<id>`（camelCase，
+    /// MCP 客户端按原样回传）；alias 兼容两种拼写，缺一个则握手后所有
+    /// POST 都因取不到会话 id 被 400 拒绝。
+    #[serde(alias = "sessionId")]
     #[allow(dead_code)]
     session_id: Option<String>,
 }
@@ -1907,5 +1911,33 @@ impl SharedState {
     /// 获取 approval registry（从 AppState 取）。
     fn approval_registry(&self) -> SharedApprovalRegistry {
         self.state.approval_registry.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::extract::FromRequest;
+    use axum::http::Request;
+
+    /// 回归：SSE endpoint 事件下发的查询参数名是 camelCase 的 `sessionId`
+    /// （客户端按原样回传），MessagesQuery 必须同时接受两种拼写——此前只有
+    /// snake_case 字段名，握手后所有 POST 都因取不到会话 id 被 400 拒绝。
+    #[tokio::test]
+    async fn messages_query_accepts_camel_case_session_id() {
+        let req = Request::builder()
+            .uri("/messages?sessionId=abc123")
+            .body(Body::empty())
+            .unwrap();
+        let q = Query::<MessagesQuery>::from_request(req, &()).await.unwrap();
+        assert_eq!(q.session_id.as_deref(), Some("abc123"));
+
+        let req = Request::builder()
+            .uri("/messages?session_id=xyz")
+            .body(Body::empty())
+            .unwrap();
+        let q = Query::<MessagesQuery>::from_request(req, &()).await.unwrap();
+        assert_eq!(q.session_id.as_deref(), Some("xyz"));
     }
 }

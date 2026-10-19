@@ -252,13 +252,10 @@ fn resolve_auth(state: &AppState, config: &Session) -> AppResult<AuthMethod> {
 /// 这是整个堡垒机模式唯一会触发认证（含 MFA 弹窗）的地方。
 async fn create_base(state: &AppState, config: &Session) -> AppResult<SharedTransport> {
     let auth = resolve_auth(state, config)?;
-    // 键含随机后缀，与终端连接一致：同一 host:port 的多条连接互不覆盖断开原因。
-    let disconnect_key = format!(
-        "{}:{}#{}",
-        config.host,
-        config.port,
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    );
+    // 断开原因注册表：本模块没有终端 reader 那样的消费点（disconnect_key
+    // 对应条目随 terminal:closed 透出仅终端会话有），传空串 = 不记录——
+    // 否则每次基础连接断开（空闲回收/停止服务）都写入一条永不被 remove
+    // 的条目，随重连次数累积泄漏。
     let handle = crate::ssh::client::connect_direct_terminal(
         &config.host,
         config.port,
@@ -266,14 +263,14 @@ async fn create_base(state: &AppState, config: &Session) -> AppResult<SharedTran
         &config.id,
         auth,
         state.clone(),
-        disconnect_key.clone(),
+        String::new(),
     )
     .await?;
     Ok(SharedTransport {
         handle: Arc::new(handle),
         session_config_id: config.id.clone(),
         app: state.app.clone(),
-        disconnect_key,
+        disconnect_key: String::new(),
         disconnect_reasons: state.ssh_disconnect_reasons.clone(),
         // 基础连接自身占 1 个引用：目标会话关闭递减计数时不会把传输层断掉，
         // 只有本模块显式释放（空闲超时 / 停止服务）才会归零并 disconnect。

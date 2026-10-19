@@ -11,7 +11,8 @@
 //! 通用规则：
 //! - 单/双/反引号字符串：字面量内的分号不切分；`\` 转义（反引号内不转义，
 //!   符合 MySQL 语义）；双写引号 = 转义引号；
-//! - 行注释 `--` / `#`、块注释 `/* ... */`：不进入语句文本（行号照计）。
+//! - 行注释：`--`（MySQL 要求后跟空白）、`#`（仅 MySQL）；块注释
+//!   `/* ... */`：不进入语句文本（行号照计）。
 
 /// 一条切分出的语句。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,11 +52,48 @@ pub fn split_sql_script(script: &str, kind: &str) -> Vec<ScriptStatement> {
     split_inner(script, SqlDialect::from_kind(kind))
 }
 
-/// 按引号外的顶层 `;` 切分 SQL（方言无关的轻量扫描，供只读校验等
-/// 逐语句复核场景复用）：字符串字面量（单/双/反引号，双写转义）内的
-/// 分号不切分——裸 `split(';')` 会把 `WHERE c = 'a;b'` 的残段 `b'` 切
-/// 出来，首关键字判定必失败，导致合法只读查询被误拒。
-pub fn top_level_fragments(sql: &str) -> Vec<&str> {
+/// 剥离 SQL 开头的前导空白与注释（`--` / `#` 行注释、`/* */` 块注释），
+/// 返回剩余部分的切片（零拷贝）。供"首关键字分类"场景使用（如
+/// `is_query_stmt`）：带前导注释的 `-- 注释\nSELECT ...` 若不剥注释，
+/// 首 token 是 `--`，会被当成非查询走 execute 路径、结果集被静默排空。
+/// 无需处理字符串字面量——合法语句不会以引号开头。
+pub fn strip_leading_comments(sql: &str) -> &str {
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if i < bytes.len() && bytes[i] == b'#' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            let mut j = i + 2;
+            while j + 1 < bytes.len() && !(bytes[j] == b'*' && bytes[j + 1] == b'/') {
+                j += 1;
+            }
+            i = (j + 2).min(bytes.len());
+            continue;
+        }
+        return &sql[i..];
+    }
+}
+
+/// 按引号与注释外的顶层 `;` 切分 SQL（方言感知，供只读校验等逐语句复核
+/// 场景复用）：字符串字面量（单/双/反引号，双写转义）与注释内的分号
+/// 不是语句边界——裸 `split(';')` 会把 `WHERE c = 'a;b'` 的残段 `b'` 或
+/// 注释里的分号后文切出来，首关键字判定必失败，导致合法只读查询被误拒。
+pub fn top_level_fragments<'a>(sql: &'a str, kind: &str) -> Vec<&'a str> {
+    let dialect = SqlDialect::from_kind(kind);
     let bytes = sql.as_bytes();
     let mut out = Vec::new();
     let mut start = 0usize;
@@ -66,6 +104,32 @@ pub fn top_level_fragments(sql: &str) -> Vec<&str> {
             out.push(&sql[start..i]);
             start = i + 1;
             i += 1;
+            continue;
+        }
+        // 行注释 --：MySQL 要求 `--` 后跟空白/控制字符才是注释（`SELECT 3--1`
+        // 是减法），PG/SQLite/SQL Server 的 `--` 恒为注释——与 split_inner 同规则。
+        let dash_comment = b == b'-'
+            && bytes.get(i + 1) == Some(&b'-')
+            && match bytes.get(i + 2) {
+                None => true,
+                Some(&c) => !matches!(dialect, SqlDialect::MySql) || c.is_ascii_whitespace(),
+            };
+        // # 行注释仅 MySQL：PG 的 `#` 是 XOR 运算符，若按注释吞到行尾，
+        // `SELECT a # b; DROP ...` 的 DROP 会被藏进注释——只读校验被绕过。
+        let hash_comment = b == b'#' && matches!(dialect, SqlDialect::MySql);
+        if dash_comment || hash_comment {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // 块注释：跳到闭合 `*/`（未闭合则到串尾）。
+        if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
             continue;
         }
         if b == b'\'' || b == b'"' || b == b'`' {
@@ -132,8 +196,10 @@ fn split_inner(script: &str, dialect: SqlDialect) -> Vec<ScriptStatement> {
                     !matches!(dialect, SqlDialect::MySql) || c.is_ascii_whitespace()
                 }
             };
-        if dash_comment || b == b'#' {
-            // # 对 SQL Server 不是注释（标识符可用），但整词场景罕见；按通用注释处理。
+        // # 行注释仅 MySQL：PG 的 `#` 是 XOR 运算符、SQLite/SQL Server 均无此
+        // 注释——按通用注释处理会把 PG 的 `SET c = a # b WHERE id=1` 连同
+        // WHERE 子句一起吞掉，语句以无 WHERE 形式被切开执行。
+        if dash_comment || (b == b'#' && matches!(dialect, SqlDialect::MySql)) {
             while i < bytes.len() && bytes[i] != b'\n' {
                 i += 1;
             }
@@ -715,10 +781,47 @@ mod tests {
     /// top_level_fragments：字符串内的分号不切分（供只读校验复用）。
     #[test]
     fn top_level_fragments_skip_quoted_semicolons() {
-        let frags = top_level_fragments("SELECT * FROM t WHERE c = 'a;b'; SELECT 2");
+        let frags = top_level_fragments("SELECT * FROM t WHERE c = 'a;b'; SELECT 2", "mysql");
         assert_eq!(frags, vec!["SELECT * FROM t WHERE c = 'a;b'", " SELECT 2"]);
         // 双写引号转义。
-        let frags = top_level_fragments("SELECT 'it''s;ok'; SELECT 2");
+        let frags = top_level_fragments("SELECT 'it''s;ok'; SELECT 2", "mysql");
         assert_eq!(frags.len(), 2);
+    }
+
+    /// 回归（只读误拒）：注释里的分号不是语句边界——`-- note; later` 若被
+    /// 切开，残段 `later` 的首关键字判定必失败，合法只读查询被整条拒绝。
+    #[test]
+    fn top_level_fragments_skip_comment_semicolons() {
+        let frags = top_level_fragments("SELECT 1 -- note; later\n", "mysql");
+        assert_eq!(frags, vec!["SELECT 1 -- note; later\n"]);
+        let frags = top_level_fragments("/* a; b */ SELECT 1; SELECT 2", "postgres");
+        assert_eq!(frags.len(), 2);
+        // MySQL `#` 行注释内的分号同样不切分。
+        let frags = top_level_fragments("SELECT 1 # note; later\n; SELECT 2", "mysql");
+        assert_eq!(frags.len(), 2);
+        assert!(frags[0].contains("# note; later"));
+    }
+
+    /// 回归（只读绕过防护）：PG 的 `#` 是 XOR 运算符而非注释——若按注释吞到
+    /// 行尾，`SELECT a # b; DROP ...` 的 DROP 会被藏进注释、只读校验被绕过。
+    #[test]
+    fn top_level_fragments_hash_is_not_comment_outside_mysql() {
+        let frags = top_level_fragments("SELECT 1 # 2; DROP TABLE t", "postgres");
+        assert_eq!(frags.len(), 2);
+        assert_eq!(frags[1].trim(), "DROP TABLE t");
+    }
+
+    /// strip_leading_comments：前导空白/行注释/块注释逐层剥离，取首个有效
+    /// 关键字场景（is_query_stmt 分类用）。
+    #[test]
+    fn strip_leading_comments_variants() {
+        assert_eq!(strip_leading_comments("  \n SELECT 1"), "SELECT 1");
+        assert_eq!(strip_leading_comments("-- note\nSELECT 1"), "SELECT 1");
+        assert_eq!(strip_leading_comments("# note\nSELECT 1"), "SELECT 1");
+        assert_eq!(strip_leading_comments("/* a */ /* b */ SELECT 1"), "SELECT 1");
+        // 非前导注释不剥离。
+        assert_eq!(strip_leading_comments("SELECT 1 -- tail"), "SELECT 1 -- tail");
+        // 全注释 → 空串。
+        assert_eq!(strip_leading_comments("-- only comment\n"), "");
     }
 }

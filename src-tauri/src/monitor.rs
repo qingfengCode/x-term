@@ -50,11 +50,16 @@ awk '{print int($1)}' /proc/uptime 2>/dev/null
 printf '%s\n' '---MEM---'
 grep -E '^(MemTotal|MemAvailable|MemFree|Buffers|Cached|SwapTotal|SwapFree):' /proc/meminfo 2>/dev/null
 printf '%s\n' '---NET---'
-awk 'NR>2 && $1!="lo:" {rx+=$1; tx+=$9} END {printf "%s %s\n", rx+0, tx+0}' /proc/net/dev 2>/dev/null
+# /proc/net/dev 数据行：iface rx_bytes rx_packets rx_errs rx_drop rx_fifo rx_frame
+# rx_compressed rx_multicast tx_bytes ... —— $1 是接口名（数值 0），字节列在
+# $2（rx）和 $10（tx）；$9 是 rx 组播包数。
+awk 'NR>2 && $1!="lo:" {rx+=$2; tx+=$10} END {printf "%s %s\n", rx+0, tx+0}' /proc/net/dev 2>/dev/null
 printf '%s\n' '---DISK---'
 df -kP 2>/dev/null | awk 'NR>1 && $1 !~ /tmpfs|devtmpfs|udev|squashfs/ {print $1"|"$2"|"$3"|"$4"|"$5"|"$6}'
 printf '%s\n' '---PROC---'
-ps -eo user:24,pid,pcpu,pmem,comm --sort=-pcpu 2>/dev/null | head -n 13 || true
+# tail -n +2 去掉 ps 的表头行（USER PID %CPU %MEM COMMAND）：解析器按
+# 空白切分，表头 5 列恰好通过长度校验，不去掉会每轮混入一条 PID=0 假进程。
+ps -eo user:24,pid,pcpu,pmem,comm --sort=-pcpu 2>/dev/null | tail -n +2 | head -n 13 || true
 "#;
 
 // ===========================================================================

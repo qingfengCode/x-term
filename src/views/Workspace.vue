@@ -7,7 +7,7 @@ import SplitArea from "@/components/SplitArea.vue";
 import MonitorPanel from "@/components/MonitorPanel.vue";
 import AiPanel from "@/components/AiPanel.vue";
 import TabBar, { type TabBarItem } from "@/components/TabBar.vue";
-import { ElMessage } from "element-plus";
+import { ElMessage, ElMessageBox } from "element-plus";
 import { eventToCombo, isModifierOnly, matchesCombo } from "@/utils/shortcut";
 import type { ShortcutCommand } from "@/api/types";
 import type { SplitDirection } from "@/utils/splitLayout";
@@ -90,7 +90,10 @@ const activeTabKey = computed(() => terminals.activeTabId ?? "");
 const tabItems = computed<TabBarItem[]>(() =>
   terminals.tabs.map((t) => ({
     key: t.id,
-    title: t.kind === "monitor" ? `监控 · ${t.session.name}` : t.session.name,
+    // 重命名（右键菜单）只覆盖本页签的显示标题；customTitle 为空回默认。
+    title:
+      t.customTitle ??
+      (t.kind === "monitor" ? `监控 · ${t.session.name}` : t.session.name),
     // 监控页签无连接状态语义：用图标区分、不显示状态圆点（面板内容才是状态）。
     icon: t.kind === "monitor" ? "DataLine" : undefined,
     hideDot: t.kind === "monitor",
@@ -103,6 +106,8 @@ const tabItems = computed<TabBarItem[]>(() =>
       t.session.protocol === "ssh" &&
       !!t.instanceId &&
       !t.disconnected,
+    // 「重命名」：终端与监控页签均可（只改显示标题，与会话配置无关）。
+    renamable: true,
   })),
 );
 
@@ -137,6 +142,10 @@ function onTabMenuCommand(cmd: string, key: string) {
         .open(t.session)
         .catch((e) => ElMessage.error("打开终端失败: " + String(e)));
       break;
+    case "rename":
+      // 重命名：只改本页签显示标题（customTitle），不回写会话配置。
+      void promptRename(t);
+      break;
     case "close":
       void terminals.close(t.id);
       break;
@@ -155,6 +164,25 @@ function onTabMenuCommand(cmd: string, key: string) {
     case "reconnect":
       if (isTerminal && t.instanceId) void terminals.reconnect(t.instanceId);
       break;
+  }
+}
+
+/**
+ * 重命名弹窗（右键菜单「重命名」）：预填当前显示标题，确认后写入 tab 的
+ * customTitle。清空保存 = 恢复默认标题；取消不改动。
+ */
+async function promptRename(t: TerminalTab) {
+  const current =
+    t.customTitle ?? (t.kind === "monitor" ? `监控 · ${t.session.name}` : t.session.name);
+  try {
+    const { value } = await ElMessageBox.prompt("页签标题（留空恢复默认）", "重命名", {
+      inputValue: current,
+      confirmButtonText: "确定",
+      cancelButtonText: "取消",
+    });
+    terminals.renameTab(t.id, value ?? "");
+  } catch {
+    /* 用户取消 */
   }
 }
 

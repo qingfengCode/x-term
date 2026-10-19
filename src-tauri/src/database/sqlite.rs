@@ -141,8 +141,9 @@ impl SqliteConn {
 fn exec_on(conn: &Connection, sql: &str, limit: u32) -> AppResult<QueryResult> {
     let limit = limit.max(1) as usize;
     // 先按语句首关键字判断是否返回行（rusqlite 的 prepare 对 PRAGMA 等也返回列，
-    // 统一尝试 prepare；错误再走 execute 路径）。
-    let trimmed = sql.trim_start();
+    // 统一尝试 prepare；错误再走 execute 路径）。前导注释需先剥离，否则
+    // `-- note\nSELECT ...` 的首 token 是 `--`、被误判为非查询。
+    let trimmed = crate::database::script_split::strip_leading_comments(sql).trim_start();
     let first_kw = trimmed
         .split(|c: char| c.is_whitespace() || c == '(')
         .next()

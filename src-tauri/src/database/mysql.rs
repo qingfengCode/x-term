@@ -380,7 +380,7 @@ pub async fn connect_via_ssh(
 ///
 /// 取 SQL 去掉前导空白与注释后的首个关键字，不区分大小写。
 fn is_query_stmt(sql: &str) -> bool {
-    let trimmed = sql.trim_start();
+    let trimmed = crate::database::script_split::strip_leading_comments(sql).trim_start();
     // 取第一个空白前的 token。
     let first = trimmed
         .split(|c: char| c.is_whitespace())

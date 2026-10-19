@@ -148,7 +148,7 @@ S3 及兼容对象存储（AWS S3 / MinIO / COS / OSS 等，SigV4 认证）双�
 |---|---|
 | Node.js | 18+ |
 | pnpm | 9+ |
-| Rust | 1.77+ |
+| Rust | 1.90+ |
 | Visual Studio 2022 | 含 C++ 桌面开发工作负载 |
 
 ### 构建步骤

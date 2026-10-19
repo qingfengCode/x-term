@@ -107,6 +107,14 @@ export const makeAiStore = (id: string) =>
     messages: AiMessage[];
     /** 该会话当前在途的请求 id（用于把流式事件路由回来）。 */
     activeRequestId: string | null;
+    /**
+     * 该会话最近一次 send() 发出的请求 id（不随请求结束清除，不持久化）。
+     * 后端对可重试错误会带同一 requestId 自动退避重试，期间用户可再发新
+     * 请求——旧请求随后到达的 chunk/done/retrying 等事件必须据此判定
+     * "已被取代"，不得再改写会话状态或最新 assistant 消息（否则会清掉
+     * 新请求的 sending/activeRequestId、把旧请求的文本追加进新消息气泡）。
+     */
+    lastSentRequestId?: string | null;
     sending: boolean;
     /** 智能体任务清单（todo_write 工具最新整表；新用户消息时清空）。 */
     todos: AiTodoItem[];
@@ -384,6 +392,7 @@ export const makeAiStore = (id: string) =>
 
     const requestId = `r-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     conv.activeRequestId = requestId;
+    conv.lastSentRequestId = requestId;
     requestToCid.set(requestId, conv.id);
 
     const assistantMsg: AiMessage = {
@@ -457,6 +466,13 @@ export const makeAiStore = (id: string) =>
     return conversations.value.find((c) => c.id === cid) ?? null;
   }
 
+  /** 该请求是否已被同会话内更新的请求取代（用户在退避/收尾窗口内又发了
+   * 新消息）。被取代请求的迟到事件只做路由清理，不得触碰会话状态或
+   * lastAssistant（此时它已是新请求的消息）。 */
+  function isSuperseded(conv: Conversation, requestId: string): boolean {
+    return conv.lastSentRequestId != null && conv.lastSentRequestId !== requestId;
+  }
+
   /** 找到该会话当前最后一条 assistant 消息（流式目标 / 工具卡片宿主）。
    *
    * 从尾部**向前**搜索，而不是只看最后一条：assistant 占位消息之后可能
@@ -489,6 +505,7 @@ export const makeAiStore = (id: string) =>
   function onChunk(requestId: string, delta: string) {
     const conv = convForRequest(requestId);
     if (!conv) return;
+    if (isSuperseded(conv, requestId)) return;
     const m = lastAssistant(conv);
     if (!m) return;
     // 追加进有序 parts：若末尾是文本段就续上，否则新建一段（与上一个工具调用分隔）。
@@ -506,6 +523,12 @@ export const makeAiStore = (id: string) =>
   function onDone(requestId: string) {
     const conv = convForRequest(requestId);
     if (!conv) return;
+    // 已被新请求取代：只清理路由，不清 sending/activeRequestId——
+    // 那是新请求的在途状态，清掉会让新请求无法停止、并允许第三个并发发送。
+    if (isSuperseded(conv, requestId)) {
+      requestToCid.delete(requestId);
+      return;
+    }
     const m = lastAssistant(conv);
     if (m) m.streaming = false;
     conv.sending = false;
@@ -517,6 +540,11 @@ export const makeAiStore = (id: string) =>
   function onError(requestId: string, message: string) {
     const conv = convForRequest(requestId);
     if (!conv) return;
+    // 已被新请求取代：错误标记不能写到 lastAssistant（那是新请求的消息）。
+    if (isSuperseded(conv, requestId)) {
+      requestToCid.delete(requestId);
+      return;
+    }
     const m = lastAssistant(conv);
     if (m) {
       m.streaming = false;
@@ -540,6 +568,9 @@ export const makeAiStore = (id: string) =>
   function onRetrying(requestId: string) {
     const conv = convForRequest(requestId);
     if (!conv) return;
+    // 已被新请求取代：不得抢回 sending/activeRequestId（会顶掉新请求的
+    // 在途标记，且其后 onDone 会把新请求的收尾一并清掉）。
+    if (isSuperseded(conv, requestId)) return;
     const m = lastAssistant(conv);
     if (m) {
       m.streaming = true;
@@ -553,6 +584,11 @@ export const makeAiStore = (id: string) =>
   function onStopped(requestId: string) {
     const conv = convForRequest(requestId);
     if (!conv) return;
+    // 已被新请求取代：只清路由映射，不给 lastAssistant 追加终止标记。
+    if (isSuperseded(conv, requestId)) {
+      requestToCid.delete(requestId);
+      return;
+    }
     finalizeStopped(conv, requestId);
     persist();
   }
@@ -650,6 +686,8 @@ export const makeAiStore = (id: string) =>
   ) {
     const conv = convForRequest(requestId);
     if (!conv) return;
+    // 已被新请求取代：卡片不能挂到新请求的 assistant 消息上。
+    if (isSuperseded(conv, requestId)) return;
     const m = lastAssistant(conv);
     if (!m) return;
     let parsed: Record<string, unknown> = {};
@@ -699,6 +737,8 @@ export const makeAiStore = (id: string) =>
   ) {
     const conv = convForRequest(requestId);
     if (!conv) return;
+    // 已被新请求取代：结果卡片属于旧请求的轮次，直接丢弃。
+    if (isSuperseded(conv, requestId)) return;
     const m = lastAssistant(conv);
     if (!m || !m.toolCalls) return;
     const item = m.toolCalls.find((t) => t.toolCallId === payload.toolCallId);
@@ -717,6 +757,8 @@ export const makeAiStore = (id: string) =>
   function onTodo(requestId: string, todos: AiTodoItem[]) {
     const conv = convForRequest(requestId);
     if (!conv) return;
+    // 已被新请求取代：新回合已清空 todos，旧任务的清单不得回填。
+    if (isSuperseded(conv, requestId)) return;
     conv.todos = todos;
     persist();
   }
@@ -729,6 +771,8 @@ export const makeAiStore = (id: string) =>
   function onUsage(requestId: string, promptTokens: number, completionTokens: number) {
     const conv = convForRequest(requestId);
     if (!conv) return;
+    // 已被新请求取代：用量显示的是"最近一次请求"，旧请求的不得覆盖。
+    if (isSuperseded(conv, requestId)) return;
     conv.usage = { prompt: promptTokens, completion: completionTokens };
     persist();
   }
@@ -742,6 +786,9 @@ export const makeAiStore = (id: string) =>
   function onSystemNote(requestId: string, text: string) {
     const conv = convForRequest(requestId);
     if (!conv) return;
+    // 已被新请求取代：旧轮次的提醒不得插进新回合的消息流（会影响展示，
+    // 也会被下一次 send() 重建 history 时带进新上下文）。
+    if (isSuperseded(conv, requestId)) return;
     conv.messages.push({
       id: genId(),
       role: "user",

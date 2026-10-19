@@ -67,6 +67,10 @@ export class TerminalTab {
   activePaneId = "";
   /** 最大化（聚焦展示）中的窗格 id；null = 正常分屏布局。 */
   zoomedPaneId: string | null = null;
+  /** 用户重命名的页签标题（右键菜单「重命名」）；null = 用默认标题
+   *  （终端=session.name，监控=`监控 · session.name`）。仅影响本页签的
+   *  显示，不回写会话配置；复制页签不继承（新页签回到默认标题）。 */
+  customTitle: string | null = null;
 
   constructor(init: {
     id: string;
@@ -852,6 +856,19 @@ export const useTerminalsStore = defineStore("terminals", () => {
   }
 
   /**
+   * 重命名页签（右键菜单「重命名」）。
+   *
+   * 仅改本页签的显示标题（customTitle），不动会话配置；空串/全空白视为
+   * 清除重命名，恢复默认标题。页签是运行时状态（不持久化），重命名随
+   * 页签关闭而消失。
+   */
+  function renameTab(tabId: string, title: string) {
+    const t = tabs.value.find((x) => x.id === tabId);
+    if (!t) return;
+    t.customTitle = title.trim() || null;
+  }
+
+  /**
    * 激活 tab。
    *
    * key 优先为稳定 tab id（同 close 的说明——同一会话多开时 session.id /
@@ -927,6 +944,7 @@ export const useTerminalsStore = defineStore("terminals", () => {
     close,
     closeBySessionId,
     setActive,
+    renameTab,
     markDisconnected,
     handleTerminalClosed,
     reconnect,

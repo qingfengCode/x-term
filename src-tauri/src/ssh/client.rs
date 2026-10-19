@@ -272,7 +272,11 @@ impl client::Handler for ClientHandler {
 
         // 并发上限：入站连接来自远端，不设上限会无界占用桥接任务。
         {
-            let tasks = bridge_tasks.lock();
+            let mut tasks = bridge_tasks.lock();
+            // 先清掉已完成的桥接句柄：JoinHandle 结束后仍在 vec 里占位，
+            // 不清理会让 len() 变成"隧道启动以来的累计连接数"——即使严格
+            // 串行，第 32 个连接之后也会永久拒绝所有新入站连接。
+            tasks.retain(|t| !t.is_finished());
             if tasks.len() >= MAX_R_BRIDGES {
                 log::warn!(
                     "远端转发 {}:{} 并发桥接已达上限（{}），拒绝新连接",
@@ -355,9 +359,14 @@ impl client::Handler for ClientHandler {
             DisconnectReason::Error(e) => format!("连接错误: {}", e),
         };
         log::warn!("SSH 连接断开 {}:{}: {}", self.host, self.port, desc);
-        self.disconnect_reasons
-            .lock()
-            .insert(format!("{}:{}", self.host, self.port), desc);
+        // 按本连接的 disconnect_key（host:port#随机后缀）写入：终端 reader 用
+        // 同一 key 取出。空串 = 非终端连接（监控/SFTP/隧道等）无 consumer，
+        // 不写——否则条目永不被 remove，注册表随连接数无限增长。
+        if !self.disconnect_key.is_empty() {
+            self.disconnect_reasons
+                .lock()
+                .insert(self.disconnect_key.clone(), desc);
+        }
         self.connection_closed.notify_waiters();
         Ok(())
     }

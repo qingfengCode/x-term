@@ -39,17 +39,14 @@ pub fn run() {
     // 日志统一由 tauri-plugin-log 管理（stdout + 应用日志目录），并承接前端
     // attachConsole 转发的 webview console 输出。注意：不能再额外初始化
     // env_logger 等全局 logger，否则插件初始化会 panic（logger 已存在）。
+    // 支持多开：不注册单实例锁，用户可同时运行多个 X-Term 进程（如分别连
+    // 不同环境）。共享资源的跨进程安全由各层保证：
+    // - xterm.db：WAL + busy_timeout=5s，写竞争由 SQLite 串行化等待；
+    // - 启动迁移：建表/加列均幂等（add_column_if_missing 容忍并发 ALTER 竞态）；
+    // - JSON 配置：write_json 用带 pid 的唯一 tmp/bak 名原子替换（最后写入者胜出）；
+    // - MCP / SSH 隧道监听端口：用户配置，冲突时后启动的实例报「端口被占用」；
+    // - RDP/VNC 桥接、数据库监控端口：绑定 :0 临时端口，互不冲突。
     let builder = tauri::Builder::default()
-        // 单实例必须最先注册：第二个进程在初始化其它插件/数据库之前就退出，
-        // 否则两个进程会各自建立 r2d2 池并发写同一个 xterm.db。
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            // 已有实例在运行：唤醒并聚焦它的窗口，而不是再开一个写库的进程。
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.unminimize();
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
-        }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())

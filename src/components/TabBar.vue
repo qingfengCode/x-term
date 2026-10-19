@@ -8,7 +8,7 @@
   - 连接状态圆点（connecting 黄 / disconnected 红 / 正常绿）
   - 滚轮纵向转横向滚动
   - HTML5 拖拽排序（过半即换位，通过 move 事件交给 store 执行）
-  - 右键菜单（关闭/复制/关闭其他/关闭全部/断开时显示重新连接），带视口钳制
+  - 右键菜单（关闭/复制/重命名/关闭其他/关闭全部/断开时显示重新连接），带视口钳制
     （窗口右/下边缘右键时菜单不会被裁掉）与统一 z-index。
 
   用法：
@@ -38,6 +38,9 @@ export interface TabBarItem {
   /** 是否可在右键菜单中"复制 SSH 通道"（同一条已认证连接上开新 channel，
    *  需已连接的 SSH——占位/断开的 tab 不显示）。 */
   cloneable?: boolean;
+  /** 是否可在右键菜单中"重命名"（仅改本页签显示标题；终端页签启用，
+   *  桌面页签暂不启用）。 */
+  renamable?: boolean;
 }
 
 const props = defineProps<{
@@ -60,6 +63,7 @@ const emit = defineEmits<{
     cmd:
       | "duplicate"
       | "cloneChannel"
+      | "rename"
       | "close"
       | "closeOthers"
       | "closeAll"
@@ -109,7 +113,10 @@ function onDragOver(e: DragEvent, targetKey: string) {
   e.preventDefault();
   if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
   const el = e.currentTarget as HTMLElement;
-  const before = e.offsetX < el.clientWidth / 2;
+  // offsetX 相对 e.target（tab 内的 dot/标题等子元素，各自左缘重新计数），
+  // 与整个 tab 的宽度比会判错方向；统一换算到 tab 自身的坐标空间。
+  const rect = el.getBoundingClientRect();
+  const before = e.clientX - rect.left < rect.width / 2;
   emit("move", from, targetKey, before);
 }
 
@@ -120,9 +127,9 @@ function onDragEnd() {
 // --- 右键菜单（视口钳制 + 统一 z-index） -------------------------------------
 
 /** 菜单浮层的估算尺寸（钳制坐标用，需覆盖最坏情况：复制通道 + 复制 +
- *  4 项 + 2 分隔线）。 */
+ *  重命名 + 4 项 + 2 分隔线）。 */
 const MENU_W = 150;
-const MENU_H = 240;
+const MENU_H = 270;
 
 const menu = ref<{ x: number; y: number; tab: TabBarItem | null }>({
   x: 0,
@@ -147,6 +154,7 @@ function onMenuCommand(
   cmd:
     | "duplicate"
     | "cloneChannel"
+    | "rename"
     | "close"
     | "closeOthers"
     | "closeAll"
@@ -232,7 +240,16 @@ defineExpose({ closeMenu });
       >
         复制
       </div>
-      <div class="tab-menu-sep" v-if="menu.tab?.duplicable" />
+      <!-- 重命名：仅改本页签显示标题（不回写会话配置） -->
+      <div
+        class="tab-menu-item"
+        v-if="menu.tab?.renamable"
+        title="修改本页签显示的标题（不影响会话配置名称）"
+        @click="onMenuCommand('rename')"
+      >
+        重命名
+      </div>
+      <div class="tab-menu-sep" v-if="menu.tab?.duplicable || menu.tab?.renamable" />
       <div class="tab-menu-item" @click="onMenuCommand('close')">关闭</div>
       <div class="tab-menu-item" @click="onMenuCommand('closeOthers')">关闭其他</div>
       <div class="tab-menu-item" @click="onMenuCommand('closeAll')">关闭全部</div>

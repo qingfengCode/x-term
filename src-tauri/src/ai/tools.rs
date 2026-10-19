@@ -1181,7 +1181,10 @@ async fn exec_ssh_visual_unlocked(state: &AppState, session_id: &str, command: &
     const POLL_INTERVAL: Duration = Duration::from_millis(200);
     /// 哨兵出现且输出停止后，视为执行完成的静默宽限时间。
     const SILENCE_GRACE: Duration = Duration::from_secs(1);
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    /// 可视化执行等待哨兵的总超时。文案直接引用本常量，防止再出现
+    /// "deadline 是 30s、提示却说 180 秒"的口径漂移误导模型。
+    const VISUAL_EXEC_TIMEOUT: Duration = Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + VISUAL_EXEC_TIMEOUT;
     #[allow(unused_assignments)]
     let mut snapshot = String::new();
     let mut last_total = 0usize;
@@ -1240,10 +1243,11 @@ async fn exec_ssh_visual_unlocked(state: &AppState, session_id: &str, command: &
             };
             let cleaned = strip_ansi(&window);
             let mut result = format!(
-                "命令已写入终端执行，但 180 秒内未检测到执行完成（命令可能仍在运行、\
+                "命令已写入终端执行，但 {} 秒内未检测到执行完成（命令可能仍在运行、\
                  等待输入，或终端当前不在 shell 提示符）。**不要盲目重发同一命令**\
                  （命令可能仍在终端里跑，重发会重复执行）。\n目前捕获到的输出：\n{}\n\
                  （如需终端当前完整输出，可调用 terminal_snapshot）",
+                VISUAL_EXEC_TIMEOUT.as_secs(),
                 truncate_output(&cleaned, MAX_EXEC_OUTPUT_BYTES)
             );
             if overflow {

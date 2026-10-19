@@ -250,6 +250,9 @@ pub fn run_migrations(conn: &Connection) -> AppResult<()> {
 }
 
 /// 幂等加列：用 pragma_table_info 检查列是否已存在，不存在则 ALTER TABLE ADD COLUMN。
+///
+/// 多开场景下两个进程可能同时启动且都读到「列不存在」，随后两个 ALTER 只有
+/// 一个成功，另一个报 duplicate column name——列实际已就位，视为成功。
 fn add_column_if_missing(
     conn: &Connection,
     table: &str,
@@ -263,8 +266,44 @@ fn add_column_if_missing(
     let exists: i64 = conn.query_row(&sql, [], |r| r.get(0))?;
     if exists == 0 {
         let alter = format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, type_def);
-        conn.execute(&alter, [])?;
-        log::info!("[db] 已添加列: {}.{}", table, column);
+        match conn.execute(&alter, []) {
+            Ok(_) => log::info!("[db] 已添加列: {}.{}", table, column),
+            Err(e) if e.to_string().contains("duplicate column name") => {
+                log::info!("[db] 列 {}.{} 已由并行实例添加", table, column)
+            }
+            Err(e) => return Err(e.into()),
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归（多开）：两个实例并发启动迁移时，都读到「列不存在」后各执行一次
+    /// ALTER，其中一个会收到 duplicate column name 错误——该错误必须被容忍，
+    /// 否则后启动的实例直接启动失败。用单连接手工触发同一错误，锁死 rusqlite
+    /// 错误文本与匹配分支的一致性（rusqlite/SQLite 升级改变措辞时此测试会红）。
+    #[test]
+    fn add_column_tolerates_duplicate_column_error() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (a INTEGER);").unwrap();
+
+        // 1. 正常路径：首次加列成功。
+        add_column_if_missing(&conn, "t", "b", "TEXT NOT NULL DEFAULT 'x'").unwrap();
+
+        // 2. 锁死错误文本：真实 ALTER 重复加列产生的 rusqlite 错误 Display
+        //    必须包含 add_column_if_missing 匹配的子串。
+        let err = conn
+            .execute("ALTER TABLE t ADD COLUMN b TEXT NOT NULL DEFAULT 'x'", [])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate column name"),
+            "rusqlite 错误文本变化，匹配分支将失效: {err}"
+        );
+
+        // 3. 列已存在路径：pragma_table_info 计数 > 0，直接跳过，成功。
+        add_column_if_missing(&conn, "t", "b", "TEXT NOT NULL DEFAULT 'x'").unwrap();
+    }
 }

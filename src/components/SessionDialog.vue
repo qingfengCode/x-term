@@ -75,21 +75,23 @@ const PROTOCOL_OPTIONS: { value: Protocol; label: string; port: number }[] = [
   { value: "rdp", label: "RDP (Windows 桌面)", port: 3389 },
   { value: "vnc", label: "VNC", port: 5900 },
 ];
-// 切换协议时自动调默认端口 + 限制认证方式。
-watch(
-  () => form.protocol,
-  (proto, old) => {
-    if (proto === old) return;
-    const opt = PROTOCOL_OPTIONS.find((o) => o.value === old);
-    // 仅当当前端口是旧协议默认端口时才改（避免覆盖用户自定义端口）。
-    if (opt && form.port === opt.port) {
-      const next = PROTOCOL_OPTIONS.find((o) => o.value === proto);
-      if (next) form.port = next.port;
-    }
-    // telnet/rdp/vnc 只支持密码认证。
-    if (proto !== "ssh") form.auth = "password";
-  },
-);
+// 协议切换时自动调默认端口 + 限制认证方式。
+// 必须挂在 el-select 的 @change 上（用户操作）而不是 watch(form.protocol)：
+// resetFromProps 会程序化赋值 protocol，同样触发 watch，而此时 old 是
+// 上一次打开对话框的协议、form.port 已是本次会话的端口——若两者恰好与
+// 某协议默认端口撞上（如自定义 23 端口的 SSH），保存前端口会被静默改写。
+let lastProtocol: Protocol = "ssh";
+function onProtocolChange(proto: Protocol) {
+  const opt = PROTOCOL_OPTIONS.find((o) => o.value === lastProtocol);
+  // 仅当当前端口是旧协议默认端口时才改（避免覆盖用户自定义端口）。
+  if (opt && form.port === opt.port) {
+    const next = PROTOCOL_OPTIONS.find((o) => o.value === proto);
+    if (next) form.port = next.port;
+  }
+  // telnet/rdp/vnc 只支持密码认证。
+  if (proto !== "ssh") form.auth = "password";
+  lastProtocol = proto;
+}
 /** 当前协议是否支持密钥认证（仅 SSH）。 */
 const supportsKeyAuth = computed(() => form.protocol === "ssh");
 
@@ -192,6 +194,7 @@ function resetFromProps() {
     form.name = s.name;
     form.groupId = s.groupId;
     form.protocol = s.protocol ?? "ssh";
+    lastProtocol = form.protocol;
     form.host = s.host;
     form.port = s.port;
     form.username = s.username;
@@ -213,6 +216,7 @@ function resetFromProps() {
     form.name = "";
     form.groupId = props.defaultGroupId ?? null;
     form.protocol = "ssh";
+    lastProtocol = "ssh";
     form.host = "127.0.0.1";
     form.port = 22;
     form.username = "root";
@@ -403,7 +407,7 @@ async function handleSave() {
       </el-form-item>
 
       <el-form-item label="协议" prop="protocol">
-        <el-select v-model="form.protocol" style="width: 100%">
+        <el-select v-model="form.protocol" style="width: 100%" @change="onProtocolChange">
           <el-option
             v-for="opt in PROTOCOL_OPTIONS"
             :key="opt.value"
