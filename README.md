@@ -164,7 +164,7 @@ python scripts/build-update.py
 python scripts/build.py
 ```
 
-产物位于 `src-tauri/target/release/bundle/nsis/`。
+安装包位于构建输出目录的 `bundle/nsis/` 下（构建结束时脚本会打印完整路径）。
 
 > **注意**：构建脚本会加载 MSVC 环境并强制使用 cl.exe 编译器，避免 MinGW 链接冲突。请勿在未加载 VS 环境的情况下直接 `cargo build`。脚本详情见 `scripts/README.md`（构建脚本目录已 git 忽略，不入库）。
 

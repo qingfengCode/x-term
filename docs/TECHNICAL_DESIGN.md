@@ -2,10 +2,9 @@
 
 > 现代化运维终端客户端 —— 集 SSH 终端、SFTP 文件传输、端口转发与 AI 智能助手于一体的桌面应用。
 
-类似 SecureCRT / XShell / Tabby / Termius，但用更现代的技术栈（Tauri 2 + Vue 3）重写：体积小、性能好、UI 现代、且内置 AI 运维助手。
+类似 SecureCRT / XShell / Tabby / Termius，但用更现代的技术栈（Rust 原生后端 + Vue 3）重写：体积小、性能好、UI 现代、且内置 AI 运维助手。
 
 ![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
-![tauri](https://img.shields.io/badge/Tauri-2.x-orange)
 ![vue](https://img.shields.io/badge/Vue-3.5-brightgreen)
 
 ## ✨ 功能特性
@@ -53,9 +52,9 @@ AI：根分区 / 使用 45%（可用 12G），未满。/data 用了 87%，接近
 
 ## 🏗 技术栈
 
-**后端（Rust）**：Tauri 2、russh 0.45（SSH/SFTP）、russh-sftp、rusqlite（bundled SQLite）+ r2d2 连接池、sqlx（MySQL，runtime-tokio-rustls）、aes-gcm + argon2（加密）、reqwest（AI HTTP）、regex（安全护栏）。
+**后端（Rust）**：russh 0.45（SSH/SFTP）、russh-sftp、rusqlite（bundled SQLite）+ r2d2 连接池、sqlx（MySQL，runtime-tokio-rustls）、aes-gcm + argon2（加密）、reqwest（AI HTTP）、regex（安全护栏）。
 
-**前端（TypeScript）**：Vue 3.5 + Vite、Element Plus、Pinia、Vue Router、xterm.js（终端）、@tauri-apps/api。
+**前端（TypeScript）**：Vue 3.5 + Vite、Element Plus、Pinia、Vue Router、xterm.js（终端）。
 
 **存储**：混合方案
 - SQLite：会话、分组、命令历史、转发规则、DB profile、日志。
@@ -72,9 +71,9 @@ x-term/
 │   │   ├── lib.rs              # 应用装配、命令注册
 │   │   ├── state.rs            # AppState（终端/MySQL/隧道/工具确认状态）
 │   │   ├── error.rs            # 统一 AppError
-│   │   ├── events.rs           # Tauri 事件定义（含工具调用/SQL 结果）
+│   │   ├── events.rs           # 事件定义（含工具调用/SQL 结果）
 │   │   ├── config.rs           # settings.json 模型
-│   │   ├── commands/           # #[tauri::command] 处理器
+│   │   ├── commands/           # 命令处理器（前端 invoke 的 Rust 接口）
 │   │   │   ├── vault.rs  session.rs  terminal.rs
 │   │   │   ├── sftp.rs  forward.rs  ai.rs  db.rs  config.rs
 │   │   ├── ssh/                # SSH 核心
@@ -140,7 +139,7 @@ $env:CC=""; $env:CXX=""  # PowerShell
 # 1. 安装前端依赖
 pnpm install
 
-# 2. 开发模式（同时启动 vite 和 tauri，自动热重载）
+# 2. 开发模式（同时启动前端与桌面端，自动热重载）
 pnpm tauri:dev
 
 # 3. 生产构建（生成 .msi / .exe 安装包）
@@ -148,7 +147,7 @@ pnpm tauri:build
 # 产物：src-tauri/target/release/bundle/
 ```
 
-### 仅前端开发（不经 Tauri）
+### 仅前端开发（浏览器预览）
 
 ```bash
 pnpm dev          # 仅 vite，浏览器预览（后端 invoke 调用会失败）
