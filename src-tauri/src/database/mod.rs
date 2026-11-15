@@ -31,6 +31,25 @@ pub use mysql::MySqlConn;
 pub use postgres::PgConn;
 pub use sqlite::SqliteConn;
 
+/// 单次查询返回行数的硬上限（AI / MCP 工具链共用）。
+///
+/// 模型 / MCP 客户端传入的 limit 必须经 [`clamp_limit`] 钳制后再进执行层：
+/// MySQL 路径按 limit 预分配行缓冲（`Vec::with_capacity(limit)`），无上限时
+/// `limit=1e9` 会立即尝试预留约 24GB，分配失败触发 `handle_alloc_error`
+/// 让整个进程 abort（不是可捕获的错误）。
+pub const MAX_QUERY_ROWS: u32 = 1000;
+
+/// 把调用方传入的 limit 钳制到 `[1, MAX_QUERY_ROWS]`，省略时用默认 100。
+///
+/// 不做裸 `as u32`：先按上限钳制再窄化，超界值不会截断绕过。
+pub fn clamp_limit(requested: Option<u64>) -> u32 {
+    const DEFAULT_LIMIT: u32 = 100;
+    match requested {
+        Some(n) => n.clamp(1, u64::from(MAX_QUERY_ROWS)) as u32,
+        None => DEFAULT_LIMIT,
+    }
+}
+
 /// 查询结果（命令返回 / 事件 payload 共用）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

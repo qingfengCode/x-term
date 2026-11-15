@@ -6,6 +6,7 @@ import { useSettingsStore } from "@/stores/settings";
 import { useUpdateStore } from "@/stores/update";
 import { useTerminalsStore } from "@/stores/terminals";
 import { useDbStore } from "@/stores/db";
+import { flushAllAiPersist } from "@/stores/ai";
 import TitleBar from "@/components/TitleBar.vue";
 import AboutDialog from "@/components/AboutDialog.vue";
 import SshAuthPrompt from "@/components/SshAuthPrompt.vue";
@@ -55,6 +56,8 @@ onMounted(async () => {
     if (active === 0) {
       // 无会话：直接退出（仍走 destroy 以统一退出路径）。
       closeConfirmed = true;
+      // 退出前冲刷 AI 对话的防抖写盘（否则最后 800ms 内的消息会丢）。
+      await flushAiBeforeExit();
       await appWindow.destroy();
       return;
     }
@@ -70,6 +73,8 @@ onMounted(async () => {
         { type: "warning", confirmButtonText: "退出", cancelButtonText: "取消" },
       );
       closeConfirmed = true;
+      // 退出前冲刷 AI 对话的防抖写盘（否则最后 800ms 内的变更会丢）。
+      await flushAiBeforeExit();
       await appWindow.destroy();
     } catch {
       /* 用户取消：窗口保持打开 */
@@ -185,8 +190,29 @@ function scheduleNextNoonCheck() {
   }, next.getTime() - now.getTime());
 }
 
+/**
+ * 退出前刷盘，最多等 1.5 秒。
+ *
+ * 必须有界：写盘走 IPC，若后端异常，直接 await 会让"点关闭后窗口一直不关"。
+ * 超时放弃即可（丢最后 800ms 的变更，远好于关不掉窗口）。
+ */
+async function flushAiBeforeExit() {
+  await Promise.race([
+    flushAllAiPersist(),
+    new Promise<void>((r) => setTimeout(r, 1500)),
+  ]);
+}
+
+// 兜底：窗口被其它方式关闭（系统关机、崩溃前的卸载）时也冲刷 AI 对话写盘。
+// 正常关闭路径（onCloseRequested → destroy）已在 destroy 前显式 flush。
+const onPageHide = () => {
+  void flushAllAiPersist();
+};
+window.addEventListener("pagehide", onPageHide);
+
 onBeforeUnmount(() => {
   if (noonCheckTimer !== null) window.clearTimeout(noonCheckTimer);
+  window.removeEventListener("pagehide", onPageHide);
   unlistenClose?.();
 });
 </script>

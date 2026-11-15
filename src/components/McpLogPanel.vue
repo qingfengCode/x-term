@@ -206,10 +206,10 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   height: 100%;
-  border: 1px solid #2a3442;
-  border-radius: 10px;
+  border: 1px solid var(--app-console-border);
+  border-radius: var(--app-radius-lg);
   overflow: hidden;
-  background: #161b22;
+  background: var(--app-console-bg);
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
 }
 
@@ -220,8 +220,8 @@ onBeforeUnmount(() => {
   justify-content: space-between;
   gap: 8px;
   padding: 6px 8px 6px 10px;
-  background: #1c2330;
-  border-bottom: 1px solid #2a3442;
+  background: var(--app-console-head);
+  border-bottom: 1px solid var(--app-console-border);
   flex-shrink: 0;
   user-select: none;
 }
@@ -242,13 +242,13 @@ onBeforeUnmount(() => {
   height: 10px;
   border-radius: 50%;
 }
-.md-r { background: #ff5f57; }
-.md-y { background: #febc2e; }
-.md-g { background: #28c840; }
+.md-r { background: var(--app-console-dot-r); }
+.md-y { background: var(--app-console-dot-y); }
+.md-g { background: var(--app-console-dot-g); }
 .head-title {
-  font-size: 12.5px;
+  font-size: 13px;
   font-weight: 600;
-  color: #e6edf3;
+  color: var(--app-console-text);
   white-space: nowrap;
 }
 /* LIVE 徽标：绿色胶囊 + 呼吸圆点 */
@@ -259,11 +259,11 @@ onBeforeUnmount(() => {
   font-size: 10px;
   font-weight: 700;
   letter-spacing: 1px;
-  color: #3fb950;
-  background: rgba(63, 185, 80, 0.12);
-  border: 1px solid rgba(63, 185, 80, 0.35);
+  color: var(--app-console-live);
+  background: color-mix(in srgb, var(--app-console-live) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--app-console-live) 35%, transparent);
   padding: 1px 7px;
-  border-radius: 10px;
+  border-radius: var(--app-radius-lg);
   font-family: var(--app-font-mono);
   flex-shrink: 0;
 }
@@ -272,7 +272,7 @@ onBeforeUnmount(() => {
   width: 5px;
   height: 5px;
   border-radius: 50%;
-  background: #3fb950;
+  background: var(--app-console-live);
   animation: badge-pulse 1.6s ease-in-out infinite;
 }
 @keyframes badge-pulse {
@@ -281,7 +281,7 @@ onBeforeUnmount(() => {
 }
 .head-file {
   font-size: 11px;
-  color: #7d8590;
+  color: var(--app-console-muted);
   font-family: var(--app-font-mono);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -293,19 +293,19 @@ onBeforeUnmount(() => {
 }
 /* 深色背景下的按钮调暗 */
 .log-head :deep(.el-button) {
-  --el-button-bg-color: #2a3442;
-  --el-button-border-color: #3a4656;
-  --el-button-text-color: #adbac7;
-  --el-button-hover-bg-color: #344050;
-  --el-button-hover-border-color: #46536a;
-  --el-button-hover-text-color: #e6edf3;
+  --el-button-bg-color: var(--app-console-border);
+  --el-button-border-color: var(--app-console-btn-border);
+  --el-button-text-color: var(--app-console-info);
+  --el-button-hover-bg-color: var(--app-console-btn-hover-bg);
+  --el-button-hover-border-color: var(--app-console-btn-hover-border);
+  --el-button-hover-text-color: var(--app-console-text);
 }
 .log-head :deep(.el-button--primary) {
-  --el-button-bg-color: #1f6f45;
-  --el-button-border-color: #2ea36a;
-  --el-button-text-color: #e6ffef;
-  --el-button-hover-bg-color: #27855a;
-  --el-button-hover-border-color: #3cc284;
+  --el-button-bg-color: var(--app-console-primary-bg);
+  --el-button-border-color: var(--app-console-primary-border);
+  --el-button-text-color: var(--app-console-primary-text);
+  --el-button-hover-bg-color: var(--app-console-primary-hover-bg);
+  --el-button-hover-border-color: var(--app-console-primary-hover-border);
   --el-button-hover-text-color: #ffffff;
 }
 
@@ -319,18 +319,18 @@ onBeforeUnmount(() => {
   line-height: 1.65;
 }
 .log-scroller::-webkit-scrollbar {
-  width: 8px;
+  width: var(--app-scrollbar);
 }
 .log-scroller::-webkit-scrollbar-thumb {
-  background: #2f3a48;
-  border-radius: 4px;
+  background: var(--app-console-scrollbar);
+  border-radius: var(--app-radius-xs);
 }
 
 /* 空状态 */
 .log-empty {
   text-align: center;
   padding: 48px 20px;
-  color: #57606a;
+  color: var(--app-console-faint);
 }
 .empty-glyph {
   font-size: 30px;
@@ -340,12 +340,12 @@ onBeforeUnmount(() => {
 .empty-text {
   font-size: 14px;
   font-weight: 600;
-  color: #7d8590;
+  color: var(--app-console-muted);
   margin-bottom: 6px;
 }
 .empty-sub {
   font-size: 12px;
-  color: #57606a;
+  color: var(--app-console-faint);
   max-width: 280px;
   margin: 0 auto;
   line-height: 1.6;
@@ -353,16 +353,16 @@ onBeforeUnmount(() => {
 
 /* 文件头 */
 .log-meta {
-  border: 1px solid #263040;
-  border-left: 3px solid #388bfd66;
-  background: #1a2230;
-  border-radius: 4px;
+  border: 1px solid var(--app-console-border);
+  border-left: 3px solid color-mix(in srgb, var(--app-console-accent) 40%, transparent);
+  background: var(--app-console-meta);
+  border-radius: var(--app-radius-xs);
   padding: 6px 9px;
   margin-bottom: 12px;
 }
 .meta-line {
-  color: #7d8590;
-  font-size: 11.5px;
+  color: var(--app-console-muted);
+  font-size: 12px;
   line-height: 1.6;
   white-space: pre-wrap;
 }
@@ -373,14 +373,14 @@ onBeforeUnmount(() => {
   gap: 10px;
   padding: 1px 4px;
   margin: 0 -4px;
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   transition: background 0.15s;
 }
 .log-line:hover {
-  background: #1d2530;
+  background: var(--app-console-hover);
 }
 .ln-time {
-  color: #57606a;
+  color: var(--app-console-faint);
   flex-shrink: 0;
   user-select: none;
 }
@@ -388,13 +388,13 @@ onBeforeUnmount(() => {
   white-space: pre-wrap;
   word-break: break-all;
 }
-.k-ok .ln-body { color: #7ee787; }
-.k-err .ln-body { color: #ff7b72; }
-.k-reject .ln-body { color: #ffa657; }
-.k-info .ln-body { color: #adbac7; }
+.k-ok .ln-body { color: var(--app-console-success); }
+.k-err .ln-body { color: var(--app-console-danger); }
+.k-reject .ln-body { color: var(--app-console-warning); }
+.k-info .ln-body { color: var(--app-console-info); }
 
 .log-idle {
-  color: #57606a;
+  color: var(--app-console-faint);
   text-align: center;
   padding: 30px 0;
   font-size: 12px;

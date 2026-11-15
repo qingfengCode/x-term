@@ -301,18 +301,6 @@ export function useSqlConsole(
         const m = USE_STMT_RE.exec(stmt);
         if (m) lastUseDb = m[1];
       }
-      if (lastUseDb) {
-        try {
-          await dbUseDatabase(connIdRef.value, lastUseDb);
-        } catch (e: unknown) {
-          // 切库失败：不执行后续语句，直接回显错误（与执行路径的报错形态一致）。
-          const msg = e instanceof Error ? e.message : String(e);
-          const errId = genId("e");
-          pushEntry({ id: errId, kind: "sql", sql: sqlRaw, status: "error" });
-          insertAfter(errId, { id: genId("e"), kind: "error", sql: sqlRaw, message: msg });
-          return false;
-        }
-      }
       // 编辑器可能含多条语句（分号分隔）；只执行最后一条非空语句，避免多语句语法错误。
       const sql = stmts.length > 0 ? stmts[stmts.length - 1] : sqlRaw;
 
@@ -324,6 +312,22 @@ export function useSqlConsole(
       if (dangerous) {
         const ok = await confirmDangerous(kw, isDeleteWithoutWhere(sql));
         if (!ok) return false;
+      }
+
+      // 切库必须放在只读拦截 / 危险确认**之后**：`USE prod; DROP TABLE users`
+      // 被拦截或用户在确认框点"取消"时，若库已切到 prod，后续不带库前缀的
+      // 查询会静默落在 prod 上——对运维场景是实际的误操作风险。
+      if (lastUseDb) {
+        try {
+          await dbUseDatabase(connIdRef.value, lastUseDb);
+        } catch (e: unknown) {
+          // 切库失败：不执行后续语句，直接回显错误（与执行路径的报错形态一致）。
+          const msg = e instanceof Error ? e.message : String(e);
+          const errId = genId("e");
+          pushEntry({ id: errId, kind: "sql", sql: sqlRaw, status: "error" });
+          insertAfter(errId, { id: genId("e"), kind: "error", sql: sqlRaw, message: msg });
+          return false;
+        }
       }
 
       const queryId = genId("q");

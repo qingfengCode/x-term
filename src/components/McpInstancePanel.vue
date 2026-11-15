@@ -29,6 +29,7 @@
 import { computed, onMounted, ref } from "vue";
 import { ElMessage } from "element-plus";
 import HelpTip from "@/components/HelpTip.vue";
+import StatusDot from "@/components/StatusDot.vue";
 import { useMcpStore } from "@/stores/mcp";
 import { useSessionsStore } from "@/stores/sessions";
 import { useTerminalsStore } from "@/stores/terminals";
@@ -201,21 +202,21 @@ const RUN_MODE_OPTIONS: {
   },
 ];
 
-/** 当前模式的说明文案（按 kind 展开白名单的具体含义）。 */
-const runModeDesc = computed(() => {
-  switch (config.value.runMode) {
-    case "auto":
-      return "外部客户端的所有调用直接执行，不弹确认（文件传输除外）";
-    case "whitelist":
-      return isSsh.value
-        ? "命令白名单内自动执行（同「设置 → AI」的 SSH 白名单），其余弹确认"
-        : isFile.value
-          ? "读操作自动执行，文件上传/下载仍弹确认"
-          : "只读 SQL（SELECT/SHOW/EXPLAIN/DESCRIBE）自动执行，其余弹确认";
-    default:
-      return "外部客户端的每次调用都需你在 X-Term 中确认后执行";
-  }
-});
+/** 下拉选项说明：白名单模式的具体含义随资源类型变化。 */
+const runModeOptions = computed(() =>
+  RUN_MODE_OPTIONS.map((opt) =>
+    opt.value === "whitelist"
+      ? {
+          ...opt,
+          desc: isSsh.value
+            ? "命令白名单内自动执行，其余弹确认"
+            : isFile.value
+              ? "读操作自动执行，上传/下载弹确认"
+              : "只读 SQL 自动执行，其余弹确认",
+        }
+      : opt,
+  ),
+);
 
 /** 运行模式的说明（悬浮帮助）。 */
 const runModeHint =
@@ -226,8 +227,8 @@ const runModeHint =
 
 /** 记录执行日志开关的说明（悬浮帮助）。 */
 const logHint =
-  "开启后，每次启动服务会生成一个文本日志文件（位于应用数据目录 mcp-logs/），\
-记录每次工具调用的时间、命令/SQL、结果与耗时。重启服务后生效。";
+  "每次调用的时间、命令与结果写入本地日志文件（位于应用数据目录 mcp-logs/，含 SQL 与耗时）。\
+开启后每次启动服务生成一个日志文件，重启服务后生效。";
 
 /** 已打开的终端标签页（含断开的，断开的禁选；连接中的无 instanceId 不列出）。 */
 const terminalOptions = computed(() =>
@@ -236,6 +237,8 @@ const terminalOptions = computed(() =>
     .map((t) => ({
       instanceId: t.instanceId,
       session: t.session,
+      // 与 TabBar 一致的显示标题（尊重页签重命名）。
+      displayTitle: t.displayTitle,
       disconnected: t.disconnected,
       connecting: t.connecting,
     })),
@@ -298,7 +301,7 @@ const boundResourceName = computed(() => {
   if (isSsh.value && terminalBound.value) {
     const t = terminalsStore.tabs.find((tab) => tab.instanceId === id);
     if (!t) return "(终端已关闭)";
-    return `终端 · ${t.session.name} (${t.session.host}:${t.session.port})`;
+    return `终端 · ${t.displayTitle} (${t.session.host}:${t.session.port})`;
   }
   if (isSsh.value) {
     return sshSessions.value.find((s) => s.id === id)?.name ?? "(会话已删除)";
@@ -735,7 +738,7 @@ onMounted(async () => {
               <el-option
                 v-for="t in terminalOptions"
                 :key="t.instanceId"
-                :label="`${t.session.name} (${t.session.host}:${t.session.port})`"
+                :label="`${t.displayTitle} (${t.session.host}:${t.session.port})`"
                 :value="t.instanceId"
                 :disabled="t.disconnected || t.connecting"
               />
@@ -902,7 +905,11 @@ onMounted(async () => {
 
       <!-- 状态 hero：运行/停止 + 绑定摘要 -->
       <div class="status-hero" :class="status.running ? 'is-on' : 'is-off'">
-        <span class="hero-dot" />
+        <StatusDot
+          :tone="status.running ? 'success' : 'info'"
+          :size="10"
+          :pulse="status.running"
+        />
         <div class="hero-text">
           <span class="hero-state">{{ status.running ? "运行中" : "已停止" }}</span>
           <span class="hero-desc">
@@ -931,19 +938,20 @@ onMounted(async () => {
         </el-tooltip>
       </div>
 
-      <!-- 运行模式（与 AI 助手执行模式一致：手动 / 白名单 / 自动） -->
+      <!-- 运行模式（与 AI 助手执行模式一致：手动 / 白名单 / 自动；
+           各模式的说明放在下拉选项内，行内只留标题，保持界面简洁） -->
       <div class="switch-row">
         <div class="switch-info">
           <div class="switch-title">
             运行模式
             <HelpTip :content="runModeHint" />
           </div>
-          <div class="switch-desc">{{ runModeDesc }}</div>
         </div>
         <el-select
           :model-value="config.runMode"
           size="small"
           class="runmode-select"
+          popper-class="runmode-pop"
           style="width: 118px"
           @change="
             (v: 'manual' | 'whitelist' | 'auto') => {
@@ -953,12 +961,16 @@ onMounted(async () => {
           "
         >
           <el-option
-            v-for="opt in RUN_MODE_OPTIONS"
+            v-for="opt in runModeOptions"
             :key="opt.value"
             :value="opt.value"
             :label="opt.label"
-            :title="opt.desc"
-          />
+          >
+            <div class="runmode-option">
+              <span>{{ opt.label }}</span>
+              <span class="runmode-desc">{{ opt.desc }}</span>
+            </div>
+          </el-option>
         </el-select>
       </div>
 
@@ -969,7 +981,6 @@ onMounted(async () => {
             记录执行日志
             <HelpTip :content="logHint" />
           </div>
-          <div class="switch-desc">每次调用的时间、命令与结果写入本地日志文件</div>
         </div>
         <el-switch v-model="config.enableLog" @change="onFieldChange" />
       </div>
@@ -1053,9 +1064,9 @@ onMounted(async () => {
 .form-card {
   background: var(--el-bg-color-overlay);
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 10px;
+  border-radius: var(--app-radius-lg);
   padding: 12px 14px 14px;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+  box-shadow: var(--app-shadow-1);
 }
 
 /* 卡片头：图标徽标 + 标题（+ 右侧动作） */
@@ -1070,7 +1081,7 @@ onMounted(async () => {
 .card-ico {
   width: 20px;
   height: 20px;
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1135,7 +1146,7 @@ onMounted(async () => {
   display: flex;
   align-items: flex-start;
   gap: 5px;
-  font-size: 11.5px;
+  font-size: 12px;
   line-height: 1.6;
   color: var(--el-text-color-secondary);
   margin-bottom: 10px;
@@ -1143,7 +1154,7 @@ onMounted(async () => {
 .compact-hint code {
   background: var(--el-fill-color-light);
   padding: 0 3px;
-  border-radius: 3px;
+  border-radius: var(--app-radius-xs);
   font-family: var(--app-font-mono);
   font-size: 11px;
 }
@@ -1162,7 +1173,7 @@ onMounted(async () => {
   align-items: center;
   gap: 10px;
   padding: 10px 12px;
-  border-radius: 8px;
+  border-radius: var(--app-radius-md);
   margin-bottom: 10px;
   border: 1px solid var(--el-border-color-lighter);
   background: var(--el-fill-color-light);
@@ -1171,22 +1182,6 @@ onMounted(async () => {
 .status-hero.is-on {
   border-color: var(--el-color-success-light-7);
   background: var(--el-color-success-light-9);
-}
-.hero-dot {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  background: var(--el-text-color-disabled);
-  flex-shrink: 0;
-}
-.is-on .hero-dot {
-  background: var(--el-color-success);
-  animation: hero-pulse 2s ease-out infinite;
-}
-@keyframes hero-pulse {
-  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--el-color-success) 45%, transparent); }
-  70% { box-shadow: 0 0 0 8px transparent; }
-  100% { box-shadow: 0 0 0 0 transparent; }
 }
 .hero-text {
   display: flex;
@@ -1225,7 +1220,7 @@ onMounted(async () => {
   font-weight: 700;
   letter-spacing: 0.5px;
   padding: 2px 6px;
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   flex-shrink: 0;
   font-family: var(--app-font-mono);
   color: var(--el-color-primary);
@@ -1235,7 +1230,7 @@ onMounted(async () => {
 }
 .endpoint-url {
   font-family: var(--app-font-mono);
-  font-size: 12.5px;
+  font-size: 13px;
   color: var(--el-color-primary);
   word-break: break-all;
   min-width: 0;
@@ -1257,18 +1252,34 @@ onMounted(async () => {
   min-width: 0;
 }
 .switch-title {
-  font-size: 12.5px;
+  font-size: 13px;
   font-weight: 500;
   color: var(--el-text-color-primary);
   display: flex;
   align-items: center;
   gap: 4px;
 }
-.switch-desc {
-  font-size: 11.5px;
-  color: var(--el-text-color-secondary);
-  margin-top: 2px;
-  line-height: 1.5;
+
+/* --- 运行模式下拉项：标签 + 说明纵向两行（与 AI 面板执行模式一致） --- */
+.runmode-option {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.4;
+  padding: 4px 0;
+}
+.runmode-option .runmode-desc {
+  font-size: 11px;
+  color: var(--el-text-color-placeholder);
+}
+/* 下拉层挂在 body 上：覆盖默认 34px 定高与 nowrap 裁切 */
+:global(.runmode-pop .el-select-dropdown__item) {
+  height: auto;
+  line-height: 1.4;
+  white-space: normal;
+  padding: 5px 32px 5px 20px;
+}
+:global(.runmode-pop) {
+  max-width: 260px;
 }
 
 /* --- 令牌 --- */
@@ -1293,9 +1304,9 @@ onMounted(async () => {
 
 /* --- 客户端配置 JSON 块（迷你终端窗口） --- */
 .json-block {
-  border-radius: 8px;
+  border-radius: var(--app-radius-md);
   overflow: hidden;
-  border: 1px solid #2a3442;
+  border: 1px solid var(--app-console-border);
   margin-top: 2px;
 }
 .json-head {
@@ -1303,8 +1314,8 @@ onMounted(async () => {
   align-items: center;
   gap: 8px;
   padding: 5px 8px 5px 10px;
-  background: #1c2330;
-  border-bottom: 1px solid #2a3442;
+  background: var(--app-console-head);
+  border-bottom: 1px solid var(--app-console-border);
 }
 .json-dots {
   display: inline-flex;
@@ -1312,35 +1323,35 @@ onMounted(async () => {
   flex-shrink: 0;
 }
 .json-dots i {
-  width: 9px;
-  height: 9px;
+  width: 10px;
+  height: 10px;
   border-radius: 50%;
 }
-.jd-r { background: #ff5f57; }
-.jd-y { background: #febc2e; }
-.jd-g { background: #28c840; }
+.jd-r { background: var(--app-console-dot-r); }
+.jd-y { background: var(--app-console-dot-y); }
+.jd-g { background: var(--app-console-dot-g); }
 .json-name {
   font-family: var(--app-font-mono);
   font-size: 11px;
-  color: #7d8590;
+  color: var(--app-console-muted);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 .json-head .el-button {
   margin-left: auto;
-  color: #adbac7;
-  background: #2a3442;
-  border-color: #3a4656;
+  color: var(--app-console-info);
+  background: var(--app-console-border);
+  border-color: var(--app-console-btn-border);
 }
 .json-head .el-button:hover {
-  color: #e6edf3;
-  background: #344050;
-  border-color: #46536a;
+  color: var(--app-console-text);
+  background: var(--app-console-btn-hover-bg);
+  border-color: var(--app-console-btn-hover-border);
 }
 .config-json {
-  background: #161b22;
-  color: #7ee787;
+  background: var(--app-console-bg);
+  color: var(--app-console-success);
   padding: 10px 12px;
   font-size: 12px;
   line-height: 1.6;
@@ -1351,10 +1362,10 @@ onMounted(async () => {
 }
 /* 深色 JSON 块内的细滚动条（与日志面板一致） */
 .config-json::-webkit-scrollbar {
-  width: 8px;
+  width: var(--app-scrollbar);
 }
 .config-json::-webkit-scrollbar-thumb {
-  background: #2f3a48;
-  border-radius: 4px;
+  background: var(--app-console-scrollbar);
+  border-radius: var(--app-radius-xs);
 }
 </style>

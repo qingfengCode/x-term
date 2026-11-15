@@ -90,10 +90,8 @@ const activeTabKey = computed(() => terminals.activeTabId ?? "");
 const tabItems = computed<TabBarItem[]>(() =>
   terminals.tabs.map((t) => ({
     key: t.id,
-    // 重命名（右键菜单）只覆盖本页签的显示标题；customTitle 为空回默认。
-    title:
-      t.customTitle ??
-      (t.kind === "monitor" ? `监控 · ${t.session.name}` : t.session.name),
+    // 重命名（右键菜单）只覆盖本页签的显示标题；displayTitle 已处理回退。
+    title: t.displayTitle,
     // 监控页签无连接状态语义：用图标区分、不显示状态圆点（面板内容才是状态）。
     icon: t.kind === "monitor" ? "DataLine" : undefined,
     hideDot: t.kind === "monitor",
@@ -172,8 +170,7 @@ function onTabMenuCommand(cmd: string, key: string) {
  * customTitle。清空保存 = 恢复默认标题；取消不改动。
  */
 async function promptRename(t: TerminalTab) {
-  const current =
-    t.customTitle ?? (t.kind === "monitor" ? `监控 · ${t.session.name}` : t.session.name);
+  const current = t.displayTitle;
   try {
     const { value } = await ElMessageBox.prompt("页签标题（留空恢复默认）", "重命名", {
       inputValue: current,
@@ -668,7 +665,7 @@ onBeforeUnmount(() => {
   padding: 0 12px;
   margin-left: 6px;
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   background: var(--el-fill-color-blank);
   color: var(--el-text-color-regular);
   font-size: 12px;
@@ -693,7 +690,7 @@ onBeforeUnmount(() => {
 }
 .tool-btn {
   padding: 5px;
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   color: var(--el-text-color-secondary);
   transition: background-color 0.15s ease, color 0.15s ease;
 }
@@ -770,13 +767,13 @@ onBeforeUnmount(() => {
   height: 22px;
   margin-left: 6px;
   border: 1px dashed var(--el-border-color);
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   background: transparent;
   color: var(--el-text-color-secondary);
   font-size: 14px;
   line-height: 1;
   cursor: pointer;
-  transition: all 0.15s;
+  transition: border-color 0.15s ease, color 0.15s ease, background-color 0.15s ease;
 }
 .sc-add:hover {
   border-color: var(--el-color-primary);
@@ -792,7 +789,7 @@ onBeforeUnmount(() => {
   font-size: 12px;
   cursor: pointer;
   white-space: nowrap;
-  transition: all 0.15s;
+  transition: color 0.15s ease, border-bottom-color 0.15s ease;
 }
 .sc-tab:hover {
   color: var(--el-color-primary);
@@ -831,14 +828,14 @@ onBeforeUnmount(() => {
   margin: 0 8px 0 2px;
   padding: 3px 8px;
   border: none;
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   background: transparent;
   color: var(--el-text-color-secondary);
   font-size: 12px;
   cursor: pointer;
   white-space: nowrap;
   flex-shrink: 0;
-  transition: all 0.15s;
+  transition: color 0.15s ease, background-color 0.15s ease;
 }
 .sc-toggle:hover {
   color: var(--el-color-primary);
@@ -854,13 +851,13 @@ onBeforeUnmount(() => {
   gap: 6px;
   padding: 3px 10px;
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   background: var(--el-fill-color-blank);
   color: var(--el-text-color-regular);
   font-size: 12px;
   cursor: pointer;
   white-space: nowrap;
-  transition: all 0.15s;
+  transition: border-color 0.15s ease, color 0.15s ease, background-color 0.15s ease, transform 0.1s ease;
 }
 .sc-btn:hover {
   border-color: var(--el-color-primary-light-5);
@@ -876,7 +873,7 @@ onBeforeUnmount(() => {
 .sc-key {
   font-size: 10px;
   padding: 1px 4px;
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   background: var(--el-fill-color-dark);
   color: var(--el-text-color-secondary);
   font-family: var(--app-font-mono);

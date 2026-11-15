@@ -864,6 +864,8 @@ const desktopControl = {
 </template>
 
 <style scoped lang="scss">
+@use "../styles/desktop-overlay" as overlay;
+
 .rdp-pane {
   position: absolute;
   inset: 0;
@@ -896,42 +898,24 @@ const desktopControl = {
   border-radius: 0;
 }
 .rdp-toolbar {
-  position: absolute;
-  top: 8px;
-  right: 12px;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 4px 10px;
-  border-radius: 6px;
-  background: rgba(0, 0, 0, 0.45);
-  backdrop-filter: blur(4px);
+  @include overlay.toolbar;
 }
 .rdp-state {
-  font-size: 12px;
-  color: #999;
+  @include overlay.state;
 }
 .rdp-state.connected {
-  color: #67c23a;
+  @include overlay.state-connected;
 }
 .rdp-state.error {
-  color: #f56c6c;
+  @include overlay.state-error;
 }
 .rdp-cad {
-  border: 1px solid rgba(255, 255, 255, 0.35);
-  background: transparent;
-  color: #ddd;
-  font-size: 12px;
-  padding: 2px 8px;
-  border-radius: 4px;
-  cursor: pointer;
+  @include overlay.button;
 }
 .rdp-cad:hover:not(:disabled) {
-  border-color: var(--el-color-primary);
-  color: var(--el-color-primary);
+  @include overlay.button-hover;
 }
 .rdp-cad:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
+  @include overlay.button-disabled;
 }
 </style>

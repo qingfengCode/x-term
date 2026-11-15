@@ -10,6 +10,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useUpdateStore } from "@/stores/update";
 import { useTransferStore } from "@/stores/transfer";
 import DownloadDrawer from "@/components/DownloadDrawer.vue";
+import BrandMark from "@/components/BrandMark.vue";
 
 const emit = defineEmits<{ about: [] }>();
 
@@ -70,7 +71,7 @@ onBeforeUnmount(() => unlisten?.());
   <div class="title-bar" data-tauri-drag-region>
     <!-- 品牌区 -->
     <div class="brand" data-tauri-drag-region>
-      <span class="brand-badge" data-tauri-drag-region>X</span>
+      <BrandMark :size="20" data-tauri-drag-region />
       <span class="brand-name" data-tauri-drag-region>X-Term</span>
     </div>
 
@@ -141,20 +142,6 @@ onBeforeUnmount(() => unlisten?.());
   gap: 8px;
   pointer-events: none;
 }
-.brand-badge {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 20px;
-  height: 20px;
-  border-radius: 6px;
-  font-family: var(--app-font-mono);
-  font-size: 12px;
-  font-weight: 700;
-  color: #fff;
-  background: linear-gradient(135deg, #2dd4bf 0%, #0d9488 55%, #0f766e 100%);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.28);
-}
 .brand-name {
   font-size: 12px;
   font-weight: 600;
@@ -177,7 +164,7 @@ onBeforeUnmount(() => unlisten?.());
   width: 32px;
   height: 26px;
   border: none;
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   background: transparent;
   color: var(--el-text-color-secondary);
   cursor: pointer;
@@ -194,6 +181,12 @@ onBeforeUnmount(() => unlisten?.());
 }
 .tb-btn:active {
   background: var(--el-fill-color-dark);
+}
+/* 键盘焦点：标题栏按钮保留可见焦点环 */
+.tb-btn:focus-visible,
+.win-btn:focus-visible {
+  outline: 2px solid var(--el-color-primary);
+  outline-offset: -2px;
 }
 /* 关于按钮：与窗口控制之间留出间距；下载按钮紧邻其左侧 */
 .about-btn {

@@ -9,7 +9,8 @@ const routes: RouteRecordRaw[] = [
     children: [
       { path: "", redirect: "/terminals" },
       { path: "terminals", name: "terminals", component: () => import("@/views/Workspace.vue") },
-      { path: "sftp", name: "sftp", component: () => import("@/views/SftpView.vue") },
+      // SFTP 已并入文件页（SSH 会话 + 对象存储统一入口），旧地址重定向保留。
+      { path: "sftp", redirect: { name: "files" } },
       { path: "files", name: "files", component: () => import("@/views/FileExplorerView.vue") },
       { path: "sql", name: "sql", component: () => import("@/views/SqlConsoleView.vue") },
       { path: "forward", name: "forward", component: () => import("@/views/ForwardView.vue") },

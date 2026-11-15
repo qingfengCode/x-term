@@ -190,7 +190,8 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
         crate::commands::backup::backup_export,
         crate::commands::backup::backup_inspect,
         crate::commands::backup::backup_import,
-        // system（系统集成：文件管理器中定位文件）
+        // system（系统集成：文件管理器中定位文件 / 用系统浏览器打开链接）
         crate::commands::system::reveal_in_folder,
+        crate::commands::system::open_external_url,
     ])
 }

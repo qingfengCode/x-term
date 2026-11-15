@@ -14,6 +14,8 @@ import { computed, onMounted, ref } from "vue";
 import { useMcpStore } from "@/stores/mcp";
 import McpInstancePanel from "@/components/McpInstancePanel.vue";
 import McpLogPanel from "@/components/McpLogPanel.vue";
+import PageHeader from "@/components/PageHeader.vue";
+import StatusDot from "@/components/StatusDot.vue";
 
 defineOptions({ name: "McpView" });
 
@@ -58,24 +60,24 @@ onMounted(async () => {
 
 <template>
   <div class="mcp-view">
-    <!-- 页头 -->
-    <header class="mcp-header">
-      <div class="header-badge">
-        <el-icon><Link /></el-icon>
-      </div>
-      <div class="header-text">
-        <div class="header-title-row">
-          <h2>MCP 服务端</h2>
-          <span class="running-summary" :class="{ on: runningCount > 0 }">
-            <i class="sum-dot" />
-            {{ runningCount > 0 ? `${runningCount}/3 运行中` : "全部未启动" }}
-          </span>
-        </div>
-        <span class="subtitle">
-          把 X-Term 的 SSH / MySQL / 对象存储能力，通过标准 MCP 暴露给 Claude Desktop、Cursor 等外部客户端
+    <PageHeader
+      title="MCP 服务端"
+      subtitle="把 X-Term 的 SSH / MySQL / 对象存储能力，通过标准 MCP 暴露给 Claude Desktop、Cursor 等外部客户端"
+      icon="Link"
+      gradient
+      :gutter="16"
+    >
+      <template #meta>
+        <span class="running-summary" :class="{ on: runningCount > 0 }">
+          <StatusDot
+            :tone="runningCount > 0 ? 'success' : 'info'"
+            :size="6"
+            :pulse="runningCount > 0"
+          />
+          {{ runningCount > 0 ? `${runningCount}/3 运行中` : "全部未启动" }}
         </span>
-      </div>
-    </header>
+      </template>
+    </PageHeader>
 
     <!-- 服务选择器：卡片式 Tab，含运行状态与端口 -->
     <div class="service-select">
@@ -85,6 +87,7 @@ onMounted(async () => {
         type="button"
         class="service-card"
         :class="{ active: activeTab === s.kind, running: s.running }"
+        :aria-pressed="activeTab === s.kind"
         @click="activeTab = s.kind"
       >
         <span class="svc-ico">
@@ -96,7 +99,11 @@ onMounted(async () => {
         </span>
         <span class="svc-side">
           <span class="svc-status" :class="{ on: s.running }">
-            <i class="st-dot" />
+            <StatusDot
+              :tone="s.running ? 'success' : 'info'"
+              :size="6"
+              :pulse="s.running"
+            />
             {{ s.running ? "运行中" : "已停止" }}
           </span>
           <span class="svc-port">:{{ s.port }}</span>
@@ -124,55 +131,20 @@ onMounted(async () => {
   flex-direction: column;
   height: 100%;
   overflow: hidden;
+  background: var(--el-bg-color-page);
 }
 
-/* --- 页头 --- */
-.mcp-header {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 16px;
-  flex-shrink: 0;
-  border-bottom: 1px solid var(--el-border-color-lighter);
-}
-.header-badge {
-  width: 30px;
-  height: 30px;
-  border-radius: 8px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 15px;
-  color: #fff;
-  flex-shrink: 0;
-  background: linear-gradient(135deg, var(--el-color-primary) 0%, var(--el-color-primary-dark-2) 100%);
-  box-shadow: 0 2px 8px color-mix(in srgb, var(--el-color-primary) 35%, transparent);
-}
-.header-text {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-.header-title-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-.mcp-header h2 {
-  margin: 0;
-  font-size: 15px;
-  font-weight: 600;
-  letter-spacing: 0.2px;
-}
+/* --- 页头（PageHeader） --- */
 .running-summary {
   display: inline-flex;
   align-items: center;
   gap: 5px;
+  flex-shrink: 0;
+  white-space: nowrap;
   font-size: 11px;
   font-weight: 500;
   padding: 2px 8px;
-  border-radius: 10px;
+  border-radius: var(--app-radius-lg);
   color: var(--el-text-color-secondary);
   background: var(--el-fill-color);
   border: 1px solid var(--el-border-color-lighter);
@@ -183,26 +155,6 @@ onMounted(async () => {
   color: var(--el-color-success);
   background: var(--el-color-success-light-9);
   border-color: var(--el-color-success-light-7);
-}
-.sum-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: currentColor;
-}
-.running-summary.on .sum-dot {
-  animation: sum-pulse 1.8s ease-in-out infinite;
-}
-@keyframes sum-pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.35; }
-}
-.subtitle {
-  font-size: 12px;
-  color: var(--el-text-color-secondary);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 /* --- 服务选择器卡片 --- */
@@ -219,7 +171,7 @@ onMounted(async () => {
   align-items: center;
   gap: 10px;
   padding: 8px 10px;
-  border-radius: 8px;
+  border-radius: var(--app-radius-md);
   border: 1px solid var(--el-border-color-lighter);
   background: var(--el-bg-color-overlay);
   cursor: pointer;
@@ -229,7 +181,7 @@ onMounted(async () => {
 }
 .service-card:hover {
   border-color: var(--el-color-primary-light-5);
-  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.06);
+  box-shadow: var(--app-shadow-hover);
 }
 .service-card:active {
   transform: scale(0.99);
@@ -242,7 +194,7 @@ onMounted(async () => {
 .svc-ico {
   width: 26px;
   height: 26px;
-  border-radius: 7px;
+  border-radius: var(--app-radius-md);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -264,7 +216,7 @@ onMounted(async () => {
   min-width: 0;
 }
 .svc-title {
-  font-size: 12.5px;
+  font-size: 13px;
   font-weight: 600;
   color: var(--el-text-color-primary);
   line-height: 1.3;
@@ -286,24 +238,13 @@ onMounted(async () => {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  font-size: 10.5px;
+  font-size: 11px;
   color: var(--el-text-color-secondary);
   font-family: var(--app-font-mono);
   user-select: none;
 }
 .svc-status.on {
   color: var(--el-color-success);
-}
-.st-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--el-text-color-disabled);
-}
-.svc-status.on .st-dot {
-  background: var(--el-color-success);
-  box-shadow: 0 0 5px color-mix(in srgb, var(--el-color-success) 70%, transparent);
-  animation: sum-pulse 1.8s ease-in-out infinite;
 }
 .svc-port {
   font-size: 11px;

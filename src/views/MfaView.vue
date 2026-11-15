@@ -13,6 +13,8 @@ import { ElMessage, ElMessageBox } from "element-plus";
 import * as totpApi from "@/api/totp";
 import type { TotpEntry, TotpCode } from "@/api/totp";
 import { useTerminalsStore } from "@/stores/terminals";
+import PageHeader from "@/components/PageHeader.vue";
+import EmptyState from "@/components/EmptyState.vue";
 
 defineOptions({ name: "MfaView" });
 
@@ -320,27 +322,29 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="mfa-view">
-    <header class="mfa-header">
-      <div class="title-area">
-        <el-icon class="title-icon"><Iphone /></el-icon>
-        <h2>MFA 验证码</h2>
-        <span class="subtitle">TOTP 双因素验证码管理 · 自动填充到终端</span>
-      </div>
-      <div class="actions">
-        <el-button :icon="'Refresh'" size="small" @click="load">刷新</el-button>
-        <el-button type="primary" :icon="'Plus'" size="small" @click="openAdd">
-          添加验证码
-        </el-button>
-      </div>
-    </header>
+    <PageHeader
+      title="MFA 验证码"
+      subtitle="TOTP 双因素验证码管理 · 自动填充到终端"
+      icon="Iphone"
+      inline-subtitle
+    >
+      <template #actions>
+        <el-button :icon="'Refresh'" @click="load">刷新</el-button>
+        <el-button type="primary" :icon="'Plus'" @click="openAdd">添加验证码</el-button>
+      </template>
+    </PageHeader>
 
     <!-- 列表 -->
     <div v-loading="loading" class="mfa-list">
-      <div v-if="entries.length === 0 && !loading" class="empty-tip">
-        <el-icon><Iphone /></el-icon>
-        <p>还没有 MFA 条目</p>
-        <span>点击"添加验证码"，输入 otpauth URI 或手动填写 secret</span>
-      </div>
+      <EmptyState
+        v-if="entries.length === 0 && !loading"
+        class="mfa-empty"
+        icon="Iphone"
+        title="还没有 MFA 条目"
+        description="点击「添加验证码」，输入 otpauth URI 或手动填写 secret"
+      >
+        <el-button type="primary" :icon="'Plus'" @click="openAdd">添加验证码</el-button>
+      </EmptyState>
 
       <div v-for="e in entries" :key="e.id" class="mfa-card" :class="{ urgent: isUrgent(e) }">
         <!-- 左：发行方/账号 + 大字号码 -->
@@ -389,10 +393,10 @@ onBeforeUnmount(() => {
             </el-tooltip>
             <el-tooltip content="删除" placement="top">
               <el-button
+                class="mfa-del-btn"
                 :icon="'Delete'"
                 circle
                 size="small"
-                type="danger"
                 @click="removeEntry(e)"
               />
             </el-tooltip>
@@ -460,68 +464,21 @@ onBeforeUnmount(() => {
   flex-direction: column;
   height: 100%;
   overflow: hidden;
+  background: var(--el-bg-color-page);
 }
-.mfa-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--el-border-color-lighter);
-  flex-shrink: 0;
-}
-.title-area {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-}
-.title-icon {
-  font-size: 22px;
-  color: var(--el-color-primary);
-  align-self: center;
-}
-.title-area h2 {
-  margin: 0;
-  font-size: 16px;
-}
-.subtitle {
-  font-size: 12px;
-  color: var(--el-text-color-secondary);
-}
-.actions {
-  display: flex;
-  gap: 8px;
-}
-
 /* 列表 */
 .mfa-list {
   flex: 1;
   overflow: auto;
-  padding: 16px;
+  padding: 16px 20px 20px;
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
   gap: 12px;
   align-content: start;
 }
-.empty-tip {
+/* 空状态横跨整个网格 */
+.mfa-empty {
   grid-column: 1 / -1;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  padding: 60px 20px;
-  color: var(--el-text-color-secondary);
-}
-.empty-tip .el-icon {
-  font-size: 48px;
-  margin-bottom: 8px;
-  opacity: 0.4;
-}
-.empty-tip p {
-  margin: 4px 0;
-  font-size: 14px;
-}
-.empty-tip span {
-  font-size: 12px;
 }
 
 /* 卡片 */
@@ -532,12 +489,12 @@ onBeforeUnmount(() => {
   padding: 14px 16px;
   background: var(--el-bg-color-overlay);
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 8px;
+  border-radius: var(--app-radius-md);
   transition: border-color 0.2s, box-shadow 0.2s;
 }
 .mfa-card:hover {
   border-color: var(--el-color-primary-light-5);
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+  box-shadow: var(--app-shadow-hover);
 }
 .mfa-card.urgent {
   border-color: var(--el-color-warning);
@@ -565,12 +522,14 @@ onBeforeUnmount(() => {
   font-size: 10px;
 }
 .code-display {
-  font-family: "Cascadia Code", Consolas, monospace;
+  font-family: var(--app-font-mono);
   font-size: 28px;
   font-weight: 700;
   letter-spacing: 3px;
   color: var(--el-color-primary);
   line-height: 1.2;
+  /* 等宽数字：每秒刷新倒计时时号码不抖动 */
+  font-variant-numeric: tabular-nums;
 }
 
 /* 倒计时环 */
@@ -612,10 +571,17 @@ onBeforeUnmount(() => {
   font-size: 12px;
   font-weight: 600;
   color: var(--el-text-color-regular);
+  font-variant-numeric: tabular-nums;
 }
 .card-actions {
   display: flex;
   gap: 4px;
+}
+/* 删除默认中性，悬停才红色化，避免每张卡片都挂一个强警示按钮 */
+.mfa-del-btn:hover {
+  color: var(--el-color-danger);
+  border-color: var(--el-color-danger-light-5);
+  background: var(--el-color-danger-light-9);
 }
 
 /* 预览 */
@@ -625,13 +591,13 @@ onBeforeUnmount(() => {
   color: var(--el-text-color-secondary);
 }
 .preview-code {
-  font-family: monospace;
+  font-family: var(--app-font-mono);
   font-size: 16px;
   font-weight: 700;
   color: var(--el-color-success);
   letter-spacing: 2px;
 }
 .mono :deep(input) {
-  font-family: "Cascadia Code", Consolas, monospace;
+  font-family: var(--app-font-mono);
 }
 </style>

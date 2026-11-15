@@ -159,14 +159,59 @@ export function useZmodemTransfer(
     active.value = false;
     progress.value = null;
     session = null;
+    lastActivityAt = Date.now();
+    if (closeWatchdog) {
+      clearTimeout(closeWatchdog);
+      closeWatchdog = null;
+    }
   }
 
   // ---------------------------------------------------------------------------
   // 下载：远端 sz → 我们
   // ---------------------------------------------------------------------------
 
-  /** 最近一次收到 offer 的时刻：sz 取消保存框后判定对端是否已卡死。 */
-  let lastOfferAt = 0;
+  /** 最近一次会话活动（收到 offer / 数据 / 结束）的时刻：判定对端是否已卡死。 */
+  let lastActivityAt = 0;
+
+  /** 收尾看门狗（下载侧）：远端 sz 发完文件后应发 ZFIN，zmodem.js 的
+   *  Receive 会话会自动回 ZFIN、收到 OO 后触发 session_end。对端卡死时
+   *  session_end 永不到来，active 会永久为 true 把键盘门控住——这里兜底
+   *  强制中止。出现任何新活动（新 offer / 数据）都会重排该定时器。 */
+  let closeWatchdog: ReturnType<typeof setTimeout> | null = null;
+  const CLOSE_IDLE_TIMEOUT_MS = 30_000;
+
+  /** 正在处理的 offer 数（保存对话框打开 / 文件接收中）。>0 时看门狗不得
+   *  中止会话：多文件场景下下一个 ZFILE 可能在本文件的收尾（flushChain）
+   *  期间就到达，若此时挂上定时器，用户停留在保存对话框超过 30s 就会被
+   *  误判为"对端卡死"而把健康会话 CAN 掉。 */
+  let offersInFlight = 0;
+
+  function noteActivity() {
+    lastActivityAt = Date.now();
+    if (closeWatchdog) {
+      clearTimeout(closeWatchdog);
+      closeWatchdog = null;
+    }
+  }
+
+  function armCloseWatchdog(sess: ZmodemSession) {
+    // 会话已结束（session_end 已把 active 置 false）时不要挂看门狗：
+    // 多文件场景下最后一个文件的 accept 与 session_end 几乎同时发生，
+    // 此时再挂定时器会在 30 秒后往 shell 提示符里注入 CAN/BS 字节。
+    // 还有在途 offer（对话框/接收中）时同样不挂——它的完成路径会再挂。
+    if (sess.aborted() || !active.value || offersInFlight > 0) return;
+    if (closeWatchdog) clearTimeout(closeWatchdog);
+    closeWatchdog = setTimeout(() => {
+      closeWatchdog = null;
+      // 定时器触发时再次确认会话仍然存活、且没有在途 offer。
+      // abort 自带 5×CAN+5×BS 并触发 session_end 复位状态；强化 CAN 序列
+      // 确保远端退出。先进入静默排空，吞掉在途的协议字节。
+      if (sess.aborted() || !active.value || offersInFlight > 0) return;
+      startDiscard();
+      sendHardAbort();
+      sess.abort();
+    }, CLOSE_IDLE_TIMEOUT_MS);
+  }
 
   // store 在传输回调运行时获取（pinia 此时已激活；避免模块顶层依赖）。
   const transfer = useTransferStore();
@@ -188,31 +233,52 @@ export function useZmodemTransfer(
 
   async function runReceive(sess: ZmodemSession) {
     sess.on("offer", (offer: ZmodemOffer) => {
-      lastOfferAt = Date.now();
+      noteActivity();
       void receiveOffer(sess, offer);
     });
     // 发送 ZRINIT，远端收到后开始 ZFILE 报价。
     await sess.start();
   }
 
+  /**
+   * 处理一个文件报价。
+   *
+   * 外层只负责"在途 offer 计数 + 收尾看门狗"：一个 offer 处理完（成功 /
+   * 用户取消 / 失败）后挂看门狗，若此时还有别的 offer 在途（多文件连续
+   * 到达），armCloseWatchdog 会自行跳过，等最后一个处理完再挂。
+   */
   async function receiveOffer(sess: ZmodemSession, offer: ZmodemOffer) {
+    offersInFlight++;
+    try {
+      await receiveOfferInner(sess, offer);
+    } finally {
+      offersInFlight--;
+      if (!sess.aborted()) armCloseWatchdog(sess);
+    }
+  }
+
+  async function receiveOfferInner(sess: ZmodemSession, offer: ZmodemOffer) {
     const details = offer.get_details();
     const name = (details.name || "unnamed").split(/[\\/]/).pop() || "unnamed";
 
     // 对话框命令异常（后端错误）按取消处理，避免走"传输异常"误报路径。
     const path = await resolveSavePath(name).catch(() => null);
     if (!path) {
-      // 用户取消：跳过该文件，远端继续下一个或结束会话。对端若就此发
-      // ZFIN 结束，同样需要我方回 ZFIN 握手，否则 sz 挂起不退回提示符。
+      // 用户取消：跳过该文件（ZSKIP），远端继续下一个或结束会话。
+      //
+      // 注意：Receive 会话没有 close() 方法（只有 Send 有），不能像上传那样
+      // 调 sess.close()——那会同步抛 TypeError，被 catch 吞掉后立刻走硬中止，
+      // 把 `sz a.txt b.txt` 的后续文件全部截断。
+      // 正确做法是只 skip：远端要么发下一个 ZFILE（offer 事件），要么发
+      // ZFIN 结束（库自动回 ZFIN 并触发 session_end）。两者都不来说明对端
+      // 已卡死，等待窗口内无任何活动则强制中止（否则键盘被永久门控）。
       offer.skip();
-      try {
-        await withTimeout(sess.close(), 15_000);
-      } catch {
-        /* 还有后续 offer 时 close 会被拒绝/挂起到超时，均忽略 */
-      }
-      // close 超时且会话仍存活、等待期间也没有新 offer 到来：对端已卡死，
-      // 强制中止（强化 CAN + 静默排空）——否则键盘被门控、终端回不到提示符。
-      if (!sess.aborted() && Date.now() - lastOfferAt > 1500) {
+      const before = lastActivityAt;
+      // 5 秒内没有任何活动（无新 offer、无 session_end、无数据）才判定对端
+      // 卡死。窗口不能太短：ZSKIP 之后远端是否立刻发下一个 ZFILE 取决于
+      // 网络往返与远端读文件速度，过早硬中止会把后续文件全部截断。
+      await new Promise<void>((r) => setTimeout(r, 5000));
+      if (!sess.aborted() && lastActivityAt === before) {
         startDiscard();
         sendHardAbort();
         sess.abort();
@@ -274,11 +340,8 @@ export function useZmodemTransfer(
 
     // 会话结束（连接断开/取消/对端中止）时立即结束 accept：zmodem.js 的
     // accept promise 只在收到 ZEOF 时才 settle，不兜底会永久挂起、句柄不关。
-    // sessionEndedFired 标记用于完成路径判定 close() 后会话是否真的结束。
-    let sessionEndedFired = false;
     const sessionEnded = new Promise<void>((resolve) => {
       sess.on("session_end", () => {
-        sessionEndedFired = true;
         resolve();
       });
     });
@@ -299,6 +362,7 @@ export function useZmodemTransfer(
         offer.accept({
           on_input: (octets) => {
             refreshTimer();
+            noteActivity();
             const chunk = new Uint8Array(octets);
             buffer.push(chunk);
             buffered += chunk.length;
@@ -326,25 +390,12 @@ export function useZmodemTransfer(
         transfer.update(taskId, { status: "done", endedAt: Date.now() });
         ElMessage.success(`已下载：${name}`);
       }
-      // ZFIN 收尾握手（与上传路径的 sess.close() 对称）：ZEOF 只表示数据发完，
-      // 远端 sz 要收到我方 ZFIN 才会退出。缺这一步 sz 永久等待，终端停在
-      // "**B00000000000000"（sz 的 ZFIN 帧文本）不回 shell 提示符。
-      // 对端无响应时 15s 超时兜底，避免挂起。
-      if (!sess.aborted()) {
-        try {
-          await withTimeout(sess.close(), 15_000);
-        } catch {
-          /* 已结束/重复关闭等，忽略 */
-        }
-        // close 超时/对端未回 ZFIN：session_end 不触发会让 active 卡在
-        // true（键盘被永久门控），远端 sz 也不退出。强制中止收尾——
-        // abort 自带 5×CAN+5×BS 并触发 session_end 复位状态；强化 CAN
-        // 序列确保远端退出。
-        if (!sessionEndedFired && !sess.aborted()) {
-          sendHardAbort();
-          sess.abort();
-        }
-      }
+      // ZFIN 收尾是协议**自动完成**的：远端 sz 发完文件后发 ZFIN，
+      // zmodem.js 的 Receive 会话会自动回 ZFIN、收到 OO 后触发 session_end
+      // 并把 active 复位。Receive 会话没有 close() 方法（只有 Send 有），
+      // 绝不能在这里调 sess.close()。
+      // 收尾看门狗由 receiveOffer 的外层 finally 统一挂（那里还负责
+      // offersInFlight 计数，避免把"用户停留在保存对话框"误判为卡死）。
     } catch (err) {
       if (!sess.aborted()) {
         console.warn("[zmodem] 下载失败", err);
@@ -354,6 +405,12 @@ export function useZmodemTransfer(
           endedAt: Date.now(),
         });
         ElMessage.error(`下载失败：${err instanceof Error ? err.message : String(err)}`);
+        // 失败同样必须中止会话：否则 session_end 不触发，active 永久为 true
+        // 把键盘/粘贴全部吞掉，而进度浮层（含取消按钮）已在 finally 里消失，
+        // 用户只能断开重连才能恢复输入。与上传路径的 catch 保持一致。
+        startDiscard();
+        sendHardAbort();
+        sess.abort();
       } else {
         transfer.update(taskId, { status: "cancelled", endedAt: Date.now() });
       }

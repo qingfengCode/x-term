@@ -24,6 +24,12 @@ export const useUiStore = defineStore("ui", () => {
   const sshAuthVisible = ref(false);
   const hostKeyVisible = ref(false);
 
+  /**
+   * 传输队列（文件页底部）是否折叠。放在全局 store：文件页不在 KeepAlive
+   * 名单里，切页重挂后组件局部状态会丢失、队列自动弹开，用户折叠意愿被覆盖。
+   */
+  const transferQueueCollapsed = ref(false);
+
   function toggleAi() {
     aiCollapsed.value = !aiCollapsed.value;
   }
@@ -44,5 +50,6 @@ export const useUiStore = defineStore("ui", () => {
     setAiWidth,
     sshAuthVisible,
     hostKeyVisible,
+    transferQueueCollapsed,
   };
 });

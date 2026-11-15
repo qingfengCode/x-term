@@ -17,6 +17,8 @@
 -->
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from "vue";
+import { useMenuKeyboard } from "@/composables/useMenuKeyboard";
+import StatusDot from "@/components/StatusDot.vue";
 
 /** 单个标签的数据抽象（终端 tab 与桌面 tab 的公共子集）。 */
 export interface TabBarItem {
@@ -136,6 +138,8 @@ const menu = ref<{ x: number; y: number; tab: TabBarItem | null }>({
   y: 0,
   tab: null,
 });
+/** 右键菜单根元素（键盘导航用）。 */
+const menuEl = ref<HTMLElement | null>(null);
 
 function onContextMenu(tab: TabBarItem, e: MouseEvent) {
   // 窗口右/下边缘右键时按菜单估算尺寸钳制坐标，避免菜单超出视口被裁掉。
@@ -144,11 +148,17 @@ function onContextMenu(tab: TabBarItem, e: MouseEvent) {
     y: Math.min(e.clientY, window.innerHeight - MENU_H - 8),
     tab,
   };
+  void focusFirst();
 }
 
 function closeMenu() {
   menu.value.tab = null;
 }
+
+const { focusFirst, onKeydown: onMenuKeydown, onItemKeydown } = useMenuKeyboard(
+  menuEl,
+  closeMenu,
+);
 
 function onMenuCommand(
   cmd:
@@ -185,15 +195,20 @@ defineExpose({ closeMenu });
 </script>
 
 <template>
-  <div class="tabs-scroll" @wheel="onWheel">
+  <div class="tabs-scroll" role="tablist" @wheel="onWheel">
     <div
       v-for="(tab, i) in props.tabs"
       :key="tab.key"
       class="tab"
       :class="{ active: tab.key === props.activeKey, dragging: dragKey === tab.key }"
+      role="tab"
+      :aria-selected="tab.key === props.activeKey"
+      tabindex="0"
       draggable="true"
       :title="tab.title"
       @click="onSelect(tab)"
+      @keydown.enter.prevent="onSelect(tab)"
+      @keydown.space.prevent="onSelect(tab)"
       @auxclick="(e: MouseEvent) => onAuxClick(tab, e)"
       @mousedown.middle.prevent
       @contextmenu.prevent="(e: MouseEvent) => onContextMenu(tab, e)"
@@ -201,10 +216,11 @@ defineExpose({ closeMenu });
       @dragover="(e: DragEvent) => onDragOver(e, tab.key)"
       @dragend="onDragEnd"
     >
-      <span
+      <StatusDot
         v-if="!tab.hideDot"
-        class="dot"
-        :class="{ connecting: tab.connecting, dead: tab.disconnected }"
+        :tone="tab.disconnected ? 'danger' : tab.connecting ? 'warning' : 'success'"
+        :size="7"
+        :pulse="!!tab.connecting"
       />
       <el-icon v-if="tab.icon" class="tab-ico"><component :is="tab.icon" /></el-icon>
       <span v-if="i < 9" class="tab-idx">{{ i + 1 }}</span>
@@ -218,44 +234,89 @@ defineExpose({ closeMenu });
     <!-- 右键菜单（fixed 浮层） -->
     <div
       v-if="menu.tab"
+      ref="menuEl"
       class="tab-menu"
+      role="menu"
+      tabindex="-1"
       :style="{ left: menu.x + 'px', top: menu.y + 'px' }"
+      @keydown="onMenuKeydown"
       @click.stop
     >
       <!-- 复制 SSH 通道：同一条已认证连接上开新 channel（不重新认证） -->
       <div
-        class="tab-menu-item"
         v-if="menu.tab?.cloneable"
+        class="tab-menu-item"
+        role="menuitem"
+        tabindex="-1"
         title="在同一条已认证连接上开新终端标签页，不重新认证（二次认证无需再输口令码）"
+        @keydown="onItemKeydown"
         @click="onMenuCommand('cloneChannel')"
       >
         复制 SSH 通道
       </div>
       <!-- 复制：同配置新开一条独立连接 -->
       <div
-        class="tab-menu-item"
         v-if="menu.tab?.duplicable"
+        class="tab-menu-item"
+        role="menuitem"
+        tabindex="-1"
         title="用同一会话配置新开一条独立连接的终端标签页（会重新认证）"
+        @keydown="onItemKeydown"
         @click="onMenuCommand('duplicate')"
       >
         复制
       </div>
       <!-- 重命名：仅改本页签显示标题（不回写会话配置） -->
       <div
-        class="tab-menu-item"
         v-if="menu.tab?.renamable"
+        class="tab-menu-item"
+        role="menuitem"
+        tabindex="-1"
         title="修改本页签显示的标题（不影响会话配置名称）"
+        @keydown="onItemKeydown"
         @click="onMenuCommand('rename')"
       >
         重命名
       </div>
       <div class="tab-menu-sep" v-if="menu.tab?.duplicable || menu.tab?.renamable" />
-      <div class="tab-menu-item" @click="onMenuCommand('close')">关闭</div>
-      <div class="tab-menu-item" @click="onMenuCommand('closeOthers')">关闭其他</div>
-      <div class="tab-menu-item" @click="onMenuCommand('closeAll')">关闭全部</div>
+      <div
+        class="tab-menu-item"
+        role="menuitem"
+        tabindex="-1"
+        @keydown="onItemKeydown"
+        @click="onMenuCommand('close')"
+      >
+        关闭
+      </div>
+      <div
+        class="tab-menu-item"
+        role="menuitem"
+        tabindex="-1"
+        @keydown="onItemKeydown"
+        @click="onMenuCommand('closeOthers')"
+      >
+        关闭其他
+      </div>
+      <div
+        class="tab-menu-item"
+        role="menuitem"
+        tabindex="-1"
+        @keydown="onItemKeydown"
+        @click="onMenuCommand('closeAll')"
+      >
+        关闭全部
+      </div>
       <template v-if="menu.tab.disconnected">
         <div class="tab-menu-sep" />
-        <div class="tab-menu-item" @click="onMenuCommand('reconnect')">重新连接</div>
+        <div
+          class="tab-menu-item"
+          role="menuitem"
+          tabindex="-1"
+          @keydown="onItemKeydown"
+          @click="onMenuCommand('reconnect')"
+        >
+          重新连接
+        </div>
       </template>
     </div>
   </div>
@@ -268,9 +329,22 @@ defineExpose({ closeMenu });
   flex: 1;
   min-width: 0;
   overflow-x: auto;
+  /* 页签多时用悬停渐显的细滚动条提示可横滑，平时不占视觉 */
+  scrollbar-width: thin;
 }
 .tabs-scroll::-webkit-scrollbar {
-  height: 0;
+  height: 3px;
+}
+.tabs-scroll::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 2px;
+  transition: background 0.15s ease;
+}
+.tabs-scroll:hover::-webkit-scrollbar-thumb {
+  background: var(--el-border-color);
+}
+.tabs-scroll::-webkit-scrollbar-track {
+  background: transparent;
 }
 .tab {
   position: relative;
@@ -280,7 +354,7 @@ defineExpose({ closeMenu });
   height: 26px;
   padding: 0 10px;
   margin-right: 4px;
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   cursor: pointer;
   font-size: 12px;
   color: var(--el-text-color-secondary);
@@ -291,6 +365,11 @@ defineExpose({ closeMenu });
 .tab:hover {
   background: var(--el-fill-color-light);
   color: var(--el-text-color-primary);
+}
+/* 键盘焦点：页签可聚焦（Enter/空格切换），内描边避免改变布局 */
+.tab:focus-visible {
+  outline: 2px solid var(--el-color-primary);
+  outline-offset: -2px;
 }
 .tab.active {
   background: var(--el-color-primary-light-9);
@@ -318,29 +397,6 @@ defineExpose({ closeMenu });
   font-size: 12px;
   flex-shrink: 0;
 }
-.tab .dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--el-color-success);
-  flex-shrink: 0;
-}
-.tab .dot.connecting {
-  background: var(--el-color-warning);
-  animation: tab-dot-pulse 1.1s ease-in-out infinite;
-}
-@keyframes tab-dot-pulse {
-  0%,
-  100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.25;
-  }
-}
-.tab .dot.dead {
-  background: var(--el-color-danger);
-}
 /* 拖拽中的 tab 半透明提示 */
 .tab.dragging {
   opacity: 0.5;
@@ -349,7 +405,7 @@ defineExpose({ closeMenu });
 .tab .close {
   font-size: 12px;
   padding: 2px;
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   color: var(--el-text-color-placeholder);
   opacity: 0;
   transition:
@@ -371,7 +427,7 @@ defineExpose({ closeMenu });
   height: 15px;
   line-height: 15px;
   padding: 0 3px;
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   background: var(--el-fill-color-dark);
   color: var(--el-text-color-placeholder);
   font-family: var(--app-font-mono);
@@ -396,10 +452,8 @@ defineExpose({ closeMenu });
   min-width: 148px;
   background: var(--el-bg-color-overlay);
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 8px;
-  box-shadow:
-    0 8px 24px rgba(0, 0, 0, 0.16),
-    0 2px 8px rgba(0, 0, 0, 0.08);
+  border-radius: var(--app-radius-md);
+  box-shadow: var(--app-shadow-2);
   padding: 4px;
   /* 统一浮层层级（与 SqlConsoleView 菜单一致；高于 el-dialog 遮罩 2000+，
      低于右侧终端右键菜单被浮层遮挡的问题不复存在）。 */
@@ -407,7 +461,7 @@ defineExpose({ closeMenu });
 }
 .tab-menu-item {
   padding: 6px 10px;
-  border-radius: 5px;
+  border-radius: var(--app-radius-xs);
   font-size: 13px;
   color: var(--el-text-color-primary);
   cursor: pointer;

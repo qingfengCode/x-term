@@ -383,6 +383,14 @@ const DISCONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 /// 会无限阻塞；写入按此超时兜底，超时视为连接已坏、退出 reader 循环。
 const CHANNEL_WRITE_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// `close()` 等待 reader 完成收尾（冲刷批次 + eof/close + 事件 + 日志落盘）的最长时间。
+///
+/// 必须**大于** [`CHANNEL_WRITE_STALL_TIMEOUT`]：reader 处理 `InputMsg::Close`
+/// 时会先做最多 5 秒的 eof/close 超时等待，期间还要执行输出日志收尾与
+/// TERMINAL_EXIT/CLOSED 事件。旧值 1 秒导致连接卡死时 reader 必然被 abort，
+/// 上述收尾全部被跳过（输出日志尾行丢失、关闭事件缺失、积压写入的 ack 丢失）。
+const CLOSE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
+
 /// 终端输出批量 emit 间隔（毫秒）。远端输出先累积进批次，到点才 emit 一次；
 /// 兼顾交互延迟（16ms ≈ 1 帧）与 IPC 次数（高吞吐下降 1~2 个数量级）。
 const TERMINAL_BATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
@@ -483,7 +491,14 @@ impl SshSession {
             session_config.port,
             &uuid::Uuid::new_v4().simple().to_string()[..8]
         );
-        let handle = client::connect_direct_terminal(
+        // 连接 / 会话建立失败时清理断开原因条目：disconnected 回调在**任何**
+        // 连接结束路径都会按 disconnect_key 写入原因，而条目只由终端 reader
+        // 退出时 remove。若连接已建（TCP+握手完成）但后续失败（认证失败/超时/
+        // 用户取消、channel/PTY/shell 被拒），reader 从未启动 → 条目无人消费。
+        // 该回调是异步触发的（Handle drop 后客户端任务收尾时才调用），所以这里
+        // 的 remove 只能覆盖"回调已先触发"的情况；真正的兜底是 client.rs 里给
+        // 注册表加的硬上限（256 条）。
+        let handle = match client::connect_direct_terminal(
             &session_config.host,
             session_config.port,
             &session_config.username,
@@ -492,28 +507,48 @@ impl SshSession {
             state,
             disconnect_key.clone(),
         )
-        .await?;
+        .await
+        {
+            Ok(h) => h,
+            Err(e) => {
+                disconnect_reasons.lock().remove(&disconnect_key);
+                return Err(e);
+            }
+        };
 
-        // 打开 session channel。
-        let channel = handle
-            .channel_open_session()
-            .await
-            .map_err(|e| AppError::Ssh(format!("打开 channel 失败: {}", e)))?;
+        // 打开 session channel / 请求 PTY / 请求 shell。
+        let setup = async {
+            let channel = handle
+                .channel_open_session()
+                .await
+                .map_err(|e| AppError::Ssh(format!("打开 channel 失败: {}", e)))?;
 
-        // 请求 PTY。terminal modes 对齐 OpenSSH 客户端默认值（完整 termios
-        // 参数）：russh 传空切片时 modes 为空串，个别服务器（如 JumpServer
-        // koko）的会话/空闲检测依赖 PTY 参数，空 modes 可能被判定异常。
-        // want_reply 用 true 与 OpenSSH 一致（russh 不等待服务器确认）。
-        channel
-            .request_pty(true, "xterm-256color", 80, 24, 0, 0, &default_pty_modes())
-            .await
-            .map_err(|e| AppError::Ssh(format!("请求 PTY 失败: {}", e)))?;
+            // 请求 PTY。terminal modes 对齐 OpenSSH 客户端默认值（完整 termios
+            // 参数）：russh 传空切片时 modes 为空串，个别服务器（如 JumpServer
+            // koko）的会话/空闲检测依赖 PTY 参数，空 modes 可能被判定异常。
+            // want_reply 用 true 与 OpenSSH 一致（russh 不等待服务器确认）。
+            channel
+                .request_pty(true, "xterm-256color", 80, 24, 0, 0, &default_pty_modes())
+                .await
+                .map_err(|e| AppError::Ssh(format!("请求 PTY 失败: {}", e)))?;
 
-        // 请求交互式 shell。
-        channel
-            .request_shell(true)
-            .await
-            .map_err(|e| AppError::Ssh(format!("请求 shell 失败: {}", e)))?;
+            // 请求交互式 shell。
+            channel
+                .request_shell(true)
+                .await
+                .map_err(|e| AppError::Ssh(format!("请求 shell 失败: {}", e)))?;
+            Ok::<_, AppError>(channel)
+        }
+        .await;
+        let channel = match setup {
+            Ok(c) => c,
+            Err(e) => {
+                // channel/PTY/shell 失败后连接随之关闭，disconnected 回调又会
+                // 写入一次原因——remove 在此之后再执行一次也无害（条目已清）。
+                disconnect_reasons.lock().remove(&disconnect_key);
+                return Err(e);
+            }
+        };
 
         Ok(SshSession {
             id: uuid::Uuid::new_v4().to_string(),
@@ -968,8 +1003,9 @@ pub async fn close(&mut self) -> AppResult<()> {
         if let Some(tx) = self.input_tx.take() {
             let (ack_tx, ack_rx) = oneshot::channel();
             let _ = tx.send(InputMsg::Close(ack_tx));
-            // 给最多 1 秒等待 reader 关闭。
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), ack_rx).await;
+            // 等待 reader 收尾：正常毫秒级返回；连接卡死时最多等 CLOSE_ACK_TIMEOUT
+            //（必须覆盖 reader 内部的 eof/close 超时，见常量注释）。
+            let _ = tokio::time::timeout(CLOSE_ACK_TIMEOUT, ack_rx).await;
         }
 
         // 强制 abort reader（若仍在运行）。

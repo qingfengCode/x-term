@@ -13,6 +13,7 @@ import { credentialSave } from "@/api/vault";
 import { remoteDesktopLaunch, type Desktop } from "@/api/remote_desktop";
 import { parseQuickConnect, type QuickConnectTarget } from "@/utils/quickConnect";
 import SessionDialog from "./SessionDialog.vue";
+import EmptyState from "./EmptyState.vue";
 
 const sessionsStore = useSessionsStore();
 const terminalsStore = useTerminalsStore();
@@ -644,13 +645,17 @@ async function onNodeDrop(
       </el-tree>
 
       <!-- 空状态 -->
-      <div v-else class="empty-state">
-        <el-icon class="empty-icon"><Connection /></el-icon>
-        <p class="empty-text">还没有会话，点击右上角新建</p>
+      <EmptyState
+        v-else
+        class="empty-state"
+        icon="Connection"
+        title="还没有会话，点击右上角新建"
+        size="sm"
+      >
         <el-button type="primary" size="small" @click="openNewSession(null)">
           新建会话
         </el-button>
-      </div>
+      </EmptyState>
     </div>
 
     <!-- 新建/编辑对话框 -->
@@ -723,7 +728,7 @@ async function onNodeDrop(
   align-items: center;
   height: 28px;
   padding: 0 2px;
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   transition: background-color 0.15s ease;
 }
 .recent-item:hover {
@@ -746,14 +751,16 @@ async function onNodeDrop(
   color: var(--el-color-primary);
 }
 .recent-menu {
-  display: none;
+  /* 常驻占位，避免悬停出现"更多"时挤压名称文本 */
+  display: flex;
+  visibility: hidden;
   align-items: center;
   cursor: pointer;
   padding: 2px;
 }
 .recent-item:hover .recent-menu,
 .recent-menu:focus-within {
-  display: flex;
+  visibility: visible;
 }
 
 /* 快速连接条目 */
@@ -768,7 +775,7 @@ async function onNodeDrop(
   gap: 6px;
   height: 30px;
   padding: 0 6px;
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   cursor: pointer;
   transition: background-color 0.15s ease;
 }
@@ -797,7 +804,7 @@ async function onNodeDrop(
   font-size: 10px;
   line-height: 1;
   padding: 3px 5px;
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   color: var(--el-color-primary);
   background: var(--el-color-primary-light-9);
 }
@@ -819,7 +826,7 @@ async function onNodeDrop(
 /* el-tree 节点高度统一 28px，圆角行 + 平滑过渡 */
 .tree-wrap :deep(.el-tree-node__content) {
   height: 28px;
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   transition: background-color 0.15s ease;
 }
 
@@ -872,7 +879,9 @@ async function onNodeDrop(
 }
 
 .node-menu {
-  display: none;
+  /* 常驻占位，避免悬停出现"更多"时树节点文字被挤动 */
+  display: flex;
+  visibility: hidden;
   align-items: center;
   cursor: pointer;
   padding: 2px;
@@ -880,13 +889,13 @@ async function onNodeDrop(
 
 .tree-node:hover .node-menu,
 .node-menu:focus-within {
-  display: flex;
+  visibility: visible;
 }
 
 .node-menu-icon {
   font-size: 14px;
   color: var(--el-text-color-secondary);
-  border-radius: 5px;
+  border-radius: var(--app-radius-sm);
 }
 
 .node-menu-icon:hover {
@@ -896,33 +905,15 @@ async function onNodeDrop(
 
 /* 空状态 */
 .empty-state {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  padding: 48px 16px;
-  color: var(--el-text-color-secondary);
-}
-
-.empty-icon {
-  font-size: 40px;
-  color: var(--el-text-color-placeholder);
-}
-
-.empty-text {
-  margin: 0;
-  font-size: 12px;
-  text-align: center;
-  line-height: 1.6;
+  padding: 40px 16px;
 }
 
 /* 滚动条美化 */
 .tree-wrap::-webkit-scrollbar {
-  width: 6px;
+  width: var(--app-scrollbar-thin);
 }
 .tree-wrap::-webkit-scrollbar-thumb {
   background: var(--el-border-color);
-  border-radius: 3px;
+  border-radius: var(--app-radius-xs);
 }
 </style>

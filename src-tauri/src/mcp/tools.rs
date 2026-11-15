@@ -783,8 +783,9 @@ fn tool_defs_db(resource_mode: &str, bound_database: Option<&str>) -> Vec<Value>
                     "sql": { "type": "string", "description": "要执行的 SQL 语句" },
                     "limit": {
                         "type": "integer",
-                        "description": "返回行数上限，默认 100",
-                        "minimum": 1
+                        "description": "返回行数上限，默认 100（最大 1000，超出按 1000 处理）",
+                        "minimum": 1,
+                        "maximum": 1000
                     }
                 },
                 "required": ["host", "username", "password", "sql"]
@@ -808,8 +809,9 @@ fn tool_defs_db(resource_mode: &str, bound_database: Option<&str>) -> Vec<Value>
                     "sql": { "type": "string", "description": "要执行的 SQL 语句" },
                     "limit": {
                         "type": "integer",
-                        "description": "返回行数上限，默认 100",
-                        "minimum": 1
+                        "description": "返回行数上限，默认 100（最大 1000，超出按 1000 处理）",
+                        "minimum": 1,
+                        "maximum": 1000
                     }
                 },
                 "required": ["sql"]

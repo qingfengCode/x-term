@@ -13,7 +13,7 @@
 
 use async_trait::async_trait;
 
-use crate::ai::tools::{ToolCall, ToolDef, ToolResult};
+use crate::ai::tools::{ToolCall, ToolDef};
 use crate::error::{AppError, AppResult};
 
 // ===========================================================================
@@ -303,10 +303,11 @@ pub trait LlmProvider: Send + Sync {
     ///
     /// 与 `chat_stream` 的区别：
     /// - `tools`：本轮暴露给模型的工具集合。为空时等价于普通对话（模型不会调用工具）。
-    /// - `tool_results`：上一轮工具调用的结果（已按 `tool_call_id` 配对）。调用方
-    ///   需要把上一轮的 assistant 消息（含 `tool_calls`）append 到 `messages`，
-    ///   再把本轮 `tool_results` 传入；本方法负责把结果序列化为厂商约定的
-    ///   "role=tool" / "tool_result" 消息塞进请求体。
+    /// - 工具结果不通过参数传入：调用方必须把上一轮的工具结果作为 `role=tool` 的
+    ///   `ChatMessage` 追加进 `messages`（紧跟对应的 assistant(tool_calls) 消息）。
+    ///   历史实现另有一个 `tool_results` 兜底参数，会在裁剪后把孤儿 tool 消息
+    ///   追加到末尾，违反 OpenAI 协议（tool 消息必须紧跟 assistant.tool_calls）
+    ///   导致严格网关直接 400——已删除。
     ///
     /// 流式过程中每得到一段文本增量都发射 `ai:chunk`（与 `chat_stream` 一致），
     /// 但**不**发射 `ai:done`——`ai:done` 由编排循环在最终（无工具调用）回合发出，
@@ -322,7 +323,6 @@ pub trait LlmProvider: Send + Sync {
         &self,
         messages: Vec<ChatMessage>,
         tools: Vec<ToolDef>,
-        tool_results: Vec<(String, ToolResult)>,
         request_id: String,
         app: tauri::AppHandle,
     ) -> AppResult<ChatWithToolsResult>;

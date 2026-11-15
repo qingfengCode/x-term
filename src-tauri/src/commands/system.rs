@@ -43,3 +43,34 @@ pub async fn reveal_in_folder(path: String) -> AppResult<()> {
     spawned.map_err(|e| AppError::Io(std::io::Error::new(e.kind(), format!("打开文件位置失败: {e}"))))?;
     Ok(())
 }
+
+/// 用系统默认浏览器打开外部 URL。
+///
+/// 前端所有"用户点击的链接"都必须走这里，而不是让 webview 自己导航：
+/// Tauri 2 中 `<a href="https://...">` 的默认行为是在应用 webview 内导航，
+/// 会把整个 X-Term 窗口替换成外部网页（未保存状态全丢，且构成应用内钓鱼）。
+///
+/// 只允许 `http` / `https`（以及 `mailto`），其它 scheme（`file:`、`javascript:`、
+/// `data:` 等）一律拒绝——避免把本地文件或可执行协议交给系统外壳。
+#[tauri::command]
+pub async fn open_external_url(app: tauri::AppHandle, url: String) -> AppResult<()> {
+    let parsed = tauri::Url::parse(url.trim())
+        .map_err(|_| AppError::InvalidInput(format!("无效的 URL：{url}")))?;
+    match parsed.scheme() {
+        "http" | "https" | "mailto" => {}
+        other => {
+            return Err(AppError::InvalidInput(format!(
+                "不允许打开 {other}: 链接（只支持 http/https/mailto）"
+            )));
+        }
+    }
+    // shell 插件的 open 在 Rust 侧调用不做 scope 校验（校验只针对前端 JS 调用）。
+    #[allow(deprecated)]
+    {
+        use tauri_plugin_shell::ShellExt;
+        app.shell()
+            .open(parsed.as_str(), None)
+            .map_err(|e| AppError::Io(std::io::Error::other(format!("打开浏览器失败: {e}"))))?;
+    }
+    Ok(())
+}

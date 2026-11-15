@@ -34,6 +34,32 @@ use storage::db;
 use storage::json_store;
 use tauri::Manager;
 
+/// 导航护栏：只允许应用自身页面，任何外部 URL 一律取消导航。
+///
+/// Tauri 2 中 `<a href="https://...">`（AI 回复里的 markdown 链接、终端里的
+/// URL 等）默认会在应用 webview 内直接导航——点一下整个 X-Term 窗口就被外部
+/// 网页替换，所有未保存状态丢失，且构成应用内钓鱼。外部链接统一走
+/// `open_external_url` 命令交给系统浏览器；这里做最后一道兜底（前端拦截
+/// 被绕过/遗漏时也不至于把窗口导航走）。
+fn navigation_guard() -> tauri::plugin::TauriPlugin<tauri::Wry> {
+    tauri::plugin::Builder::new("xterm-navigation-guard")
+        .on_navigation(|_webview, url| {
+            // 开发态：Vite dev server（http://localhost:1622）。
+            if cfg!(dev) {
+                return url.scheme() == "http"
+                    && matches!(url.host_str(), Some("localhost") | Some("127.0.0.1"));
+            }
+            // 发布态：tauri://localhost（Linux/macOS）或
+            // http(s)://tauri.localhost（Windows 的 WebView2 自定义协议；
+            // 若将来开启 useHttpsScheme 则为 https，一并放行避免白屏）。
+            url.scheme() == "tauri"
+                || (matches!(url.scheme(), "http" | "https")
+                    && url.host_str() == Some("tauri.localhost"))
+                || url.as_str() == "about:blank"
+        })
+        .build()
+}
+
 /// 启动 Tauri 应用。
 pub fn run() {
     // 日志统一由 tauri-plugin-log 管理（stdout + 应用日志目录），并承接前端
@@ -51,6 +77,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_os::init())
+        .plugin(navigation_guard())
         .plugin(
             tauri_plugin_log::Builder::new()
                 // 开发态全量 Debug 便于排障；发布态只留 Info（桥接生命周期/错误）。

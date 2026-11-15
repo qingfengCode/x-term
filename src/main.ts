@@ -9,6 +9,7 @@ import App from "./App.vue";
 import router from "./router";
 import "./styles/main.css";
 import { useSettingsStore } from "@/stores/settings";
+import { openExternalUrl } from "@/api/system";
 import { info, warn, error, debug } from "@tauri-apps/plugin-log";
 
 // 把 webview console 转发到后端日志（Rust log → dev 终端），WebView2 里无法直接
@@ -48,6 +49,30 @@ import { info, warn, error, debug } from "@tauri-apps/plugin-log";
   hook("error", "error");
   hook("debug", "debug");
 }
+
+// 全局兜底：拦截所有 `<a href>` 的点击，改走系统默认浏览器。
+//
+// Tauri webview 中链接默认在应用内导航——点一下整个窗口就被外部网页替换，
+// 未保存状态全丢（AI 回复里的 markdown 链接、帮助文档等都可能触发）。用
+// 捕获阶段拦在所有组件之前，避免各组件各写一份。Rust 侧还有导航护栏兜底。
+document.addEventListener(
+  "click",
+  (e) => {
+    const anchor = (e.target as HTMLElement | null)?.closest?.("a[href]") as
+      | HTMLAnchorElement
+      | null;
+    if (!anchor) return;
+    const href = anchor.getAttribute("href") ?? "";
+    // 站内路由链接（#/xxx 或相对路径）保持默认行为。
+    if (!/^(https?:|mailto:)/i.test(href)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    void openExternalUrl(href).catch((err) => {
+      void warn(`打开外部链接失败: ${String(err)}`).catch(() => {});
+    });
+  },
+  true,
+);
 
 const app = createApp(App);
 

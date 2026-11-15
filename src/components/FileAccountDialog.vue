@@ -255,7 +255,7 @@ async function submit() {
 .hint-text code {
   background: var(--el-fill-color-light);
   padding: 1px 4px;
-  border-radius: 3px;
+  border-radius: var(--app-radius-xs);
   font-size: 11px;
 }
 .warn-text {

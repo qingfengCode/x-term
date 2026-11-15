@@ -26,6 +26,7 @@ import TabBar, { type TabBarItem } from "@/components/TabBar.vue";
 import VncPane from "@/components/VncPane.vue";
 import RdpPane from "@/components/RdpPane.vue";
 import AiPanel from "@/components/AiPanel.vue";
+import EmptyState from "@/components/EmptyState.vue";
 import { matchesCombo } from "@/utils/shortcut";
 
 // KeepAlive 按 name 匹配缓存本组件（MainLayout），切走页面时已连接的桌面会话不中断。
@@ -520,13 +521,14 @@ function preloadRdpWasmWhenIdle() {
         </div>
 
         <!-- 空状态 -->
-        <div v-if="!active" class="desktop-empty">
-          <div class="empty-main">从左侧列表选择桌面连接打开</div>
-          <div class="empty-hint">
-            客户端模式可在「设置 → 连接」中按协议选择：程序内嵌（本页打开）或系统客户端
-            （RDP: mstsc / VNC: vncviewer）。内嵌 RDP 需填写用户名和密码。
-          </div>
-        </div>
+        <EmptyState
+          v-if="!active"
+          class="desktop-empty"
+          icon="Platform"
+          title="从左侧列表选择桌面连接打开"
+          description="客户端模式可在「设置 → 连接」中按协议选择：程序内嵌（本页打开）或系统客户端（RDP: mstsc / VNC: vncviewer）。内嵌 RDP 需填写用户名和密码。"
+          size="lg"
+        />
       </div>
     </div>
 
@@ -658,10 +660,11 @@ function preloadRdpWasmWhenIdle() {
   flex-direction: column;
   align-items: center;
   gap: 12px;
-  padding: 20px 28px;
+  padding: 24px 32px;
   background: var(--el-bg-color-overlay);
-  border-radius: 8px;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: var(--app-radius-xl);
+  box-shadow: var(--app-shadow-2);
 }
 .reconnect-title {
   font-size: 14px;
@@ -681,21 +684,5 @@ function preloadRdpWasmWhenIdle() {
 /* --- 空状态 --- */
 .desktop-empty {
   height: 100%;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  padding: 0 24px;
-}
-.empty-main {
-  font-size: 14px;
-  color: var(--el-text-color-secondary);
-}
-.empty-hint {
-  font-size: 12px;
-  color: var(--el-text-color-placeholder);
-  text-align: center;
-  line-height: 1.8;
 }
 </style>

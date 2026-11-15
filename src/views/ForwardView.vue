@@ -25,6 +25,8 @@ import {
   forwardStop,
 } from "@/api/forward";
 import type { ForwardRule } from "@/api/types";
+import PageHeader from "@/components/PageHeader.vue";
+import StatusDot from "@/components/StatusDot.vue";
 
 const sessions = useSessionsStore();
 
@@ -266,10 +268,14 @@ onMounted(async () => {
 
 // 订阅后端状态推送：隧道启动/停止/异常退出（SSH 断开）时实时更新标签，
 // 修复"SSH 断开后仍显示运行中"的陈旧状态问题。
+// 注意：await listen 期间组件可能已卸载（本视图不在 KeepAlive 缓存，快速切
+// 页即触发），此时 resolve 出的 unlistenFn 必须立刻注销，否则监听器连同
+// 组件闭包永久泄漏，每条事件被 N 个死监听器处理（提示重复弹 N 次）。
 const forwardStateUnlisten = ref<UnlistenFn | null>(null);
+let unmounted = false;
 onMounted(async () => {
   try {
-    forwardStateUnlisten.value = await listen<{ ruleId: string; running: boolean; reason: string }>(
+    const unlisten = await listen<{ ruleId: string; running: boolean; reason: string }>(
       "forward:state",
       (e) => {
         const { ruleId, running: isRunning, reason } = e.payload;
@@ -284,95 +290,114 @@ onMounted(async () => {
         }
       },
     );
+    if (unmounted) unlisten();
+    else forwardStateUnlisten.value = unlisten;
   } catch (e) {
     console.error("订阅 forward:state 失败:", e);
   }
 });
 onUnmounted(() => {
+  unmounted = true;
   forwardStateUnlisten.value?.();
 });
 </script>
 
 <template>
   <div class="forward-view">
-    <div class="header">
-      <div class="title">
-        <h2>端口转发</h2>
-        <p class="subtitle">通过 SSH 隧道转发本地 / 远程端口</p>
-      </div>
-      <el-button type="primary" :icon="undefined" @click="openCreate">新建转发规则</el-button>
-    </div>
-
-    <el-table
-      v-loading="loading"
-      :data="rules"
-      empty-text="暂无转发规则，点击右上角“新建转发规则”创建"
-      stripe
-      height="100%"
-      class="rules-table"
+    <PageHeader
+      title="端口转发"
+      subtitle="通过 SSH 隧道转发本地 / 远程端口"
+      icon="Connection"
     >
-      <el-table-column label="名称" prop="name" min-width="140">
-        <template #default="{ row }">
-          <span class="rule-name">{{ row.name }}</span>
-        </template>
-      </el-table-column>
+      <template #actions>
+        <el-button type="primary" @click="openCreate">新建转发规则</el-button>
+      </template>
+    </PageHeader>
 
-      <el-table-column label="会话" min-width="140">
-        <template #default="{ row }">{{ sessionName(row.sessionId) }}</template>
-      </el-table-column>
+    <div class="forward-body">
+      <div class="rules-surface surface-card">
+        <el-table
+          v-loading="loading"
+          :data="rules"
+          empty-text="暂无转发规则，点击右上角“新建转发规则”创建"
+          stripe
+          height="100%"
+          class="rules-table"
+        >
+          <el-table-column label="名称" prop="name" min-width="140">
+            <template #default="{ row }">
+              <span class="rule-name">{{ row.name }}</span>
+            </template>
+          </el-table-column>
 
-      <el-table-column label="类型" width="120">
-        <template #default="{ row }">
-          <el-tag :type="kindTagType[row.kind] ?? 'info'" size="small" effect="light">
-            {{ kindLabel[row.kind] ?? row.kind }}
-          </el-tag>
-        </template>
-      </el-table-column>
+          <el-table-column label="会话" min-width="140">
+            <template #default="{ row }">{{ sessionName(row.sessionId) }}</template>
+          </el-table-column>
 
-      <el-table-column label="转发" min-width="220">
-        <template #default="{ row }">
-          <span class="addr">{{ row.localHost }}:{{ row.localPort }}</span>
-          <span class="arrow">→</span>
-          <span class="addr">{{ row.remoteHost }}:{{ row.remotePort }}</span>
-        </template>
-      </el-table-column>
+          <el-table-column label="类型" width="120">
+            <template #default="{ row }">
+              <el-tag :type="kindTagType[row.kind] ?? 'info'" size="small" effect="light">
+                {{ kindLabel[row.kind] ?? row.kind }}
+              </el-tag>
+            </template>
+          </el-table-column>
 
-      <el-table-column label="状态" width="110" align="center">
-        <template #default="{ row }">
-          <el-tag v-if="isRunning(row.id)" type="success" size="small" effect="dark">运行中</el-tag>
-          <el-tag v-else type="info" size="small" effect="plain">已停止</el-tag>
-        </template>
-      </el-table-column>
+          <el-table-column label="转发" min-width="220">
+            <template #default="{ row }">
+              <span class="addr">{{ row.localHost }}:{{ row.localPort }}</span>
+              <span class="arrow">→</span>
+              <span class="addr">{{ row.remoteHost }}:{{ row.remotePort }}</span>
+            </template>
+          </el-table-column>
 
-      <el-table-column label="操作" width="240" align="center" fixed="right">
-        <template #default="{ row }">
-          <el-button
-            v-if="!isRunning(row.id)"
-            type="success"
-            size="small"
-            :loading="toggling.has(row.id)"
-            @click="startRule(row)"
-          >
-            启动
-          </el-button>
-          <el-button
-            v-else
-            type="warning"
-            size="small"
-            :loading="toggling.has(row.id)"
-            @click="stopRule(row)"
-          >
-            停止
-          </el-button>
-          <el-button size="small" :disabled="isRunning(row.id)" @click="openEdit(row)">
-            编辑
-          </el-button>
-          <el-button type="danger" size="small" :disabled="isRunning(row.id)" @click="removeRule(row)">
-            删除
-          </el-button>
-        </template>
-      </el-table-column>
-    </el-table>
+          <el-table-column label="状态" width="110" align="center">
+            <template #default="{ row }">
+              <span class="forward-status">
+                <StatusDot
+                  :tone="isRunning(row.id) ? 'success' : 'info'"
+                  :size="6"
+                />
+                {{ isRunning(row.id) ? "运行中" : "已停止" }}
+              </span>
+            </template>
+          </el-table-column>
+
+          <el-table-column label="操作" width="240" align="center" fixed="right">
+            <template #default="{ row }">
+              <el-button
+                v-if="!isRunning(row.id)"
+                type="primary"
+                size="small"
+                :loading="toggling.has(row.id)"
+                @click="startRule(row)"
+              >
+                启动
+              </el-button>
+              <el-button
+                v-else
+                size="small"
+                :loading="toggling.has(row.id)"
+                @click="stopRule(row)"
+              >
+                停止
+              </el-button>
+              <el-button size="small" :disabled="isRunning(row.id)" @click="openEdit(row)">
+                编辑
+              </el-button>
+              <el-button
+                type="danger"
+                size="small"
+                link
+                :disabled="isRunning(row.id)"
+                @click="removeRule(row)"
+              >
+                删除
+              </el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+      </div>
+    </div>
 
     <!-- 新建 / 编辑 弹窗 -->
     <el-dialog
@@ -447,32 +472,26 @@ onUnmounted(() => {
 
 <style scoped lang="scss">
 .forward-view {
-  padding: 20px 24px;
   display: flex;
   flex-direction: column;
-  gap: 16px;
   height: 100%;
   box-sizing: border-box;
+  background: var(--el-bg-color-page);
 }
 
-.header {
+.forward-body {
+  flex: 1;
+  min-height: 0;
   display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 16px;
+  padding: 16px 20px 20px;
 }
 
-.title h2 {
-  margin: 0;
-  font-size: 20px;
-  font-weight: 600;
-  color: var(--el-text-color-primary);
-}
-
-.subtitle {
-  margin: 4px 0 0;
-  font-size: 13px;
-  color: var(--el-text-color-secondary);
+.rules-surface {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
 }
 
 .rules-table {
@@ -485,8 +504,17 @@ onUnmounted(() => {
   color: var(--el-text-color-primary);
 }
 
+/* 状态用圆点 + 文本，避免浅色语义标签文字对比度偏低 */
+.forward-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--el-text-color-regular);
+}
+
 .addr {
-  font-family: "Consolas", "Cascadia Code", monospace;
+  font-family: var(--app-font-mono);
   font-size: 13px;
   color: var(--el-text-color-regular);
 }

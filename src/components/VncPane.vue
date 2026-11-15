@@ -289,6 +289,8 @@ function sendCtrlAltDel() {
 </template>
 
 <style scoped lang="scss">
+@use "../styles/desktop-overlay" as overlay;
+
 .vnc-pane {
   position: absolute;
   inset: 0;
@@ -337,7 +339,7 @@ function sendCtrlAltDel() {
   flex-direction: column;
   gap: 10px;
   padding: 16px;
-  border-radius: 8px;
+  border-radius: var(--app-radius-md);
   background: var(--el-bg-color-overlay);
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
   color: var(--el-text-color-primary);
@@ -360,7 +362,7 @@ function sendCtrlAltDel() {
   color: var(--el-text-color-primary);
   background: var(--el-bg-color);
   border: 1px solid var(--el-border-color);
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   outline: none;
 }
 .cred-input:focus {
@@ -378,56 +380,37 @@ function sendCtrlAltDel() {
   color: var(--el-text-color-primary);
   font-size: 12px;
   padding: 4px 14px;
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   cursor: pointer;
 }
 .cred-btn.primary {
-  border-color: var(--el-color-primary);
-  background: var(--el-color-primary);
-  color: #fff;
+  border-color: var(--app-primary-strong);
+  background: var(--app-primary-strong);
+  color: var(--app-accent-contrast);
 }
 .cred-btn:hover:not(.primary) {
   border-color: var(--el-color-primary);
   color: var(--el-color-primary);
 }
 .vnc-toolbar {
-  position: absolute;
-  top: 8px;
-  right: 12px;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 4px 10px;
-  border-radius: 6px;
-  background: rgba(0, 0, 0, 0.45);
-  backdrop-filter: blur(4px);
+  @include overlay.toolbar;
 }
 .vnc-state {
-  font-size: 12px;
-  color: #999;
+  @include overlay.state;
 }
 .vnc-state.connected {
-  color: #67c23a;
+  @include overlay.state-connected;
 }
 .vnc-cad {
-  border: 1px solid rgba(255, 255, 255, 0.35);
-  background: transparent;
-  color: #ddd;
-  font-size: 12px;
-  padding: 2px 8px;
-  border-radius: 4px;
-  cursor: pointer;
+  @include overlay.button;
 }
 .vnc-cad:hover:not(:disabled) {
-  border-color: var(--el-color-primary);
-  color: var(--el-color-primary);
+  @include overlay.button-hover;
 }
 .vnc-cad.on {
-  border-color: var(--el-color-warning);
-  color: var(--el-color-warning);
+  @include overlay.button-on;
 }
 .vnc-cad:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
+  @include overlay.button-disabled;
 }
 </style>

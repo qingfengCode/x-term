@@ -246,9 +246,23 @@ export function useSuggestions() {
     return matches.slice(0, 10);
   }
 
+  /** 最近一次 refresh 的入参：loading 期间被抑制的刷新在结束后补跑时用。 */
+  let lastToken = "";
+  let lastAiEnabled = false;
+  /** loading 期间有击键 → 结束后补一次刷新（见 updateSuggestions）。 */
+  let pendingRefresh = false;
+
+  /**
+   * 建议列表"代"计数：每次重排/关闭自增。异步 AI 生成返回时若代已变化
+   * （用户又敲了键、按 Enter 执行了命令、Esc 关闭），结果必须丢弃——
+   * 否则迟到结果会把已关闭的列表填回来并把选中项指向不可见条目。
+   */
+  let suggestGen = 0;
+
   /** 调用模型生成 AI 建议（用户选中占位项时触发）。 */
   async function generateAISuggestion(currentInput: string): Promise<void> {
     if (!currentInput.trim() || state.value.loading) return;
+    const gen = suggestGen;
     state.value.items = state.value.items.filter((i) => i.type !== "ai-preview");
     state.value.items.push({ type: "ai-preview", label: "AI 生成中…", value: "" });
     state.value.loading = true;
@@ -259,6 +273,8 @@ export function useSuggestions() {
         .replace(/^```[\w]*\n?/, "")
         .replace(/\n?```$/, "")
         .trim();
+      // 迟到结果：期间列表已被关闭/重排（执行了命令、继续输入、Esc），丢弃。
+      if (gen !== suggestGen || !state.value.visible) return;
       if (cleaned) {
         state.value.items = state.value.items.filter((i) => i.type !== "ai-preview");
         state.value.items.push({ type: "ai-result", label: cleaned, value: cleaned });
@@ -267,9 +283,15 @@ export function useSuggestions() {
         removeAiPlaceholder();
       }
     } catch {
-      removeAiPlaceholder();
+      if (gen === suggestGen) removeAiPlaceholder();
     } finally {
       state.value.loading = false;
+      // 生成期间用户继续输入时，刷新被 loading 抑制；这里补一次，
+      // 否则列表会停留在旧 token 的结果上直到下一次击键。
+      if (pendingRefresh) {
+        pendingRefresh = false;
+        updateSuggestions(lastToken, lastAiEnabled);
+      }
     }
   }
 
@@ -285,6 +307,9 @@ export function useSuggestions() {
 
   /** 击键后更新建议（150ms 防抖）。aiEnabled = 设置开关 && AI 已配置。 */
   function updateSuggestions(token: string, aiEnabled: boolean) {
+    lastToken = token;
+    lastAiEnabled = aiEnabled;
+    suggestGen++;
     if (debounceTimer) clearTimeout(debounceTimer);
     if (!token || suppressedUntilNextCommand) {
       state.value.visible = false;
@@ -293,7 +318,12 @@ export function useSuggestions() {
     }
     debounceTimer = setTimeout(() => {
       debounceTimer = null;
-      if (state.value.loading) return;
+      if (state.value.loading) {
+        // AI 生成期间不能重排列表（会丢掉"生成中"占位项/结果），但击键
+        // 意味着 token 已变——标记待刷新，加载结束后补一次。
+        pendingRefresh = true;
+        return;
+      }
       const items = [
         ...getQuickCommandSuggestions(token),
         ...getHistorySuggestions(token),
@@ -336,6 +366,8 @@ export function useSuggestions() {
   }
 
   function close() {
+    suggestGen++;
+    pendingRefresh = false;
     if (debounceTimer) {
       clearTimeout(debounceTimer);
       debounceTimer = null;

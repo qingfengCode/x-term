@@ -80,10 +80,12 @@ const v2Columns = computed<Column<any>[]>(() => {
   white-space: nowrap;
   line-height: 34px;
   font-size: 12px;
+  /* 数字列等宽对齐，金额/ID 更易纵向比较 */
+  font-variant-numeric: tabular-nums;
 }
 .cell-idx {
   color: var(--el-text-color-placeholder);
   font-size: 12px;
-  font-family: var(--el-font-family-mono, monospace);
+  font-family: var(--app-font-mono);
 }
 </style>

@@ -177,7 +177,7 @@ async function respondCurrent(decision: HostKeyDecision) {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 15px;
+  font-size: var(--app-font-size-lg);
   font-weight: 600;
   color: var(--el-text-color-primary);
 }
@@ -213,11 +213,11 @@ async function respondCurrent(decision: HostKeyDecision) {
 }
 
 .hk-fp-code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: var(--app-font-mono);
   font-size: 12px;
   padding: 6px 8px;
   background: var(--el-fill-color-light);
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   word-break: break-all;
   color: var(--el-color-success);
 }

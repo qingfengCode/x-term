@@ -903,6 +903,9 @@ impl FileBackend for S3Backend {
     async fn rename(&self, oldpath: &str, newpath: &str) -> AppResult<()> {
         let src = Self::normalize_key(oldpath);
         let dst = Self::normalize_key(newpath);
+        if src == dst {
+            return Ok(());
+        }
 
         // 判定源是单对象还是"目录"（前缀）：
         // 先 HEAD 单对象；命中则走单对象 copy+delete；否则按前缀递归处理。
@@ -920,12 +923,29 @@ impl FileBackend for S3Backend {
         if !dst_prefix.ends_with('/') {
             dst_prefix.push('/');
         }
+        // 目标位于源子树内时必须拒绝：rename_prefix 边遍历边 copy+delete，
+        // 新复制的对象仍匹配源前缀，会在后续分页中被再次 copy+delete
+        //（a/f1 → a/b/f1 → a/b/b/f1），文件被埋进未知层级的路径，且因分页
+        // token 时序不确定而无法回放。前端只校验名称非空，名称含 `/` 即可构造
+        // 该输入（rename("a", "a/b")）。
+        if dst_prefix == src_prefix || dst_prefix.starts_with(&src_prefix) {
+            return Err(AppError::InvalidInput(format!(
+                "不能把目录重命名到自身的子路径下（{src_prefix} → {dst_prefix}）"
+            )));
+        }
         self.rename_prefix(&src_prefix, &dst_prefix).await
     }
 
     async fn mkdir(&self, path: &str) -> AppResult<()> {
         // 写入 0 字节占位对象使目录在前端可见。
         let mut key = Self::normalize_key(path);
+        // 空路径会生成 "/ .dirkeep"（带前导斜杠的异常对象，与其它 key 的
+        // 规范化规则不一致），直接拒绝。
+        if key.is_empty() {
+            return Err(AppError::InvalidInput(
+                "拒绝在 S3 根目录创建同名目录（path 为空）".to_string(),
+            ));
+        }
         if !key.ends_with('/') {
             key.push('/');
         }
@@ -953,6 +973,14 @@ impl FileBackend for S3Backend {
     async fn remove_dir(&self, path: &str) -> AppResult<()> {
         // 列出前缀下所有对象，用 DeleteObjects 批量接口删除（一次最多 1000 个，远快于逐个 DELETE）。
         let mut prefix = Self::normalize_key(path);
+        // 空/根前缀必须拒绝：normalize_key 会去掉前导 `/`，而所有写入路径的
+        // key 都没有前导 `/`——`prefix="/"` 永远列出 0 个对象，"删除根目录"
+        // 会返回成功但什么都没删。与 list_dir 的空前缀守卫对齐。
+        if prefix.is_empty() {
+            return Err(AppError::InvalidInput(
+                "拒绝删除 S3 根目录（path 为空）".to_string(),
+            ));
+        }
         if !prefix.ends_with('/') {
             prefix.push('/');
         }

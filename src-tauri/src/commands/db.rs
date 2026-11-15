@@ -299,9 +299,12 @@ pub async fn db_use_database(
 ///
 /// 逐条检查输入里的每条非空语句：必须通过 [`crate::ai::tools::is_readonly_sql`]
 /// （SELECT/SHOW/EXPLAIN/DESCRIBE/DESC/TABLE/VALUES，WITH 引导的 CTE 由
-/// sql_first_keyword 解析成主语句关键字后再判定），并拒绝
-/// `SELECT ... INTO OUTFILE/DUMPFILE`（会在服务器文件系统上写文件）。
-/// 违反任一即返回错误。
+/// sql_first_keyword 解析成主语句关键字后再判定），且不携带"查询形态的写
+/// 副作用"（`SELECT ... INTO OUTFILE/DUMPFILE`、`LOAD_FILE` 等，见
+/// [`crate::ai::tools::readonly_side_effect`]）。违反任一即返回错误。
+///
+/// 副作用检测与控制台 / AI / MCP 共用同一实现（`is_readonly_sql` 内部已含），
+/// 避免"一处修了别处漏了"。
 fn enforce_read_only(sql: &str, kind: &str) -> AppResult<()> {
     // 引号与注释感知切分（方言由 kind 决定）：字符串字面量/注释内的分号不是
     // 语句边界——裸 split(';') 会把 `WHERE c='a;b'` 的残段或注释里的后文切
@@ -311,18 +314,16 @@ fn enforce_read_only(sql: &str, kind: &str) -> AppResult<()> {
         if s.is_empty() {
             continue;
         }
+        // 先给副作用一个具体的错误原因（比"首关键字 SELECT 不允许"有用）。
+        if let Some(reason) = crate::ai::tools::readonly_side_effect(s) {
+            return Err(AppError::Auth(format!("只读模式不允许：{reason}")));
+        }
         if !crate::ai::tools::is_readonly_sql(s) {
             let kw = s.split_whitespace().next().unwrap_or("?");
             return Err(AppError::Auth(format!(
                 "只读模式不允许执行写操作（首关键字 {}）",
                 kw
             )));
-        }
-        let upper = s.to_ascii_uppercase();
-        if upper.contains("INTO OUTFILE") || upper.contains("INTO DUMPFILE") {
-            return Err(AppError::Auth(
-                "只读模式不允许 SELECT INTO OUTFILE/DUMPFILE".to_string(),
-            ));
         }
     }
     Ok(())

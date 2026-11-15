@@ -70,7 +70,24 @@ export const useDesktopTabsStore = defineStore("desktopTabs", () => {
   async function open(desktop: Desktop, password?: string) {
     const existed = tabs.value.find((t) => t.desktopId === desktop.id);
     if (existed) {
+      // 只用 instanceId 作为 activeId：内容区按 `tab.instanceId === activeId`
+      // 过滤，占位标签（instanceId 为空）写 desktopId 会让所有 v-show 为 false，
+      // 而关闭/失败路径只按 instanceId（或 ""）复位，会留下"空白内容区"。
       activeId.value = existed.instanceId;
+      // 原会话已断开/失败时，用本次传入的口令重连（否则新口令被静默丢弃，
+      // 用户改了密码后必须先手动关标签才能重连，且无任何提示）。
+      //
+      // 注意**不能**以"口令与标签里的不同"为条件：连接成功后 clearPassword
+      // 会把标签口令清空（安全考虑），那样每次重新双击都会把健康的会话踢掉
+      // 重连。只在需要重建连接时才用新口令。
+      const needsReconnect = !!existed.instanceId && (existed.disconnected || !!existed.error);
+      if (password !== undefined && needsReconnect) {
+        existed.password = password;
+        existed.error = null;
+        void reconnect(existed.instanceId).catch(() => {
+          /* 失败已写入 tab.error，由桌面页展示 */
+        });
+      }
       return;
     }
     // reactive 化后再 push（与 terminals store 同理：raw 对象的属性赋值
@@ -193,7 +210,8 @@ export const useDesktopTabsStore = defineStore("desktopTabs", () => {
     const [removed] = tabs.value.splice(idx, 1);
     await stopBackend(removed);
     if (activeId.value === removed.instanceId) {
-      activeId.value = tabs.value[idx]?.instanceId ?? tabs.value[idx - 1]?.instanceId ?? null;
+      // 左邻优先（与其它标签栏一致；新标签追加在右侧）。
+      activeId.value = tabs.value[idx - 1]?.instanceId ?? tabs.value[idx]?.instanceId ?? null;
     }
     return true;
   }

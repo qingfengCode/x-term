@@ -340,8 +340,23 @@ pub async fn sftp_close(sftp_id: String, state: State<'_, AppState>) -> AppResul
         .remove(&sftp_id)
         .ok_or_else(|| AppError::NotFound(format!("SFTP 会话 {} 不存在", sftp_id)))?;
     use russh::Disconnect;
-    let _ = handle
-        .disconnect(Disconnect::ByApplication, "bye", "en")
-        .await;
+    // 必须加超时：russh 的 disconnect 通过会话任务的有界 channel 投递，底层
+    // 连接"活着但卡死"时永久挂起——命令不返回、连接句柄被悬空 future 持有
+    // （与 ssh/session.rs 的 DISCONNECT_TIMEOUT 同成因、同兜底）。
+    if tokio::time::timeout(
+        SFTP_DISCONNECT_TIMEOUT,
+        handle.disconnect(Disconnect::ByApplication, "bye", "en"),
+    )
+    .await
+    .is_err()
+    {
+        log::warn!(
+            "sftp_close: disconnect 超过 {} 秒未完成（连接可能已卡死），放弃等待",
+            SFTP_DISCONNECT_TIMEOUT.as_secs()
+        );
+    }
     Ok(())
 }
+
+/// SFTP 会话关闭的超时（见 `sftp_close`）。
+const SFTP_DISCONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);

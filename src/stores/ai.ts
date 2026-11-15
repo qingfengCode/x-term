@@ -186,24 +186,43 @@ export const makeAiStore = (id: string) =>
   function persist() {
     if (persistTimer) clearTimeout(persistTimer);
     persistTimer = setTimeout(() => {
-      const serialize = (c: Conversation, archived: boolean) => ({
-        id: c.id,
-        title: c.title,
-        messages: c.messages.map((m) => ({ ...m, streaming: false })),
-        todos: c.todos,
-        usage: c.usage,
-        archived,
-        updatedAt: c.updatedAt,
-        archivedAt: archived ? c.archivedAt : undefined,
-      });
-      const data = [
-        ...conversations.value.map((c) => serialize(c, false)),
-        ...archives.value.map((c) => serialize(c, true)),
-      ];
-      aiApi.aiSaveConversations(domain, data).catch(() => {
-        /* 持久化失败不阻塞对话（如磁盘满），仅忽略 */
-      });
+      persistTimer = null;
+      writePersist();
     }, PERSIST_DEBOUNCE_MS);
+  }
+
+  /** 立即把待写的对话落盘（取消防抖定时器）。 */
+  function writePersist() {
+    const serialize = (c: Conversation, archived: boolean) => ({
+      id: c.id,
+      title: c.title,
+      messages: c.messages.map((m) => ({ ...m, streaming: false })),
+      todos: c.todos,
+      usage: c.usage,
+      archived,
+      updatedAt: c.updatedAt,
+      archivedAt: archived ? c.archivedAt : undefined,
+    });
+    const data = [
+      ...conversations.value.map((c) => serialize(c, false)),
+      ...archives.value.map((c) => serialize(c, true)),
+    ];
+    return aiApi.aiSaveConversations(domain, data).catch(() => {
+      /* 持久化失败不阻塞对话（如磁盘满），仅忽略 */
+    });
+  }
+
+  /**
+   * 立即冲刷待写入的对话（窗口关闭/页面隐藏时调用）。
+   *
+   * 没有这个兜底时：回复完成（或删除消息/重命名会话）后 800ms 内的防抖窗口
+   * 里关闭应用，该轮变更整段丢失，用户无感知。
+   */
+  function flushPersist(): Promise<void> {
+    if (!persistTimer) return Promise.resolve();
+    clearTimeout(persistTimer);
+    persistTimer = null;
+    return writePersist();
   }
 
   /** 启动时从文件加载历史会话，替换默认的空对话。文件为空则保留默认。 */
@@ -302,7 +321,10 @@ export const makeAiStore = (id: string) =>
       archives.value.unshift(closed);
     }
     if (activeCid.value === cid) {
-      activeCid.value = conversations.value[0]?.id ?? null;
+      // 与终端标签一致：优先激活左邻（conversations 顺序即标签顺序，新会话
+      // 追加在右侧）。之前固定跳 conversations[0]（最左），关中间标签会一下
+      // 跳到最左边，且与"新建在右、+ 在右"的操作方向相反。
+      activeCid.value = conversations.value[idx - 1]?.id ?? conversations.value[idx]?.id ?? null;
       if (!activeCid.value) ensureConversation();
     }
     persist();
@@ -661,8 +683,9 @@ export const makeAiStore = (id: string) =>
   ) => Promise<void>;
   let desktopToolExecutor: DesktopToolExecutor | null = null;
 
-  /** 注册桌面工具执行器（桌面助手面板挂载时调用；其它域不注册、永不命中）。 */
-  function setDesktopToolExecutor(fn: DesktopToolExecutor) {
+  /** 注册桌面工具执行器（桌面助手面板挂载时调用；其它域不注册、永不命中）。
+   *  传 null 注销（面板卸载时调用）——否则执行器闭包会指向已卸载组件的状态。 */
+  function setDesktopToolExecutor(fn: DesktopToolExecutor | null) {
     desktopToolExecutor = fn;
   }
 
@@ -1058,9 +1081,24 @@ export const makeAiStore = (id: string) =>
     deleteMessage,
     regenerate,
     loadPersisted,
+    flushPersist,
   };
 });
 
 export const useAiSshStore = makeAiStore("ai:ssh");
 export const useAiDbStore = makeAiStore("ai:db");
 export const useAiDesktopStore = makeAiStore("ai:desktop");
+
+/**
+ * 冲刷全部域（SSH / DB / Desktop）中待写盘的对话。
+ *
+ * 窗口关闭或页面隐藏时调用：每个域的持久化都有 800ms 防抖，没有这个兜底
+ * 时最后一段变更会静默丢失。
+ */
+export async function flushAllAiPersist(): Promise<void> {
+  await Promise.all([
+    useAiSshStore().flushPersist(),
+    useAiDbStore().flushPersist(),
+    useAiDesktopStore().flushPersist(),
+  ]);
+}

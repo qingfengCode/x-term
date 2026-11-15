@@ -257,10 +257,20 @@ pub async fn ai_desktop_tool_respond(
             _ => None,
         },
     };
-    if let Some((_, tx)) = state.pending_desktop_calls.lock().remove(&tool_call_id) {
-        let _ = tx.send(outcome);
+    // 与 ai_execute_tool 一致：确认项不存在（等待已超时 300s / 请求已被终止）
+    // 时显式报错。silent Ok 会让前端显示"提交成功"而后端永远收不到结果，
+    // 用户对着不变的卡片干等。
+    match state.pending_desktop_calls.lock().remove(&tool_call_id) {
+        Some((_, tx)) => {
+            tx.send(outcome).map_err(|_| {
+                AppError::NotFound("桌面工具执行结果无处送达（等待已结束）".into())
+            })?;
+            Ok(())
+        }
+        None => Err(AppError::NotFound(
+            "该桌面工具调用已不在等待中（可能已超时或被终止）".to_string(),
+        )),
     }
-    Ok(())
 }
 
 /// 回传 ask_user_question 的用户回答（前端问题表单「提交/取消」触发）。
@@ -276,10 +286,18 @@ pub async fn ai_ask_user_respond(
     state: State<'_, AppState>,
 ) -> AppResult<()> {
     let outcome = crate::ai::tools::AskUserOutcome { answered, answers };
-    if let Some((_, tx)) = state.pending_ask_user_calls.lock().remove(&tool_call_id) {
-        let _ = tx.send(outcome);
+    // 同 ai_desktop_tool_respond：等待项已消失时显式报错，避免"提交成功但
+    // 后端永远收不到"的僵尸体验。
+    match state.pending_ask_user_calls.lock().remove(&tool_call_id) {
+        Some((_, tx)) => {
+            tx.send(outcome)
+                .map_err(|_| AppError::NotFound("提问回答无处送达（等待已结束）".into()))?;
+            Ok(())
+        }
+        None => Err(AppError::NotFound(
+            "该提问已不在等待中（可能已超时或被终止）".to_string(),
+        )),
     }
-    Ok(())
 }
 
 /// 终止正在进行的 AI 请求（前端"终止"按钮触发）。
@@ -616,9 +634,15 @@ fn plan_call<'a>(
             .and_then(Value::as_str)
             .unwrap_or("");
         if !tools::sql_allowed_by_mode(sql_text, &sql_cfg.sql_mode) {
+            // 副作用类拒绝（INTO OUTFILE / LOAD_FILE 等）给出具体原因，
+            // 比笼统的"首个关键字被拦截"更能帮模型自我纠正。
+            let reason = match tools::readonly_side_effect(sql_text) {
+                Some(r) => format!("（{r}）"),
+                None => "（首个关键字被拦截）".to_string(),
+            };
             rejected = Some(format!(
-                "当前 SQL 模式为 `{}`，不允许执行该语句（首个关键字被拦截）",
-                sql_cfg.sql_mode
+                "当前 SQL 模式为 `{}`，不允许执行该语句{}",
+                sql_cfg.sql_mode, reason
             ));
         }
     }
@@ -817,7 +841,6 @@ async fn run_agent_loop(
     let mut messages = req.messages.clone();
     // context_budget 在上下文超限降级重试中会被下调（降至 2/3），因此这里取可变副本。
     let mut context_budget = context_budget;
-    let mut tool_results: Vec<(String, ToolResult)> = Vec::new();
     let request_id = req.request_id.clone();
     let mut last_text = String::new();
     // 重复工具调用守卫（借鉴 dsh repeat-tool-reminder）：跟踪连续相同调用，
@@ -833,7 +856,6 @@ async fn run_agent_loop(
             provider.as_ref(),
             &mut messages,
             &tools,
-            &tool_results,
             &request_id,
             app,
             &mut context_budget,
@@ -873,7 +895,6 @@ async fn run_agent_loop(
         // 关键：每个 tool_call 的结果必须以 role=tool 消息紧跟在 assistant(tool_calls)
         // 之后追加进 messages，否则 OpenAI 兼容协议会以 400 拒绝
         // （"assistant with tool_calls must be followed by tool messages"）。
-        tool_results.clear();
         // 本轮触发的重复调用提醒（轮末统一注入，避免插在 tool 消息序列中间）。
         let mut reminders: Vec<String> = Vec::new();
 
@@ -1197,7 +1218,6 @@ async fn run_agent_loop(
                     output: result.output.clone(),
                 },
             );
-            tool_results.push((call_id.clone(), result.clone()));
             // 把工具结果作为 role=tool 消息追加进 messages（紧跟
             // assistant(tool_calls)）。入上下文前压缩到 8 KiB：完整内容已通过
             // ai:tool_result 事件推给前端展示，模型只需要足够理解结果的头部，
@@ -1255,10 +1275,29 @@ async fn run_agent_loop(
     }
 
     // 达到 max_tool_calls 上限：以最后一段文本收尾。
+    //
+    // 注意最后一轮的工具已真实执行（含 exec_ssh/exec_sql 等有副作用的操作），
+    // 但循环随即结束、结果没机会再交给模型消费。必须明确告知用户，否则
+    // 表现是"工具卡片全部完成，然后对话无声终止"（last_text 通常是空串或
+    // 上一轮的"让我检查一下"），用户完全不知道发生了什么。
     log::warn!(
         "[ai:{}] 智能体循环达到 {} 轮上限，强制结束",
         request_id,
         max_tool_calls
+    );
+    // 提示走 ai:system_note（前端渲染为灰色系统提示，并以 user 角色进入上下文，
+    // 下一轮模型可见）。不写进 full_text：前端不使用 AiDoneEvent.full_text
+    // （stores/ai.ts 的 onDone 只清 streaming 状态）。
+    events::emit(
+        app,
+        events::AI_SYSTEM_NOTE,
+        events::AiSystemNoteEvent {
+            request_id: request_id.to_string(),
+            text: format!(
+                "[系统提示] 智能体循环达到 {max_tool_calls} 轮上限已强制结束，任务可能未完成；\
+如需继续请回复「继续」，或在设置页调大轮数上限"
+            ),
+        },
     );
     events::emit(
         app,
@@ -1337,7 +1376,6 @@ async fn chat_with_tools_with_retry(
     provider: &dyn LlmProvider,
     messages: &mut Vec<ChatMessage>,
     tools: &[ToolDef],
-    tool_results: &[(String, ToolResult)],
     request_id: &str,
     app: &AppHandle,
     context_budget: &mut usize,
@@ -1357,7 +1395,6 @@ async fn chat_with_tools_with_retry(
             .chat_with_tools(
                 round,
                 tools.to_vec(),
-                tool_results.to_vec(),
                 request_id.to_string(),
                 app.clone(),
             )
@@ -1832,7 +1869,7 @@ pub async fn ai_complete_command(
     ];
     let request_id = format!("ai-complete-{}", uuid::Uuid::new_v4());
     let resp = provider
-        .chat_with_tools(messages, vec![], vec![], request_id, app)
+        .chat_with_tools(messages, vec![], request_id, app)
         .await?;
 
     // 剥离模型偶尔附带的 markdown 代码围栏与首尾空白。多行围栏
@@ -2275,6 +2312,42 @@ mod tests {
         let p = plan_call(&c, &a, &ssh_cfg("manual"), &cfg, None).unwrap();
         assert!(p.rejected.is_some(), "readonly 模式应拦截 UPDATE");
         assert!(p.rejected.unwrap().contains("readonly"));
+    }
+
+    /// sql_mode 是"允许什么语句"的硬边界：查询形态的写副作用（INTO OUTFILE /
+    /// LOAD_FILE）在 readonly / restricted 下必须预拒绝——包括 run_mode=auto
+    ///（auto 只跳过危险确认，不改写 sql_mode）。
+    #[test]
+    fn plan_sql_mode_rejects_side_effect_selects() {
+        let a = allowed(&["exec_sql"]);
+        for mode in ["readonly", "restricted"] {
+            let cfg = sql_cfg("auto", mode);
+            for sql in [
+                "SELECT 'x' INTO OUTFILE '/tmp/pwn'",
+                "SELECT '# ' INTO/**/OUTFILE '/tmp/pwn'",
+                "SELECT LOAD_FILE('/etc/passwd')",
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity",
+            ] {
+                let c = tc("exec_sql", serde_json::json!({ "sql": sql }));
+                let p = plan_call(&c, &a, &ssh_cfg("manual"), &cfg, None).unwrap();
+                assert!(
+                    p.rejected.is_some(),
+                    "{mode} 模式应拦截带副作用的查询: {sql}"
+                );
+            }
+            // 普通只读查询不受影响。
+            let c = tc("exec_sql", serde_json::json!({ "sql": "SELECT 1" }));
+            let p = plan_call(&c, &a, &ssh_cfg("manual"), &cfg, None).unwrap();
+            assert!(p.rejected.is_none(), "{mode} 模式不应拦截普通 SELECT");
+        }
+        // full 模式不做 sql_mode 拦截（危险确认仍按 run_mode 走）。
+        let cfg_full = sql_cfg("manual", "full");
+        let c = tc(
+            "exec_sql",
+            serde_json::json!({ "sql": "SELECT LOAD_FILE('/etc/passwd')" }),
+        );
+        let p = plan_call(&c, &a, &ssh_cfg("manual"), &cfg_full, None).unwrap();
+        assert!(p.rejected.is_none(), "full 模式不应被 sql_mode 拦截");
     }
 
     /// SQL 危险判定：full 模式放行 DELETE，但 manual 模式下仍强制人工确认。

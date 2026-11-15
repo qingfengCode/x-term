@@ -149,7 +149,7 @@ function totpLabel(entry: TotpEntry): string {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 15px;
+  font-size: var(--app-font-size-lg);
   font-weight: 600;
   color: var(--el-text-color-primary);
 }
@@ -172,7 +172,7 @@ function totpLabel(entry: TotpEntry): string {
   font-size: 12px;
   color: var(--el-color-danger);
   background: var(--el-color-danger-light-9);
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   word-break: break-all;
 }
 

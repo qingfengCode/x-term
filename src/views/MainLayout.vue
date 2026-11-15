@@ -37,8 +37,7 @@ const sidebarRef = ref<InstanceType<typeof SessionSidebar> | null>(null);
 // 导航项：设置固定底部（不随中间项滚动，矮窗口也始终可见）。
 const navItems = [
   { key: "terminals", label: "终端", icon: "Monitor" },
-  { key: "sftp", label: "SFTP", icon: "FolderOpened" },
-  { key: "files", label: "文件", icon: "Files" },
+  { key: "files", label: "文件", icon: "FolderOpened" },
   { key: "sql", label: "DB", icon: "Coin" },
   { key: "forward", label: "转发", icon: "Connection" },
   { key: "remote", label: "桌面", icon: "Platform" },
@@ -68,7 +67,6 @@ async function onLock() {
 const activeNav = computed(() => {
   if (
     route.name === "terminals" ||
-    route.name === "sftp" ||
     route.name === "files" ||
     route.name === "sql" ||
     route.name === "forward" ||
@@ -406,29 +404,34 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onNumberKeydown));
           <span>{{ item.label }}</span>
         </div>
       </div>
-      <!-- 底部固定项（设置/锁定）：矮窗口也始终可见 -->
-      <div
-        v-if="showLock"
-        class="nav-item nav-item-fixed"
-        title="锁定保险库（需重新输入主密码）"
-        @click="onLock"
-      >
-        <el-icon><component :is="'Lock'" /></el-icon>
-        <span>锁定</span>
-      </div>
-      <div
-        v-for="item in navFooterItems"
-        :key="item.key"
-        class="nav-item nav-item-fixed"
-        :class="{ active: activeNav === item.key }"
-        role="button"
-        tabindex="0"
-        :aria-current="activeNav === item.key ? 'page' : undefined"
-        @click="go(item.key)"
-        @keydown.enter.prevent="go(item.key)"
-      >
-        <el-icon><component :is="item.icon" /></el-icon>
-        <span>{{ item.label }}</span>
+      <!-- 底部固定项（设置/锁定）：矮窗口也始终可见；整组共用一条分隔线 -->
+      <div class="nav-footer">
+        <div
+          v-if="showLock"
+          class="nav-item nav-item-fixed"
+          role="button"
+          tabindex="0"
+          title="锁定保险库（需重新输入主密码）"
+          @click="onLock"
+          @keydown.enter.prevent="onLock"
+        >
+          <el-icon><component :is="'Lock'" /></el-icon>
+          <span>锁定</span>
+        </div>
+        <div
+          v-for="item in navFooterItems"
+          :key="item.key"
+          class="nav-item nav-item-fixed"
+          :class="{ active: activeNav === item.key }"
+          role="button"
+          tabindex="0"
+          :aria-current="activeNav === item.key ? 'page' : undefined"
+          @click="go(item.key)"
+          @keydown.enter.prevent="go(item.key)"
+        >
+          <el-icon><component :is="item.icon" /></el-icon>
+          <span>{{ item.label }}</span>
+        </div>
       </div>
     </aside>
 
@@ -510,7 +513,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onNumberKeydown));
 /* 窄栏用细滚动条，避免挤占栏宽（nav-rail 与 nav-items 一致） */
 .nav-rail::-webkit-scrollbar,
 .nav-items::-webkit-scrollbar {
-  width: 4px;
+  width: var(--app-scrollbar-narrow);
 }
 .nav-rail::-webkit-scrollbar-thumb,
 .nav-items::-webkit-scrollbar-thumb {
@@ -521,14 +524,19 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onNumberKeydown));
 .nav-items::-webkit-scrollbar-track {
   background: transparent;
 }
-/* 底部固定项（设置）：不与中间项一起滚动，矮窗口始终可见 */
+/* 底部固定项（设置/锁定）：整组独立于中间滚动区，共用一条分隔线 */
+.nav-footer {
+  width: 100%;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding-top: 8px;
+  margin-top: 4px;
+  border-top: 1px solid var(--el-border-color-lighter);
+}
 .nav-item-fixed {
   flex-shrink: 0;
-  width: 100%;
-  border-top: 1px solid var(--el-border-color-lighter);
-  border-radius: 0;
-  padding-top: 12px;
-  margin-bottom: 0;
 }
 .nav-item {
   position: relative;
@@ -539,7 +547,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onNumberKeydown));
   align-items: center;
   gap: 3px;
   cursor: pointer;
-  border-radius: 8px;
+  border-radius: var(--app-radius-md);
   font-size: 11px;
   color: var(--el-text-color-secondary);
   margin-bottom: 2px;
@@ -612,7 +620,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onNumberKeydown));
   width: 24px;
   height: 24px;
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   background: var(--el-bg-color-overlay);
   color: var(--el-text-color-secondary);
   cursor: pointer;

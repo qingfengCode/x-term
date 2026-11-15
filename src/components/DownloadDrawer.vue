@@ -22,6 +22,7 @@ import { zmodemPickFolder } from "@/api/terminal";
 import { revealInFolder } from "@/api/system";
 import { configuredDownloadDir } from "@/utils/downloadPath";
 import { humanSize } from "@/utils/format";
+import EmptyState from "@/components/EmptyState.vue";
 
 defineProps<{ visible: boolean }>();
 const emit = defineEmits<{ (e: "update:visible", v: boolean): void }>();
@@ -129,11 +130,13 @@ function removeItem(t: TransferTask) {
       </el-button>
     </div>
 
-    <div v-if="downloads.length === 0" class="dl-empty">
-      <el-icon class="dl-empty-icon"><Download /></el-icon>
-      <span class="dl-empty-text">暂无下载记录</span>
-      <span class="dl-empty-sub">终端里执行 sz、或 SFTP 下载文件后会出现在这里</span>
-    </div>
+    <EmptyState
+      v-if="downloads.length === 0"
+      class="dl-empty"
+      icon="Download"
+      title="暂无下载记录"
+      description="终端里执行 sz、或 SFTP 下载文件后会出现在这里"
+    />
 
     <div v-else class="dl-list">
       <div v-for="t in downloads" :key="t.id" class="dl-item" :class="`is-${t.status}`">
@@ -211,7 +214,7 @@ function removeItem(t: TransferTask) {
   gap: 6px;
   padding: 6px 8px;
   margin-bottom: 8px;
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   background: var(--el-fill-color-light);
   border: 1px solid var(--el-border-color-lighter);
 }
@@ -238,23 +241,7 @@ function removeItem(t: TransferTask) {
 }
 
 .dl-empty {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 6px;
-  padding: 48px 0;
-  color: var(--el-text-color-secondary);
-}
-.dl-empty-icon {
-  font-size: 32px;
-  color: var(--el-color-info-light-5);
-}
-.dl-empty-text {
-  font-size: 13px;
-}
-.dl-empty-sub {
-  font-size: 12px;
-  color: var(--el-text-color-placeholder);
+  padding: 40px 0;
 }
 
 .dl-list {
@@ -267,7 +254,7 @@ function removeItem(t: TransferTask) {
   align-items: flex-start;
   gap: 10px;
   padding: 10px 8px;
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
 }
 .dl-item:hover {
   background: var(--el-fill-color-light);
@@ -346,7 +333,7 @@ function removeItem(t: TransferTask) {
   font-size: 10px;
   line-height: 1;
   padding: 2px 4px;
-  border-radius: 3px;
+  border-radius: var(--app-radius-xs);
   color: var(--el-color-info);
   background: var(--el-fill-color);
 }
@@ -404,7 +391,7 @@ function removeItem(t: TransferTask) {
   color: var(--el-text-color-secondary);
   cursor: pointer;
   padding: 4px;
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
 }
 .dl-remove:hover {
   color: var(--el-color-danger);

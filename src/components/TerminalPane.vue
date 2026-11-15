@@ -9,11 +9,13 @@ import { ElMessageBox } from "element-plus";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import * as terminalApi from "@/api/terminal";
 import type { TerminalDataPayload } from "@/api/terminal";
+import { openExternalUrl } from "@/api/system";
 import { useSettingsStore } from "@/stores/settings";
 import { matchesCombo } from "@/utils/shortcut";
 import { base64ToBytes, bytesToBase64 } from "@/utils/binary";
 import { formatSize } from "@/utils/format";
 import { resolveScheme } from "@/utils/terminalThemes";
+import { useMenuKeyboard } from "@/composables/useMenuKeyboard";
 import {
   normalizePastedText,
   needsPasteConfirm,
@@ -205,6 +207,8 @@ const track = async (un: Promise<UnlistenFn>) => {
 const menuVisible = ref(false);
 const menuX = ref(0);
 const menuY = ref(0);
+/** 右键菜单根元素（键盘导航用）。 */
+const menuEl = ref<HTMLElement | null>(null);
 
 // --- 搜索浮层 ---
 const searchOpen = ref(false);
@@ -361,7 +365,7 @@ function buildOptions() {
     fontSize: t.fontSize,
     lineHeight: t.lineHeight,
     scrollback: t.scrollback,
-    cursorBlink: true,
+    cursorBlink: false,
     // 完整 ANSI 16 色配色方案（旧配置空值按明暗回退 Catppuccin）。
     theme: resolveScheme(t.colorScheme, t.theme).theme,
     allowProposedApi: true,
@@ -407,7 +411,16 @@ onMounted(async () => {
   fitAddon = new FitAddon();
   searchAddon = new SearchAddon();
   term.loadAddon(fitAddon);
-  term.loadAddon(new WebLinksAddon());
+  // 自定义链接处理器：默认实现走 window.open/应用内导航，在 Tauri webview 里
+  // 会把整个窗口导航走。统一交给系统浏览器（后端只放行 http/https/mailto）。
+  term.loadAddon(
+    new WebLinksAddon((event, uri) => {
+      event.preventDefault();
+      void openExternalUrl(uri).catch(() => {
+        /* 链接格式不受支持（如 mailto 被系统拒绝）时静默忽略 */
+      });
+    }),
+  );
   term.loadAddon(searchAddon);
   if (settings.terminal.enableWebgl) {
     try {
@@ -932,6 +945,9 @@ onBeforeUnmount(() => {
   containerRef.value?.removeEventListener("mousemove", onPaneMouseMove);
   window.removeEventListener("mouseup", onWindowMouseUp);
   containerRef.value?.removeEventListener("wheel", onMouseWheelCapture, { capture: true });
+  // 中止进行中的 ZMODEM 会话并清掉收尾看门狗：否则标签关闭后 30s 的定时器
+  // 仍会触发一次注定失败的 sendHardAbort（往已销毁的终端写）。
+  zmodemReset();
   term?.dispose();
   term = null;
 });
@@ -952,10 +968,15 @@ function onContextMenu(e: MouseEvent) {
   menuX.value = Math.min(e.clientX, window.innerWidth - MENU_W - 8);
   menuY.value = Math.min(e.clientY, window.innerHeight - MENU_H - 8);
   menuVisible.value = true;
+  void focusFirst();
 }
 function closeMenu() {
   menuVisible.value = false;
 }
+const { focusFirst, onKeydown: onMenuKeydown, onItemKeydown } = useMenuKeyboard(
+  menuEl,
+  closeMenu,
+);
 async function menuCopy() {
   const sel = term?.getSelection() ?? "";
   if (sel) await copyText(sel);
@@ -1187,16 +1208,60 @@ defineExpose({
     <!-- 右键菜单 -->
     <div
       v-if="menuVisible"
+      ref="menuEl"
       class="term-menu"
+      role="menu"
+      tabindex="-1"
       :style="{ left: menuX + 'px', top: menuY + 'px' }"
+      @keydown="onMenuKeydown"
       @click.stop
     >
-      <div class="term-menu-item" @click="menuCopy">复制</div>
-      <div class="term-menu-item" @click="menuPaste">粘贴</div>
-      <div class="term-menu-item" @click="menuSelectAll">全选</div>
+      <div
+        class="term-menu-item"
+        role="menuitem"
+        tabindex="-1"
+        @keydown="onItemKeydown"
+        @click="menuCopy"
+      >
+        复制
+      </div>
+      <div
+        class="term-menu-item"
+        role="menuitem"
+        tabindex="-1"
+        @keydown="onItemKeydown"
+        @click="menuPaste"
+      >
+        粘贴
+      </div>
+      <div
+        class="term-menu-item"
+        role="menuitem"
+        tabindex="-1"
+        @keydown="onItemKeydown"
+        @click="menuSelectAll"
+      >
+        全选
+      </div>
       <div class="term-menu-sep" />
-      <div class="term-menu-item" @click="menuClear">清屏</div>
-      <div class="term-menu-item" @click="menuSearch">搜索 (Ctrl+F)</div>
+      <div
+        class="term-menu-item"
+        role="menuitem"
+        tabindex="-1"
+        @keydown="onItemKeydown"
+        @click="menuClear"
+      >
+        清屏
+      </div>
+      <div
+        class="term-menu-item"
+        role="menuitem"
+        tabindex="-1"
+        @keydown="onItemKeydown"
+        @click="menuSearch"
+      >
+        搜索 (Ctrl+F)
+      </div>
     </div>
 
     <!-- 智能补全建议弹窗（历史 + 快捷命令 + AI） -->
@@ -1256,11 +1321,9 @@ defineExpose({
   gap: 4px;
   background: var(--el-bg-color-overlay);
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 8px;
+  border-radius: var(--app-radius-md);
   padding: 4px 6px;
-  box-shadow:
-    0 8px 24px rgba(0, 0, 0, 0.16),
-    0 2px 8px rgba(0, 0, 0, 0.08);
+  box-shadow: var(--app-shadow-2);
   z-index: 10;
 }
 .term-search-input {
@@ -1278,7 +1341,7 @@ defineExpose({
   color: var(--el-text-color-secondary);
   cursor: pointer;
   padding: 2px 6px;
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   font-size: 13px;
   line-height: 1;
   transition: background-color 0.15s ease, color 0.15s ease;
@@ -1301,17 +1364,15 @@ defineExpose({
   min-width: 148px;
   background: var(--el-bg-color-overlay);
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 8px;
-  box-shadow:
-    0 8px 24px rgba(0, 0, 0, 0.16),
-    0 2px 8px rgba(0, 0, 0, 0.08);
+  border-radius: var(--app-radius-md);
+  box-shadow: var(--app-shadow-2);
   padding: 4px;
   /* 与共享 TabBar 菜单统一层级（避免被后开的浮层/菜单遮挡）。 */
   z-index: 3000;
 }
 .term-menu-item {
   padding: 6px 10px;
-  border-radius: 5px;
+  border-radius: var(--app-radius-xs);
   font-size: 13px;
   color: var(--el-text-color-primary);
   cursor: pointer;
@@ -1341,7 +1402,7 @@ defineExpose({
   pointer-events: auto;
   background: var(--el-bg-color-overlay);
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 10px;
+  border-radius: var(--app-radius-lg);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
   padding: 10px 12px;
 }
@@ -1375,7 +1436,7 @@ defineExpose({
   font-size: 12px;
   cursor: pointer;
   padding: 2px 8px;
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
 }
 .zmodem-cancel:hover {
   background: var(--el-color-danger-light-9);

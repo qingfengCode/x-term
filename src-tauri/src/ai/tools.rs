@@ -184,6 +184,13 @@ pub struct AskUserOutcome {
 
 /// 单命令执行超时（30 秒）。
 const EXEC_TIMEOUT: Duration = Duration::from_secs(30);
+/// SQL 执行超时（120 秒）。
+///
+/// AI 的 SQL 工具（exec_sql / list_db_tables / describe_table）在并发段执行
+/// 并持有全局并发许可：没有超时时一条挂死语句（`SELECT SLEEP(3600)`、锁等待、
+/// 大表扫描）会把整个会话卡到用户手动"终止"，白名单模式下还可能是提示注入
+/// 诱导发起的。
+const SQL_EXEC_TIMEOUT: Duration = Duration::from_secs(120);
 /// exec_ssh（独立连接模式）输出截断上限（16 KiB）。
 const EXEC_OUTPUT_CAP: usize = 16 * 1024;
 /// exec_ssh（终端可视化模式）返回给 AI 的输出截断上限（16 KiB）。
@@ -258,8 +265,9 @@ cat 配置文件等）。单命令超时 30 秒，输出截断 16KB（超出会�
                     },
                     "maxBytes": {
                         "type": "integer",
-                        "description": "最多返回的字节数，可省略（默认 8192）",
-                        "minimum": 1
+                        "description": "最多返回的字节数，可省略（默认 16384，即 16KB）",
+                        "minimum": 1,
+                        "maximum": 262144
                     }
                 },
                 "required": ["sessionId"]
@@ -290,8 +298,9 @@ pub fn sql_tools() -> Vec<ToolDef> {
                     "sql": { "type": "string" },
                     "limit": {
                         "type": "integer",
-                        "description": "返回行数上限，默认 100",
-                        "minimum": 1
+                        "description": "返回行数上限，默认 100（最大 1000，超出按 1000 处理）",
+                        "minimum": 1,
+                        "maximum": 1000
                     }
                 },
                 "required": ["dbConnId", "sql"]
@@ -893,7 +902,7 @@ pub async fn execute_tool(
     let mut result = match call.name.as_str() {
         "exec_ssh" => exec_ssh(state, &call.arguments, visualization).await,
         "terminal_snapshot" => terminal_snapshot(state, &call.arguments),
-        "exec_sql" => exec_sql(app, state, &call.arguments, visualization).await,
+        "exec_sql" => exec_sql(app, state, &call.arguments, visualization, request_id).await,
         "list_db_tables" => list_db_tables(state, &call.arguments).await,
         "describe_table" => describe_table(state, &call.arguments).await,
         "read_file" => read_file(state, &call.arguments, file_domain),
@@ -943,12 +952,13 @@ async fn exec_ssh(state: &AppState, args: &Value, visualization: bool) -> ToolRe
     }
 
     log::info!(
-        "[agent] exec_ssh 开始：会话 {session_id}，模式 {}，命令：{command}",
+        "[agent] exec_ssh 开始：会话 {session_id}，模式 {}，命令：{}",
         if visualization {
             "可视化(写PTY)"
         } else {
             "独立连接"
-        }
+        },
+        truncate_log(&command, 200)
     );
 
     // 1.5 终端可视化模式：把命令写入用户活动终端的 PTY（命令实时显示在 xterm），
@@ -958,19 +968,47 @@ async fn exec_ssh(state: &AppState, args: &Value, visualization: bool) -> ToolRe
         return exec_ssh_visual(state, &session_id, &command).await;
     }
 
-    // 2. 从 terminals 取 session_config_id。
-    let session_config_id = {
+    // 2. 从 terminals 取会话类型 + session_config_id。
+    //    只有 SSH 会话能走独立连接：本地 shell 的 session_config_id 是空串，
+    //    Telnet 会话的配置不是 SSH（拿去握手必然协议不匹配）。必须提前给出
+    //    明确错误——否则模型会收到"会话配置  不存在"（id 为空串，无法理解）
+    //    之类误导信息并反复重试，直到被重复调用守卫硬拦。
+    //
+    //    注意：可视化模式（上面已 return）对**任何**终端类型都可用（它就是往
+    //    用户终端里写命令，本地 shell/Telnet 同样成立）；这里限制的只是
+    //    "独立连接"模式。
+    let (session_kind, session_config_id) = {
         let terminals = state.terminals.lock();
-        terminals
-            .get(&session_id)
-            .map(|s| s.session_config_id().to_string())
+        match terminals.get(&session_id) {
+            Some(s) => {
+                let kind = match s {
+                    crate::state::TerminalSession::Ssh(_) => "ssh",
+                    crate::state::TerminalSession::Telnet(_) => "telnet",
+                    crate::state::TerminalSession::Local(_) => "local",
+                };
+                (Some(kind), s.session_config_id().to_string())
+            }
+            None => (None, String::new()),
+        }
     };
-    let session_config_id = match session_config_id {
-        Some(id) => id,
+    let session_kind = match session_kind {
+        Some(k) => k,
         None => {
             return ToolResult::err(format!("找不到终端会话 {session_id}"));
         }
     };
+    if session_kind != "ssh" {
+        let label = if session_kind == "telnet" {
+            "Telnet"
+        } else {
+            "本地 shell"
+        };
+        return ToolResult::err(format!(
+            "exec_ssh 的独立连接模式只支持 SSH 会话（需要会话配置建新连接），\
+当前会话 {session_id} 是{label}会话：请直接在用户终端里执行，\
+或在设置中开启「终端可视化」让命令写入该终端"
+        ));
+    }
 
     // 3. 加载会话配置 + 解析凭据（同步操作；多次获取短生命 DB 连接）。
     let setup: AppResult<(
@@ -1371,6 +1409,17 @@ fn truncate_output(s: &str, max_bytes: usize) -> String {
     )
 }
 
+/// 日志截断：SQL/命令原文可能含敏感数据（INSERT/UPDATE 的明文值），
+/// 日志只保留前 `max` 个字符，避免凭据随日志落盘。
+fn truncate_log(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max).collect();
+        format!("{head}…")
+    }
+}
+
 /// terminal_snapshot：取指定终端最近输出。
 fn terminal_snapshot(state: &AppState, args: &Value) -> ToolResult {
     let session_id = match args.get("sessionId").and_then(Value::as_str) {
@@ -1407,6 +1456,7 @@ async fn exec_sql(
     state: &AppState,
     args: &Value,
     visualization: bool,
+    request_id: &str,
 ) -> ToolResult {
     let (conn_id, sql) = match (
         args.get("dbConnId").and_then(Value::as_str),
@@ -1415,15 +1465,14 @@ async fn exec_sql(
         (Some(c), Some(s)) => (c.to_string(), s.to_string()),
         _ => return ToolResult::err("exec_sql 缺少 dbConnId 或 sql"),
     };
-    let limit = args
-        .get("limit")
-        .and_then(Value::as_u64)
-        .map(|n| n as u32)
-        .unwrap_or(100);
+    // limit 必须钳制：模型可传任意大值，执行层会按它预分配行缓冲，
+    // 无上限时一次调用就能把进程 abort 掉（见 database::MAX_QUERY_ROWS）。
+    let limit = crate::database::clamp_limit(args.get("limit").and_then(Value::as_u64));
 
     log::info!(
-        "[agent] exec_sql 开始：连接 {conn_id}，可视化 {}，SQL：{sql}",
-        if visualization { "是" } else { "否" }
+        "[agent] exec_sql 开始：连接 {conn_id}，可视化 {}，SQL：{}",
+        if visualization { "是" } else { "否" },
+        truncate_log(&sql, 200)
     );
 
     // 取出 conn 句柄（enum 克隆；并发下不会与用户操作互相 remove/insert 竞争）。
@@ -1452,7 +1501,17 @@ async fn exec_sql(
 
     let started = std::time::Instant::now();
     // 执行（MySQL 自动落在连接的当前库上；PG 的库在连接层已确定）。
-    let res = conn.execute(&sql, limit).await;
+    //
+    // 必须加超时：SQL 在并发工具段执行并持有全局并发许可，一条挂死语句
+    //（`SELECT SLEEP(3600)`、锁等待、无索引大表扫描）会把整个 agent 会话
+    // 卡到用户手动"终止"，白名单模式下还可能是提示注入诱导发起的。
+    let res = match timeout(SQL_EXEC_TIMEOUT, conn.execute(&sql, limit)).await {
+        Ok(r) => r,
+        Err(_) => Err(AppError::Storage(format!(
+            "SQL 执行超过 {} 秒已中止，请缩小查询范围或分批执行",
+            SQL_EXEC_TIMEOUT.as_secs()
+        ))),
+    };
     let elapsed_ms = started.elapsed().as_millis() as u64;
 
     // SQL 终端可视化：把结构化结果回显给 SQL 控制台（命令行模式）。
@@ -1477,7 +1536,8 @@ async fn exec_sql(
             app,
             crate::events::AI_SQL_RESULT,
             crate::events::AiSqlResultEvent {
-                request_id: String::new(),
+                request_id: request_id.to_string(),
+                db_conn_id: conn_id.clone(),
                 sql: sql.clone(),
                 columns,
                 rows,
@@ -1509,8 +1569,16 @@ async fn list_db_tables(state: &AppState, args: &Value) -> ToolResult {
         }
     };
     // 带当前库执行（MySQL SHOW TABLES / PG information_schema，PG 表名带
-    // schema 前缀，如 public.users）。
-    let res = conn.list_tables(None).await;
+    // schema 前缀，如 public.users）。加超时防止挂死占满并发许可。
+    let res = match timeout(SQL_EXEC_TIMEOUT, conn.list_tables(None)).await {
+        Ok(r) => r,
+        Err(_) => {
+            return ToolResult::err(format!(
+                "列出表超过 {} 秒已中止",
+                SQL_EXEC_TIMEOUT.as_secs()
+            ))
+        }
+    };
 
     match res {
         Ok(tables) => {
@@ -1539,7 +1607,15 @@ async fn describe_table(state: &AppState, args: &Value) -> ToolResult {
     };
     // 标识符校验与限定名拼接由 describe_table 内部按方言处理
     // （MySQL `db.table` / PG `schema.table`）。
-    let res = conn.describe_table(&table).await;
+    let res = match timeout(SQL_EXEC_TIMEOUT, conn.describe_table(&table)).await {
+        Ok(r) => r,
+        Err(_) => {
+            return ToolResult::err(format!(
+                "查看表结构超过 {} 秒已中止",
+                SQL_EXEC_TIMEOUT.as_secs()
+            ))
+        }
+    };
 
     match res {
         Ok(qr) => ToolResult::ok(format_query_result(&qr)),
@@ -1683,13 +1759,55 @@ fn write_file(state: &AppState, args: &Value, domain: &str) -> ToolResult {
         Ok(p) => p,
         Err(e) => return ToolResult::err(e),
     };
-    match std::fs::write(&path, content) {
+    // 原子写入：先写同目录临时文件再 rename。`std::fs::write` 是先截断再写，
+    // 磁盘满/权限中断/进程被杀时原文件已被截成半截内容且无备份提示。
+    // 同目录 rename 在同一文件系统内是原子的（json_store::write_json 同理）。
+    //
+    // 目标是目录（path 为空/指向已有子目录）时提前拒绝：否则临时文件会建在
+    // 其父目录（工作目录之外）再因 rename 到目录而失败，白写一次。
+    if path.is_dir() {
+        return ToolResult::err(format!("{} 是目录，不能写入文件", path.display()));
+    }
+    // 临时名带随机后缀：同一轮多个工具调用是并行执行的，两个调用写同一路径
+    // 时固定名会让它们互相覆盖对方的内容（都报"已写入"，先写者静默丢失）。
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    let tmp = path.with_file_name(format!(
+        ".{}.xterm-tmp-{}-{}",
+        path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "file".into()),
+        std::process::id(),
+        &unique[..8]
+    ));
+    // 覆盖已有文件时保留其权限：rename 换的是 inode，新文件按 umask 重建。
+    // Unix 上 0600 的私钥/配置文件不能因为改写而变成 0644；Windows 上保留
+    // 只读属性。ACL 无法用 std 完整复制，但至少不把显式 mode 抹掉。
+    let existing_perms = std::fs::metadata(&path).ok().map(|m| m.permissions());
+    if let Err(e) = std::fs::write(&tmp, content) {
+        let _ = std::fs::remove_file(&tmp);
+        return ToolResult::err(format!("写入失败: {e}"));
+    }
+    if let Some(perms) = existing_perms {
+        let _ = std::fs::set_permissions(&tmp, perms);
+    }
+    match std::fs::rename(&tmp, &path) {
         Ok(()) => ToolResult::ok(format!(
             "已写入 {}（{} 字节）",
             path.display(),
             content.len()
         )),
-        Err(e) => ToolResult::err(format!("写入失败: {e}")),
+        Err(e) => {
+            // rename 失败（跨盘/目标被占用）：清理临时文件，回退到直接覆盖。
+            let _ = std::fs::remove_file(&tmp);
+            match std::fs::write(&path, content) {
+                Ok(()) => ToolResult::ok(format!(
+                    "已写入 {}（{} 字节）",
+                    path.display(),
+                    content.len()
+                )),
+                Err(e2) => ToolResult::err(format!("写入失败: {e}（回退写入也失败: {e2}）")),
+            }
+        }
     }
 }
 
@@ -2091,6 +2209,16 @@ pub fn sql_allowed_by_mode(sql: &str, mode: &str) -> bool {
     if kw.is_empty() {
         return false;
     }
+    if mode == "full" {
+        return true;
+    }
+    // 非 full 模式：查询形态也可能带写副作用（`SELECT ... INTO OUTFILE`、
+    // `LOAD_FILE`、`pg_terminate_backend` 等）。sql_mode 是"允许什么语句"的
+    // 策略闸门，readonly/restricted 必须在这里就拒绝——否则 `run_mode=auto`
+    // 时这些语句会被免确认执行（auto 模式只跳过"危险确认"，不改写 sql_mode）。
+    if readonly_side_effect(sql).is_some() {
+        return false;
+    }
     match mode {
         "full" => true,
         // restricted 允许 DML（EXPLAIN ANALYZE 执行的是 DML 时可放行；DDL 仍禁止）。
@@ -2148,6 +2276,245 @@ fn sql_executes_explain_analyze(sql: &str) -> bool {
     false
 }
 
+/// 只读模式下额外拒绝的副作用函数（首关键字是查询也拦）。
+///
+/// 这些函数本身带写副作用或能读取服务器文件，恰是提示注入最易诱导的形态
+/// （AI 读完表内容后按表内指令行动）：
+/// - MySQL：`LOAD_FILE`（读服务器文件）、`SYS_EXEC`/`SYS_EVAL`（UDF 执行系统命令）；
+/// - PostgreSQL：`pg_read_file`/`pg_read_binary_file`/`pg_ls_dir`（读服务器文件）、
+///   `pg_terminate_backend`/`pg_cancel_backend`（打断其它连接）、
+///   `pg_reload_conf`/`pg_rotate_logfile`/`pg_switch_wal`（改服务端状态）、
+///   `setval`（改序列）、`lo_import`/`lo_export`/`lo_unlink`（大对象写/导出/删）、
+///   `dblink`/`dblink_exec`（跨库读写）、`pg_create_restore_point`（改 WAL 状态）。
+static SIDE_EFFECT_FN_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?i)\b(LOAD_FILE|SYS_EXEC|SYS_EVAL|PG_READ_FILE|PG_READ_BINARY_FILE|PG_LS_DIR|PG_TERMINATE_BACKEND|PG_CANCEL_BACKEND|PG_RELOAD_CONF|PG_ROTATE_LOGFILE|PG_SWITCH_WAL|PG_CREATE_RESTORE_POINT|SETVAL|LO_IMPORT|LO_EXPORT|LO_UNLINK|DBLINK|DBLINK_EXEC)\s*\(",
+    )
+    .expect("副作用函数名单正则必须可编译")
+});
+
+/// SQL 结构化的方言开关。
+///
+/// 侧信道检测无法得知当前方言（控制台/AI/MCP 共用同一入口），因此对同一
+/// 条语句按**多种方言解释各扫一遍，任意一种命中即拒绝**（保守取向：只会
+/// 多拦，不会漏拦）。
+#[derive(Clone, Copy)]
+struct SqlScanOpts {
+    /// 字面量内 `\` 是转义（MySQL 默认；`NO_BACKSLASH_ESCAPES` 下不是）。
+    backslash_escape: bool,
+    /// `#` 起行注释（MySQL）；PostgreSQL 里 `#` 是 XOR 运算符。
+    hash_comment: bool,
+}
+
+/// 需要尝试的方言解释。
+///
+/// 1. MySQL 默认（反斜杠转义 + `#` 注释）；
+/// 2. MySQL `NO_BACKSLASH_ESCAPES`（此时 `'a\'` 是完整字面量，后面的
+///    `INTO OUTFILE` 是真实子句——单按默认解释会把它当字符串吞掉）；
+/// 3. PostgreSQL（`#` 是运算符，`SELECT 1 # 0, pg_read_file(…)` 里的
+///    函数不能被当注释吞掉）。
+const SQL_SCAN_VARIANTS: [SqlScanOpts; 3] = [
+    SqlScanOpts {
+        backslash_escape: true,
+        hash_comment: true,
+    },
+    SqlScanOpts {
+        backslash_escape: false,
+        hash_comment: true,
+    },
+    SqlScanOpts {
+        backslash_escape: false,
+        hash_comment: false,
+    },
+];
+
+/// 判断 `$tag$`（PostgreSQL 美元引号）起始位置，返回分隔符长度。
+///
+/// `$$` 与 `$tag$` 都合法，tag 允许字母/数字/下划线且不以数字开头。
+fn dollar_quote_delim_len(b: &[u8], i: usize) -> Option<usize> {
+    if b.get(i) != Some(&b'$') {
+        return None;
+    }
+    let mut j = i + 1;
+    while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+        j += 1;
+    }
+    if b.get(j) == Some(&b'$') {
+        // 纯数字前缀不是合法 tag（`$1$`），交给普通字符处理。
+        let tag = &b[i + 1..j];
+        if !tag.is_empty() && tag[0].is_ascii_digit() {
+            return None;
+        }
+        Some(j - i + 1)
+    } else {
+        None
+    }
+}
+
+/// 把 SQL 归一成"只保留语句结构"的文本，供副作用检测使用。
+///
+/// 与 [`strip_sql_comments`] 的区别是**引号感知**，这是安全前提：
+/// - 字面量里的 `#`/`--` 不是注释起点。若像 strip_sql_comments 那样一律当
+///   注释，`SELECT '#' INTO OUTFILE '/tmp/x'` 会把真正的 OUTFILE 一起吞掉，
+///   只读模式下直接漏检（写入服务器文件）。
+/// - 字面量里的 "INTO OUTFILE"/"load_file(" 不是语法，替换成空格可避免
+///   `WHERE sql LIKE '%INTO OUTFILE%'` 这类审计查询被误拒。
+///
+/// 注释处理规则：
+/// - `--` 仅在其后是空白/行尾时按注释处理（MySQL 要求 `-- `；PG 的 `--x`
+///   会被当代码继续扫描，只会误拒不会漏检）；
+/// - `#` 按 `opts.hash_comment` 处理；
+/// - `/* ... */` 按注释处理，但 MySQL 的 `/*! ... */` 与 MariaDB 的
+///   `/*M! ... */` **保留内容**参与检查——两者内容都会被服务端真实执行；
+/// - `$tag$ ... $tag$`（PostgreSQL 美元引号）跳过内容，避免其中的引号把
+///   后续真实子句吞掉。
+fn sql_structure(sql: &str, opts: SqlScanOpts) -> String {
+    let b = sql.as_bytes();
+    let n = b.len();
+    let mut out = String::with_capacity(n);
+    let mut i = 0usize;
+    while i < n {
+        match b[i] {
+            quote @ (b'\'' | b'"' | b'`') => {
+                // 跳过整个字面量（含 '' 双写转义与反斜杠转义）。
+                out.push(' ');
+                i += 1;
+                while i < n {
+                    if b[i] == b'\\' && opts.backslash_escape && quote != b'`' && i + 1 < n {
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == quote {
+                        if i + 1 < n && b[i + 1] == quote {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                out.push(' ');
+            }
+            b'$' => {
+                match dollar_quote_delim_len(b, i) {
+                    Some(len) => {
+                        let delim = &b[i..i + len];
+                        // 找匹配的结束分隔符；找不到按普通字符处理（不是合法
+                        // 美元引号，不能因此吞掉后续文本）。
+                        let mut j = i + len;
+                        let mut end = None;
+                        while j + len <= n {
+                            if &b[j..j + len] == delim {
+                                end = Some(j + len);
+                                break;
+                            }
+                            j += 1;
+                        }
+                        match end {
+                            Some(after) => {
+                                out.push(' ');
+                                i = after;
+                                out.push(' ');
+                            }
+                            None => {
+                                out.push('$');
+                                i += 1;
+                            }
+                        }
+                    }
+                    None => {
+                        out.push('$');
+                        i += 1;
+                    }
+                }
+            }
+            b'-' if i + 1 < n && b[i + 1] == b'-' => {
+                let next = b.get(i + 2).copied();
+                // MySQL：`--` 后必须是空白/控制字符/行尾才是注释。
+                let is_comment =
+                    matches!(next, None | Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n'));
+                if is_comment {
+                    while i < n && b[i] != b'\n' {
+                        i += 1;
+                    }
+                    out.push(' ');
+                } else {
+                    out.push('-');
+                    i += 1;
+                }
+            }
+            b'#' if opts.hash_comment => {
+                while i < n && b[i] != b'\n' {
+                    i += 1;
+                }
+                out.push(' ');
+            }
+            b'/' if i + 1 < n && b[i + 1] == b'*' => {
+                // MySQL `/*!` / MariaDB `/*M!` 是可执行注释：内容会被真实执行，
+                // 保留并继续扫描（丢掉注释标记，避免影响 token 边界判断）。
+                let m_exec = i + 2 < n && b[i + 2] == b'M' && b.get(i + 3) == Some(&b'!');
+                let bang_exec = i + 2 < n && b[i + 2] == b'!';
+                if bang_exec || m_exec {
+                    out.push(' ');
+                    i += if bang_exec { 3 } else { 4 };
+                    continue;
+                }
+                i += 2;
+                while i + 1 < n && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(n);
+                out.push(' ');
+            }
+            _ => {
+                let ch = sql[i..].chars().next().unwrap_or_default();
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+    out
+}
+
+/// 在一种方言解释下检查副作用。
+fn side_effect_in_variant(sql: &str, opts: SqlScanOpts) -> Option<String> {
+    let normalized = sql_structure(sql, opts)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_uppercase();
+    if normalized.contains("INTO OUTFILE") || normalized.contains("INTO DUMPFILE") {
+        return Some("SELECT ... INTO OUTFILE/DUMPFILE 会写数据库服务器文件".to_string());
+    }
+    if let Some(caps) = SIDE_EFFECT_FN_RE.captures(&normalized) {
+        let name = caps.get(1).map(|m| m.as_str()).unwrap_or("该函数");
+        return Some(format!(
+            "函数 {name} 有写副作用或可读写服务器文件（只读模式禁止）"
+        ));
+    }
+    None
+}
+
+/// 检查"查询形态但带写副作用"的语句，返回人类可读的原因。
+///
+/// 只读判定不能只看首关键字：`SELECT` 语句体同样可以写服务器文件
+/// （`SELECT ... INTO OUTFILE/DUMPFILE`）、读服务器任意文件（`LOAD_FILE`、
+/// `pg_read_file`）、打断其它连接（`pg_terminate_backend`）或改序列
+/// （`setval`）。
+///
+/// 按 [`SQL_SCAN_VARIANTS`] 的多种方言解释各扫一遍，任意命中即拒绝——
+/// 单一方言解释会被另一方言的语法绕过（如 MySQL `NO_BACKSLASH_ESCAPES`
+/// 下的 `'a\'`、PostgreSQL 的 `#` 运算符与 `$$` 美元引号）。
+pub fn readonly_side_effect(sql: &str) -> Option<String> {
+    for opts in SQL_SCAN_VARIANTS {
+        if let Some(reason) = side_effect_in_variant(sql, opts) {
+            return Some(reason);
+        }
+    }
+    None
+}
+
 /// [`sql_allowed_by_mode`] 的 readonly 集合一致。
 pub fn is_readonly_sql(sql: &str) -> bool {
     let kw = sql_first_keyword(sql);
@@ -2159,10 +2526,14 @@ pub fn is_readonly_sql(sql: &str) -> bool {
         //（table_info / integrity_check 等是高频只读操作）。
         return is_readonly_pragma(sql);
     }
-    matches!(
+    if !matches!(
         kw.as_str(),
         "SELECT" | "SHOW" | "EXPLAIN" | "DESCRIBE" | "DESC" | "TABLE" | "VALUES"
-    )
+    ) {
+        return false;
+    }
+    // 首关键字合法不代表语句无副作用，见 [`readonly_side_effect`]。
+    readonly_side_effect(sql).is_none()
 }
 
 /// SQLite 只读 PRAGMA 名单（无写副作用）。
@@ -2494,6 +2865,143 @@ mod tests {
     #[test]
     fn metachar_regex_compiles() {
         assert!(COMMAND_METACHAR_RE.is_match("ls; rm -rf /"));
+    }
+
+    /// 查询形态但带写副作用的语句必须被判为"非只读"。
+    ///
+    /// 注释/多空格/换行都不能绕过（历史缺陷：裸 `contains("INTO OUTFILE")`
+    /// 可被 `INTO/**/OUTFILE` 绕过）。
+    #[test]
+    fn readonly_side_effect_variants() {
+        // INTO OUTFILE / DUMPFILE：常规、注释、换行、多空格。
+        assert!(!is_readonly_sql(
+            "SELECT 'x' INTO OUTFILE '/tmp/pwn'"
+        ));
+        assert!(!is_readonly_sql(
+            "SELECT 'x' INTO/**/OUTFILE '/tmp/pwn'"
+        ));
+        assert!(!is_readonly_sql("SELECT 'x' INTO\n  OUTFILE '/tmp/pwn'"));
+        assert!(!is_readonly_sql("select payload into dumpfile '/tmp/x'"));
+        // 有副作用的函数（大小写、函数名与括号间空白都不影响）。
+        assert!(!is_readonly_sql("SELECT LOAD_FILE('/etc/passwd')"));
+        assert!(!is_readonly_sql("SELECT load_file /*x*/ ('/etc/passwd')"));
+        assert!(!is_readonly_sql(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity"
+        ));
+        assert!(!is_readonly_sql("SELECT setval('s', 1)"));
+        assert!(!is_readonly_sql("SELECT lo_import('/etc/passwd')"));
+        assert!(!is_readonly_sql(
+            "SELECT * FROM dblink('host=x', 'DELETE FROM t') AS r(a int)"
+        ));
+        // 普通只读查询不受影响（含名字相近的普通标识符）。
+        assert!(is_readonly_sql("SELECT id, name FROM users WHERE id = 1"));
+        assert!(is_readonly_sql(
+            "SELECT * FROM t WHERE note = 'load_file'"
+        ));
+        assert!(is_readonly_sql("SELECT my_load_file(x) FROM t"));
+        assert!(is_readonly_sql("SHOW VARIABLES LIKE 'version'"));
+        // 错误原因可读（用于控制台报错）。
+        let reason = readonly_side_effect("SELECT 'x' INTO/**/OUTFILE '/tmp/a'")
+            .expect("必须识别为副作用");
+        assert!(reason.contains("OUTFILE"), "原因应指明 OUTFILE: {reason}");
+    }
+
+    /// 引号感知的副作用检测：字面量里的 `#`/`--` 不能把后文当注释吞掉
+    /// （历史缺陷：strip_sql_comments 不区分引号，`SELECT '#' INTO OUTFILE …`
+    /// 会把真正的 OUTFILE 一起跳过，只读模式漏检）。
+    #[test]
+    fn readonly_side_effect_quote_aware() {
+        // 字面量内的 `#` 之后仍有真实 OUTFILE：必须拦。
+        assert!(!is_readonly_sql("SELECT '#' INTO OUTFILE '/tmp/pwn'"));
+        assert!(!is_readonly_sql(
+            "SELECT '#', LOAD_FILE('/etc/passwd')"
+        ));
+        // 字面量内的 `--` 同理。
+        assert!(!is_readonly_sql(
+            "SELECT '--' INTO DUMPFILE '/tmp/pwn'"
+        ));
+        // MySQL 的 `--` 不带空白时不是注释（是减号），后文 OUTFILE 必须拦。
+        assert!(!is_readonly_sql(
+            "SELECT 1--2 INTO OUTFILE '/tmp/pwn'"
+        ));
+        // MySQL 可执行注释 /*! … */ 的内容会被真实执行：保留参与检查。
+        assert!(!is_readonly_sql(
+            "SELECT 1 /*!50000 INTO OUTFILE '/tmp/pwn' */"
+        ));
+        // 字符串转义（'' 双写、反斜杠）不能破坏引号配对。
+        assert!(!is_readonly_sql(
+            "SELECT 'it''s' INTO OUTFILE '/tmp/pwn'"
+        ));
+        assert!(!is_readonly_sql(
+            "SELECT 'a\\'b' INTO OUTFILE '/tmp/pwn'"
+        ));
+        // 字面量/标识符里的同名文本不该误伤（避免审计类查询被拒）。
+        assert!(is_readonly_sql(
+            "SELECT sql FROM audit_log WHERE sql LIKE '%INTO OUTFILE%'"
+        ));
+        assert!(is_readonly_sql("SELECT 'load_file(' AS x"));
+        assert!(is_readonly_sql("SELECT 1 AS `INTO OUTFILE`"));
+        // 真注释里的 OUTFILE 不执行，不应误判。
+        assert!(is_readonly_sql("SELECT 1 -- note INTO OUTFILE /tmp/x"));
+        assert!(is_readonly_sql("SELECT 1 /* INTO OUTFILE */"));
+    }
+
+    /// 方言差异不能成为绕过的入口：同一语句按多种方言解释，任一命中即拒绝。
+    #[test]
+    fn readonly_side_effect_dialect_bypasses() {
+        // MariaDB 可执行注释 /*M! … */（旧实现只认 MySQL 的 /*!）。
+        assert!(!is_readonly_sql(
+            "SELECT 1 /*M!100100 INTO OUTFILE '/tmp/pwn' */"
+        ));
+        // MySQL NO_BACKSLASH_ESCAPES：`'a\'` 是完整字面量，后面的 OUTFILE 真实执行。
+        assert!(!is_readonly_sql(
+            "SELECT 'a\\' INTO OUTFILE '/tmp/pwn'"
+        ));
+        // PostgreSQL 的 `#` 是 XOR 运算符，不是注释：后面的函数必须被看到。
+        assert!(!is_readonly_sql(
+            "SELECT 1 # 0, pg_read_file('/etc/passwd')"
+        ));
+        // PostgreSQL 美元引号里的引号不能让后续子句被吞掉。
+        assert!(!is_readonly_sql(
+            "SELECT $$'$$, pg_read_file('/etc/passwd')"
+        ));
+        assert!(!is_readonly_sql(
+            "SELECT $t$'$t$, LOAD_FILE('/etc/passwd')"
+        ));
+        // 美元引号内的同名文本被正确跳过（不误伤 PG 审计查询）。
+        assert!(is_readonly_sql("SELECT $$ nothing here $$ AS s"));
+        assert!(is_readonly_sql("SELECT $$INTO OUTFILE$$ AS s"));
+    }
+
+    /// 常见只读查询不能因为副作用检测被误拒（回归护栏）。
+    #[test]
+    fn readonly_allows_common_queries() {
+        for sql in [
+            "SELECT * FROM users WHERE name = 'O\\'Brien'",
+            "SELECT * FROM users WHERE name = 'O''Brien'",
+            "SELECT * FROM t WHERE path LIKE 'C:\\\\temp\\\\%'",
+            "SELECT `a`, `b` FROM `t` WHERE `c` = 'x'",
+            "SELECT JSON_OBJECT('a', 'b') FROM t",
+            "SELECT COUNT(*) FROM t WHERE note <> '#'",
+            "SHOW CREATE TABLE users",
+            "SHOW VARIABLES LIKE 'version%'",
+            "EXPLAIN SELECT * FROM t WHERE id = 1",
+            "DESCRIBE users",
+            "TABLE users",
+            "VALUES ROW(1, 2)",
+            "SELECT * FROM t1 JOIN t2 ON t1.id = t2.id",
+            "SELECT 'it''s a #hashtag' AS s",
+        ] {
+            assert!(is_readonly_sql(sql), "常见只读查询被误拒: {sql}");
+        }
+        // restricted 下带字面量的 DML 也不能被误拒。
+        for sql in [
+            "INSERT INTO t (a) VALUES ('#x')",
+            "UPDATE t SET a = 'load_file(' WHERE id = 1",
+            "DELETE FROM t WHERE b = 'INTO OUTFILE'",
+        ] {
+            assert!(sql_allowed_by_mode(sql, "restricted"), "restricted 误拒: {sql}");
+        }
     }
 
     /// 各类 shell 分隔符/重定向/命令替换必须被判定为"非白名单"（防拼接绕过）。

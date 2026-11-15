@@ -214,7 +214,7 @@ impl MySqlConn {
             use futures::TryStreamExt;
             let mut stream = sqlx::query(sql).fetch(&mut *conn);
             let mut columns: Vec<String> = Vec::new();
-            let mut out_rows: Vec<Vec<String>> = Vec::with_capacity(limit as usize);
+            let mut out_rows: Vec<Vec<String>> = Vec::with_capacity(limit.min(1024) as usize);
             let mut seen: u64 = 0;
             let mut truncated = false;
             while let Some(row) = stream.try_next().await? {
@@ -376,9 +376,12 @@ pub async fn connect_via_ssh(
 // 辅助
 // ===========================================================================
 
-/// 判断 SQL 是否为"返回结果集"的语句（需要走 `fetch_all`）。
+/// 判断 SQL 是否为"返回结果集"的语句（需要走流式 fetch）。
 ///
 /// 取 SQL 去掉前导空白与注释后的首个关键字，不区分大小写。
+/// `TABLE t` / `VALUES ROW(...)` 是 MySQL 8.0.19+ 的隐式查询形式（等价
+/// `SELECT * FROM t` / `VALUES`），漏判会让结果集被 execute 分支丢弃、前端
+/// 只看到"影响 0 行"，用户误以为表是空的。PG/SQLite 的实现都包含这两个关键字。
 fn is_query_stmt(sql: &str) -> bool {
     let trimmed = crate::database::script_split::strip_leading_comments(sql).trim_start();
     // 取第一个空白前的 token。
@@ -390,7 +393,7 @@ fn is_query_stmt(sql: &str) -> bool {
     let upper = first.to_uppercase();
     matches!(
         upper.as_str(),
-        "SELECT" | "SHOW" | "EXPLAIN" | "DESC" | "DESCRIBE" | "WITH"
+        "SELECT" | "SHOW" | "EXPLAIN" | "DESC" | "DESCRIBE" | "WITH" | "TABLE" | "VALUES"
     )
 }
 

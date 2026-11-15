@@ -362,10 +362,24 @@ impl client::Handler for ClientHandler {
         // 按本连接的 disconnect_key（host:port#随机后缀）写入：终端 reader 用
         // 同一 key 取出。空串 = 非终端连接（监控/SFTP/隧道等）无 consumer，
         // 不写——否则条目永不被 remove，注册表随连接数无限增长。
+        //
+        // 有界兜底：条目由 reader 退出时 remove，但本回调是**异步**触发的
+        //（Handle drop 后客户端任务收尾时才调用），"连接建立成功但会话建立
+        // 失败"（认证失败/channel/PTY/shell 被拒）等路径上 reader 从未启动，
+        // 调用方在返回前的 remove 可能被本回调晚到的 insert 重新覆盖。这里给
+        // 注册表加硬上限：只影响"断开原因"这一提示信息（key 含随机后缀，不会
+        // 串到别的连接），内存则严格有界。
         if !self.disconnect_key.is_empty() {
-            self.disconnect_reasons
-                .lock()
-                .insert(self.disconnect_key.clone(), desc);
+            let mut reasons = self.disconnect_reasons.lock();
+            const MAX_DISCONNECT_REASONS: usize = 256;
+            if reasons.len() >= MAX_DISCONNECT_REASONS {
+                // 任意淘汰一条（HashMap 无序）：最坏情况只是某次断开的提示
+                // 原因缺失，不影响连接与功能。
+                if let Some(stale) = reasons.keys().next().cloned() {
+                    reasons.remove(&stale);
+                }
+            }
+            reasons.insert(self.disconnect_key.clone(), desc);
         }
         self.connection_closed.notify_waiters();
         Ok(())
@@ -669,6 +683,13 @@ impl ClientHandler {
 /// 不能误判为密码，否则会被已保存密码自动填充，用户永远看不到输入框。
 fn looks_like_password(prompt: &str) -> bool {
     let lower = prompt.to_ascii_lowercase();
+    // "One-time password"/"OTP" 是验证码提示，不是账户密码：英文方向没有像
+    // 中文那样的互斥（"口令码/动态口令"不算密码），"one-time password" 含
+    // "password" 子串会被误判为密码 → 首轮自动填入已保存密码，浪费一次
+    // MaxAuthTries 且二次认证必然失败。先排除 OTP 形态。
+    if looks_like_otp(prompt) {
+        return false;
+    }
     if lower.contains("password") || lower.contains("passphrase") {
         return true;
     }
@@ -693,6 +714,10 @@ fn looks_like_otp(prompt: &str) -> bool {
         || lower.contains("two-factor")
         || lower.contains("2fa")
         || lower.contains("token")
+        // 英文 OTP 的常见写法（含 "One-time password (OTP)" 的变体）。
+        || lower.contains("one-time")
+        || lower.contains("one time")
+        || lower.contains("authenticator")
         || lower.contains("验证码")
         || lower.contains("动态码")
         || lower.contains("口令码")
@@ -930,7 +955,13 @@ async fn connect_direct_inner(
                     Err(e) => return Err(e.into()),
                 },
                 secs => {
-                    let deadline = tokio::time::Instant::now() + Duration::from_secs(u64::from(secs));
+                    let mut deadline =
+                        tokio::time::Instant::now() + Duration::from_secs(u64::from(secs));
+                    // 主机公钥确认的等待起点：deadline 是**绝对时刻**，等待期间
+                    // 时间照常流逝。只在 pending 期间"跳过检查"并不能暂停计时——
+                    // 用户比对指纹耗时超过连接超时后，一确认就会被判定超时杀掉。
+                    // 因此恢复计时时把等待时长顺延到 deadline 上。
+                    let mut pending_since: Option<tokio::time::Instant> = None;
                     loop {
                         if connect_task.is_finished() {
                             break match connect_task.await {
@@ -942,8 +973,12 @@ async fn connect_direct_inner(
                         }
                         // 主机公钥确认等待用户决策期间，连接超时暂停计。
                         if *host_key_pending.lock() {
+                            pending_since.get_or_insert_with(tokio::time::Instant::now);
                             tokio::time::sleep(Duration::from_millis(200)).await;
                             continue;
+                        }
+                        if let Some(since) = pending_since.take() {
+                            deadline += since.elapsed();
                         }
                         if tokio::time::Instant::now() >= deadline {
                             connect_task.abort();

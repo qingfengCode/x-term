@@ -7239,7 +7239,7 @@ dependencies = [
 
 [[package]]
 name = "x-term"
-version = "0.1.69"
+version = "0.1.76"
 dependencies = [
  "aes-gcm",
  "anyhow",

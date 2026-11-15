@@ -217,10 +217,8 @@ watch(
   flex-direction: column;
   background: var(--el-bg-color-overlay);
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 8px;
-  box-shadow:
-    0 8px 24px rgba(0, 0, 0, 0.16),
-    0 2px 8px rgba(0, 0, 0, 0.08);
+  border-radius: var(--app-radius-md);
+  box-shadow: var(--app-shadow-2);
 }
 
 .suggestion-list {
@@ -236,7 +234,7 @@ watch(
   gap: 6px;
   padding: 5px 10px;
   font-size: 13px;
-  font-family: Consolas, "Cascadia Code", "Courier New", monospace;
+  font-family: var(--app-font-mono);
   color: var(--el-text-color-primary);
   cursor: pointer;
   user-select: none;
@@ -300,7 +298,7 @@ watch(
   background: transparent;
   color: var(--el-text-color-secondary);
   cursor: pointer;
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   flex-shrink: 0;
   padding: 0;
 }

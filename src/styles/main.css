@@ -65,6 +65,117 @@
   --el-button-active-text-color: var(--app-accent-contrast);
 }
 
+/* --- 设计令牌：形状 / 间距 / 字号 / 动效 / 阴影 ---------------------------
+   组件优先使用这些令牌，避免 3/4/5/6/8/10/12px 与半像素字号继续扩散。 */
+:root {
+  --app-radius-xs: 4px;
+  --app-radius-sm: 6px;
+  --app-radius-md: 8px;
+  --app-radius-lg: 10px;
+  --app-radius-xl: 12px;
+
+  --app-space-1: 4px;
+  --app-space-2: 8px;
+  --app-space-3: 12px;
+  --app-space-4: 16px;
+  --app-space-5: 24px;
+  --app-space-6: 32px;
+  --app-scrollbar: 8px;
+  --app-scrollbar-thin: 6px;
+  --app-scrollbar-narrow: 4px;
+
+  --app-font-size-caption: 11px;
+  --app-font-size-sm: 12px;
+  --app-font-size-base: 13px;
+  --app-font-size-md: 14px;
+  --app-font-size-lg: 16px;
+  --app-font-size-title: 18px;
+  --app-brand-gradient: linear-gradient(135deg, #2dd4bf 0%, #0d9488 55%, #0f766e 100%);
+
+  --app-duration-fast: 120ms;
+  --app-duration-base: 160ms;
+  --app-duration-slow: 240ms;
+  --app-ease: cubic-bezier(0.2, 0, 0.2, 1);
+
+  --app-shadow-1: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --app-shadow-hover: 0 2px 8px rgba(0, 0, 0, 0.06);
+  --app-shadow-2: 0 8px 24px rgba(0, 0, 0, 0.16), 0 2px 8px rgba(0, 0, 0, 0.08);
+
+  /* Element Plus 组件圆角与浮层：与卡片 8–12px 的体系对齐 */
+  --el-border-radius-base: var(--app-radius-sm);
+  --el-border-radius-small: var(--app-radius-xs);
+  --el-popover-border-radius: var(--app-radius-md);
+
+  /* 深色日志 / 代码块（始终深色：浅色主题下也保留终端观感） */
+  --app-console-bg: #161b22;
+  --app-console-head: #1c2330;
+  --app-console-border: #2a3442;
+  --app-console-hover: #1d2530;
+  --app-console-meta: #1a2230;
+  --app-console-text: #e6edf3;
+  --app-console-muted: #7d8590;
+  --app-console-faint: #57606a;
+  --app-console-success: #7ee787;
+  --app-console-danger: #ff7b72;
+  --app-console-warning: #ffa657;
+  --app-console-info: #adbac7;
+  --app-console-live: #3fb950;
+  --app-console-accent: #388bfd;
+  --app-console-scrollbar: #2f3a48;
+  --app-console-btn-bg: #2a3442;
+  --app-console-btn-border: #3a4656;
+  --app-console-btn-hover-bg: #344050;
+  --app-console-btn-hover-border: #46536a;
+  --app-console-primary-bg: #1f6f45;
+  --app-console-primary-border: #2ea36a;
+  --app-console-primary-hover-bg: #27855a;
+  --app-console-primary-hover-border: #3cc284;
+  --app-console-primary-text: #e6ffef;
+  --app-console-dot-r: #ff5f57;
+  --app-console-dot-y: #febc2e;
+  --app-console-dot-g: #28c840;
+
+  /* 监控图表系列色：集中定义，模板只引用变量 */
+  --app-chart-cpu: #409eff;
+  --app-chart-mem: #8b5cf6;
+  --app-chart-net: #67c23a;
+  --app-chart-load: #e6a23c;
+}
+
+/* 浅色主题：Element 默认 secondary (#909399) 在 12px 文本上约 2.9:1；
+   主色实心按钮白字在 #0d9488 上约 3.7:1。这里分别加深一档。 */
+html:not(.dark) {
+  --el-text-color-secondary: #6b7280;
+  --app-primary-strong: #0f766e;
+  --app-primary-strong-hover: #0b635c;
+  --app-primary-strong-active: #08544e;
+}
+.dark {
+  --app-primary-strong: #2dd4bf;
+  --app-primary-strong-hover: #57dccb;
+  --app-primary-strong-active: #5eead4;
+}
+
+/* 浅色主题实心主色按钮使用更深的主色阶，保证正文对比度 */
+html:not(.dark) .el-button--primary:not(.is-plain):not(.is-text):not(.is-link) {
+  --el-button-bg-color: var(--app-primary-strong);
+  --el-button-border-color: var(--app-primary-strong);
+  --el-button-hover-bg-color: var(--app-primary-strong-hover);
+  --el-button-hover-border-color: var(--app-primary-strong-hover);
+  --el-button-active-bg-color: var(--app-primary-strong-active);
+  --el-button-active-border-color: var(--app-primary-strong-active);
+}
+
+/* 浅色主题下 link 按钮用深一档语义色，小字号更可读 */
+html:not(.dark) .el-button.is-link.el-button--primary {
+  --el-button-text-color: var(--el-color-primary-dark-2);
+  --el-button-hover-link-text-color: var(--el-color-primary);
+}
+html:not(.dark) .el-button.is-link.el-button--danger {
+  --el-button-text-color: var(--el-color-danger-dark-2);
+  --el-button-hover-link-text-color: var(--el-color-danger);
+}
+
 /* --- 重置 --- */
 * {
   box-sizing: border-box;
@@ -89,6 +200,59 @@ body {
   flex-direction: column;
 }
 
+/* --- 统一样式基元 --------------------------------------------------------- */
+/* 表面卡片：内容页统一的浮层表面（设置 / 列表 / 空状态容器） */
+.surface-card {
+  background: var(--el-bg-color-overlay);
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: var(--app-radius-lg);
+}
+
+/* 表格皮肤：表头浅底、行悬停统一。各页面不再各自覆盖。 */
+.el-table {
+  --el-table-header-bg-color: var(--el-fill-color-lighter);
+  --el-table-row-hover-bg-color: var(--el-fill-color-light);
+}
+.el-table th.el-table__cell {
+  font-size: var(--app-font-size-sm);
+  font-weight: 600;
+  color: var(--el-text-color-secondary);
+}
+
+/* 弹窗：Element Plus 在 .el-dialog 自身重新声明了 --el-dialog-*，
+   :root 覆盖不会生效，必须在组件选择器上覆写。 */
+.el-dialog {
+  --el-dialog-border-radius: var(--app-radius-xl);
+  --el-dialog-padding-primary: 20px;
+  --el-dialog-title-font-size: var(--app-font-size-lg);
+}
+.el-message-box {
+  --el-messagebox-border-radius: var(--app-radius-xl);
+}
+/* 弹窗标题字重：与页面标题一致 */
+.el-dialog__title {
+  font-weight: 600;
+}
+
+/* 键盘焦点：自定义按钮/页签/菜单项统一描边（组件内 outline:none 的，
+   需在组件里补 :focus-visible，不能依赖这条通用规则）。 */
+:where(button, a, [role="button"], [role="tab"], [tabindex]:not(input):not(textarea)):focus-visible {
+  outline: 2px solid var(--el-color-primary);
+  outline-offset: 2px;
+}
+
+/* 尊重系统"减弱动态效果"：无限脉冲/闪烁在开启后停止 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 /* 文本选区：主色浅底 */
 ::selection {
   background: var(--el-color-primary-light-7);
@@ -96,8 +260,8 @@ body {
 
 /* --- 滚动条（统一样式，主题感知） --- */
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: var(--app-scrollbar);
+  height: var(--app-scrollbar);
 }
 ::-webkit-scrollbar-thumb {
   background: rgba(128, 128, 128, 0.35); /* 不支持 color-mix 的引擎兜底 */

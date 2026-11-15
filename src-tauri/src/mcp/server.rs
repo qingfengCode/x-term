@@ -55,6 +55,12 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 const MAX_CONCURRENT_CALLS: usize = 16;
 const MAX_SSE_CLIENTS: usize = 32;
 const SSE_CHANNEL_CAPACITY: usize = 256;
+/// 向 SSE channel 推送响应的最长等待时间。
+///
+/// channel 有界，客户端停止读取但 TCP 未断时发送端会永久阻塞；而发送方持有
+/// `call_slots` 并发许可——许可被无限期占住会让整个服务永久"繁忙"。超时即
+/// 丢弃响应（客户端已不读，重发无意义）并释放许可。
+const SSE_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 // ===========================================================================
 // 全局服务端句柄（按 kind 管理：SSH MCP / DB MCP 各一个实例）
@@ -804,9 +810,13 @@ async fn messages_handler(
                     -32000,
                     &format!("服务繁忙，请稍后重试（并发调用数已达上限 {}）", MAX_CONCURRENT_CALLS),
                 );
-                let _ = tx
-                    .send(serde_json::to_string(&busy).unwrap_or_default())
-                    .await;
+                // 超时兜底：客户端停止读取 SSE 时 channel 满会永久阻塞，
+                // 未持有许可的任务也不能无限堆积。
+                let _ = tokio::time::timeout(
+                    SSE_SEND_TIMEOUT,
+                    tx.send(serde_json::to_string(&busy).unwrap_or_default()),
+                )
+                .await;
                 return;
             }
         };
@@ -819,8 +829,23 @@ async fn messages_handler(
             }
         };
         // 有界 channel：客户端不读时此处阻塞而非无限堆积内存。
-        if tx.send(json_str).await.is_err() {
-            log::warn!("[mcp] SSE 会话 {} 已断开，响应未送达", sid_for_log);
+        //
+        // 但必须有超时：持有 `call_slots` 许可的任务若永久阻塞在 send 上，许可
+        // 永不释放（客户端冻结/SIGSTOP 但 TCP 未断时 channel 一直是满的）——
+        // 16 个许可全部卡死后该 MCP 服务对所有客户端永久"繁忙"。超时即丢弃
+        // 该响应（客户端已不读，重发无意义）并释放许可。
+        match tokio::time::timeout(SSE_SEND_TIMEOUT, tx.send(json_str)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                log::warn!("[mcp] SSE 会话 {} 已断开，响应未送达", sid_for_log);
+            }
+            Err(_) => {
+                log::warn!(
+                    "[mcp] SSE 会话 {} 超过 {} 秒未读取响应（客户端可能已卡死），丢弃本次响应",
+                    sid_for_log,
+                    SSE_SEND_TIMEOUT.as_secs()
+                );
+            }
         }
     });
 
@@ -828,20 +853,44 @@ async fn messages_handler(
 }
 
 /// 校验 token：Authorization 头或 ?token= 二选一匹配。
+///
+/// 空 token 一律拒绝（fail-closed）：期望 token 为空时 `"" == ""` 恒真，
+/// 任何带 `Authorization: Bearer `（空凭证）或 `?token=` 空值的请求都能
+/// 通过认证——包括 auto 模式下的免确认命令执行。启动路径已校验非空，
+/// 这里是配置被手工改坏时的最后一道防线。
+///
+/// 比较用常量时间实现（长度不同直接 false），避免逐字节短路泄露前缀。
 fn check_token(shared: &SharedState, query_token: Option<&str>, headers: &HeaderMap) -> bool {
+    let expected = shared.token.trim();
+    if expected.is_empty() {
+        return false;
+    }
     if let Some(t) = query_token {
-        return t == shared.token;
+        return token_eq(t, expected);
     }
     if let Some(auth) = headers.get(axum::http::header::AUTHORIZATION) {
         if let Ok(s) = auth.to_str() {
             if let Some(rest) = s.strip_prefix("Bearer ") {
-                return rest == shared.token;
+                return token_eq(rest, expected);
             }
             // 兼容直接传裸 token。
-            return s == shared.token;
+            return token_eq(s, expected);
         }
     }
     false
+}
+
+/// 常量时间字符串比较（长度差异直接返回 false）。
+fn token_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 // ===========================================================================
@@ -1181,7 +1230,12 @@ async fn handle_tool_call(
     let resource_name = target.display_name();
 
     // 执行内容原文（记录到日志，按工具名提取关键字段，不含密码）。
-    let exec_detail = tools::exec_detail_for(name, arguments);
+    //
+    // 落盘前截断：SQL/命令可能含明文敏感值（INSERT/UPDATE 的字面量、命令参数
+    // 里的密码），全文留存于 mcp-*.log 属数据泄漏。exec.rs 的 log::info 已按
+    // 200 字符截断，这里保持一致（日志文件按启动新建、无轮转，长期累积）。
+    let exec_detail =
+        crate::mcp::exec::truncate_log(&tools::exec_detail_for(name, arguments), 200);
 
     // 运行模式判定（与 AI 助手的执行模式语义一致）：
     // - manual：人工确认（默认）；

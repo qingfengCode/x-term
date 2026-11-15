@@ -329,12 +329,18 @@ pub async fn mcp_start(
 
     let host = host.unwrap_or(cfg.host);
     let port = port.unwrap_or(cfg.port);
-    let token = cfg.token.ok_or_else(|| {
-        AppError::Config(format!(
-            "未配置 {} 的 token：请先在 MCP 页面生成 token",
-            kind.label()
-        ))
-    })?;
+    let token = cfg
+        .token
+        // 空白串等同未配置（否则 `"" == ""` 恒真，认证形同虚设）；同时去掉
+        // 首尾空白，与 `check_token` 的 trim 比较保持一致。
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| {
+            AppError::Config(format!(
+                "未配置 {} 的 token（或 token 为空）：请先在 MCP 页面生成 token",
+                kind.label()
+            ))
+        })?;
     // bound 模式要求绑定资源；client 模式（客户端直连）不要求。
     let bound_source = normalize_bound_source(&cfg.bound_source);
     // 终端标签页绑定仅 SSH kind + bound 模式支持；其它 kind 或特殊模式

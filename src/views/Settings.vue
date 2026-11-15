@@ -13,6 +13,8 @@ import { onBeforeRouteLeave } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 import type { FormInstance, FormRules, TabsInstance } from "element-plus";
 import HelpTip from "@/components/HelpTip.vue";
+import PageHeader from "@/components/PageHeader.vue";
+import AboutPanel from "@/components/AboutPanel.vue";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { setWorkspaceDir } from "@/api/ai";
 import * as backupApi from "@/api/backup";
@@ -26,7 +28,6 @@ import { useUpdateStore } from "@/stores/update";
 import { useVaultStore } from "@/stores/vault";
 import { useMcpStore } from "@/stores/mcp";
 import { TERMINAL_COLOR_SCHEMES, defaultSchemeFor } from "@/utils/terminalThemes";
-import { formatSize } from "@/utils/format";
 import { errorMessage } from "@/utils/error";
 import { ProviderKind, PROVIDER_DEFAULTS } from "@/api/types";
 import {
@@ -58,20 +59,6 @@ const activeTab = ref<
 const tabsRef = ref<TabsInstance | null>(null);
 
 // --- 关于 / 更新 -----------------------------------------------------------
-
-/** 安装前二次确认（会退出应用）。 */
-async function confirmInstall() {
-  try {
-    await ElMessageBox.confirm(
-      "安装将退出当前应用并启动安装程序，未保存的会话将断开。继续？",
-      "安装确认",
-      { type: "warning", confirmButtonText: "安装并重启", cancelButtonText: "取消" },
-    );
-  } catch {
-    return;
-  }
-  void updater.install();
-}
 
 // 切到关于页时按需加载应用信息与更新源；切到数据迁移页时刷新保险库状态。
 watch(activeTab, (tab) => {
@@ -938,10 +925,13 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
 
 <template>
   <div class="settings-view">
-    <div class="header">
-      <h2><el-icon><Setting /></el-icon> 设置</h2>
-      <span class="header-sub">应用偏好与配置管理</span>
-    </div>
+    <PageHeader
+      title="设置"
+      subtitle="应用偏好与配置管理"
+      icon="Setting"
+      inline-subtitle
+      :gutter="28"
+    />
 
     <el-tabs v-model="activeTab" ref="tabsRef" class="settings-tabs">
       <!-- ============ 终端 ============ -->
@@ -1821,100 +1811,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
       <!-- ============ 关于 ============ -->
       <el-tab-pane label="关于" name="about">
         <div class="about-page">
-          <!-- 品牌区 -->
-          <div class="about-brand">
-            <div class="about-logo">X</div>
-            <div class="about-name">X-Term</div>
-            <div class="about-slogan">一站式运维工作站</div>
-            <div class="about-version">当前版本 v{{ updater.info?.currentVersion ?? "—" }}</div>
-          </div>
-
-          <!-- 检查更新卡片 -->
-          <div class="form-card about-update">
-            <div class="about-card-title">检查更新</div>
-
-            <!-- 空闲 / 错误后重试 -->
-            <div v-if="updater.status === 'idle'" class="about-update-body">
-              <el-button type="primary" :icon="'Refresh'" @click="updater.check()">检查更新</el-button>
-              <span v-if="updater.skippedVersion" class="about-hint">
-                已跳过 v{{ updater.skippedVersion }}，点击检查将重新提示
-              </span>
-            </div>
-
-            <!-- 检查中 -->
-            <div v-else-if="updater.status === 'checking'" class="about-update-body">
-              <el-icon class="is-loading"><Refresh /></el-icon>
-              <span>正在检查更新…</span>
-            </div>
-
-            <!-- 已是最新 -->
-            <div v-else-if="updater.status === 'up-to-date'" class="about-update-body">
-              <el-tag type="success" effect="light">✓ 当前已是最新版本</el-tag>
-              <el-button link @click="updater.reset()">返回</el-button>
-            </div>
-
-            <!-- 发现新版本 -->
-            <div v-else-if="updater.status === 'update-available'" class="about-update-body column">
-              <div class="about-new-ver">
-                <el-tag type="warning" effect="dark">发现新版本 v{{ updater.manifest?.version }}</el-tag>
-              </div>
-              <pre v-if="updater.manifest?.notes" class="about-notes">{{ updater.manifest.notes }}</pre>
-              <div class="about-actions">
-                <el-button type="primary" @click="updater.download()">立即更新</el-button>
-                <el-button @click="updater.skip()">跳过此版本</el-button>
-              </div>
-            </div>
-
-            <!-- 下载中 -->
-            <div v-else-if="updater.status === 'downloading'" class="about-update-body column">
-              <el-progress
-                :percentage="updater.progress.percent"
-                :stroke-width="14"
-                :format="(p: number) => `${p}%`"
-              />
-              <div class="about-dl-meta">
-                {{ formatSize(updater.progress.received) }}
-                <template v-if="updater.progress.total"> / {{ formatSize(updater.progress.total) }}</template>
-              </div>
-            </div>
-
-            <!-- 下载完成 -->
-            <div v-else-if="updater.status === 'downloaded'" class="about-update-body column">
-              <el-tag type="success" effect="light">✓ 下载完成</el-tag>
-              <div class="about-actions">
-                <el-button type="primary" @click="confirmInstall">立即安装并重启</el-button>
-              </div>
-            </div>
-
-            <!-- 出错 -->
-            <div v-else-if="updater.status === 'error'" class="about-update-body column">
-              <el-alert :title="updater.error ?? '更新失败'" type="error" :closable="false" show-icon />
-              <div class="about-actions">
-                <el-button @click="updater.reset()">返回</el-button>
-                <el-button type="primary" @click="updater.check()">重试</el-button>
-              </div>
-            </div>
-          </div>
-
-          <!-- 技术信息 -->
-          <div class="form-card about-meta">
-            <div class="about-card-title">技术信息</div>
-            <div class="about-meta-grid">
-              <span class="k">平台</span><span class="v">Windows x64</span>
-              <span class="k">数据目录</span><span class="v">{{ updater.info?.dataDir ?? "—" }}</span>
-              <span class="k">项目地址</span>
-              <span class="v">
-                <a
-                  class="about-link"
-                  href="https://github.com/qingfengCode/x-term"
-                  target="_blank"
-                  rel="noopener"
-                >
-                  https://github.com/qingfengCode/x-term
-                </a>
-              </span>
-            </div>
-          </div>
+          <AboutPanel variant="page" />
         </div>
       </el-tab-pane>
     </el-tabs>
@@ -1924,7 +1821,6 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
 <style scoped lang="scss">
 /* ============ 页面骨架：浅底衬托卡片，头部 + 顶部 Tab + 滚动内容 ============ */
 .settings-view {
-  padding: 18px 28px 0;
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -1933,47 +1829,15 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
   background: var(--el-bg-color-page);
 }
 
-.header {
-  display: flex;
-  align-items: center;
-  padding-bottom: 14px;
-  margin-bottom: 2px;
-  border-bottom: 1px solid var(--el-border-color-lighter);
-  flex-shrink: 0;
-}
-
-.header h2 {
-  margin: 0;
-  font-size: 19px;
-  font-weight: 600;
-  letter-spacing: 0.3px;
-  color: var(--el-text-color-primary);
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.header h2 .el-icon {
-  font-size: 21px;
-  color: var(--el-color-primary);
-}
-
-.header-sub {
-  margin-left: 14px;
-  padding-left: 14px;
-  border-left: 1px solid var(--el-border-color-lighter);
-  font-size: 12px;
-  color: var(--el-text-color-placeholder);
-}
-
-/* 顶部 Tab 导航 + 下方内容区滚动 */
+/* 顶部 Tab 导航 + 下方内容区滚动（左右留白与 PageHeader 对齐） */
 .settings-tabs {
   flex: 1;
   min-height: 0;
   display: flex;
+  padding: 0 28px;
 }
 .settings-tabs :deep(.el-tabs__header) {
-  margin: 0 0 14px;
+  margin: 10px 0 14px;
   flex-shrink: 0;
 }
 .settings-tabs :deep(.el-tabs__nav-wrap::after) {
@@ -1984,7 +1848,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
   height: 38px;
   line-height: 38px;
   padding: 0 20px;
-  font-size: 13.5px;
+  font-size: 14px;
   color: var(--el-text-color-secondary);
   transition: color 0.15s ease;
 }
@@ -2010,11 +1874,11 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
   max-width: 1080px;
 }
 .settings-tabs :deep(.el-tabs__content)::-webkit-scrollbar {
-  width: 8px;
+  width: var(--app-scrollbar);
 }
 .settings-tabs :deep(.el-tabs__content)::-webkit-scrollbar-thumb {
   background: var(--el-border-color-light);
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
 }
 .settings-tabs :deep(.el-tabs__content)::-webkit-scrollbar-track {
   background: transparent;
@@ -2024,10 +1888,10 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
 .form-card {
   background: var(--el-bg-color-overlay);
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 10px;
+  border-radius: var(--app-radius-lg);
   padding: 18px 22px 20px;
   margin-bottom: 16px;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+  box-shadow: var(--app-shadow-1);
 }
 
 /* 输出日志开关 + 打开目录按钮同行 */
@@ -2135,21 +1999,10 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
   flex-shrink: 0;
 }
 
-/* 模型列表表格：表头浅底、行悬停反馈 */
-.form-card :deep(.el-table) {
-  --el-table-header-bg-color: var(--el-fill-color-lighter);
-  --el-table-row-hover-bg-color: var(--el-fill-color-light);
-}
-.form-card :deep(.el-table th.el-table__cell) {
-  font-weight: 600;
-  color: var(--el-text-color-regular);
-}
-.form-card :deep(.el-table .el-table__cell) {
-  padding: 10px 0;
-}
+/* 模型列表表格：皮肤由 main.css 的全局 .el-table 规则统一提供 */
 
 .mono {
-  font-family: "Consolas", "Cascadia Code", monospace;
+  font-family: var(--app-font-mono);
   font-size: 13px;
   color: var(--el-text-color-regular);
 }
@@ -2243,7 +2096,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
 .card-desc code {
   background: var(--el-fill-color-light);
   padding: 1px 4px;
-  border-radius: 3px;
+  border-radius: var(--app-radius-xs);
   font-size: 11px;
 }
 /* 安全规则类说明：保持直接展示。 */
@@ -2302,7 +2155,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
 }
 .workspace-path {
   max-width: 320px;
-  font-family: "Consolas", "Cascadia Code", monospace;
+  font-family: var(--app-font-mono);
   font-size: 12px;
 }
 /* el-tag 是 inline-flex，text-overflow 在它身上不生效；截断放到内部 span。
@@ -2319,7 +2172,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
 .sc-cmd-list,
 .app-shortcut-list {
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 10px;
+  border-radius: var(--app-radius-lg);
   background: var(--el-bg-color-overlay);
   overflow: hidden;
 }
@@ -2367,7 +2220,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
   justify-self: center;
 }
 .sc-command :deep(input) {
-  font-family: var(--el-font-family-mono, "Cascadia Code", Consolas, monospace);
+  font-family: var(--app-font-mono);
 }
 /* 表格底部操作行：右对齐（与终端 tab 的应用/重置一致） */
 .table-actions {
@@ -2446,7 +2299,7 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
   align-items: center;
   justify-content: center;
   border: 1px dashed var(--el-border-color);
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   cursor: pointer;
   font-size: 12px;
   color: var(--el-text-color-regular);
@@ -2459,6 +2312,10 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
   border-color: var(--el-color-primary);
   border-style: solid;
 }
+.key-input:focus-visible {
+  outline: 2px solid var(--el-color-primary);
+  outline-offset: 1px;
+}
 .key-input.recording {
   border-color: var(--el-color-primary);
   background: var(--el-color-primary-light-9);
@@ -2470,12 +2327,12 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
   50% { opacity: 0.6; }
 }
 .key-input kbd {
-  font-family: var(--el-font-family-mono, monospace);
+  font-family: var(--app-font-mono);
   font-size: 12px;
   padding: 2px 6px;
   background: var(--el-fill-color-dark);
   color: var(--el-color-success);
-  border-radius: 3px;
+  border-radius: var(--app-radius-xs);
 }
 .key-input .unbound {
   color: var(--el-text-color-placeholder);
@@ -2486,112 +2343,9 @@ async function clearWorkspaceDir(domain: "ssh" | "db") {
   white-space: nowrap;
 }
 
-/* --- 关于页 --- */
+/* --- 关于页（内容由 AboutPanel 提供，仅保留页面限宽） --- */
 .about-page {
   max-width: 720px;
   margin: 0 auto;
-}
-.about-brand {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 4px;
-  padding: 24px 0 28px;
-}
-.about-logo {
-  width: 64px;
-  height: 64px;
-  border-radius: 16px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 34px;
-  font-weight: 700;
-  color: var(--el-color-white);
-  /* 终点用 dark-2：浅色主题下 light-3 接近白色，白字对比度不足 */
-  background: linear-gradient(135deg, var(--el-color-primary), var(--el-color-primary-dark-2));
-  margin-bottom: 8px;
-}
-.about-name {
-  font-size: 22px;
-  font-weight: 700;
-  color: var(--el-text-color-primary);
-}
-.about-slogan {
-  font-size: 13px;
-  color: var(--el-text-color-secondary);
-}
-.about-version {
-  font-size: 12px;
-  color: var(--el-text-color-placeholder);
-  margin-top: 4px;
-}
-.about-card-title {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--el-text-color-primary);
-  margin-bottom: 14px;
-}
-.about-update-body {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-.about-update-body.column {
-  flex-direction: column;
-  align-items: stretch;
-  gap: 12px;
-}
-.about-new-ver {
-  display: flex;
-  align-items: center;
-}
-.about-notes {
-  margin: 0;
-  padding: 10px 12px;
-  font-size: 12px;
-  line-height: 1.7;
-  white-space: pre-wrap;
-  word-break: break-all;
-  background: var(--el-fill-color-light);
-  border-radius: 6px;
-  color: var(--el-text-color-regular);
-  max-height: 200px;
-  overflow-y: auto;
-  font-family: inherit;
-}
-.about-actions {
-  display: flex;
-  gap: 10px;
-}
-.about-dl-meta {
-  font-size: 12px;
-  color: var(--el-text-color-secondary);
-  text-align: center;
-}
-.about-hint {
-  font-size: 12px;
-  color: var(--el-text-color-placeholder);
-}
-.about-meta-grid {
-  display: grid;
-  grid-template-columns: 90px 1fr;
-  row-gap: 8px;
-  column-gap: 12px;
-  font-size: 13px;
-}
-.about-meta-grid .k {
-  color: var(--el-text-color-secondary);
-}
-.about-meta-grid .v {
-  color: var(--el-text-color-primary);
-  word-break: break-all;
-}
-.about-link {
-  color: var(--el-color-primary);
-  text-decoration: none;
-}
-.about-link:hover {
-  text-decoration: underline;
 }
 </style>

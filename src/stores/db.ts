@@ -86,6 +86,18 @@ export const useDbStore = defineStore("db", () => {
       activeTabId.value = existing.id;
       return existing.id;
     }
+    // 已有"连接中"的占位标签（connId 仍为 null）：复用**该标签自己**那次
+    // 打开的在途 promise（按标签的 database 维度查 opening），而不是"该
+    // profile 最近一次打开"——后者可能属于另一个库，会激活 A 标签却等待 B
+    // 的连接结果。`findTab(p, null)` 的回落语义即"同 profile 任一标签"，
+    // 因此这里复用该标签的连接是预期行为。
+    if (existing && !existing.connId) {
+      const pending = opening.get(`${profile.id}|${existing.database ?? ""}`);
+      if (pending) {
+        activeTabId.value = existing.id;
+        return pending;
+      }
+    }
     // 同 key 的打开动作在途（并发点击/树加载）→ 复用它，避免重复建标签；
     // 已有占位标签先激活，否则连接完成时活动标签可能仍是别的标签。
     const key = `${profile.id}|${database ?? ""}`;
@@ -171,7 +183,8 @@ export const useDbStore = defineStore("db", () => {
       }
     }
     if (activeTabId.value === tabId) {
-      activeTabId.value = tabs.value[idx]?.id ?? tabs.value[idx - 1]?.id ?? null;
+      // 左邻优先（与终端标签、AI 会话标签一致；新标签追加在右侧）。
+      activeTabId.value = tabs.value[idx - 1]?.id ?? tabs.value[idx]?.id ?? null;
     }
   }
 

@@ -5,9 +5,10 @@
 // 后端通过 transfer:progress / transfer:done / transfer:error 事件推送进度，
 // MainLayout 已统一订阅并写入 transferStore，本组件仅负责展示。
 // ----------------------------------------------------------------------------
-import { computed, ref } from "vue";
+import { computed } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { useTransferStore, type TransferTask } from "@/stores/transfer";
+import { useUiStore } from "@/stores/ui";
 import {
   transferPercent as percent,
   transferProgressStatus as progressStatus,
@@ -15,11 +16,14 @@ import {
 } from "@/stores/transfer";
 import { humanSize } from "@/utils/format";
 import { sftpTransferCancel } from "@/api/sftp";
+import EmptyState from "@/components/EmptyState.vue";
 
 const transfer = useTransferStore();
+const ui = useUiStore();
 
-// 折叠状态：默认展开，便于看到正在进行的任务。
-const collapsed = ref(false);
+// 折叠状态存 ui store（跨页面切换保持；组件局部状态会在文件页重挂时丢失，
+// 导致用户折叠后切页回来队列又自动弹开）。默认展开，便于看到正在进行的任务。
+const collapsed = computed(() => ui.transferQueueCollapsed);
 
 // 倒序展示，让最新创建的任务出现在顶部。
 const sortedTasks = computed(() => [...transfer.tasks].reverse());
@@ -68,7 +72,7 @@ async function clearDone() {
 }
 
 function toggle() {
-  collapsed.value = !collapsed.value;
+  ui.transferQueueCollapsed = !ui.transferQueueCollapsed;
 }
 </script>
 
@@ -82,13 +86,15 @@ function toggle() {
         <el-badge v-if="runningCount > 0" :value="runningCount" class="tq-badge" type="primary" />
         <span v-else-if="doneCount > 0" class="tq-done-count">{{ doneCount }} 完成</span>
       </div>
-      <div class="tq-actions" @click.stop>
+      <!-- 注意：不能在容器上挂 @click.stop——折叠箭头也在这个容器里，会被一起
+           拦截导致点箭头无法折叠（旧缺陷）；只拦截清除按钮自身的点击。 -->
+      <div class="tq-actions">
         <el-button
           size="small"
           text
           :icon="'Delete'"
           :disabled="doneCount === 0"
-          @click="clearDone"
+          @click.stop="clearDone"
         >
           清除已完成
         </el-button>
@@ -98,10 +104,13 @@ function toggle() {
 
     <!-- 任务列表 -->
     <div v-show="!collapsed" class="tq-body">
-      <div v-if="sortedTasks.length === 0" class="tq-empty">
-        <el-icon class="tq-empty-icon"><FolderOpened /></el-icon>
-        <span class="tq-empty-text">暂无传输任务</span>
-      </div>
+      <EmptyState
+        v-if="sortedTasks.length === 0"
+        class="tq-empty"
+        icon="FolderOpened"
+        title="暂无传输任务"
+        size="sm"
+      />
 
       <div v-else class="tq-list">
         <div
@@ -211,6 +220,10 @@ function toggle() {
   font-size: 14px;
   color: var(--el-text-color-secondary);
 }
+/* 悬停高亮：箭头是折叠的主点击目标，给出可点反馈 */
+.tq-toggle:hover {
+  color: var(--el-color-primary);
+}
 
 .tq-body {
   max-height: 220px;
@@ -219,20 +232,7 @@ function toggle() {
 
 /* 空状态 */
 .tq-empty {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  padding: 24px;
-  color: var(--el-text-color-secondary);
-}
-.tq-empty-icon {
-  font-size: 28px;
-  color: var(--el-text-color-placeholder);
-}
-.tq-empty-text {
-  font-size: 12px;
+  padding: 12px 16px;
 }
 
 /* 任务行 */
@@ -246,7 +246,7 @@ function toggle() {
   align-items: center;
   gap: 10px;
   padding: 8px 8px;
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
 }
 .tq-item:hover {
   background: var(--el-fill-color-light);
@@ -332,7 +332,7 @@ function toggle() {
   color: var(--el-text-color-secondary);
   cursor: pointer;
   padding: 4px;
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   flex-shrink: 0;
 }
 .tq-cancel {
@@ -340,7 +340,7 @@ function toggle() {
   color: var(--el-text-color-secondary);
   cursor: pointer;
   padding: 4px;
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   flex-shrink: 0;
 }
 .tq-cancel:hover {
@@ -359,10 +359,10 @@ function toggle() {
 
 /* 滚动条美化 */
 .tq-body::-webkit-scrollbar {
-  width: 6px;
+  width: var(--app-scrollbar-thin);
 }
 .tq-body::-webkit-scrollbar-thumb {
   background: var(--el-border-color);
-  border-radius: 3px;
+  border-radius: var(--app-radius-xs);
 }
 </style>

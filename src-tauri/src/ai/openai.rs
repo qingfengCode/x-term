@@ -25,7 +25,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use crate::ai::provider::{ChatMessage, ChatWithToolsResult, LlmProvider, ProviderConfig, Role};
-use crate::ai::tools::{ToolCall, ToolDef, ToolResult};
+use crate::ai::tools::{ToolCall, ToolDef};
 use crate::error::{AppError, AppResult};
 use crate::events::{self, AiChunkEvent, AiDoneEvent, AiErrorEvent};
 
@@ -340,35 +340,23 @@ impl LlmProvider for OpenAiProvider {
         &self,
         messages: Vec<ChatMessage>,
         tools: Vec<ToolDef>,
-        tool_results: Vec<(String, ToolResult)>,
         request_id: String,
         app: tauri::AppHandle,
     ) -> AppResult<ChatWithToolsResult> {
         // 1. 把通用消息转换为 OpenAI 格式。
-        // 注意：调用方（run_agent_loop）已把工具结果作为 role=tool 的 ChatMessage
-        // 放进 messages 中（紧跟带 tool_calls 的 assistant 消息），这里直接转换即可，
-        // 不再从 tool_results 参数追加——否则会重复，且历史轮次会缺失 tool 消息导致 400。
+        //
+        // 工具结果由调用方（run_agent_loop）作为 role=tool 的 ChatMessage 放进
+        // messages 中，紧跟带 tool_calls 的 assistant 消息——这里直接按序转换。
+        //
+        // 历史实现还有一条"兼容兜底"：把未出现在 messages 里的工具结果以
+        // role=tool 追加到序列末尾。那条路径从不追加配套的 assistant(tool_calls)，
+        // 一旦触发就构造出**孤儿 tool 消息**，OpenAI/DeepSeek 等严格网关直接 400。
+        // 触发条件是上下文裁剪把最新一轮 tool 组整组裁掉（tool 组后面还有截图/
+        // 提醒 user 消息时，裁剪的保护条件仍满足）——即"长会话偶发 400"的真正
+        // 根因。兜底已删除：宁可少一条 tool 结果，也不构造非法序列。
         let mut oa_messages: Vec<OpenAiMessage> = Vec::with_capacity(messages.len());
         for m in &messages {
             oa_messages.push(OpenAiMessage::from_chat(m));
-        }
-        // 兼容：若调用方仍通过 tool_results 传结果（messages 里没有），则追加。
-        // 用 tool_call_id 判断是否已在 messages 中。
-        let existing_ids: std::collections::HashSet<String> = oa_messages
-            .iter()
-            .filter_map(|m| m.tool_call_id)
-            .map(str::to_string)
-            .collect();
-        for (tool_call_id, result) in &tool_results {
-            if existing_ids.contains(tool_call_id) {
-                continue;
-            }
-            oa_messages.push(OpenAiMessage {
-                role: "tool",
-                content: ReqContent::Text(result.output.clone()),
-                tool_calls: None,
-                tool_call_id: Some(tool_call_id.as_str()),
-            });
         }
 
         // 2. 构造请求体。
@@ -567,7 +555,45 @@ impl LlmProvider for OpenAiProvider {
 
         // finish_reason == "tool_calls" 表示本轮有工具调用；但即使没拿到该字段，
         // 只要 tool_calls 非空也按工具调用处理（兼容各厂商）。
-        let _ = finish_reason; // 仅用于日志，不影响逻辑。
+        //
+        // finish_reason == "length" 表示输出被 max_tokens 截断：此时 tool
+        // arguments 很可能是残缺 JSON（被包成 {"_raw": ...}）。把这种调用当作
+        // 合法参数喂给执行器只会报"缺少参数"→模型原样重试→再次被截断，空转到
+        // 重复调用守卫硬拦。直接丢弃无法解析的调用，并在文本里明确告知模型
+        // 缩短参数（如分段写文件）后重试。
+        if finish_reason.as_deref() == Some("length")
+            && tool_calls.iter().any(|c| c.arguments.get("_raw").is_some())
+        {
+            let dropped = tool_calls
+                .iter()
+                .filter(|c| c.arguments.get("_raw").is_some())
+                .count();
+            tool_calls.retain(|c| c.arguments.get("_raw").is_none());
+            if !text_buffer.is_empty() {
+                text_buffer.push_str("\n\n");
+            }
+            text_buffer.push_str(&format!(
+                "[本轮有 {dropped} 个工具调用参数因单次输出长度上限被截断，已取消这些调用。\
+请缩短参数（例如把大段内容拆成多次写入）后重试]"
+            ));
+            log::warn!(
+                "[ai] finish_reason=length：丢弃 {dropped} 个参数被截断的工具调用"
+            );
+            // 前端气泡只按 ai:chunk 累积文本（不使用 ai:done 的 full_text），
+            // 这里的说明必须走 system_note 才可见——否则用户只看到工具卡片
+            // 消失、没有任何解释。
+            events::emit(
+                &app,
+                events::AI_SYSTEM_NOTE,
+                events::AiSystemNoteEvent {
+                    request_id: request_id.clone(),
+                    text: format!(
+                        "[系统提示] 有 {dropped} 个工具调用因单次输出长度上限被截断，\
+                        已取消；请缩短参数（如分段写入）后重试"
+                    ),
+                },
+            );
+        }
 
         Ok(ChatWithToolsResult {
             message: text_buffer,

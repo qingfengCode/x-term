@@ -71,7 +71,7 @@ withDefaults(defineProps<{ content?: string; size?: number }>(), { content: "", 
      这里显式用主题变量，深/浅主题下都保持深字浅底 / 浅字深底。 */
   color: var(--el-text-color-regular);
   padding: 1px 4px;
-  border-radius: 3px;
+  border-radius: var(--app-radius-xs);
   font-size: 11px;
 }
 </style>

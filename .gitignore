@@ -102,6 +102,7 @@ scripts/tos.env
 # ---- 本地代码审查与随手笔记（含内部问题清单，不适合公开）----
 ed.md
 review.md
+review-*.md
 yh.md
 out.md
 notes.md

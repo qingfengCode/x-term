@@ -72,6 +72,16 @@ export class TerminalTab {
    *  显示，不回写会话配置；复制页签不继承（新页签回到默认标题）。 */
   customTitle: string | null = null;
 
+  /** 页签显示标题：重命名优先，否则回默认标题。
+   *  TabBar / AI 绑定下拉 / 窗格头等所有展示页签名的地方统一用它，
+   *  避免各自读 `session.name` 导致重命名不生效。 */
+  get displayTitle(): string {
+    return (
+      this.customTitle ??
+      (this.kind === "monitor" ? `监控 · ${this.session.name}` : this.session.name)
+    );
+  }
+
   constructor(init: {
     id: string;
     kind: "terminal" | "monitor";
@@ -742,7 +752,10 @@ export const useTerminalsStore = defineStore("terminals", () => {
     if (manualAuth.value?.tab === removed) manualAuth.value = null;
     await stopBackend(removed);
     if (activeTabId.value === removed.id) {
-      activeTabId.value = tabs.value[idx]?.id ?? tabs.value[idx - 1]?.id ?? null;
+      // 激活**左邻**标签而不是右邻：新建标签一律追加在右侧、新建按钮也固定在
+      // 右端，用户关掉当前标签时预期回到左侧刚用过的那个（右邻通常是刚开的
+      // 新标签，左边的才是"上一个"）。关闭的是最左侧标签时才回退到右邻。
+      activeTabId.value = tabs.value[idx - 1]?.id ?? tabs.value[idx]?.id ?? null;
     }
     return true;
   }

@@ -33,7 +33,7 @@
           </div>
         </div>
         <span v-if="!closedReason" class="live-badge">
-          <span class="live-dot" />
+          <StatusDot :size="6" pulse />
           实时 · 3s
         </span>
       </header>
@@ -42,7 +42,7 @@
       <div class="metric-grid">
         <div class="kpi-card">
           <div class="kpi-head">
-            <span class="kpi-icon" style="--accent: #409eff"><el-icon><Cpu /></el-icon></span>
+            <span class="kpi-icon" style="--accent: var(--app-chart-cpu)"><el-icon><Cpu /></el-icon></span>
             <span class="kpi-title">CPU 使用率</span>
           </div>
           <div class="kpi-value" :class="pctClass(data.cpu.usagePct)">{{ formatPct(data.cpu.usagePct) }}</div>
@@ -55,7 +55,7 @@
 
         <div class="kpi-card">
           <div class="kpi-head">
-            <span class="kpi-icon" style="--accent: #8b5cf6"><el-icon><Coin /></el-icon></span>
+            <span class="kpi-icon" style="--accent: var(--app-chart-mem)"><el-icon><Coin /></el-icon></span>
             <span class="kpi-title">内存</span>
           </div>
           <div class="kpi-value" :class="pctClass(data.mem.usedPct)">
@@ -80,7 +80,7 @@
 
         <div class="kpi-card">
           <div class="kpi-head">
-            <span class="kpi-icon" style="--accent: #67c23a"><el-icon><Connection /></el-icon></span>
+            <span class="kpi-icon" style="--accent: var(--app-chart-net)"><el-icon><Connection /></el-icon></span>
             <span class="kpi-title">网络</span>
           </div>
           <div class="kpi-value net">
@@ -93,7 +93,7 @@
 
         <div v-if="data.load" class="kpi-card">
           <div class="kpi-head">
-            <span class="kpi-icon" style="--accent: #e6a23c"><el-icon><DataLine /></el-icon></span>
+            <span class="kpi-icon" style="--accent: var(--app-chart-load)"><el-icon><DataLine /></el-icon></span>
             <span class="kpi-title">系统负载</span>
           </div>
           <div class="kpi-value">{{ data.load.m1.toFixed(2) }}</div>
@@ -176,6 +176,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import * as monitorApi from "@/api/monitor";
 import type { MonitorDataEvent } from "@/api/monitor";
 import { formatSize } from "@/utils/format";
+import StatusDot from "@/components/StatusDot.vue";
 
 const props = defineProps<{ sessionConfigId: string }>();
 
@@ -212,8 +213,11 @@ async function start() {
     return;
   }
   monitorId = id;
-  unlistens.push(
-    await listen<MonitorDataEvent>("monitor:data", (e) => {
+  // await listen 期间组件可能已卸载（快速切页）：此时 unlistens 数组不会再被
+  // onBeforeUnmount 处理，resolve 出的 unlistenFn 必须立刻注销，否则监听器
+  // （连同组件闭包）永久泄漏。
+  await track(
+    listen<MonitorDataEvent>("monitor:data", (e) => {
       if (unmounted || e.payload.monitorId !== monitorId) return;
       data.value = e.payload;
       closedReason.value = null;
@@ -228,12 +232,19 @@ async function start() {
       if (netHistory.value.length > HISTORY_CAP) netHistory.value.shift();
     }),
   );
-  unlistens.push(
-    await listen<monitorApi.MonitorClosedEvent>("monitor:closed", (e) => {
+  await track(
+    listen<monitorApi.MonitorClosedEvent>("monitor:closed", (e) => {
       if (unmounted || e.payload.monitorId !== monitorId) return;
       closedReason.value = e.payload.reason;
     }),
   );
+}
+
+/** 注册监听器；卸载后才 resolve 的立即注销（避免监听器泄漏）。 */
+async function track(register: Promise<UnlistenFn>): Promise<void> {
+  const fn = await register;
+  if (unmounted) fn();
+  else unlistens.push(fn);
 }
 
 function stop() {
@@ -382,7 +393,7 @@ export default { components: { Sparkline } };
   align-items: center;
   gap: 12px;
   padding: 14px 16px;
-  border-radius: 10px;
+  border-radius: var(--app-radius-lg);
   background: var(--el-color-danger-light-9);
   color: var(--el-color-danger);
 
@@ -420,7 +431,7 @@ export default { components: { Sparkline } };
   padding: 14px 16px;
   background: var(--el-bg-color);
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 12px;
+  border-radius: var(--app-radius-xl);
 }
 
 .host-id {
@@ -433,14 +444,14 @@ export default { components: { Sparkline } };
 .host-avatar {
   width: 38px;
   height: 38px;
-  border-radius: 10px;
+  border-radius: var(--app-radius-lg);
   flex-shrink: 0;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   font-size: 19px;
   color: #fff;
-  background: linear-gradient(135deg, #409eff, #2f6fed);
+  background: linear-gradient(135deg, var(--el-color-primary), var(--el-color-primary-dark-2));
 }
 
 .host-info {
@@ -469,7 +480,7 @@ export default { components: { Sparkline } };
   display: inline-block;
   max-width: 280px;
   padding: 2px 8px;
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   background: var(--el-fill-color);
   font-size: 12px;
   line-height: 18px;
@@ -480,7 +491,7 @@ export default { components: { Sparkline } };
   vertical-align: bottom;
 
   &.mono {
-    font-family: Consolas, ui-monospace, monospace;
+    font-family: var(--app-font-mono);
   }
 }
 
@@ -494,27 +505,7 @@ export default { components: { Sparkline } };
   font-size: 12px;
   color: var(--el-color-success);
   background: var(--el-color-success-light-9);
-  border: 1px solid rgba(103, 194, 58, 0.35);
-}
-
-.live-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--el-color-success);
-  animation: live-pulse 1.8s ease-out infinite;
-}
-
-@keyframes live-pulse {
-  0% {
-    box-shadow: 0 0 0 0 rgba(103, 194, 58, 0.5);
-  }
-  70% {
-    box-shadow: 0 0 0 6px rgba(103, 194, 58, 0);
-  }
-  100% {
-    box-shadow: 0 0 0 0 rgba(103, 194, 58, 0);
-  }
+  border: 1px solid var(--el-color-success-light-5);
 }
 
 /* --- KPI 指标卡 -------------------------------------------------------- */
@@ -531,7 +522,7 @@ export default { components: { Sparkline } };
   padding: 12px 14px 10px;
   background: var(--el-bg-color);
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 12px;
+  border-radius: var(--app-radius-xl);
   transition: box-shadow 0.2s ease, border-color 0.2s ease;
 
   &:hover {
@@ -554,7 +545,7 @@ export default { components: { Sparkline } };
 .kpi-icon {
   width: 26px;
   height: 26px;
-  border-radius: 8px;
+  border-radius: var(--app-radius-md);
   flex-shrink: 0;
   display: inline-flex;
   align-items: center;
@@ -605,11 +596,11 @@ export default { components: { Sparkline } };
       margin-right: 4px;
 
       &.rx {
-        color: #409eff;
+        color: var(--app-chart-cpu);
       }
 
       &.tx {
-        color: #67c23a;
+        color: var(--app-chart-net);
       }
     }
   }
@@ -660,7 +651,7 @@ export default { components: { Sparkline } };
   padding: 12px 16px 14px;
   background: var(--el-bg-color);
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 12px;
+  border-radius: var(--app-radius-xl);
   min-width: 0;
 }
 
@@ -707,7 +698,7 @@ export default { components: { Sparkline } };
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 12px;
-  font-family: Consolas, ui-monospace, monospace;
+  font-family: var(--app-font-mono);
   color: var(--el-text-color-primary);
 }
 
@@ -767,7 +758,7 @@ export default { components: { Sparkline } };
   }
 
   .mono {
-    font-family: Consolas, ui-monospace, monospace;
+    font-family: var(--app-font-mono);
     font-size: 12px;
   }
 }

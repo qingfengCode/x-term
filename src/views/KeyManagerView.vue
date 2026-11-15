@@ -17,6 +17,7 @@ import {
   type SshKeyGenerateInput,
   type GeneratedKeyInfo,
 } from "@/api/vault";
+import PageHeader from "@/components/PageHeader.vue";
 
 defineOptions({ name: "KeyManagerView" });
 
@@ -207,48 +208,54 @@ onMounted(load);
 
 <template>
   <div class="key-manager">
-    <div class="header">
-      <h2><el-icon><Key /></el-icon> 密钥管理</h2>
-      <div class="header-actions">
-        <el-button type="primary" :icon="'MagicStick'" @click="openGen">生成密钥对</el-button>
+    <PageHeader title="密钥管理" icon="Key" subtitle="管理 SSH 密码与私钥凭据">
+      <template #actions>
+        <el-button :icon="'MagicStick'" @click="openGen">生成密钥对</el-button>
         <el-button type="primary" :icon="'Plus'" @click="openAdd">添加凭据</el-button>
+      </template>
+    </PageHeader>
+
+    <div class="key-body">
+      <div class="hint">
+        所有凭据（密码、私钥）经主密码派生密钥 AES-256-GCM 加密后存储，运行时解密。
+        列表不显示明文，需手动点"查看"。
+      </div>
+
+      <div class="key-surface surface-card">
+        <el-table :data="list" v-loading="loading" stripe>
+          <el-table-column label="名称" prop="name" min-width="160">
+            <template #default="{ row }">
+              <el-icon class="kind-icon">
+                <Key v-if="row.kind === 'private_key_text'" />
+                <Lock v-else />
+              </el-icon>
+              {{ row.name }}
+            </template>
+          </el-table-column>
+          <el-table-column label="类型" width="100">
+            <template #default="{ row }">
+              <el-tag size="small" :type="row.kind === 'private_key_text' ? 'success' : 'info'">
+                {{ kindLabel(row.kind) }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="创建时间" width="180">
+            <template #default="{ row }">
+              {{ new Date(row.createdAt).toLocaleString() }}
+            </template>
+          </el-table-column>
+          <el-table-column label="操作" width="220" align="center">
+            <template #default="{ row }">
+              <el-button size="small" :icon="'View'" link @click="reveal(row)">查看</el-button>
+              <el-button size="small" :icon="'EditPen'" link @click="rename(row)">重命名</el-button>
+              <el-button size="small" :icon="'Delete'" link type="danger" @click="remove(row)">
+                删除
+              </el-button>
+            </template>
+          </el-table-column>
+        </el-table>
       </div>
     </div>
-    <div class="hint">
-      所有凭据（密码、私钥）经主密码派生密钥 AES-256-GCM 加密后存储，运行时解密。
-      列表不显示明文，需手动点"查看"。
-    </div>
-
-    <el-table :data="list" v-loading="loading" border stripe>
-      <el-table-column label="名称" prop="name" min-width="160">
-        <template #default="{ row }">
-          <el-icon class="kind-icon">
-            <Key v-if="row.kind === 'private_key_text'" />
-            <Lock v-else />
-          </el-icon>
-          {{ row.name }}
-        </template>
-      </el-table-column>
-      <el-table-column label="类型" width="100">
-        <template #default="{ row }">
-          <el-tag size="small" :type="row.kind === 'private_key_text' ? 'success' : 'info'">
-            {{ kindLabel(row.kind) }}
-          </el-tag>
-        </template>
-      </el-table-column>
-      <el-table-column label="创建时间" width="180">
-        <template #default="{ row }">
-          {{ new Date(row.createdAt).toLocaleString() }}
-        </template>
-      </el-table-column>
-      <el-table-column label="操作" width="220" align="center">
-        <template #default="{ row }">
-          <el-button size="small" :icon="'View'" link @click="reveal(row)">查看</el-button>
-          <el-button size="small" :icon="'EditPen'" link @click="rename(row)">重命名</el-button>
-          <el-button size="small" :icon="'Delete'" link type="danger" @click="remove(row)">删除</el-button>
-        </template>
-      </el-table-column>
-    </el-table>
 
     <!-- 添加/编辑对话框 -->
     <el-dialog
@@ -356,38 +363,32 @@ onMounted(load);
 
 <style scoped lang="scss">
 .key-manager {
-  padding: 20px 24px;
+  display: flex;
+  flex-direction: column;
   height: 100%;
-  overflow: auto;
+  overflow: hidden;
   box-sizing: border-box;
+  background: var(--el-bg-color-page);
 }
-.header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 12px;
+.key-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 16px 20px 20px;
 }
-.header h2 {
-  margin: 0;
-  font-size: 20px;
-  font-weight: 600;
-  display: flex;
-  align-items: center;
-  gap: 8px;
+.key-surface {
+  overflow: hidden;
 }
 .hint {
+  max-width: 900px;
   font-size: 12px;
   color: var(--el-text-color-secondary);
-  margin-bottom: 16px;
+  margin-bottom: 12px;
   line-height: 1.6;
 }
 .kind-icon {
   margin-right: 4px;
   vertical-align: middle;
-}
-.header-actions {
-  display: flex;
-  gap: 8px;
 }
 .gen-hint {
   width: 100%;
@@ -414,7 +415,7 @@ onMounted(load);
   flex: 1;
 }
 .gen-result-fp {
-  font-family: Consolas, Monaco, monospace;
+  font-family: var(--app-font-mono);
   font-size: 13px;
   color: var(--el-text-color-primary);
   margin-bottom: 12px;
@@ -427,7 +428,7 @@ onMounted(load);
 .gen-result-tip code {
   background: var(--el-fill-color-light);
   padding: 1px 5px;
-  border-radius: 3px;
-  font-family: Consolas, Monaco, monospace;
+  border-radius: var(--app-radius-xs);
+  font-family: var(--app-font-mono);
 }
 </style>

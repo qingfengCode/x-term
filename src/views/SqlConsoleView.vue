@@ -34,7 +34,9 @@ import { useAiDbStore } from "@/stores/ai";
 import { useDbStore, type DbTab } from "@/stores/db";
 import { useSettingsStore } from "@/stores/settings";
 import { useCodeMirror } from "@/composables/useCodeMirror";
+import { useMenuKeyboard } from "@/composables/useMenuKeyboard";
 import ResultTableV2 from "@/components/ResultTableV2.vue";
+import StatusDot from "@/components/StatusDot.vue";
 import { stripLeadingComments, useSqlConsole } from "@/composables/useSqlConsole";
 
 // KeepAlive 按 name 匹配缓存本组件（保留 DB 助手面板状态）。
@@ -902,14 +904,22 @@ async function onAddTabCommand(command: string | number | object) {
 // --- 标签右键菜单（关闭/关闭其他/关闭全部） --------------------------------
 
 const tabMenu = ref<{ x: number; y: number; tab: DbTab | null }>({ x: 0, y: 0, tab: null });
+/** 右键菜单根元素（键盘导航用）。 */
+const tabMenuEl = ref<HTMLElement | null>(null);
 
 function openTabMenu(tab: DbTab, e: MouseEvent) {
   tabMenu.value = { x: e.clientX, y: e.clientY, tab };
+  void focusFirst();
 }
 
 function closeTabMenu() {
   tabMenu.value.tab = null;
 }
+
+const { focusFirst, onKeydown: onTabMenuKeydown, onItemKeydown } = useMenuKeyboard(
+  tabMenuEl,
+  closeTabMenu,
+);
 
 function onTabMenuCommand(cmd: "close" | "closeOthers" | "closeAll") {
   const t = tabMenu.value.tab;
@@ -1254,13 +1264,24 @@ onMounted(async () => {
   await loadProfiles();
   window.addEventListener("click", onWindowClick);
   window.addEventListener("keydown", onWindowKeydown);
-  // 订阅 ai:sql_result（exec_sql 终端可视化回显到活动标签）。
+  // 订阅 ai:sql_result（exec_sql 终端可视化回显）。
   try {
     const fn = await listen<AiSqlResultEvent>("ai:sql_result", (e) => {
       if (unmounted) return;
+      // 按事件携带的连接 id 找到对应标签回显，而不是一律推给活动标签：
+      // 用户停在 B 标签时，AI 在 A 连接上的结果不应显示进 B 的控制台。
+      // 找不到匹配标签（连接已关闭）则丢弃——回显给错误连接比不显示更糟。
+      let target: TabState | null = null;
+      for (const tab of db.tabs) {
+        if (tab.connId && tab.connId === e.payload.dbConnId) {
+          target = tabStates.get(tab.id) ?? null;
+          break;
+        }
+      }
       // 仅命令行模式回显（代码模式有自己的结果区，不混入输出流）。
-      const s = activeState.value;
-      if (s && s.editorMode.value === "console") s.console.pushExternal(e.payload);
+      if (target && target.editorMode.value === "console") {
+        target.console.pushExternal(e.payload);
+      }
     });
     if (unmounted) fn();
     else unlistenSqlResult = fn;
@@ -1309,7 +1330,11 @@ onBeforeUnmount(() => {
           @mousedown.middle.prevent="db.closeTab(tab.id)"
           @contextmenu.prevent="openTabMenu(tab, $event)"
         >
-          <span class="dot" :class="{ connecting: tab.connecting }" />
+          <StatusDot
+            :tone="tab.connecting ? 'warning' : 'success'"
+            :size="6"
+            :pulse="!!tab.connecting"
+          />
           <span v-if="i < 9" class="tab-idx">{{ i + 1 }}</span>
           <span class="title">{{ tabTitle(tab) }}</span>
           <el-icon class="close" title="关闭" @click.stop="db.closeTab(tab.id)"><Close /></el-icon>
@@ -1318,13 +1343,41 @@ onBeforeUnmount(() => {
       <!-- 标签右键菜单（fixed 浮层，视口钳制） -->
       <div
         v-if="tabMenu.tab"
+        ref="tabMenuEl"
         class="tab-menu"
+        role="menu"
+        tabindex="-1"
         :style="{ left: tabMenu.x + 'px', top: tabMenu.y + 'px' }"
+        @keydown="onTabMenuKeydown"
         @click.stop
       >
-        <div class="tab-menu-item" @click="onTabMenuCommand('close')">关闭</div>
-        <div class="tab-menu-item" @click="onTabMenuCommand('closeOthers')">关闭其他</div>
-        <div class="tab-menu-item" @click="onTabMenuCommand('closeAll')">关闭全部</div>
+        <div
+          class="tab-menu-item"
+          role="menuitem"
+          tabindex="-1"
+          @keydown="onItemKeydown"
+          @click="onTabMenuCommand('close')"
+        >
+          关闭
+        </div>
+        <div
+          class="tab-menu-item"
+          role="menuitem"
+          tabindex="-1"
+          @keydown="onItemKeydown"
+          @click="onTabMenuCommand('closeOthers')"
+        >
+          关闭其他
+        </div>
+        <div
+          class="tab-menu-item"
+          role="menuitem"
+          tabindex="-1"
+          @keydown="onItemKeydown"
+          @click="onTabMenuCommand('closeAll')"
+        >
+          关闭全部
+        </div>
       </div>
       <el-dropdown trigger="click" @command="onAddTabCommand">
         <div class="tab-add" title="新建标签"><el-icon><Plus /></el-icon></div>
@@ -1708,7 +1761,7 @@ onBeforeUnmount(() => {
   width: 24px;
   height: 24px;
   border: none;
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   background: transparent;
   color: var(--el-text-color-secondary);
   cursor: pointer;
@@ -1765,9 +1818,9 @@ onBeforeUnmount(() => {
   gap: 6px;
   height: 26px;
   padding: 0 8px;
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   cursor: pointer;
-  font-size: 12.5px;
+  font-size: 13px;
   color: var(--el-text-color-regular);
   flex-shrink: 0;
   max-width: 200px;
@@ -1786,16 +1839,6 @@ onBeforeUnmount(() => {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.db-tab .dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--el-color-success);
-  flex-shrink: 0;
-}
-.db-tab .dot.connecting {
-  background: var(--el-color-warning);
-}
 .db-tab .tab-idx {
   font-size: 10px;
   color: var(--el-text-color-placeholder);
@@ -1809,7 +1852,7 @@ onBeforeUnmount(() => {
 .db-tab .close {
   font-size: 12px;
   padding: 2px;
-  border-radius: 3px;
+  border-radius: var(--app-radius-xs);
   color: var(--el-text-color-secondary);
   opacity: 0;
   flex-shrink: 0;
@@ -1829,7 +1872,7 @@ onBeforeUnmount(() => {
   justify-content: center;
   width: 22px;
   height: 22px;
-  border-radius: 5px;
+  border-radius: var(--app-radius-sm);
   cursor: pointer;
   color: var(--el-text-color-secondary);
   font-size: 14px;
@@ -1844,21 +1887,22 @@ onBeforeUnmount(() => {
   position: fixed;
   z-index: 3000;
   background: var(--el-bg-color-overlay);
-  border: 1px solid var(--el-border-color);
-  border-radius: 6px;
-  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.15);
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: var(--app-radius-md);
+  box-shadow: var(--app-shadow-2);
   padding: 4px;
-  min-width: 110px;
+  min-width: 148px;
 }
 .tab-menu-item {
-  padding: 6px 12px;
+  padding: 6px 10px;
   font-size: 13px;
   cursor: pointer;
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   color: var(--el-text-color-primary);
+  transition: background-color 0.12s ease, color 0.12s ease;
 }
 .tab-menu-item:hover {
-  background: var(--el-fill-color);
+  background: var(--el-color-primary-light-9);
   color: var(--el-color-primary);
 }
 
@@ -2000,7 +2044,7 @@ onBeforeUnmount(() => {
 .node-menu-icon {
   font-size: 13px;
   color: var(--el-text-color-secondary);
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
 }
 .node-menu-icon:hover {
   color: var(--el-color-primary);
@@ -2030,7 +2074,7 @@ onBeforeUnmount(() => {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  font-family: "Consolas", monospace;
+  font-family: var(--app-font-mono);
 }
 .history-meta {
   font-size: 10px;
@@ -2061,7 +2105,7 @@ onBeforeUnmount(() => {
   overflow-y: auto;
   padding: 8px 12px;
   background: var(--el-bg-color);
-  font-family: "Consolas", "Cascadia Code", "JetBrains Mono", monospace;
+  font-family: var(--app-font-mono);
   font-size: 13px;
 }
 /* 帮助浮层内容 */
@@ -2151,7 +2195,7 @@ onBeforeUnmount(() => {
   align-items: center;
   padding: 0 8px;
   color: var(--el-color-success);
-  font-family: "Consolas", monospace;
+  font-family: var(--app-font-mono);
   font-size: 13px;
   flex-shrink: 0;
 }
@@ -2168,7 +2212,7 @@ onBeforeUnmount(() => {
   outline: none;
   background: transparent;
   color: var(--el-text-color-primary);
-  font-family: "Consolas", "Cascadia Code", "JetBrains Mono", monospace;
+  font-family: var(--app-font-mono);
   font-size: 13px;
   line-height: 1.6;
   padding: 8px 0;
@@ -2182,7 +2226,7 @@ onBeforeUnmount(() => {
   max-height: 160px;
 }
 .console-input :deep(.cm-scroller) {
-  font-family: "Consolas", "Cascadia Code", monospace;
+  font-family: var(--app-font-mono);
   font-size: 13px;
   line-height: 1.5;
 }
@@ -2220,7 +2264,7 @@ onBeforeUnmount(() => {
   overflow: auto;
   border-bottom: 1px solid var(--el-border-color-lighter);
   background: var(--el-bg-color);
-  font-family: "Consolas", "Cascadia Code", monospace;
+  font-family: var(--app-font-mono);
   font-size: 13px;
   flex-shrink: 0;
 }

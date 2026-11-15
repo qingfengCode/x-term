@@ -203,7 +203,7 @@ function kindLabel(kind: string): string {
   background: var(--el-bg-color-overlay);
   border: 1px solid var(--el-border-color-light);
   border-left: 4px solid var(--el-color-warning);
-  border-radius: 8px;
+  border-radius: var(--app-radius-md);
   padding: 12px 14px;
   box-shadow: var(--el-box-shadow-light);
   display: flex;
@@ -244,7 +244,7 @@ function kindLabel(kind: string): string {
 
 .card-args {
   background: var(--el-fill-color-light);
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   padding: 6px 8px;
   display: flex;
   flex-direction: column;
@@ -266,7 +266,7 @@ function kindLabel(kind: string): string {
 }
 .arg-val {
   margin: 0;
-  font-family: "Consolas", "Cascadia Code", monospace;
+  font-family: var(--app-font-mono);
   color: var(--el-text-color-regular);
   white-space: pre-wrap;
   word-break: break-all;
@@ -277,7 +277,7 @@ function kindLabel(kind: string): string {
   font-size: 12px;
   color: var(--el-color-danger);
   background: var(--el-color-danger-light-9);
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   padding: 4px 6px;
 }
 
@@ -290,7 +290,7 @@ function kindLabel(kind: string): string {
 /* 进出过渡 */
 .mcp-toast-enter-active,
 .mcp-toast-leave-active {
-  transition: all 0.25s ease;
+  transition: opacity 0.25s ease, transform 0.25s ease;
 }
 .mcp-toast-enter-from {
   opacity: 0;

@@ -12,6 +12,7 @@ import type { TreeInstance } from "element-plus";
 import { useDesktopsStore, type DesktopTreeNode } from "@/stores/desktops";
 import { useDesktopTabsStore } from "@/stores/desktopTabs";
 import type { Desktop, DesktopGroup } from "@/api/remote_desktop";
+import StatusDot from "@/components/StatusDot.vue";
 
 const desktopsStore = useDesktopsStore();
 const desktopTabs = useDesktopTabsStore();
@@ -301,9 +302,9 @@ async function onNodeDrop(
         <template #default="{ data }">
           <div class="tree-node" :class="{ 'is-group': data.type === 'group' }">
             <span class="node-label" :title="nodeTitle(data)">
-              <span
+              <StatusDot
                 v-if="data.type === 'desktop' && openIds.has(data.id)"
-                class="status-dot"
+                :size="7"
                 title="已打开"
               />
               <el-icon v-if="data.type === 'group'" class="node-icon"><Folder /></el-icon>
@@ -461,14 +462,7 @@ async function onNodeDrop(
   color: var(--el-color-primary);
 }
 
-/* 已打开标签的绿点 */
-.status-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: #67c23a;
-  flex-shrink: 0;
-}
+/* 已打开标签的绿点由 StatusDot 组件渲染 */
 
 .node-text {
   overflow: hidden;
@@ -501,7 +495,7 @@ async function onNodeDrop(
 .node-menu-icon {
   font-size: 14px;
   color: var(--el-text-color-secondary);
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
 }
 
 .node-menu-icon:hover {
@@ -534,10 +528,10 @@ async function onNodeDrop(
 
 /* 滚动条美化 */
 .tree-wrap::-webkit-scrollbar {
-  width: 6px;
+  width: var(--app-scrollbar-thin);
 }
 .tree-wrap::-webkit-scrollbar-thumb {
   background: var(--el-border-color);
-  border-radius: 3px;
+  border-radius: var(--app-radius-xs);
 }
 </style>

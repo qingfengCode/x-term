@@ -510,7 +510,7 @@ async function handleSave() {
   width: 100%;
 }
 :deep(.el-textarea__inner) {
-  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+  font-family: var(--app-font-mono);
   font-size: 12px;
 }
 </style>

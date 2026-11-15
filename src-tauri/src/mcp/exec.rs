@@ -44,6 +44,12 @@ pub const MAX_EXEC_TIMEOUT_SECS: u64 = 300;
 const EXEC_OUTPUT_CAP: usize = 16 * 1024;
 /// SFTP 文件操作超时（5 分钟）。文件传输比单条命令耗时，给较大余量。
 const SFTP_OP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// SQL 执行超时（120 秒）。
+///
+/// 必须加：`exec_sql` 持有 `call_slots` 并发许可（16 个），一条挂死语句
+///（`SELECT SLEEP(99999)`、锁等待、大表扫描）会无限期占住许可，16 条即可让
+/// 该 MCP 服务对所有客户端拒绝服务。白名单模式下 SELECT 形态还免确认。
+const SQL_EXEC_TIMEOUT: Duration = Duration::from_secs(120);
 
 // ===========================================================================
 // 视图（不含敏感字段）
@@ -952,7 +958,14 @@ async fn exec_sql_with_profile(
     }
 
     // 执行并立即关闭连接（MCP 模式不缓存连接池）。
-    let res = conn_obj.execute(sql, limit).await;
+    // 超时兜底：挂死语句会无限期占住并发许可（见 SQL_EXEC_TIMEOUT）。
+    let res = match timeout(SQL_EXEC_TIMEOUT, conn_obj.execute(sql, limit)).await {
+        Ok(r) => r,
+        Err(_) => Err(AppError::Storage(format!(
+            "SQL 执行超过 {} 秒已中止，请缩小查询范围或分批执行",
+            SQL_EXEC_TIMEOUT.as_secs()
+        ))),
+    };
     conn_obj.close().await;
 
     let qr = res?;
@@ -1041,7 +1054,14 @@ pub async fn exec_sql_direct(
         };
     }
 
-    let res = conn_obj.execute(sql, limit).await;
+    // 超时兜底（同 exec_sql_with_profile）。
+    let res = match timeout(SQL_EXEC_TIMEOUT, conn_obj.execute(sql, limit)).await {
+        Ok(r) => r,
+        Err(_) => Err(AppError::Storage(format!(
+            "SQL 执行超过 {} 秒已中止，请缩小查询范围或分批执行",
+            SQL_EXEC_TIMEOUT.as_secs()
+        ))),
+    };
     conn_obj.close().await;
 
     let qr = res?;
@@ -1100,11 +1120,11 @@ pub fn arg_sql(args: &Value) -> AppResult<String> {
 }
 
 /// 解析工具参数中 `limit` 字段（exec_sql 用，默认 100）。
+///
+/// 必须钳制：MCP 客户端可传任意大值，执行层按 limit 预分配行缓冲，
+/// 无上限时一次调用就能把进程 abort 掉（见 `database::MAX_QUERY_ROWS`）。
 pub fn arg_limit(args: &Value) -> u32 {
-    args.get("limit")
-        .and_then(Value::as_u64)
-        .map(|n| n as u32)
-        .unwrap_or(100)
+    crate::database::clamp_limit(args.get("limit").and_then(Value::as_u64))
 }
 
 // --- 客户端直连模式参数解析（host/port/username/password/database） ---
@@ -1187,7 +1207,7 @@ pub fn arg_db_kind(args: &Value) -> String {
 // 编码大文件膨胀 context。
 
 /// 日志截断：命令/SQL 等用户输入可能很长且含敏感内容，日志只保留前 `max` 字符。
-fn truncate_log(s: &str, max: usize) -> String {
+pub(crate) fn truncate_log(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {

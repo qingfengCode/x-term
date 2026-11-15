@@ -334,6 +334,12 @@ pub struct AiSystemNoteEvent {
 pub struct AiSqlResultEvent {
     /// 触发执行的 AI 请求 id（便于调试；控制台不依赖它路由）。
     pub request_id: String,
+    /// 执行该 SQL 的数据库连接 id。
+    ///
+    /// 控制台据此把结果回显到**对应连接**的标签：事件此前不带连接 id，前端
+    /// 只能推给当前活动标签——用户停在 B 标签时，AI 在 A 连接上的执行结果
+    /// （SQL 文本 + 行数据）会显示进 B 的控制台，看起来像在 B 上执行过。
+    pub db_conn_id: String,
     /// 执行的 SQL 文本。
     pub sql: String,
     /// 结果列名（非查询语句为空）。

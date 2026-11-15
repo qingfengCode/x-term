@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "X-Term 默认权限",
+  "description": "X-Term 默认权限（注意：fs 全盘读写是本地文件管理器/下载落盘的功能刚需；shell:allow-open 已移除——前端零引用且可打开任意 URL/路径，属纯死权限）",
   "windows": ["main"],
   "permissions": [
     "core:default",
@@ -13,7 +13,6 @@
     "core:window:allow-close",
     "core:window:allow-destroy",
     "core:window:allow-start-dragging",
-    "shell:allow-open",
     "dialog:allow-open",
     "dialog:allow-save",
     "dialog:allow-message",

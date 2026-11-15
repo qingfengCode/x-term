@@ -3,6 +3,7 @@ import { onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
 import { ElMessage } from "element-plus";
 import { useVaultStore } from "@/stores/vault";
+import BrandMark from "@/components/BrandMark.vue";
 
 const router = useRouter();
 const vault = useVaultStore();
@@ -56,7 +57,11 @@ async function submit() {
 <template>
   <div class="unlock-page">
     <div class="unlock-card">
-      <div class="logo">🔐</div>
+      <div class="logo">
+        <BrandMark :size="56">
+          <el-icon><Lock /></el-icon>
+        </BrandMark>
+      </div>
       <h2>{{ vault.exists ? "解锁凭据保险库" : "创建凭据保险库" }}</h2>
       <p class="hint">
         {{
@@ -103,17 +108,21 @@ async function submit() {
 .unlock-card {
   width: 380px;
   padding: 32px;
-  background: var(--el-bg-color);
-  border-radius: 8px;
-  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.15);
+  background: var(--el-bg-color-overlay);
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: var(--app-radius-xl);
+  box-shadow: var(--app-shadow-2);
 }
 .logo {
-  font-size: 48px;
-  text-align: center;
+  display: flex;
+  justify-content: center;
+  margin-bottom: 10px;
 }
 h2 {
   text-align: center;
-  margin: 8px 0 4px;
+  margin: 0 0 4px;
+  font-size: var(--app-font-size-title);
+  font-weight: 600;
 }
 .hint {
   font-size: 12px;

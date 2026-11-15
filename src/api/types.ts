@@ -411,6 +411,8 @@ export interface ToolResult {
 export interface AiSqlResultEvent {
   /** 触发执行的 AI 请求 id（调试用，控制台不依赖它路由）。 */
   requestId: string;
+  /** 执行该 SQL 的数据库连接 id（控制台据此把结果回显到对应连接的标签）。 */
+  dbConnId: string;
   /** 执行的 SQL 文本。 */
   sql: string;
   /** 结果列名（非查询语句为空）。 */

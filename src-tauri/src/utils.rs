@@ -30,6 +30,25 @@ pub fn strip_ansi(s: &str) -> String {
 // 查询结果格式化
 // ===========================================================================
 
+/// 结果文本的总字节上限。
+///
+/// 单个单元格可达 LONGTEXT 级别，limit 行 × 大单元格能拼出数百 MB 字符串
+/// （同时推给模型 / IPC / 日志）。超限后按整行截断并给出明确提示。
+const MAX_FORMAT_BYTES: usize = 256 * 1024;
+
+/// 返回不超过 `max` 的最大 UTF-8 字符边界（std 的 `floor_char_boundary`
+/// 尚未稳定，这里自带一份等价实现）。
+fn floor_char_boundary(s: &str, max: usize) -> usize {
+    if max >= s.len() {
+        return s.len();
+    }
+    let mut i = max;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 /// 把 [`QueryResult`] 格式化成可读的对齐文本表格。
 ///
 /// 首行列名，分隔线，每行数据，末尾行数。
@@ -43,17 +62,40 @@ pub fn format_query_result(qr: &QueryResult) -> String {
     out.push('\n');
     out.push_str(&"-".repeat(qr.columns.iter().map(|c| c.len() + 3).sum::<usize>()));
     out.push('\n');
+    let mut shown = 0usize;
+    let mut size_capped = false;
     for row in &qr.rows {
-        out.push_str(&row.join(" | "));
-        out.push('\n');
+        let mut line = row.join(" | ");
+        line.push('\n');
+        if out.len() + line.len() > MAX_FORMAT_BYTES {
+            // 当前行会顶穿总量上限：按字符边界截断该行后停止，避免静默
+            // 生成巨型字符串（也避免完全无输出）。
+            let budget = MAX_FORMAT_BYTES.saturating_sub(out.len());
+            let cut = floor_char_boundary(&line, budget);
+            if cut > 0 {
+                out.push_str(&line[..cut]);
+                out.push_str("…(单行超长已截断)\n");
+                shown += 1;
+            }
+            size_capped = true;
+            break;
+        }
+        out.push_str(&line);
+        shown += 1;
     }
     if qr.rows.is_empty() {
         out.push_str("(无数据)\n");
     }
-    if qr.truncated {
+    if size_capped {
+        // 面向模型的截断提示：明确告知是"输出体积"而非"行数"受限，
+        // 避免模型误以为结果完整。
+        out.push_str(&format!(
+            "显示前 {shown} 行（输出超过 {MAX_FORMAT_BYTES} 字节上限已截断：请减少返回列、缩小查询范围或分批查询）\n"
+        ));
+    } else if qr.truncated {
         // 面向模型的截断提示：否则模型会把"仅前 limit 行"误当作完整结果。
         out.push_str(&format!(
-            "显示前 {} 行（结果已截断：查询实际返回超过 {} 行；可调大 limit 参数重新查询）\n",
+            "显示前 {} 行（结果已截断：查询实际返回超过 {} 行；请减少返回列、缩小查询范围或分批查询）\n",
             qr.rows.len(),
             qr.rows.len()
         ));
@@ -80,7 +122,7 @@ mod tests {
         };
         let out = format_query_result(&qr);
         assert!(out.contains("已截断"), "截断提示缺失: {out}");
-        assert!(out.contains("limit"), "应引导调大 limit: {out}");
+        assert!(out.contains("分批查询"), "应引导模型缩小查询范围: {out}");
         assert!(!out.contains("共 2 行"), "截断时不应显示误导性的完整行数: {out}");
     }
 

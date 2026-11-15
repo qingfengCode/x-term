@@ -78,6 +78,14 @@ export const useTransferStore = defineStore("transfer", () => {
 
   function add(task: TransferTask) {
     tasks.value.push(task);
+    // 内存列表同步修剪：持久化侧只保留最后 ZMODEM_HISTORY_MAX 条，但内存
+    // 数组此前只增不减——长会话里每次传输（含启动恢复的 100 条历史）都会
+    // 常驻并渲染在下载抽屉里。已结束任务超过上限时按最旧的先丢。
+    const ended = tasks.value.filter(isEnded);
+    if (ended.length > ZMODEM_HISTORY_MAX) {
+      const drop = new Set(ended.slice(0, ended.length - ZMODEM_HISTORY_MAX).map((t) => t.id));
+      tasks.value = tasks.value.filter((t) => !drop.has(t.id));
+    }
   }
 
   function update(id: string, patch: Partial<TransferTask>) {

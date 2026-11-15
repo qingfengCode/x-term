@@ -24,11 +24,31 @@ use crate::ssh::client::ClientHandler;
 /// （连同其持有的 `Arc<Handle>`），超时直接断开。
 const SOCKS5_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// 取消远端转发（`cancel_tcpip_forward`）的最长等待时间。
+///
+/// 与 `ssh::session` 的 DISCONNECT_TIMEOUT 同成因：russh 通过会话任务的有界
+/// channel 投递消息并等回执，底层连接卡死时 await 永久挂起。
+const CANCEL_FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// 该转发下存量桥接任务的注册表类型。
 ///
 /// 桥接任务持有 `Arc<Handle>`，只要有一条空闲连接不关闭，整条 SSH 连接就
 /// 永不释放。`stop` 时遍历 abort 所有句柄，切断这条泄漏链。
 pub type BridgeTasks = std::sync::Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>>;
+
+/// 登记一条桥接任务，同时清理已完成的句柄。
+///
+/// 只 push 不清理会让注册表变成"隧道启动以来的累计连接数"——-L 转发供浏览器
+/// 走 SOCKS/HTTP 代理时一天数万条短连接，Vec 无界增长（慢速内存泄漏）。
+/// -R 路径（ssh/client.rs 的 `retain(!is_finished)`）已修同款问题，这里对齐。
+fn push_bridge(
+    bridge_tasks: &BridgeTasks,
+    bridge: tokio::task::JoinHandle<()>,
+) {
+    let mut tasks = bridge_tasks.lock();
+    tasks.retain(|t| !t.is_finished());
+    tasks.push(bridge);
+}
 
 // ===========================================================================
 // 数据模型
@@ -200,7 +220,7 @@ pub async fn start_local(handle: Handle<ClientHandler>, spec: TunnelSpec) -> App
                             }
                         }
                     });
-                    bridge_tasks.lock().push(bridge);
+                    push_bridge(&bridge_tasks, bridge);
                 }
             }
         }
@@ -397,7 +417,7 @@ pub async fn start_dynamic(handle: Handle<ClientHandler>, spec: TunnelSpec) -> A
                             Err(e) => log::warn!("动态转发通道出错 [{}]: {}", target, e),
                         }
                     });
-                    bridge_tasks.lock().push(bridge);
+                    push_bridge(&bridge_tasks, bridge);
                 }
             }
         }
@@ -554,12 +574,25 @@ pub async fn stop(mut tunnel: Tunnel) -> AppResult<()> {
 
     // 远程转发：取消远端监听 + 移除映射 + abort 存量桥接任务。
     if let Some(rf) = tunnel.remote_forward.take() {
-        if let Err(e) = rf
-            .handle
-            .cancel_tcpip_forward(rf.remote_host.clone(), rf.remote_port)
-            .await
+        // 必须加超时：russh 的 cancel_tcpip_forward 通过会话任务的有界 channel
+        // 投递并等 oneshot 回执，底层连接"活着但卡死"（黑洞网络、发送缓冲满）
+        // 时该 await 永久挂起——forward_stop 的 invoke 永不返回、Tunnel 连同
+        // Arc<Handle> 被悬空 future 持有（连接不释放），独立 spawn 的调用方
+        // 还会泄漏一个永久挂起的 tokio 任务。与 ssh/session.rs 的
+        // DISCONNECT_TIMEOUT 保持一致（同样的成因、同样的兜底）。
+        match tokio::time::timeout(
+            CANCEL_FORWARD_TIMEOUT,
+            rf.handle
+                .cancel_tcpip_forward(rf.remote_host.clone(), rf.remote_port),
+        )
+        .await
         {
-            log::warn!("cancel_tcpip_forward 失败: {}", e);
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => log::warn!("cancel_tcpip_forward 失败: {}", e),
+            Err(_) => log::warn!(
+                "cancel_tcpip_forward 超过 {} 秒未完成（连接可能已卡死），放弃等待",
+                CANCEL_FORWARD_TIMEOUT.as_secs()
+            ),
         }
         let key = (
             rf.remote_host.clone(),

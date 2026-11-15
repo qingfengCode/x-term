@@ -34,12 +34,12 @@ function onRef(el: unknown) {
   registerPaneRef?.(props.tab.id, props.pane.id, el);
 }
 
-/** 窗格标题：会话名；多窗格时追加序号区分。 */
+/** 窗格标题：页签显示标题（尊重重命名）；多窗格时追加序号区分。 */
 const title = computed(() => {
   const idx = props.tab.panes.indexOf(props.pane);
   return props.tab.panes.length > 1 && idx >= 0
-    ? `${props.tab.session.name} · ${idx + 1}`
-    : props.tab.session.name;
+    ? `${props.tab.displayTitle} · ${idx + 1}`
+    : props.tab.displayTitle;
 });
 const isActive = computed(() => props.tab.activePaneId === props.pane.id);
 const zoomed = computed(() => props.tab.zoomedPaneId === props.pane.id);
@@ -188,9 +188,9 @@ function manualAuth() {
   font-size: 10px;
   line-height: 1;
   padding: 2px 5px;
-  border-radius: 3px;
-  background: var(--el-color-primary);
-  color: #fff;
+  border-radius: var(--app-radius-xs);
+  background: var(--app-primary-strong);
+  color: var(--app-accent-contrast);
 }
 .term-item-spacer {
   flex: 1;
@@ -202,7 +202,7 @@ function manualAuth() {
   width: 20px;
   height: 20px;
   border: none;
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   background: transparent;
   color: var(--el-text-color-secondary);
   font-size: 12px;
@@ -292,7 +292,7 @@ function manualAuth() {
   padding: 24px 32px;
   background: var(--el-bg-color-overlay);
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 12px;
+  border-radius: var(--app-radius-xl);
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.22);
 }
 .reconnect-title {

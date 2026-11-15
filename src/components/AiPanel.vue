@@ -109,6 +109,12 @@ function resetWidth() {
 onBeforeUnmount(() => {
   if (dragging.value) onResizeEnd();
   if (composerHeightDragging.value) onComposerResizeEnd();
+  // 注销桌面工具执行器：执行器闭包捕获了本组件状态，卸载后仍留在全局 store
+  // 会被后续 desktop_* 工具调用命中（当前靠 KeepAlive 长期缓存不出问题，
+  // 但一旦桌面页改为非缓存路由或多实例挂载就是隐患）。
+  if (props.domain === "desktop") ai.setDesktopToolExecutor(null);
+  if (tabLockHintTimer) clearTimeout(tabLockHintTimer);
+  tabLockHintTimer = null;
 });
 
 // --- 模式 ----------------------------------------------------------------
@@ -250,10 +256,15 @@ function formatTokens(n: number): string {
   return `${fmt(n / 1_000_000)}M`;
 }
 
-/** 系统注入的提醒消息（如重复调用守卫的 [重复调用提醒]）：以灰色提示渲染，
- *  不伪装成用户自己发送的消息。 */
+/** 系统注入的提醒消息前缀：以灰色提示渲染，不伪装成用户自己发送的消息。
+ *  - `[重复调用提醒]`：重复工具调用守卫；
+ *  - `[系统提示]`：编排层提示（工具参数被输出上限截断、达到轮数上限等）。 */
+const SYSTEM_NOTE_PREFIXES = ["[重复调用提醒]", "[系统提示]"];
+
 function isSystemReminder(m: AiMessage): boolean {
-  return m.role === "user" && m.content.startsWith("[重复调用提醒]");
+  return (
+    m.role === "user" && SYSTEM_NOTE_PREFIXES.some((p) => m.content.startsWith(p))
+  );
 }
 
 // --- 对话标签重命名（双击进入编辑） ---
@@ -330,6 +341,37 @@ watch(
 
 // 响应期间用户切换终端 tab：AI 本轮仍操作发送时的终端，提示用户避免误判
 // （实际锁定已由 resolvedTerminalTab 的 sentTerminalId 分支保证，这里只告知）。
+//
+// 提示渲染在**面板工具栏内**（红色小字 chip，3 秒自动消失，可点击提前关闭）：
+// - 不用全局 ElMessage：默认的顶部弹层正压住标签栏，且会截获鼠标事件，
+//   切换 tab 时被挡住/点不中；
+// - 放面板里既完全不遮挡操作，又能让用户随时瞥一眼、必要时看完整说明。
+const tabLockHintVisible = ref(false);
+let tabLockHintTimer: ReturnType<typeof setTimeout> | null = null;
+
+function notifyTabLock() {
+  tabLockHintVisible.value = true;
+  if (tabLockHintTimer) clearTimeout(tabLockHintTimer);
+  tabLockHintTimer = setTimeout(() => {
+    tabLockHintTimer = null;
+    tabLockHintVisible.value = false;
+  }, 3000);
+}
+
+function dismissTabLockHint() {
+  if (tabLockHintTimer) clearTimeout(tabLockHintTimer);
+  tabLockHintTimer = null;
+  tabLockHintVisible.value = false;
+}
+
+// 响应结束：锁定已解除、提示不再有意义，立即收起（避免残留到下一轮）。
+watch(
+  () => ai.sending,
+  (sending) => {
+    if (!sending) dismissTabLockHint();
+  },
+);
+
 watch(
   () => terminals.activeId,
   (id, old) => {
@@ -340,7 +382,7 @@ watch(
       sentTerminalId.value &&
       id !== sentTerminalId.value
     ) {
-      ElMessage.info("AI 响应中，本轮仍操作发送时的终端（响应结束后自动跟随）");
+      notifyTabLock();
     }
   },
 );
@@ -363,17 +405,21 @@ const resolvedTerminalTab = computed(() => {
   return t && !t.disconnected ? t : null;
 });
 
-/** 可绑定的终端选项（仅终端页签；断开的标记，重连后绑定自动恢复）。 */
+/** 可绑定的终端选项（仅终端页签；断开的标记，重连后绑定自动恢复）。
+ *  名称用页签显示标题（重命名后与 TabBar 一致），不能读 session.name。 */
 const terminalOptions = computed(() =>
-  terminalTabs.value.map((t, i) => ({
-    id: t.id,
-    label:
-      (terminalOptions_dup(t.session.name) ? `${t.session.name} #${i + 1}` : t.session.name) +
-      (t.disconnected ? "（已断开）" : t.instanceId ? "" : "（连接中…）"),
-  })),
+  terminalTabs.value.map((t, i) => {
+    const name = t.displayTitle;
+    return {
+      id: t.id,
+      label:
+        (hasDuplicateTitle(name) ? `${name} #${i + 1}` : name) +
+        (t.disconnected ? "（已断开）" : t.instanceId ? "" : "（连接中…）"),
+    };
+  }),
 );
-function terminalOptions_dup(name: string): boolean {
-  return terminalTabs.value.filter((t) => t.session.name === name).length > 1;
+function hasDuplicateTitle(name: string): boolean {
+  return terminalTabs.value.filter((t) => t.displayTitle === name).length > 1;
 }
 
 function setBoundTerminal(v: string) {
@@ -408,10 +454,10 @@ const contextTip = computed(() => {
         // 已跟随到新切换的 tab（发送后 contextTip 立即显示锁定结果）。
         parts.push(
           ai.sending && sentTerminalId.value
-            ? `${tab.session.name}（本轮固定）`
+            ? `${tab.displayTitle}（本轮固定）`
             : boundTerminalId.value === AUTO_TERMINAL
-              ? `${tab.session.name}（跟随当前）`
-              : `${tab.session.name}（已绑定）`,
+              ? `${tab.displayTitle}（跟随当前）`
+              : `${tab.displayTitle}（已绑定）`,
         );
       }
     }
@@ -551,6 +597,14 @@ const activeModel = computed({
     await settings.save().catch(() => {});
   },
 });
+
+/** 面板过窄（< 340px）时模型选择框切到纯图标（省出约 70px 横向空间），
+ *  保证底部工具行**始终单行**不换行（与执行模式的 compactRunMode 同一思路）。 */
+const compactModel = computed(() => panelWidth.value < 340);
+/** 当前模型名（图标模式下的 title / 下拉回显用）。 */
+const activeModelLabel = computed(
+  () => modelOptions.value.find((o) => o.value === activeModel.value)?.label ?? "未选择模型",
+);
 
 /** 本域的执行模式绑定（ssh 域 → sshAgent.runMode；db 域 → sqlAgent.runMode）。
  *  desktop 域无后端执行工具，不显示。切换即时持久化。 */
@@ -737,6 +791,7 @@ const inputRef = ref();
 
 // --- 输入框高度拖拽（拖动 composer 上边缘调整；仅放大，拖回自然高度恢复自适应） ---
 const composerRef = ref<HTMLElement | null>(null);
+
 /** 自定义高度（px）；null = 内容自适应（默认，autosize 2~5 行）。 */
 const composerH = ref<number | null>(null);
 const composerHeightDragging = ref(false);
@@ -1138,7 +1193,7 @@ function buildSendContext(agent: boolean): {
   if (props.domain === "ssh") {
     if (resolvedTerminalId.value) {
       const tab = terminals.tabs.find((t) => t.instanceId === resolvedTerminalId.value);
-      const name = tab?.session.name ?? "未命名";
+      const name = tab?.displayTitle ?? "未命名";
       // 用户手动绑定的终端在整个会话期间固定（对话/切 tab 不漂移）。
       const bindNote =
         boundTerminalId.value === AUTO_TERMINAL ? "当前活动" : "用户指定";
@@ -1988,7 +2043,13 @@ function renderMarkdown(text: string): string {
   // 代码块加容器与「复制」按钮：随最终字符串一起进缓存，每条消息只处理一次。
   const decorated = decorateCodeBlocks(clean);
   // 缓存上限 200 条，避免长对话内存膨胀。
-  if (renderedCache.size > 200) renderedCache.clear();
+  // 淘汰用 FIFO（Map 按插入序迭代，删最旧一条）：整表 clear 会让下一次渲染把
+  // 200+ 段文本全部重跑 marked + DOMPurify + DOMParser（长对话滚动时肉眼可见
+  // 卡顿），而逐条淘汰同样是 O(1)。
+  if (renderedCache.size >= 200) {
+    const oldest = renderedCache.keys().next();
+    if (!oldest.done) renderedCache.delete(oldest.value);
+  }
   renderedCache.set(text, decorated);
   return decorated;
 }
@@ -2025,6 +2086,13 @@ function renderMarkdown(text: string): string {
           <el-tooltip content="收起" placement="bottom">
             <el-button class="icon-btn" link @click="toggle">
               <el-icon><DArrowRight /></el-icon>
+            </el-button>
+          </el-tooltip>
+          <!-- 新对话：固定在头部（历史会话左侧）。原先放在会话标签行右端，
+               标签多了以后会被滚出视野、且与"新建在右侧"的操作方向混淆。 -->
+          <el-tooltip content="新对话" placement="bottom">
+            <el-button class="icon-btn" link @click="ai.createConversation()">
+              <el-icon><Plus /></el-icon>
             </el-button>
           </el-tooltip>
           <!-- 历史会话：关闭归档的会话列表，面板在按钮下方弹出 -->
@@ -2154,11 +2222,6 @@ function renderMarkdown(text: string): string {
             <Close />
           </el-icon>
         </div>
-        <el-tooltip content="新对话" placement="bottom">
-          <el-button class="conv-new" link @click="ai.createConversation()">
-            <el-icon><Plus /></el-icon>
-          </el-button>
-        </el-tooltip>
       </div>
 
       <!-- 模式选择 + 智能体上下文提示已移至底部输入区（composer）上方 -->
@@ -2525,7 +2588,9 @@ function renderMarkdown(text: string): string {
           <!-- ssh 域：提示条即终端绑定入口（点击弹出终端菜单，选择结果体现在
                提示文案"xxx（已绑定/跟随当前）"里）——不额外占用工具栏宽度。 -->
           <el-dropdown
-            v-if="props.domain === 'ssh' && mode === 'agent' && !configBlocked"
+            v-if="
+              props.domain === 'ssh' && mode === 'agent' && !configBlocked && !tabLockHintVisible
+            "
             trigger="click"
             popper-class="ai-term-bind-dropdown"
             :disabled="ai.sending"
@@ -2561,10 +2626,30 @@ function renderMarkdown(text: string): string {
               </el-dropdown-menu>
             </template>
           </el-dropdown>
-          <span v-else-if="mode === 'agent' && !configBlocked" class="ctx-tip-inline">
+          <span
+            v-else-if="mode === 'agent' && !configBlocked && !tabLockHintVisible"
+            class="ctx-tip-inline"
+          >
             <el-icon><Connection /></el-icon>
             <span>{{ contextTip }}</span>
           </span>
+          <!-- 响应期间切到别的终端标签的临时提示：红色小字，3s 自动消失，点击可立即关闭。
+               放在面板内（而非全局弹层）——不遮挡标签栏、不拦截任何鼠标操作。
+               显示期间暂时顶替左侧的"上下文提示"（同一行只留一条信息，窄面板也不挤）。 -->
+          <span
+            v-if="tabLockHintVisible"
+            class="ctx-tab-lock-hint"
+            title="AI 响应中，本轮仍操作发送时选中的终端；响应结束后自动跟随当前标签。点击可关闭本提示"
+            @click="dismissTabLockHint"
+          >
+            <el-icon><WarningFilled /></el-icon>
+            <span class="ctx-tab-lock-text">本轮仍操作发送时的终端</span>
+          </span>
+          <!-- 弹性占位：把 token 用量 + 图片按钮这组推到右侧贴边。
+               不能用 auto 外边距：usage 和图片按钮都设了 margin-left:auto 时，
+               flex 会把剩余空间**平分**给两个 auto 边距，导致 token 计数落在
+               中间、与图片按钮之间留出同样宽的空白。 -->
+          <span class="toolbar-spacer" />
           <!-- token 用量（最近一次模型请求；取最后一次返回的 usage，不累计） -->
           <span
             v-if="activeUsage.prompt > 0 || activeUsage.completion > 0"
@@ -2714,6 +2799,7 @@ function renderMarkdown(text: string): string {
                 v-model="mode"
                 size="small"
                 placement="top-start"
+                :fallback-placements="['top-start', 'top-end', 'bottom-start', 'bottom-end']"
                 popper-class="composer-pop"
                 class="inline-select inline-mode-select"
               >
@@ -2731,7 +2817,8 @@ function renderMarkdown(text: string): string {
                 v-model="runMode"
                 size="small"
                 placement="top-start"
-                :offset="88"
+                :offset="8"
+                :fallback-placements="['top-start', 'top-end', 'bottom-start', 'bottom-end']"
                 popper-class="composer-pop runmode-pop"
                 class="inline-select inline-runmode-select"
                 :class="[`runmode-${runMode}`, { 'is-compact': compactRunMode }]"
@@ -2758,17 +2845,26 @@ function renderMarkdown(text: string): string {
                 </el-option>
               </el-select>
               <span class="inline-spacer" />
-              <!-- 模型选择：只显示模型名（top-end 右对齐，防超出窗口右缘） -->
+              <!-- 模型选择：只显示模型名（top-end 右对齐，防超出窗口右缘）。
+                   面板过窄时切为纯图标（只留"模型"图标+箭头），保证工具行单行。 -->
               <el-select
                 v-model="activeModel"
                 size="small"
                 filterable
                 :disabled="modelOptions.length === 0"
                 placement="top-end"
+                :fallback-placements="['top-end', 'top-start', 'bottom-end', 'bottom-start']"
                 popper-class="composer-pop"
                 class="inline-select inline-model-select"
-                title="当前模型"
+                :class="{ 'is-icon-only': compactModel }"
+                :title="compactModel ? `当前模型：${activeModelLabel}（点击切换）` : '当前模型'"
               >
+                <template #label>
+                  <span v-if="compactModel" class="model-icon-label">
+                    <el-icon :size="14"><Cpu /></el-icon>
+                  </span>
+                  <template v-else>{{ activeModelLabel }}</template>
+                </template>
                 <el-option
                   v-for="m in modelOptions"
                   :key="m.value"
@@ -2954,7 +3050,7 @@ function renderMarkdown(text: string): string {
   font-size: 12px;
   color: var(--el-text-color-secondary);
   background: var(--el-fill-color-light);
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   cursor: pointer;
   white-space: nowrap;
   transition: background 0.15s, color 0.15s;
@@ -2977,7 +3073,7 @@ function renderMarkdown(text: string): string {
   min-width: 40px;
   max-width: 110px;
   border: 1px solid var(--el-color-primary);
-  border-radius: 3px;
+  border-radius: var(--app-radius-xs);
   background: var(--el-bg-color);
   color: var(--el-text-color-primary);
   font-size: 12px;
@@ -2992,11 +3088,6 @@ function renderMarkdown(text: string): string {
 }
 .conv-tab-close:hover {
   background: var(--el-fill-color-dark);
-}
-.conv-new {
-  padding: 4px 6px;
-  color: var(--el-text-color-secondary);
-  flex-shrink: 0;
 }
 .conv-new:hover {
   color: var(--el-color-primary);
@@ -3037,7 +3128,7 @@ function renderMarkdown(text: string): string {
   gap: 8px;
   padding: 8px 10px;
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   cursor: pointer;
   transition: border-color 0.15s, background 0.15s;
 }
@@ -3105,8 +3196,7 @@ function renderMarkdown(text: string): string {
    弹出方向由各 select 的 placement 属性控制（向上弹）。 */
 :global(.composer-pop) {
   max-width: 280px;
-}
-:global(.composer-pop .el-select-dropdown__list) {
+}:global(.composer-pop .el-select-dropdown__list) {
   max-height: 220px;
 }
 /* 执行模式下拉项是两行内容（标签+说明）：覆盖默认 34px 定高/nowrap 裁切 */
@@ -3174,7 +3264,7 @@ function renderMarkdown(text: string): string {
 /* --- 智能体任务清单条（todo_write 维护） --- */
 .todo-strip {
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   background: var(--el-fill-color-light);
   padding: 8px 10px;
   /* 固定条：不参与 flex 压缩；左右留白对齐消息区 padding（12px）。 */
@@ -3272,7 +3362,7 @@ function renderMarkdown(text: string): string {
   transition: opacity 0.15s;
   background: var(--el-bg-color-overlay);
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   padding: 2px;
   z-index: 5;
 }
@@ -3290,7 +3380,7 @@ function renderMarkdown(text: string): string {
   font-size: 13px;
   color: var(--el-text-color-secondary);
   cursor: pointer;
-  border-radius: 3px;
+  border-radius: var(--app-radius-xs);
 }
 .msg-action:hover {
   background: var(--el-fill-color);
@@ -3309,7 +3399,7 @@ function renderMarkdown(text: string): string {
 .bubble {
   max-width: 85%;
   padding: 8px 12px;
-  border-radius: 10px;
+  border-radius: var(--app-radius-lg);
   font-size: 13px;
   line-height: 1.5;
   word-break: break-word;
@@ -3364,7 +3454,7 @@ function renderMarkdown(text: string): string {
   color: var(--el-text-color-secondary);
   background: var(--el-fill-color-light);
   border: 1px dashed var(--el-border-color-lighter);
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   padding: 4px 10px;
   word-break: break-word;
 }
@@ -3405,10 +3495,10 @@ function renderMarkdown(text: string): string {
   background: var(--el-fill-color-darker);
   color: var(--el-color-success);
   padding: 8px 10px;
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   overflow-x: auto;
   margin: 6px 0;
-  font-family: Consolas, "Cascadia Code", "Courier New", monospace;
+  font-family: var(--app-font-mono);
   font-size: 12px;
   line-height: 1.5;
   white-space: pre;
@@ -3441,7 +3531,7 @@ function renderMarkdown(text: string): string {
   color: var(--el-text-color-secondary);
   background: var(--el-bg-color-overlay);
   border: 1px solid var(--el-border-color);
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   opacity: 0;
   transition: opacity 0.15s;
   cursor: pointer;
@@ -3458,8 +3548,8 @@ function renderMarkdown(text: string): string {
   background: var(--el-fill-color-darker);
   color: var(--el-color-warning);
   padding: 1px 5px;
-  border-radius: 3px;
-  font-family: Consolas, "Cascadia Code", "Courier New", monospace;
+  border-radius: var(--app-radius-xs);
+  font-family: var(--app-font-mono);
   font-size: 12px;
 }
 /* 标题 */
@@ -3595,10 +3685,9 @@ function renderMarkdown(text: string): string {
 }
 .composer.has-custom-height .input-wrap {
   height: 100%;
-  display: flex;
-  flex-direction: column;
 }
-/* el-input textarea：flex 拉伸填满容器（autosize 内联高度不生效），超长内容内部滚动。 */
+/* el-input textarea：flex 拉伸填满剩余空间（autosize 内联高度不生效），
+   超长内容内部滚动；底部工具行在流内，不占用正文可视区。 */
 .composer.has-custom-height :deep(.el-textarea) {
   flex: 1;
   min-height: 0;
@@ -3625,7 +3714,7 @@ function renderMarkdown(text: string): string {
   margin-bottom: 6px;
   padding: 4px 6px;
   background: var(--el-fill-color-light);
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   font-size: 12px;
 }
 /* 已选技能标签条（输入框上方简短显示，复用附加表视觉）。 */
@@ -3637,7 +3726,7 @@ function renderMarkdown(text: string): string {
   margin-bottom: 6px;
   padding: 4px 6px;
   background: var(--el-fill-color-light);
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   font-size: 12px;
 }
 .attached-label {
@@ -3660,7 +3749,7 @@ function renderMarkdown(text: string): string {
   margin-bottom: 6px;
   padding: 6px;
   background: var(--el-fill-color-light);
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   font-size: 12px;
 }
 .attached-img-item {
@@ -3671,13 +3760,13 @@ function renderMarkdown(text: string): string {
   padding: 2px;
   background: var(--el-bg-color);
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
 }
 .attached-img-thumb {
   width: 36px;
   height: 36px;
   object-fit: cover;
-  border-radius: 3px;
+  border-radius: var(--app-radius-xs);
   display: block;
 }
 .attached-img-remove {
@@ -3705,9 +3794,13 @@ function renderMarkdown(text: string): string {
   color: var(--el-text-color-secondary);
   padding: 2px;
   height: 22px;
-  margin-left: auto; /* 靠右贴边 */
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   flex-shrink: 0;
+}
+/* 工具栏弹性占位：独占剩余空间，右侧元素组（token 用量 / 图片按钮）因此贴右。 */
+.toolbar-spacer {
+  flex: 1;
+  min-width: 0;
 }
 .attach-img-btn:hover:not(:disabled) {
   color: var(--el-color-primary);
@@ -3726,7 +3819,7 @@ function renderMarkdown(text: string): string {
   max-height: 160px;
   width: auto;
   height: auto;
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   cursor: zoom-in;
   display: block;
   transition: transform 0.15s, box-shadow 0.15s;
@@ -3743,10 +3836,17 @@ function renderMarkdown(text: string): string {
   margin-bottom: 6px;
   min-height: 24px;
 }
+/* 上下文提示的 el-dropdown 包裹层：允许收缩（内部文字省略），否则窄面板下
+   "会话名（跟随当前）" 的固有宽度会把整行顶出面板、右侧 token/图片按钮溢出。
+   只收缩不伸展——伸展会与 .toolbar-spacer 平分剩余空间，把 token 计数推到中间。 */
+.composer-toolbar :deep(> .el-dropdown) {
+  flex: 0 1 auto;
+  min-width: 0;
+}
 /* 可点击的上下文提示（ssh 域 = 终端绑定入口）：hover 提示可交互 */
 .ctx-tip-link {
   cursor: pointer;
-  border-radius: 3px;
+  border-radius: var(--app-radius-xs);
   padding: 1px 4px;
   margin-left: -4px;
 }
@@ -3764,7 +3864,7 @@ function renderMarkdown(text: string): string {
   gap: 4px;
   font-size: 11px;
   color: var(--el-text-color-secondary);
-  /* 占满中间剩余空间（usage-meter 靠右不被挤出） */
+  /* 占满中间剩余空间（右侧 token/图片按钮用 .toolbar-spacer 贴右） */
   flex: 1;
   min-width: 0;
   /* 截断过长的会话名，避免撑宽面板 */
@@ -3772,12 +3872,58 @@ function renderMarkdown(text: string): string {
   white-space: nowrap;
   text-overflow: ellipsis;
 }
+/* 文字在 flex 子项里，text-overflow 必须落在该子项上才显示省略号 */
+.ctx-tip-inline > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 响应期间切换终端标签的临时提示：红色小字、紧凑、可点击关闭（3s 自动消失）。
+   位于面板工具栏内，完全不遮挡标签栏/终端，也不拦截任何操作。 */
+.ctx-tab-lock-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  /* 面板很窄时要能被压缩（否则会把工具栏撑出横向滚动），文字走省略号 */
+  flex-shrink: 1;
+  min-width: 0;
+  max-width: 100%;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--el-color-danger-light-9);
+  color: var(--el-color-danger);
+  font-size: 11px;
+  line-height: 16px;
+  white-space: nowrap;
+  cursor: pointer;
+  animation: ctx-tab-lock-in 0.15s ease-out;
+}
+.ctx-tab-lock-hint .el-icon {
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.ctx-tab-lock-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+@keyframes ctx-tab-lock-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
 /* 最近一次模型请求的 token 用量（ai:usage 事件覆盖写入，非累计） */
 .usage-meter {
   display: inline-flex;
   align-items: center;
   gap: 3px;
-  margin-left: auto; /* 靠右，不挤占上下文提示 */
   font-size: 11px;
   color: var(--el-text-color-secondary);
   white-space: nowrap;
@@ -3790,31 +3936,62 @@ function renderMarkdown(text: string): string {
   display: flex;
   align-items: flex-end;
 }
-/* 输入框容器：工具行悬浮在内部底部 */
+/* 输入框容器：边框/背景/圆角由容器提供，内部 textarea 无边框，工具行作为
+   普通流式子项贴在容器底部。
+   为什么不用"textarea + 底部 padding + 工具行绝对定位"：padding 属于可滚动
+   内容的一部分，textarea 滚动到中间时正文依然会画到元素底边，绝对定位的
+   工具行必然盖住最后一行（窄面板下工具行换行变高时更明显）。流式布局下
+   textarea 的可视区天然止于工具行上方，任何宽度/控件组合都不会重叠。 */
 .input-wrap {
   position: relative;
   flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--el-input-border-color, var(--el-border-color));
+  border-radius: var(--el-input-border-radius, var(--el-border-radius-base));
+  background: var(--el-input-bg-color, var(--el-fill-color-blank));
+  transition: border-color 0.2s, box-shadow 0.2s;
 }
+.input-wrap:hover {
+  border-color: var(--el-input-hover-border-color, var(--el-border-color-hover));
+}
+.input-wrap:focus-within {
+  border-color: var(--el-input-focus-border-color, var(--el-color-primary));
+  box-shadow: 0 0 0 1px var(--el-input-focus-border-color, var(--el-color-primary)) inset;
+}
+/* 配置缺失时输入框禁用：容器底色跟随禁用态（:has 不支持时退化为普通底色）。 */
+.input-wrap:has(.el-textarea__inner:disabled) {
+  background: var(--el-disabled-bg-color);
+  cursor: not-allowed;
+}
+/* 内部 textarea 去掉自带边框/背景（改由容器提供）。 */
 .composer-row :deep(.el-textarea__inner) {
   resize: none;
-  /* 底部给内嵌工具行（模式/执行模式/模型/发送）留出空间 */
-  padding-bottom: 38px;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
 }
-/* --- 输入框内底部工具行：左=模式/执行模式，右=模型+发送，同一行 ---
-   面板过窄时 flex-wrap 自动换行（模型+发送掉到第二行），不溢出。 */
+.composer-row :deep(.el-textarea__inner:focus) {
+  box-shadow: none;
+}
+/* --- 输入框内底部工具行：左=技能/模式/执行模式，右=模型+发送，同一行 ---
+   面板过窄时 flex-wrap 自动换行（模型+发送掉到第二行），不溢出；
+   换行只影响自身高度，不会挤压/遮挡上方正文。 */
 .composer-inline-bar {
-  position: absolute;
-  left: 5px;
-  right: 5px;
-  bottom: 5px;
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   gap: 6px;
-  flex-wrap: wrap;
+  /* 强制单行：窄面板靠"模型选择切纯图标 + 模式选择可压缩省略"腾挪空间，
+     不再换行（换行会把工具行挤成两行、压缩输入框可视高度）。 */
+  flex-wrap: nowrap;
+  padding: 0 5px 5px;
 }
 /* 中部弹性占位：把模型选择+发送推到右侧 */
 .inline-spacer {
   flex: 1;
+  min-width: 0;
 }
 /* 技能按钮（+）：与 select 同高的无边框图标按钮 */
 .skill-btn {
@@ -3862,19 +4039,34 @@ function renderMarkdown(text: string): string {
 .inline-select :deep(.el-select__caret) {
   font-size: 12px;
 }
-/* 模式选择：紧凑定宽（最长选项"智能体"三字 + 箭头） */
+/* 模式选择：紧凑定宽（最长选项"智能体"三字 + 箭头）；
+   极窄面板（< 280px）时允许被压缩并显示省略号，避免撑破单行。 */
 .inline-mode-select {
-  width: 72px;
-  flex-shrink: 0;
+  flex: 0 1 72px;
+  min-width: 52px;
 }
-/* 执行模式：与模式选择同宽（最长选项"白名单运行"五字收窄内边距后可容纳） */
+.inline-mode-select :deep(.el-select__selected-item) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 执行模式：默认 84px（"白名单运行"五字 + 箭头可完整显示），
+   空间不够时允许压缩并省略——不再固定 76px 导致常态截断成"白名单…"。 */
 .inline-runmode-select {
-  width: 76px;
-  flex-shrink: 0;
+  flex: 0 1 84px;
+  min-width: 64px;
 }
-/* 面板过窄时执行模式切为纯图标：收窄为图标+箭头位宽并居中 */
+.inline-runmode-select :deep(.el-select__selected-item) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 面板过窄时执行模式切为纯图标：收窄为图标+箭头位宽并居中
+   （flex-basis/min-width 一并收到 34，避免上面的 min-width:64 把图标态撑回去） */
 .inline-runmode-select.is-compact {
+  flex: 0 0 34px;
   width: 34px;
+  min-width: 34px;
 }
 .inline-runmode-select.is-compact :deep(.el-select__wrapper) {
   padding: 0 3px;
@@ -3894,6 +4086,19 @@ function renderMarkdown(text: string): string {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* 面板过窄时模型选择切为纯图标：宽度收到图标+箭头，居中显示 */
+.inline-model-select.is-icon-only {
+  width: 34px;
+}
+.inline-model-select.is-icon-only :deep(.el-select__wrapper) {
+  padding: 0 3px;
+  justify-content: center;
+}
+.model-icon-label {
+  display: inline-flex;
+  align-items: center;
+  color: var(--el-text-color-regular);
+}
 /* 执行模式按当前值着色：白名单=主色、自动=警示橙（手动=默认色） */
 .inline-runmode-select.runmode-whitelist :deep(.el-select__wrapper) {
   color: var(--el-color-primary);
@@ -3907,7 +4112,7 @@ function renderMarkdown(text: string): string {
   font-size: 16px;
   color: var(--el-color-primary);
   padding: 2px;
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   flex-shrink: 0;
 }
 .inline-send-btn:disabled {
@@ -3942,7 +4147,7 @@ function renderMarkdown(text: string): string {
    首个/最后一个元素用 :first-child 折叠多余外边距，避免气泡上下出现空白。 */
 .tool-card {
   border: 1px solid var(--el-border-color);
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   background: var(--el-fill-color-blank);
   overflow: hidden;
   font-size: 12px;
@@ -4003,7 +4208,7 @@ function renderMarkdown(text: string): string {
   color: var(--el-text-color-secondary);
   cursor: pointer;
   padding: 2px;
-  border-radius: 3px;
+  border-radius: var(--app-radius-xs);
 }
 .tool-copy:hover {
   background: var(--el-fill-color);
@@ -4027,7 +4232,7 @@ function renderMarkdown(text: string): string {
   padding: 4px 6px;
   background: var(--el-fill-color-dark);
   color: var(--el-color-success);
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   font-size: 11px;
   max-height: 160px;
   overflow: auto;
@@ -4064,7 +4269,7 @@ function renderMarkdown(text: string): string {
 .ask-q {
   padding: 8px 10px;
   background: var(--el-fill-color-light);
-  border-radius: 8px;
+  border-radius: var(--app-radius-md);
 }
 /* 问题元信息行：序号 + 短标题 + 多选标记 */
 .ask-q-head {
@@ -4078,7 +4283,7 @@ function renderMarkdown(text: string): string {
   font-size: 11px;
   color: var(--el-text-color-secondary);
   background: var(--el-fill-color);
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   padding: 0 6px;
   line-height: 18px;
   flex-shrink: 0;
@@ -4088,7 +4293,7 @@ function renderMarkdown(text: string): string {
   font-weight: 600;
   color: var(--el-color-warning);
   background: var(--el-color-warning-light-9);
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   padding: 0 6px;
   line-height: 18px;
   max-width: 60%;
@@ -4101,7 +4306,7 @@ function renderMarkdown(text: string): string {
   color: var(--el-color-primary);
   background: var(--el-color-primary-light-9);
   border: 1px dashed var(--el-color-primary-light-5);
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   padding: 0 6px;
   line-height: 16px;
   flex-shrink: 0;
@@ -4129,7 +4334,7 @@ function renderMarkdown(text: string): string {
   cursor: pointer;
   padding: 6px 8px;
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   background: var(--el-fill-color-blank);
   transition:
     border-color 0.15s ease,
@@ -4170,7 +4375,7 @@ function renderMarkdown(text: string): string {
     background-color 0.15s ease;
 }
 .ask-opt-box.multi {
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
 }
 .ask-option input:checked + .ask-opt-box {
   border-color: var(--el-color-primary);
@@ -4185,7 +4390,7 @@ function renderMarkdown(text: string): string {
 }
 /* 多选选中：主色底 + 白色对勾 */
 .ask-option input:checked + .ask-opt-box.multi {
-  background: var(--el-color-primary);
+  background: var(--app-primary-strong);
 }
 .ask-option input:checked + .ask-opt-box.multi::after {
   content: "✓";
@@ -4196,7 +4401,7 @@ function renderMarkdown(text: string): string {
   justify-content: center;
   font-size: 10px;
   line-height: 1;
-  color: #fff;
+  color: var(--app-accent-contrast);
 }
 .ask-opt-body {
   min-width: 0;
@@ -4216,7 +4421,7 @@ function renderMarkdown(text: string): string {
   color: var(--el-color-success);
   background: var(--el-color-success-light-9);
   border: 1px solid var(--el-color-success-light-7);
-  border-radius: 3px;
+  border-radius: var(--app-radius-xs);
   padding: 0 4px;
   margin-left: 4px;
   vertical-align: 1px;
@@ -4247,7 +4452,7 @@ function renderMarkdown(text: string): string {
   color: var(--el-color-success);
   background: var(--el-color-success-light-9);
   border: 1px solid var(--el-color-success-light-7);
-  border-radius: 10px;
+  border-radius: var(--app-radius-lg);
   padding: 1px 8px;
   max-width: 100%;
   overflow: hidden;
